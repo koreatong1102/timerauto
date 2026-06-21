@@ -1,0 +1,68 @@
+name: Build latest release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-latest:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Build portable package
+        shell: pwsh
+        run: |
+          $version = "1.0.${{ github.run_number }}"
+          .\build_release.ps1 -Version $version
+
+      - name: Prepare latest release files
+        shell: pwsh
+        run: |
+          $version = "1.0.${{ github.run_number }}"
+          $sourceZip = "release\TimerAuto_v${version}_portable.zip"
+          $latestZip = "release\TimerAuto_latest_portable.zip"
+          Copy-Item -LiteralPath $sourceZip -Destination $latestZip -Force
+
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $latestZip).Hash.ToLowerInvariant()
+          $repo = "${{ github.repository }}"
+          $metadata = [ordered]@{
+            version = $version
+            url = "https://github.com/$repo/releases/download/latest/TimerAuto_latest_portable.zip"
+            notes = "TimerAuto $version"
+            sha256 = $hash
+          }
+          $metadata | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "release\latest.json" -Encoding UTF8
+
+      - name: Publish latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          gh release delete latest --yes --cleanup-tag 2>$null
+
+          git tag -f latest
+          git push origin latest --force
+
+          gh release create latest `
+            "release\TimerAuto_latest_portable.zip" `
+            "release\latest.json" `
+            --title "TimerAuto latest" `
+            --notes "Automatic latest build from ${{ github.sha }}" `
+            --latest

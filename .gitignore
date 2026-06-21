@@ -1,0 +1,41 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Build outputs
+build/
+dist/
+release/
+*.spec.bak
+
+# Logs and runtime output
+logs/
+*.log
+*.jsonl
+
+# Local backups and scratch files
+.git_backup_*/
+백업/
+백업/
+backup/
+0619/
+2.py
+presets/2.py
+
+# Local/user configuration
+config.json
+profile.json
+profile1.json
+as.json
+test.json
+
+# Installer output
+installer/TimerAuto_Setup_*.exe
+installer/*.tmp
+
+# Editor/OS noise
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

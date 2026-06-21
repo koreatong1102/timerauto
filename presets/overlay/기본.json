@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "overlay_bg_color": "#55aa00",
+  "overlay_bg_opacity": 0.0,
+  "overlay_player_mask": "hex",
+  "overlay_show_round": true,
+  "overlay_show_time": true,
+  "overlay_show_blue_img": true,
+  "overlay_show_blue_name": true,
+  "overlay_show_red_img": true,
+  "overlay_show_red_name": true,
+  "overlay_show_arena_name": true,
+  "overlay_style": {
+    "round": {
+      "bg_color": "#bfa57a",
+      "bg_opacity": 1.0,
+      "border_color": "#5b4631",
+      "border_opacity": 1.0,
+      "border_width": 2,
+      "text_color": "#3a2a1d",
+      "text_opacity": 0.82,
+      "font_family": "Bahnschrift",
+      "font_size": 0,
+      "font_bold": true,
+      "font_weight": 700
+    },
+    "time": {
+      "bg_color": "#3a3a3a",
+      "bg_opacity": 1.0,
+      "border_color": "#1a1a1a",
+      "border_opacity": 1.0,
+      "border_width": 2,
+      "text_color": "#ffffff",
+      "text_opacity": 1.0,
+      "font_family": "Bahnschrift",
+      "font_size": 0,
+      "font_bold": true,
+      "font_weight": 700
+    },
+    "blue_name": {
+      "bg_color": "#2d5ed0",
+      "bg_opacity": 1.0,
+      "border_color": "#1b3f8a",
+      "border_opacity": 1.0,
+      "border_width": 1,
+      "text_color": "#ffffff",
+      "text_opacity": 1.0,
+      "font_family": "Noto Sans KR",
+      "font_size": 0,
+      "font_bold": true,
+      "font_weight": 900
+    },
+    "red_name": {
+      "bg_color": "#d14b4b",
+      "bg_opacity": 1.0,
+      "border_color": "#8f2d2d",
+      "border_opacity": 1.0,
+      "border_width": 1,
+      "text_color": "#ffffff",
+      "text_opacity": 1.0,
+      "font_family": "Noto Sans KR",
+      "font_size": 0,
+      "font_bold": true,
+      "font_weight": 900
+    },
+    "arena": {
+      "bg_color": "#222222",
+      "bg_opacity": 1.0,
+      "border_color": "#555555",
+      "border_opacity": 1.0,
+      "border_width": 1,
+      "text_color": "#ffffff",
+      "text_opacity": 1.0,
+      "font_family": "Malgun Gothic",
+      "font_size": 0,
+      "font_bold": true,
+      "font_weight": 700
+    }
+  },
+  "overlay_layout": {
+    "arena_name": {
+      "h": 25.0,
+      "w": 175.0,
+      "x": 10.0,
+      "y": 125.0
+    },
+    "blue_img": {
+      "h": 100.0,
+      "w": 115.0,
+      "x": 190.0,
+      "y": 34.0
+    },
+    "blue_name": {
+      "h": 55.0,
+      "w": 195.0,
+      "x": 315.0,
+      "y": 70.0
+    },
+    "custom_elements": [],
+    "red_img": {
+      "h": 100.0,
+      "w": 115.0,
+      "x": 190.0,
+      "y": 150.0
+    },
+    "red_name": {
+      "h": 55.0,
+      "w": 195.0,
+      "x": 315.0,
+      "y": 150.0
+    },
+    "round": {
+      "h": 80.0,
+      "w": 175.0,
+      "x": 10.0,
+      "y": 34.0
+    },
+    "time": {
+      "h": 85.0,
+      "w": 175.0,
+      "x": 10.0,
+      "y": 160.0
+    }
+  }
+}

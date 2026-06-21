@@ -118,27 +118,16 @@ except Exception:
 # --- OCR: EasyOCR ---
 _EASYOCR_IMPORT_ERROR = None
 _EASYOCR_READER_ERROR = None
-try:
-    import easyocr
-    HAS_EASYOCR = True
-except Exception as e:
-    HAS_EASYOCR = False
-    easyocr = None
-    _EASYOCR_IMPORT_ERROR = str(e)
+easyocr = None
+HAS_EASYOCR = True
 
 if TYPE_CHECKING:
     from easyocr import Reader as EasyOCRReader
 
 # --- Player segmentation: MediaPipe ---
-try:
-    import mediapipe as mp
-    HAS_MEDIAPIPE = True
-    if not hasattr(mp, "solutions") or not hasattr(mp.solutions, "selfie_segmentation"):
-        HAS_MEDIAPIPE = False
-        mp = None
-except Exception:
-    HAS_MEDIAPIPE = False
-    mp = None
+mp = None
+HAS_MEDIAPIPE = True
+_MEDIAPIPE_IMPORT_ERROR = None
 
 from actions import ActionRunner
 from browser_overlay import BrowserOverlayServer
@@ -1844,10 +1833,21 @@ def press_vk_for_window_title(
 
 
 def _get_easyocr_reader(langs: Tuple[str, ...]):
-    global HAS_EASYOCR, _EASYOCR_IMPORT_ERROR, _EASYOCR_READER_ERROR
+    global easyocr, HAS_EASYOCR, _EASYOCR_IMPORT_ERROR, _EASYOCR_READER_ERROR
     if not HAS_EASYOCR:
         return None
     with _EASYOCR_LOCK:
+        if easyocr is None:
+            try:
+                import easyocr as _easyocr
+                easyocr = _easyocr
+                HAS_EASYOCR = True
+                _EASYOCR_IMPORT_ERROR = None
+            except Exception as e:
+                HAS_EASYOCR = False
+                _EASYOCR_IMPORT_ERROR = str(e)
+                _EASYOCR_READER_ERROR = str(e)
+                return None
         reader = _EASYOCR_READERS.get(langs)
         if reader is None:
             try:
@@ -2206,12 +2206,24 @@ def save_ocr_debug_report(cfg: AppConfig, out_dir: str) -> Tuple[List[str], str]
 
 
 def _get_mediapipe_selfie():
-    global _MP_SELFIE
+    global mp, HAS_MEDIAPIPE, _MEDIAPIPE_IMPORT_ERROR, _MP_SELFIE
     if not HAS_MEDIAPIPE:
         return None
     if _MP_SELFIE is not None:
         return _MP_SELFIE
     with _MP_LOCK:
+        if mp is None:
+            try:
+                import mediapipe as _mp
+                if not hasattr(_mp, "solutions") or not hasattr(_mp.solutions, "selfie_segmentation"):
+                    raise RuntimeError("mediapipe selfie_segmentation unavailable")
+                mp = _mp
+                HAS_MEDIAPIPE = True
+                _MEDIAPIPE_IMPORT_ERROR = None
+            except Exception as e:
+                HAS_MEDIAPIPE = False
+                _MEDIAPIPE_IMPORT_ERROR = str(e)
+                return None
         if _MP_SELFIE is None:
             _MP_SELFIE = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
     return _MP_SELFIE

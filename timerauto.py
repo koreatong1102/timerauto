@@ -27,6 +27,9 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from collections import deque
 
+APP_VERSION = "1.0.0"
+UPDATE_FEED_URL = "https://github.com/koreatong1102/timerauto/releases/download/latest/latest.json"
+
 # Ensure a non-native Qt Quick Controls style for QML customization.
 os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Fusion")
 
@@ -4294,6 +4297,7 @@ class PlayerImageProvider(QQuickImageProvider):
 
 class TimerBackend(QObject):
     open_settings_requested = pyqtSignal()
+    check_updates_requested = pyqtSignal()
     start_detection_requested = pyqtSignal()
     start_screen_detection_requested = pyqtSignal()
     toggle_ocr_detection_requested = pyqtSignal()
@@ -5627,6 +5631,10 @@ class TimerBackend(QObject):
     def open_settings(self):
         self.open_settings_requested.emit()
 
+    @pyqtSlot()
+    def check_updates(self):
+        self.check_updates_requested.emit()
+
     @pyqtSlot(str, bool)
     def set_overlay_visible(self, key: str, visible: bool):
         self.overlayVisibilityRequested.emit(str(key or ""), bool(visible))
@@ -5861,11 +5869,13 @@ class OverlayHitTestFilter(QAbstractNativeEventFilter):
 
 class QmlTimerWindow(QObject):
     open_settings = pyqtSignal()
+    check_updates = pyqtSignal()
 
     def __init__(self, cfg: AppConfig, cfg_path: str):
         super().__init__()
         self._backend = TimerBackend()
         self._backend.open_settings_requested.connect(self.open_settings.emit)
+        self._backend.check_updates_requested.connect(self.check_updates.emit)
         self._backend.overlayResetRequested.connect(self._on_overlay_reset)
         self._layout = LayoutBackend(cfg, cfg_path)
 
@@ -6489,6 +6499,7 @@ class QmlTimerWindow(QObject):
 # -----------------------------
 class TimerWindow(QMainWindow):
     open_settings = pyqtSignal()
+    check_updates = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -6502,6 +6513,9 @@ class TimerWindow(QMainWindow):
             lambda: QDesktopServices.openUrl(QUrl("http://127.0.0.1:17872/overlay"))
         )
         menu_file.addAction(act_open_browser_overlay)
+        act_check_updates = QAction("Check for Updates", self)
+        act_check_updates.triggered.connect(lambda: self.check_updates.emit())
+        menu_file.addAction(act_check_updates)
         act_quit = QAction("Exit", self)
         act_quit.triggered.connect(self.close)
         menu_file.addAction(act_quit)
@@ -17345,9 +17359,15 @@ class SettingsDialog(QDialog):
 # -----------------------------
 class MainApp(QObject):
     _ocr_actions_ready = pyqtSignal()
+    _update_metadata_ready = pyqtSignal(dict, bool)
+    _update_error_ready = pyqtSignal(str, bool)
+    _update_download_ready = pyqtSignal(str)
 
     def __init__(self, cfg_path: str):
         super().__init__()
+        self._update_metadata_ready.connect(self._handle_update_metadata)
+        self._update_error_ready.connect(self._finish_update_check_error)
+        self._update_download_ready.connect(self._confirm_apply_update)
         self.cfg_path = cfg_path
         self.cfg = AppConfig.from_json(cfg_path)
         # Chapter anchor is session-scoped runtime state.
@@ -17361,6 +17381,10 @@ class MainApp(QObject):
         self._action_last_run: Dict[str, float] = {}
 
         self.timer_win = QmlTimerWindow(self.cfg, self.cfg_path)
+        try:
+            self.timer_win.check_updates.connect(self.check_for_updates)
+        except Exception:
+            pass
         self.timer_win.set_qml_preview_enabled(bool(getattr(self.cfg, "qml_preview_enabled", True)))
         self.browser_overlay = BrowserOverlayServer(17872, no_update=_NO_UPDATE, path_resolver=normalize_app_path)
         self.browser_overlay.start()
@@ -19752,6 +19776,121 @@ class MainApp(QObject):
         except Exception:
             pass
 
+    def check_for_updates(self, silent: bool = False):
+        if getattr(self, "_update_check_busy", False):
+            if not silent:
+                QMessageBox.information(None, "Update", "Update check is already running.")
+            return
+        self._update_check_busy = True
+
+        def _work():
+            try:
+                req = Request(UPDATE_FEED_URL, headers={"User-Agent": "TimerAuto-Updater"})
+                with urlopen(req, timeout=30) as resp:
+                    meta = json.loads(resp.read().decode("utf-8-sig", errors="replace"))
+                latest = str(meta.get("version") or "").strip()
+                url = str(meta.get("url") or "").strip()
+                sha256 = str(meta.get("sha256") or "").strip().lower()
+                notes = str(meta.get("notes") or "").strip()
+                if not latest or not url:
+                    raise RuntimeError("Invalid update metadata.")
+                self._update_metadata_ready.emit(
+                    {"latest": latest, "url": url, "sha256": sha256, "notes": notes},
+                    bool(silent),
+                )
+            except Exception as e:
+                logging.warning("UPDATE_CHECK_FAIL: %s", e, exc_info=True)
+                self._update_error_ready.emit(str(e), bool(silent))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _finish_update_check_error(self, msg: str, silent: bool = False):
+        self._update_check_busy = False
+        if not silent:
+            QMessageBox.warning(None, "Update", f"Update check failed:\n{msg}")
+
+    def _handle_update_metadata(self, meta: dict, silent: bool = False):
+        latest = str(meta.get("latest") or "")
+        if _parse_version(latest) <= _parse_version(APP_VERSION):
+            self._update_check_busy = False
+            if not silent:
+                QMessageBox.information(None, "Update", f"Already up to date.\nCurrent: {APP_VERSION}")
+            return
+        notes = str(meta.get("notes") or "")
+        msg = f"A new version is available.\n\nCurrent: {APP_VERSION}\nLatest: {latest}"
+        if notes:
+            msg += f"\n\n{notes}"
+        msg += "\n\nDownload it now?"
+        resp = QMessageBox.question(
+            None,
+            "Update",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            self._update_check_busy = False
+            return
+        self._download_and_apply_update(meta)
+
+    def _download_and_apply_update(self, meta: dict):
+        url = str(meta.get("url") or "")
+        sha256 = str(meta.get("sha256") or "").strip().lower()
+        latest = str(meta.get("latest") or "latest")
+        if not url:
+            self._finish_update_check_error("Missing download URL.")
+            return
+        QMessageBox.information(None, "Update", "Downloading update. Please wait.")
+
+        def _work():
+            try:
+                work_dir = os.path.join(tempfile.gettempdir(), "timerauto_update")
+                os.makedirs(work_dir, exist_ok=True)
+                zip_path = os.path.join(work_dir, f"TimerAuto_{latest}_portable.zip")
+                _download_file(url, zip_path)
+                if sha256:
+                    actual = _file_sha256(zip_path)
+                    if actual != sha256:
+                        raise RuntimeError("Downloaded file checksum mismatch.")
+                self._update_download_ready.emit(zip_path)
+            except Exception as e:
+                logging.warning("UPDATE_DOWNLOAD_FAIL: %s", e, exc_info=True)
+                self._update_error_ready.emit(str(e), False)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _confirm_apply_update(self, zip_path: str):
+        self._update_check_busy = False
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                None,
+                "Update",
+                f"Download and checksum verification completed.\nAutomatic replacement is disabled in development mode.\n\n{zip_path}",
+            )
+            return
+        try:
+            exe_path = os.path.abspath(sys.executable)
+            app_dir = os.path.dirname(exe_path)
+            script = _write_update_script(zip_path, app_dir, exe_path)
+        except Exception as e:
+            QMessageBox.warning(None, "Update", f"Failed to prepare update:\n{e}")
+            return
+        resp = QMessageBox.question(
+            None,
+            "Update",
+            "Download completed.\nClose TimerAuto and apply the update now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            import subprocess
+            subprocess.Popen(["cmd", "/c", script], close_fds=True)
+            QApplication.quit()
+        except Exception as e:
+            QMessageBox.warning(None, "Update", f"Failed to launch updater:\n{e}")
+
     def _global_pick_busy(self) -> bool:
         if self._quick_pick_active:
             return True
@@ -21240,6 +21379,51 @@ def _setup_logging(cfg_path: str) -> str:
 
     logging.info("Logging started: %s", log_path)
     return log_path
+
+
+def _parse_version(value: Any) -> Tuple[int, ...]:
+    nums = [int(x) for x in re.findall(r"\d+", str(value or ""))]
+    return tuple(nums or [0])
+
+
+def _download_file(url: str, dst: str) -> None:
+    req = Request(url, headers={"User-Agent": "TimerAuto-Updater"})
+    with urlopen(req, timeout=60) as resp, open(dst, "wb") as f:
+        shutil.copyfileobj(resp, f)
+
+
+def _file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def _write_update_script(zip_path: str, app_dir: str, exe_path: str) -> str:
+    script_path = os.path.join(tempfile.gettempdir(), "timerauto_apply_update.bat")
+    zip_path = os.path.abspath(zip_path)
+    app_dir = os.path.abspath(app_dir)
+    exe_path = os.path.abspath(exe_path)
+    exe_name = os.path.basename(exe_path)
+    lines = [
+        "@echo off",
+        "setlocal",
+        "timeout /t 2 /nobreak >nul",
+        ":waitloop",
+        f'tasklist /fi "imagename eq {exe_name}" | find /i "{exe_name}" >nul',
+        "if not errorlevel 1 (",
+        "  timeout /t 1 /nobreak >nul",
+        "  goto waitloop",
+        ")",
+        f'powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath ''{zip_path}'' -DestinationPath ''{app_dir}'' -Force"',
+        f'start "" "{exe_path}"',
+        "endlocal",
+        'del "%~f0"',
+    ]
+    with open(script_path, "w", encoding="mbcs", errors="ignore") as f:
+        f.write("\r\n".join(lines) + "\r\n")
+    return script_path
 
 
 def main():

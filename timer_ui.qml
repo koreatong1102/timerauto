@@ -1622,6 +1622,25 @@ ApplicationWindow {
                 ToolTip.text: "\uC124\uC815\uCC3D \uC5F4\uAE30"
             }
             Button {
+                text: "\uC5C5\uB370\uC774\uD2B8"
+                width: 68
+                height: 26
+                hoverEnabled: true
+                contentItem: Text {
+                    text: parent.text
+                    color: "#ffffff"
+                    font.pixelSize: 12
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                }
+                background: Rectangle { color: "#1f1f1f"; radius: 4 }
+                onClicked: { if (backend) backend.check_updates() }
+                visible: true
+                ToolTip.visible: hovered
+                ToolTip.text: "\uC0C8 \uBC84\uC804 \uD655\uC778"
+            }
+            Button {
                 text: "\uBC29\uC1A1\uB3D9\uAE30\uD654"
                 width: 84
                 height: 26

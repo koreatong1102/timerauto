@@ -26,6 +26,9 @@ jobs:
         shell: pwsh
         run: |
           $version = "1.0.${{ github.run_number }}"
+          $source = Get-Content -Raw timerauto.py
+          $source = $source -replace 'APP_VERSION = "[^"]+"', "APP_VERSION = `"$version`""
+          Set-Content -LiteralPath timerauto.py -Value $source -Encoding UTF8
           .\build_release.ps1 -Version $version
 
       - name: Prepare latest release files

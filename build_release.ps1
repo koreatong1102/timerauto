@@ -126,7 +126,6 @@ $imageFiles += Get-ChildItem -Path $root -Recurse -Filter *.jpeg -File -ErrorAct
   Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\logs\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
 $imageFiles += Get-ChildItem -Path $root -Recurse -Filter *.bmp -File -ErrorAction SilentlyContinue |
   Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\logs\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
-$imageFiles = $imageFiles | Where-Object { $_.FullName -notmatch "\\image\\players\\" }
 foreach ($img in $imageFiles) {
   Copy-RelativeFile $img.FullName $root $dist
 }
@@ -166,11 +165,6 @@ if (Test-Path $cfgPath) {
 $imgSrc = Join-Path $root "image"
 if (Test-Path $imgSrc) {
   Copy-Item -Recurse -Force $imgSrc $dist
-}
-
-$distPlayerImages = Join-Path $dist "image\players"
-if (Test-Path $distPlayerImages) {
-  Remove-Item -LiteralPath $distPlayerImages -Recurse -Force
 }
 
 @(

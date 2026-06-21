@@ -21406,6 +21406,7 @@ def _write_update_script(zip_path: str, app_dir: str, exe_path: str) -> str:
     app_dir = os.path.abspath(app_dir)
     exe_path = os.path.abspath(exe_path)
     exe_name = os.path.basename(exe_path)
+    extract_dir = os.path.join(tempfile.gettempdir(), "timerauto_update_extract")
     lines = [
         "@echo off",
         "setlocal",
@@ -21416,7 +21417,12 @@ def _write_update_script(zip_path: str, app_dir: str, exe_path: str) -> str:
         "  timeout /t 1 /nobreak >nul",
         "  goto waitloop",
         ")",
-        f'powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath ''{zip_path}'' -DestinationPath ''{app_dir}'' -Force"',
+        f'if exist "{extract_dir}" rmdir /s /q "{extract_dir}"',
+        f'mkdir "{extract_dir}"',
+        f'powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath ''{zip_path}'' -DestinationPath ''{extract_dir}'' -Force"',
+        f'robocopy "{extract_dir}" "{app_dir}" /E /R:2 /W:1 /XD "{extract_dir}\\image\\players"',
+        "if %ERRORLEVEL% GEQ 8 exit /b %ERRORLEVEL%",
+        f'rmdir /s /q "{extract_dir}"',
         f'start "" "{exe_path}"',
         "endlocal",
         'del "%~f0"',

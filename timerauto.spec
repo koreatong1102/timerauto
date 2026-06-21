@@ -2,6 +2,7 @@
 
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
+from pathlib import Path
 
 
 def _try_collect(name):
@@ -52,19 +53,22 @@ binaries_extra = []
 binaries_extra += _try_collect_libs('torch')
 binaries_extra += _try_collect_libs('torchvision')
 
+datas_base = [
+    ('HELP.md', '.'),
+    ('timer_ui.qml', '.'),
+    ('cinematic_overlay.qml', '.'),
+    ('timer_controls.qml', '.'),
+    ('image', 'image'),
+]
+for optional_file in ('config.json', 'profile.json'):
+    if Path(optional_file).exists():
+        datas_base.append((optional_file, '.'))
+
 a = Analysis(
     ['timerauto.py'],
     pathex=['.'],
     binaries=binaries_extra,
-    datas=[
-        ('HELP.md', '.'),
-        ('timer_ui.qml', '.'),
-        ('cinematic_overlay.qml', '.'),
-        ('timer_controls.qml', '.'),
-        ('image', 'image'),
-        ('config.json', '.'),
-        ('profile.json', '.'),
-    ] + datas_extra,
+    datas=datas_base + datas_extra,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

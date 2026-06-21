@@ -31,7 +31,6 @@ if (-not $SkipPip) {
     "mss",
     "opencv-python",
     "numpy",
-    "mediapipe",
     "pillow",
     "edge-tts",
     "pywin32"

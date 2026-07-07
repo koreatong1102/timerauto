@@ -19,6 +19,7 @@ ApplicationWindow {
     property bool editMode: false
     property bool showControls: true
     property bool qmlPreviewEnabled: backend ? backend.qmlPreviewEnabled : true
+    property bool qmlEffectsEnabled: backend ? backend.qmlEffectsEnabled : false
     property int gridSize: 5
     property int snapThreshold: 6
     property int topBarHeight: 32
@@ -98,7 +99,7 @@ ApplicationWindow {
     }
 
     function maybeStartTekkenVsIntro() {
-        if (!root.tekkenPreset || !backend || !backend.overlayShowCinematic)
+        if (!root.qmlEffectsEnabled || !root.tekkenPreset || !backend || !backend.overlayShowCinematic)
             return
         var key = String(backend.blueName || "") + "\u001f" + String(backend.redName || "")
         if (key === "\u001f" || key === root._tekkenVsKey)
@@ -109,7 +110,7 @@ ApplicationWindow {
     }
 
     function maybeStartTekkenRoundIntro(force) {
-        if (!root.tekkenPreset || !backend || !backend.overlayShowCinematic)
+        if (!root.qmlEffectsEnabled || !root.tekkenPreset || !backend || !backend.overlayShowCinematic)
             return
         var key = String(backend.roundText || "")
         if (key === "" || (!force && key === root._tekkenRoundIntroKey))
@@ -332,8 +333,8 @@ ApplicationWindow {
 
     Rectangle {
         anchors.fill: parent
-        color: backend ? backend.overlayBgColor : "transparent"
-        opacity: backend ? backend.overlayBgOpacity : 0.0
+        color: "#000000"
+        opacity: backend ? backend.overlayUiBgOpacity : 0.75
         z: -10
     }
 
@@ -388,7 +389,7 @@ ApplicationWindow {
     }
 
     function triggerFailEffect(side) {
-        if (!root.qmlPreviewEnabled || !root._cfg("fail.enabled", true)) return
+        if (!root.qmlEffectsEnabled || !root._cfg("fail.enabled", true)) return
         if (side === "blue") {
             _blueFailLines = _makeCracks(blueImgBox.width, blueImgBox.height)
             blueFailCanvas.requestPaint()
@@ -421,7 +422,7 @@ ApplicationWindow {
             root.scheduleBoundsUpdate()
         }
         function onBlueWinStreakChanged() {
-            if (!root.qmlPreviewEnabled) { root._lastBlueStreak = backend.blueWinStreak; return }
+            if (!root.qmlEffectsEnabled) { root._lastBlueStreak = backend.blueWinStreak; return }
             if (backend.blueWinStreak > root._lastBlueStreak) {
                 root.triggerWinTextPulse("blue")
             }
@@ -440,7 +441,7 @@ ApplicationWindow {
             root._lastBlueStreak = backend.blueWinStreak
         }
         function onRedWinStreakChanged() {
-            if (!root.qmlPreviewEnabled) { root._lastRedStreak = backend.redWinStreak; return }
+            if (!root.qmlEffectsEnabled) { root._lastRedStreak = backend.redWinStreak; return }
             if (backend.redWinStreak > root._lastRedStreak) {
                 root.triggerWinTextPulse("red")
             }
@@ -459,7 +460,7 @@ ApplicationWindow {
             root._lastRedStreak = backend.redWinStreak
         }
         function onStunFlashRequested(side) {
-            if (!root.qmlPreviewEnabled) return
+            // Stage46: spectator/test portrait FX must still be visible in the local preview.
             if (side === "blue") {
                 blueStunFlashAnim.restart()
                 tekkenBlueStunAnim.restart()
@@ -469,7 +470,7 @@ ApplicationWindow {
             }
         }
         function onSpectatorEffectRequested(side, kind) {
-            if (!root.qmlPreviewEnabled) return
+            // Stage46: do not hide spectator KO/stun portrait feedback behind the generic QML effects toggle.
             if (kind === "stun") {
                 if (side === "blue") { blueStunFlashAnim.restart(); tekkenBlueStunAnim.restart() }
                 else if (side === "red") { redStunFlashAnim.restart(); tekkenRedStunAnim.restart() }
@@ -508,7 +509,7 @@ ApplicationWindow {
             }
         }
         function onHitImpactRequested(side, damage) {
-            if (!root.qmlPreviewEnabled) return
+            // Stage46: settings/test hit impact should be visible in the local preview too.
             if (side === "blue") {
                 root._blueHitDamage = damage
                 blueHitImpactAnim.restart()
@@ -747,6 +748,8 @@ ApplicationWindow {
     }
 
     function triggerWinTextPulse(side) {
+        if (!root.qmlEffectsEnabled)
+            return
         if (side === "blue") {
             if (blueWinTextPulse) blueWinTextPulse.restart()
         } else if (side === "red") {
@@ -1535,10 +1538,10 @@ ApplicationWindow {
                 visible: true
                 Text {
                     id: bgOpacityLabel
-                    text: "\uD22C\uBA85\uB3C4"
+                    text: "UI\n\uD22C\uBA85"
                     width: 38
                     color: "#e5e7eb"
-                    font.pixelSize: 11
+                    font.pixelSize: 10
                     horizontalAlignment: Text.AlignRight
                     verticalAlignment: Text.AlignVCenter
                 }
@@ -1547,19 +1550,19 @@ ApplicationWindow {
                     hoverEnabled: true
                     from: 0.0
                     to: 1.0
-                    value: backend ? backend.overlayBgOpacity : 0.85
+                    value: backend ? backend.overlayUiBgOpacity : 0.75
                     width: 92
                     height: 16
                     ToolTip.visible: hovered
-                ToolTip.text: "\uBC30\uACBD \uD22C\uBA85\uB3C4 (\uC67C\uCABD=\uBD88\uD22C\uBA85, \uC624\uB978\uCABD=\uD22C\uBA85)"
+                    ToolTip.text: "\uD504\uB85C\uADF8\uB7A8 UI \uCC3D \uC804\uCCB4 \uD22C\uBA85\uB3C4 (\uC67C\uCABD=\uD22C\uBA85, \uC624\uB978\uCABD=\uBD88\uD22C\uBA85)"
                     onValueChanged: {
                         if (!pressed && backend) {
-                            backend.setOverlayBgOpacity(value)
+                            backend.setOverlayUiBgOpacity(value)
                         }
                     }
                     onPressedChanged: {
                         if (!pressed && backend) {
-                            backend.setOverlayBgOpacity(value)
+                            backend.setOverlayUiBgOpacity(value)
                         }
                     }
                 }
@@ -1600,7 +1603,7 @@ ApplicationWindow {
                 background: Rectangle { color: "#1f1f1f"; radius: 4 }
                 onClicked: showControls = true
                 ToolTip.visible: hovered
-                ToolTip.text: "\uC0C1\uB2E8 \uB3C4\uAD6C \uD45C\uC2DC/\uC228\uAE40"
+                ToolTip.text: "\uC0C1\uB2E8 \uB3C4\uAD6C \uD56D\uC0C1 \uD45C\uC2DC"
             }
             Button {
                 text: "\uC124\uC815"
@@ -1876,7 +1879,7 @@ ApplicationWindow {
         anchors.rightMargin: 10
         anchors.top: parent.top
         anchors.topMargin: 8
-        visible: !editMode && (showControls || topBarHover)
+        visible: true
         opacity: miniHover.containsMouse ? 1.0 : 0.82
 
         MouseArea {
@@ -1884,8 +1887,8 @@ ApplicationWindow {
             anchors.fill: parent
             hoverEnabled: true
             onClicked: {
-                root.showControls = false
-                root.topBarHover = false
+                root.showControls = true
+                root.topBarHover = true
                 root.showMinimized()
             }
         }
@@ -2366,15 +2369,19 @@ ApplicationWindow {
         function hpRatio(side) { return root.hpCurrentRatio(side) }
         function ghostRatio(side) { return root.hpGhostRatio(side) }
         function dmgText(side) {
+            if (!root.qmlEffectsEnabled) return ""
             return side === "blue" ? (backend ? backend.blueDamageText : "DMG 0") : (backend ? backend.redDamageText : "DMG 0")
         }
         function recentText(side) {
+            if (!root.qmlEffectsEnabled) return ""
             return side === "blue" ? (backend ? backend.blueRecentHitText : "") : (backend ? backend.redRecentHitText : "")
         }
         function comboHit(side) {
+            if (!root.qmlEffectsEnabled) return ""
             return side === "blue" ? (backend ? backend.blueComboHitText : "") : (backend ? backend.redComboHitText : "")
         }
         function comboDamage(side) {
+            if (!root.qmlEffectsEnabled) return ""
             return side === "blue" ? (backend ? backend.blueComboDamageText : "") : (backend ? backend.redComboDamageText : "")
         }
         function commaInt(n) {
@@ -3317,42 +3324,66 @@ ApplicationWindow {
         Connections {
             target: backend
             function onBlueComboHitTextChanged() {
+                if (!root.qmlEffectsEnabled) {
+                    root._tekkenBlueComboVisible = false
+                    tekkenBlueComboHideTimer.stop()
+                    return
+                }
                 if (backend.blueComboHitText !== "") {
                     var wasVisible = root._tekkenBlueComboVisible
                     root._tekkenBlueComboVisible = true
-                    if (!wasVisible)
+                    if (root.qmlEffectsEnabled && !wasVisible)
                         tekkenBlueComboIn.restart()
-                    tekkenBlueComboPunch.restart()
+                    if (root.qmlEffectsEnabled)
+                        tekkenBlueComboPunch.restart()
                     tekkenBlueComboHideTimer.restart()
                 } else {
                     root._tekkenBlueComboVisible = false
                 }
             }
             function onRedComboHitTextChanged() {
+                if (!root.qmlEffectsEnabled) {
+                    root._tekkenRedComboVisible = false
+                    tekkenRedComboHideTimer.stop()
+                    return
+                }
                 if (backend.redComboHitText !== "") {
                     var wasVisible = root._tekkenRedComboVisible
                     root._tekkenRedComboVisible = true
-                    if (!wasVisible)
+                    if (root.qmlEffectsEnabled && !wasVisible)
                         tekkenRedComboIn.restart()
-                    tekkenRedComboPunch.restart()
+                    if (root.qmlEffectsEnabled)
+                        tekkenRedComboPunch.restart()
                     tekkenRedComboHideTimer.restart()
                 } else {
                     root._tekkenRedComboVisible = false
                 }
             }
             function onBlueRecentHitTextChanged() {
+                if (!root.qmlEffectsEnabled) {
+                    root._tekkenBlueRecentVisible = false
+                    tekkenBlueRecentHideTimer.stop()
+                    return
+                }
                 if (backend.blueRecentHitText !== "") {
                     root._tekkenBlueRecentVisible = true
-                    tekkenBlueRecentImpact.restart()
+                    if (root.qmlEffectsEnabled)
+                        tekkenBlueRecentImpact.restart()
                     tekkenBlueRecentHideTimer.restart()
                 } else {
                     root._tekkenBlueRecentVisible = false
                 }
             }
             function onRedRecentHitTextChanged() {
+                if (!root.qmlEffectsEnabled) {
+                    root._tekkenRedRecentVisible = false
+                    tekkenRedRecentHideTimer.stop()
+                    return
+                }
                 if (backend.redRecentHitText !== "") {
                     root._tekkenRedRecentVisible = true
-                    tekkenRedRecentImpact.restart()
+                    if (root.qmlEffectsEnabled)
+                        tekkenRedRecentImpact.restart()
                     tekkenRedRecentHideTimer.restart()
                 } else {
                     root._tekkenRedRecentVisible = false
@@ -4417,7 +4448,7 @@ ApplicationWindow {
         color: Qt.rgba(5 / 255, 18 / 255, 36 / 255, 0.88)
         border.color: Qt.rgba(96 / 255, 165 / 255, 250 / 255, 0.95)
         border.width: 1
-        visible: root.qmlPreviewEnabled && backend && backend.blueRecentHitText !== ""
+        visible: root.qmlPreviewEnabled && root.qmlEffectsEnabled && backend && backend.blueRecentHitText !== ""
         onVisibleChanged: scheduleBoundsUpdate()
         onWidthChanged: scheduleBoundsUpdate()
         onHeightChanged: scheduleBoundsUpdate()
@@ -4446,7 +4477,7 @@ ApplicationWindow {
         color: Qt.rgba(39 / 255, 7 / 255, 7 / 255, 0.88)
         border.color: Qt.rgba(248 / 255, 113 / 255, 113 / 255, 0.95)
         border.width: 1
-        visible: root.qmlPreviewEnabled && backend && backend.redRecentHitText !== ""
+        visible: root.qmlPreviewEnabled && root.qmlEffectsEnabled && backend && backend.redRecentHitText !== ""
         onVisibleChanged: scheduleBoundsUpdate()
         onWidthChanged: scheduleBoundsUpdate()
         onHeightChanged: scheduleBoundsUpdate()
@@ -4496,28 +4527,28 @@ ApplicationWindow {
         property real wispPulse: 1.0
 
         SequentialAnimation on corePulse {
-            running: root.qmlPreviewEnabled && blueAura.visible
+            running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueAura.visible
             loops: Animation.Infinite
             NumberAnimation { from: 0.75; to: 1.25; duration: 900 }
             NumberAnimation { from: 1.25; to: 0.85; duration: 700 }
             PauseAnimation { duration: 200 }
         }
         SequentialAnimation on bodyPulse {
-            running: root.qmlPreviewEnabled && blueAura.visible
+            running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueAura.visible
             loops: Animation.Infinite
             NumberAnimation { from: 0.7; to: 1.15; duration: 1200 }
             NumberAnimation { from: 1.15; to: 0.85; duration: 900 }
             PauseAnimation { duration: 300 }
         }
         SequentialAnimation on glowPulse {
-            running: root.qmlPreviewEnabled && blueAura.visible
+            running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueAura.visible
             loops: Animation.Infinite
             NumberAnimation { from: 0.6; to: 1.2; duration: 1600 }
             NumberAnimation { from: 1.2; to: 0.75; duration: 1200 }
             PauseAnimation { duration: 400 }
         }
         SequentialAnimation on wispPulse {
-            running: root.qmlPreviewEnabled && blueAura.visible
+            running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueAura.visible
             loops: Animation.Infinite
             NumberAnimation { from: 0.5; to: 1.1; duration: 1800 }
             NumberAnimation { from: 1.1; to: 0.7; duration: 1400 }
@@ -4542,7 +4573,7 @@ ApplicationWindow {
 
         ParticleSystem {
             id: blueParticles
-            running: root.qmlPreviewEnabled && blueAura.visible
+            running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueAura.visible
             Item {
                 id: blueNeonFrame
                 visible: false
@@ -5158,7 +5189,7 @@ ApplicationWindow {
             color: "transparent"
             border.color: "transparent"
             border.width: 0
-            visible: root.qmlPreviewEnabled && blueImgBox.visible && backend && backend.blueDamageText !== ""
+            visible: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueImgBox.visible && backend && backend.blueDamageText !== ""
             onVisibleChanged: scheduleBoundsUpdate()
             onWidthChanged: scheduleBoundsUpdate()
             onHeightChanged: scheduleBoundsUpdate()
@@ -5189,7 +5220,7 @@ ApplicationWindow {
             x: blueImgBox.x + (blueImgBox.width - width) * 0.5
             y: Math.max(0, blueImgBox.y - height - Math.max(12, blueImgBox.height * 0.12))
             radius: Math.max(4, height * 0.12)
-            visible: root.qmlPreviewEnabled && active && backend && backend.blueComboHitText !== ""
+            visible: root.qmlPreviewEnabled && root.qmlEffectsEnabled && active && backend && backend.blueComboHitText !== ""
             color: "transparent"
             border.color: "transparent"
             onVisibleChanged: scheduleBoundsUpdate()
@@ -5207,6 +5238,11 @@ ApplicationWindow {
             Connections {
                 target: backend
                 function onBlueComboHitTextChanged() {
+                    if (!root.qmlEffectsEnabled) {
+                        blueComboBadge.active = false
+                        blueComboHideTimer.stop()
+                        return
+                    }
                     if (backend.blueComboHitText !== "") {
                         blueComboBadge.active = true
                         blueComboHideTimer.restart()
@@ -5555,7 +5591,7 @@ ApplicationWindow {
             Timer {
                 interval: 40
                 repeat: true
-                running: root.qmlPreviewEnabled && blueImgBox.visible
+                running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueImgBox.visible
                 onTriggered: {
                     blueImgBoxBorder.shimmerPhase = (blueImgBoxBorder.shimmerPhase + 0.02) % 1.0
                     blueImgBoxBorder.requestPaint()
@@ -5652,7 +5688,7 @@ ApplicationWindow {
             Timer {
                 interval: root._cfg("inner.dust.interval", 140)
                 repeat: true
-                running: root.qmlPreviewEnabled && blueInnerFx.visible && blueDust.visible
+                running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueInnerFx.visible && blueDust.visible
                 onTriggered: blueDust.requestPaint()
             }
             Canvas {
@@ -5661,7 +5697,7 @@ ApplicationWindow {
                 renderTarget: Canvas.Image
                 visible: root.qmlPreviewEnabled && root._cfg("inner.hud.enabled", true) && backend && backend.blueWinStreak >= root._cfg("inner.hud.min", 6)
                 property real rot: 0
-                RotationAnimation on rot { from: 0; to: 360; duration: root._cfg("inner.hud.speed", 10000); loops: Animation.Infinite; running: root.qmlPreviewEnabled && blueHUD.visible }
+                RotationAnimation on rot { from: 0; to: 360; duration: root._cfg("inner.hud.speed", 10000); loops: Animation.Infinite; running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueHUD.visible }
                 onRotChanged: requestPaint()
                 onPaint: {
                     var ctx = getContext("2d"); ctx.clearRect(0,0,width,height); ctx.save()
@@ -5693,7 +5729,7 @@ ApplicationWindow {
                 visible: root.qmlPreviewEnabled && root._cfg("inner.electric.enabled", true) && backend && backend.blueWinStreak >= root._cfg("inner.electric.min", 9)
                 property var bolts: []
                 Timer {
-                    interval: root._cfg("inner.electric.interval", 100); repeat: true; running: root.qmlPreviewEnabled && blueElectricBits.visible
+                    interval: root._cfg("inner.electric.interval", 100); repeat: true; running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueElectricBits.visible
                     onTriggered: {
                         var b = []; if (Math.random() > 0.4) {
                             var w = parent.width, h = parent.height
@@ -5735,7 +5771,7 @@ ApplicationWindow {
                 property real energy: 0; property real shock: 0
                 visible: root.qmlPreviewEnabled && root._cfg("inner.core.enabled", true) && backend && backend.blueWinStreak >= root._cfg("inner.core.min", 12)
                 ParallelAnimation {
-                    running: root.qmlPreviewEnabled && blueNovaPulse.visible; loops: Animation.Infinite
+                    running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueNovaPulse.visible; loops: Animation.Infinite
                     SequentialAnimation {
                         NumberAnimation { target: blueNovaPulse; property: "energy"; from: 0; to: 1; duration: root._cfg("inner.core.period", 900) * 0.28; easing.type: Easing.InSine }
                         NumberAnimation { target: blueNovaPulse; property: "energy"; from: 1; to: 0; duration: root._cfg("inner.core.period", 900) * 0.72; easing.type: Easing.OutCubic }
@@ -5784,7 +5820,7 @@ ApplicationWindow {
                 renderTarget: Canvas.Image
                 visible: root.qmlPreviewEnabled && root._cfg("inner.chrono.enabled", true) && backend && backend.blueWinStreak >= root._cfg("inner.chrono.min", 30)
                 property real p: 0
-                NumberAnimation on p { from: 0; to: 1; duration: root._cfg("inner.chrono.speed", 1500); loops: Animation.Infinite; running: root.qmlPreviewEnabled && blueChronoRift.visible }
+                NumberAnimation on p { from: 0; to: 1; duration: root._cfg("inner.chrono.speed", 1500); loops: Animation.Infinite; running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && blueChronoRift.visible }
                 onPChanged: {
                     if (p > 0.9) { blueImgBox.jitterX = (Math.random()-0.5)*8; blueImgBox.jitterY = (Math.random()-0.5)*8 }
                     requestPaint()
@@ -6011,7 +6047,7 @@ ApplicationWindow {
             Timer {
                 interval: 20
                 repeat: true
-                running: root.qmlPreviewEnabled && root._blueFailOpacity > 0.0
+                running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && root._blueFailOpacity > 0.0
                 onTriggered: {
                     blueImgBox.jitterX = (Math.random() - 0.5) * 9
                     blueImgBox.jitterY = (Math.random() - 0.5) * 9
@@ -6502,28 +6538,28 @@ ApplicationWindow {
         property real wispPulse: 1.0
 
         SequentialAnimation on corePulse {
-            running: root.qmlPreviewEnabled && redAura.visible
+            running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redAura.visible
             loops: Animation.Infinite
             NumberAnimation { from: 0.75; to: 1.25; duration: 900 }
             NumberAnimation { from: 1.25; to: 0.85; duration: 700 }
             PauseAnimation { duration: 200 }
         }
         SequentialAnimation on bodyPulse {
-            running: root.qmlPreviewEnabled && redAura.visible
+            running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redAura.visible
             loops: Animation.Infinite
             NumberAnimation { from: 0.7; to: 1.15; duration: 1200 }
             NumberAnimation { from: 1.15; to: 0.85; duration: 900 }
             PauseAnimation { duration: 300 }
         }
         SequentialAnimation on glowPulse {
-            running: root.qmlPreviewEnabled && redAura.visible
+            running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redAura.visible
             loops: Animation.Infinite
             NumberAnimation { from: 0.6; to: 1.2; duration: 1600 }
             NumberAnimation { from: 1.2; to: 0.75; duration: 1200 }
             PauseAnimation { duration: 400 }
         }
         SequentialAnimation on wispPulse {
-            running: root.qmlPreviewEnabled && redAura.visible
+            running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redAura.visible
             loops: Animation.Infinite
             NumberAnimation { from: 0.5; to: 1.1; duration: 1800 }
             NumberAnimation { from: 1.1; to: 0.7; duration: 1400 }
@@ -6548,7 +6584,7 @@ ApplicationWindow {
 
         ParticleSystem {
             id: redParticles
-            running: root.qmlPreviewEnabled && redAura.visible
+            running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redAura.visible
             Item {
                 id: redNeonFrame
                 visible: false
@@ -7164,7 +7200,7 @@ ApplicationWindow {
             color: "transparent"
             border.color: "transparent"
             border.width: 0
-            visible: root.qmlPreviewEnabled && redImgBox.visible && backend && backend.redDamageText !== ""
+            visible: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redImgBox.visible && backend && backend.redDamageText !== ""
             onVisibleChanged: scheduleBoundsUpdate()
             onWidthChanged: scheduleBoundsUpdate()
             onHeightChanged: scheduleBoundsUpdate()
@@ -7195,7 +7231,7 @@ ApplicationWindow {
             x: redImgBox.x + (redImgBox.width - width) * 0.5
             y: Math.max(0, redImgBox.y - height - Math.max(12, redImgBox.height * 0.12))
             radius: Math.max(4, height * 0.12)
-            visible: root.qmlPreviewEnabled && active && backend && backend.redComboHitText !== ""
+            visible: root.qmlPreviewEnabled && root.qmlEffectsEnabled && active && backend && backend.redComboHitText !== ""
             color: "transparent"
             border.color: "transparent"
             onVisibleChanged: scheduleBoundsUpdate()
@@ -7213,6 +7249,11 @@ ApplicationWindow {
             Connections {
                 target: backend
                 function onRedComboHitTextChanged() {
+                    if (!root.qmlEffectsEnabled) {
+                        redComboBadge.active = false
+                        redComboHideTimer.stop()
+                        return
+                    }
                     if (backend.redComboHitText !== "") {
                         redComboBadge.active = true
                         redComboHideTimer.restart()
@@ -7558,7 +7599,7 @@ ApplicationWindow {
             Timer {
                 interval: 40
                 repeat: true
-                running: root.qmlPreviewEnabled && redImgBox.visible
+                running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redImgBox.visible
                 onTriggered: {
                     redImgBoxBorder.shimmerPhase = (redImgBoxBorder.shimmerPhase + 0.02) % 1.0
                     redImgBoxBorder.requestPaint()
@@ -7655,7 +7696,7 @@ ApplicationWindow {
             Timer {
                 interval: root._cfg("inner.dust.interval", 140)
                 repeat: true
-                running: root.qmlPreviewEnabled && redInnerFx.visible && redDust.visible
+                running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redInnerFx.visible && redDust.visible
                 onTriggered: redDust.requestPaint()
             }
             Canvas {
@@ -7664,7 +7705,7 @@ ApplicationWindow {
                 renderTarget: Canvas.Image
                 visible: root.qmlPreviewEnabled && root._cfg("inner.hud.enabled", true) && backend && backend.redWinStreak >= root._cfg("inner.hud.min", 6)
                 property real rot: 0
-                RotationAnimation on rot { from: 0; to: 360; duration: root._cfg("inner.hud.speed", 10000); loops: Animation.Infinite; running: root.qmlPreviewEnabled && redHUD.visible }
+                RotationAnimation on rot { from: 0; to: 360; duration: root._cfg("inner.hud.speed", 10000); loops: Animation.Infinite; running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redHUD.visible }
                 onRotChanged: requestPaint()
                 onPaint: {
                     var ctx = getContext("2d"); ctx.clearRect(0,0,width,height); ctx.save()
@@ -7694,7 +7735,7 @@ ApplicationWindow {
                 visible: root.qmlPreviewEnabled && root._cfg("inner.electric.enabled", true) && backend && backend.redWinStreak >= root._cfg("inner.electric.min", 9)
                 property var bolts: []
                 Timer {
-                    interval: root._cfg("inner.electric.interval", 100); repeat: true; running: root.qmlPreviewEnabled && redElectricBits.visible
+                    interval: root._cfg("inner.electric.interval", 100); repeat: true; running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redElectricBits.visible
                     onTriggered: {
                         var b = []; if (Math.random() > 0.4) {
                             var w = parent.width, h = parent.height
@@ -7736,7 +7777,7 @@ ApplicationWindow {
                 property real energy: 0; property real shock: 0
                 visible: root.qmlPreviewEnabled && root._cfg("inner.core.enabled", true) && backend && backend.redWinStreak >= root._cfg("inner.core.min", 12)
                 ParallelAnimation {
-                    running: root.qmlPreviewEnabled && redNovaPulse.visible; loops: Animation.Infinite
+                    running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redNovaPulse.visible; loops: Animation.Infinite
                     SequentialAnimation {
                         NumberAnimation { target: redNovaPulse; property: "energy"; from: 0; to: 1; duration: root._cfg("inner.core.period", 900) * 0.28; easing.type: Easing.InSine }
                         NumberAnimation { target: redNovaPulse; property: "energy"; from: 1; to: 0; duration: root._cfg("inner.core.period", 900) * 0.72; easing.type: Easing.OutCubic }
@@ -7785,7 +7826,7 @@ ApplicationWindow {
                 renderTarget: Canvas.Image
                 visible: root.qmlPreviewEnabled && root._cfg("inner.chrono.enabled", true) && backend && backend.redWinStreak >= root._cfg("inner.chrono.min", 30)
                 property real p: 0
-                NumberAnimation on p { from: 0; to: 1; duration: root._cfg("inner.chrono.speed", 1500); loops: Animation.Infinite; running: root.qmlPreviewEnabled && redChronoRift.visible }
+                NumberAnimation on p { from: 0; to: 1; duration: root._cfg("inner.chrono.speed", 1500); loops: Animation.Infinite; running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && redChronoRift.visible }
                 onPChanged: {
                     if (p > 0.9) { redImgBox.jitterX = (Math.random()-0.5)*8; redImgBox.jitterY = (Math.random()-0.5)*8 }
                     requestPaint()
@@ -8012,7 +8053,7 @@ ApplicationWindow {
             Timer {
                 interval: 20
                 repeat: true
-                running: root.qmlPreviewEnabled && root._redFailOpacity > 0.0
+                running: root.qmlPreviewEnabled && root.qmlEffectsEnabled && root._redFailOpacity > 0.0
                 onTriggered: {
                     redImgBox.jitterX = (Math.random() - 0.5) * 9
                     redImgBox.jitterY = (Math.random() - 0.5) * 9
@@ -8685,3 +8726,6 @@ ApplicationWindow {
     }
 
 }
+
+
+

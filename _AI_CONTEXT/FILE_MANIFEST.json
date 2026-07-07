@@ -1,0 +1,822 @@
+{
+  "root": ".",
+  "files": [
+    {
+      "path": "BEST_COMMENTARY_PATCH_NOTES.md",
+      "size": 1090,
+      "mtime": 1782506042,
+      "sha256_16": "2bb7bc494a63a05e"
+    },
+    {
+      "path": "BREAK_BUDGET_SUMMARY_NOTES.md",
+      "size": 720,
+      "mtime": 1782506042,
+      "sha256_16": "b6192259b20221c1"
+    },
+    {
+      "path": "COMMENTARY_TEST_HOTFIX_NOTES.md",
+      "size": 1201,
+      "mtime": 1782506042,
+      "sha256_16": "3125745e1cd70e75"
+    },
+    {
+      "path": "COMMENTARY_TEST_SUITE_HOTFIX_NOTES.md",
+      "size": 1446,
+      "mtime": 1782506042,
+      "sha256_16": "8102793c2a82984d"
+    },
+    {
+      "path": "CONSOLE_SAFE_HOTFIX_NOTES.md",
+      "size": 447,
+      "mtime": 1782506042,
+      "sha256_16": "5bb413d18cc0cc1a"
+    },
+    {
+      "path": "DAMAGE_GAUGE_FINAL_COMMENTARY_NOTES.md",
+      "size": 809,
+      "mtime": 1782506042,
+      "sha256_16": "584dee83d87ead8e"
+    },
+    {
+      "path": "DOWN_STATE_MACHINE_HOTFIX_NOTES.md",
+      "size": 1514,
+      "mtime": 1782506042,
+      "sha256_16": "df1b312cbaaac244"
+    },
+    {
+      "path": "DUO_TEST_FLOW_HOTFIX_NOTES.md",
+      "size": 683,
+      "mtime": 1782506042,
+      "sha256_16": "1074d9303d95e370"
+    },
+    {
+      "path": "FINAL_OPTIMIZATION_NOTES.md",
+      "size": 3167,
+      "mtime": 1782506042,
+      "sha256_16": "ea48323d19efe978"
+    },
+    {
+      "path": "FULL_SYSTEM_AUDIT_HOTFIX_NOTES.md",
+      "size": 1914,
+      "mtime": 1782506042,
+      "sha256_16": "29ce6d13ec5d5d32"
+    },
+    {
+      "path": "GAUGE_AWARE_COMMENTARY_NOTES.md",
+      "size": 1083,
+      "mtime": 1782506042,
+      "sha256_16": "806b67c5335a80b8"
+    },
+    {
+      "path": "HELP.md",
+      "size": 1928,
+      "mtime": 1782506042,
+      "sha256_16": "46d6ae626518577d"
+    },
+    {
+      "path": "IDLE_ROLE_POLICY_NOTES.md",
+      "size": 597,
+      "mtime": 1782506042,
+      "sha256_16": "19ba076c0cc77b7c"
+    },
+    {
+      "path": "IMAGE_PATH_CONSOLE_HOTFIX_NOTES.md",
+      "size": 473,
+      "mtime": 1782506042,
+      "sha256_16": "6f0783be8d09fc8e"
+    },
+    {
+      "path": "JOSA_TKO_REPORT_HOTFIX_NOTES.md",
+      "size": 1122,
+      "mtime": 1782506042,
+      "sha256_16": "675d5590f4dc47ce"
+    },
+    {
+      "path": "LOGIC_RELEASE_AUDIT_NOTES.md",
+      "size": 2651,
+      "mtime": 1782506042,
+      "sha256_16": "1a821bd314a341fe"
+    },
+    {
+      "path": "LOG_DETECT_RELEASE_HOTFIX_NOTES.md",
+      "size": 899,
+      "mtime": 1782506042,
+      "sha256_16": "2a29866ab7d27a35"
+    },
+    {
+      "path": "LONG_REST_SUMMARY_HOTFIX_NOTES.md",
+      "size": 892,
+      "mtime": 1782506042,
+      "sha256_16": "6d427f97b481c21d"
+    },
+    {
+      "path": "MAJOR_SURGERY_NOTES.md",
+      "size": 1925,
+      "mtime": 1782506042,
+      "sha256_16": "17fa3261050febf3"
+    },
+    {
+      "path": "MATCH_END_SUMMARY_HOTFIX_NOTES.md",
+      "size": 819,
+      "mtime": 1782506042,
+      "sha256_16": "2dca9adc64811999"
+    },
+    {
+      "path": "MENU_LOG_TOGGLE_OPACITY_HOTFIX_NOTES.md",
+      "size": 1321,
+      "mtime": 1782506042,
+      "sha256_16": "b96a3f7d7f1e3000"
+    },
+    {
+      "path": "NATURAL_IDLE_COMMENTARY_NOTES.md",
+      "size": 1286,
+      "mtime": 1782506042,
+      "sha256_16": "cfacb1df6d5b1e08"
+    },
+    {
+      "path": "OPTIMIZED_NOTES.md",
+      "size": 1285,
+      "mtime": 1782506042,
+      "sha256_16": "fc86e9d740e504cf"
+    },
+    {
+      "path": "PERFORMANCE_HOTFIX_STAGE18_NOTES.md",
+      "size": 541,
+      "mtime": 1782506042,
+      "sha256_16": "b00554e9975e9e28"
+    },
+    {
+      "path": "PLAYER_UI_SYNC_HOTFIX_NOTES.md",
+      "size": 614,
+      "mtime": 1782506042,
+      "sha256_16": "a79844ab0d7468c8"
+    },
+    {
+      "path": "REBASE_FROM_5_CLEAN_FIX_NOTES.md",
+      "size": 926,
+      "mtime": 1782506042,
+      "sha256_16": "78ab5edbdce1aa76"
+    },
+    {
+      "path": "RFC_WITTY_DUO_COMMENTARY_NOTES.md",
+      "size": 1872,
+      "mtime": 1782506042,
+      "sha256_16": "5b045ad49cb1235a"
+    },
+    {
+      "path": "ROUND_REPORT_BROADCAST_CARD_NOTES.md",
+      "size": 884,
+      "mtime": 1782506042,
+      "sha256_16": "6d61f6ab06e85c77"
+    },
+    {
+      "path": "ROUND_REPORT_TTS_LINK_NOTES.md",
+      "size": 796,
+      "mtime": 1782506042,
+      "sha256_16": "2a2887b84347f364"
+    },
+    {
+      "path": "ROUND_REPORT_V2_FIRST_PASS_NOTES.md",
+      "size": 754,
+      "mtime": 1782506042,
+      "sha256_16": "3d8551c69be65bee"
+    },
+    {
+      "path": "ROUND_REPORT_V2_STAGE16_FULL_HIT_CLOUD_NOTES.md",
+      "size": 456,
+      "mtime": 1782506042,
+      "sha256_16": "d48865633d64de0c"
+    },
+    {
+      "path": "ROUND_REPORT_V2_STAGE17_HEATMAP_CALIBRATION_NOTES.md",
+      "size": 343,
+      "mtime": 1782506042,
+      "sha256_16": "690162db5385f384"
+    },
+    {
+      "path": "ROUND_REPORT_V2_STAGE2_NOTES.md",
+      "size": 623,
+      "mtime": 1782506042,
+      "sha256_16": "e5b326e5e8fccf2d"
+    },
+    {
+      "path": "ROUND_REPORT_V2_STAGE3_HEATMAP_NOTES.md",
+      "size": 746,
+      "mtime": 1782506042,
+      "sha256_16": "201e709c8e20753c"
+    },
+    {
+      "path": "ROUND_REPORT_V2_STAGE4_TEST_BUTTON_NOTES.md",
+      "size": 730,
+      "mtime": 1782506042,
+      "sha256_16": "6b7e8d70d1a3e8ab"
+    },
+    {
+      "path": "ROUND_REPORT_V2_STAGE6_CLEAN_BOARD_NOTES.md",
+      "size": 650,
+      "mtime": 1782506042,
+      "sha256_16": "e453939b857bd591"
+    },
+    {
+      "path": "ROUND_REPORT_VISUAL_FIRST_PASS_NOTES.md",
+      "size": 1337,
+      "mtime": 1782506042,
+      "sha256_16": "e9d571be4852e005"
+    },
+    {
+      "path": "ROUND_SUMMARY_HOTFIX_NOTES.md",
+      "size": 588,
+      "mtime": 1782506042,
+      "sha256_16": "4d5a6567bfd98818"
+    },
+    {
+      "path": "SCORECARD_FINAL_COMMENTARY_NOTES.md",
+      "size": 1149,
+      "mtime": 1782506042,
+      "sha256_16": "d5391400e56b9fc0"
+    },
+    {
+      "path": "SIMPLE_MANUAL.md",
+      "size": 2279,
+      "mtime": 1782506042,
+      "sha256_16": "4e88f4dc0b9b38f6"
+    },
+    {
+      "path": "STAGE19_REALTIME_LATENCY_HOTFIX_NOTES.md",
+      "size": 679,
+      "mtime": 1782506042,
+      "sha256_16": "35411714e360d971"
+    },
+    {
+      "path": "STAGE23_STABLE_GLOVE_HIT_FX_NOTES.md",
+      "size": 562,
+      "mtime": 1782506042,
+      "sha256_16": "da0eacf789a8d99d"
+    },
+    {
+      "path": "STAGE24_PORTRAIT_GAUGE_SYNC_NOTES.md",
+      "size": 393,
+      "mtime": 1782506042,
+      "sha256_16": "7832ed6e20da35d8"
+    },
+    {
+      "path": "STAGE34_FAST_HITFX_SUMMARY_QUEUE_NOTES.md",
+      "size": 766,
+      "mtime": 1782506042,
+      "sha256_16": "e5f0d6ddb7359fe4"
+    },
+    {
+      "path": "STAGE35_FAST_HITFX_COLOR_PICKER_NOTES.md",
+      "size": 711,
+      "mtime": 1782506042,
+      "sha256_16": "ab2ba73dbfbdb241"
+    },
+    {
+      "path": "STAGE36_SPRITE_HIT_FX_NOTES.md",
+      "size": 455,
+      "mtime": 1782506042,
+      "sha256_16": "6d2ae7b07e8958fa"
+    },
+    {
+      "path": "STAGE37A_HITFX_TEST_PORTRAIT_FIX_NOTES.md",
+      "size": 557,
+      "mtime": 1782506044,
+      "sha256_16": "53c6508531408709"
+    },
+    {
+      "path": "STAGE37_HITFX_GAUGE_FIX_NOTES.md",
+      "size": 484,
+      "mtime": 1782506042,
+      "sha256_16": "7ce18b7b6b80a0c6"
+    },
+    {
+      "path": "STAGE38_PORTRAIT_HITFX_REWORK_NOTES.md",
+      "size": 712,
+      "mtime": 1782507226,
+      "sha256_16": "14b9266e0948dc31"
+    },
+    {
+      "path": "STAGE39A_PORTRAIT_FX_FIX_NOTES.md",
+      "size": 309,
+      "mtime": 1782510738,
+      "sha256_16": "108446daf31b1a6f"
+    },
+    {
+      "path": "STAGE40B_PORTRAIT_CLONE_SIZE_HOTFIX_NOTES.md",
+      "size": 404,
+      "mtime": 1783145759,
+      "sha256_16": "432e059fb94c6f0b"
+    },
+    {
+      "path": "STAGE40_LOG_FORMAT_AND_PORTRAIT_FIX_NOTES.md",
+      "size": 1210,
+      "mtime": 1783145156,
+      "sha256_16": "0f0f7ce0d48951a9"
+    },
+    {
+      "path": "STAGE41_DIAGNOSTIC_PACKAGE_NOTES.md",
+      "size": 1528,
+      "mtime": 1783147584,
+      "sha256_16": "6b4a7c284fe50ed1"
+    },
+    {
+      "path": "SUMMARY_PATTERN_UPGRADE_NOTES.md",
+      "size": 995,
+      "mtime": 1782506042,
+      "sha256_16": "4f4af6937c7e7dc9"
+    },
+    {
+      "path": "TTS_ROLE_POLICY_HOTFIX_NOTES.md",
+      "size": 587,
+      "mtime": 1782506042,
+      "sha256_16": "1bda9a12462b3a64"
+    },
+    {
+      "path": "TTS_WORDING_HOTFIX_NOTES.md",
+      "size": 731,
+      "mtime": 1782506042,
+      "sha256_16": "5216f3ccd32cf4bd"
+    },
+    {
+      "path": "UI_OPACITY_MENUBAR_HOTFIX_NOTES.md",
+      "size": 604,
+      "mtime": 1782506042,
+      "sha256_16": "f801982f06d58c25"
+    },
+    {
+      "path": "actions.py",
+      "size": 36092,
+      "mtime": 1782506042,
+      "sha256_16": "5274a792317b32b7"
+    },
+    {
+      "path": "ai_project_snapshot.py",
+      "size": 23575,
+      "mtime": 1783148367,
+      "sha256_16": "8a8918a799a4665f"
+    },
+    {
+      "path": "app_paths.py",
+      "size": 4352,
+      "mtime": 1782506042,
+      "sha256_16": "9753ff468dc35a4a"
+    },
+    {
+      "path": "browser_overlay.py",
+      "size": 2866040,
+      "mtime": 1783147537,
+      "sha256_16": "cc3d9f45b96fd49f"
+    },
+    {
+      "path": "browser_overlay_sync.py",
+      "size": 8857,
+      "mtime": 1782506042,
+      "sha256_16": "aa038fc3b18bd8fa"
+    },
+    {
+      "path": "build_release.ps1",
+      "size": 10305,
+      "mtime": 1782506042,
+      "sha256_16": "141729745cda95a3"
+    },
+    {
+      "path": "cinematic_overlay.qml",
+      "size": 15895,
+      "mtime": 1782506042,
+      "sha256_16": "5acf6a6252a877ef"
+    },
+    {
+      "path": "config.json",
+      "size": 28221,
+      "mtime": 1782506042,
+      "sha256_16": "fc3996413fd71c77"
+    },
+    {
+      "path": "config_model.py",
+      "size": 66435,
+      "mtime": 1783147431,
+      "sha256_16": "a15dedfa49fa4a3e"
+    },
+    {
+      "path": "diagnostics.py",
+      "size": 14853,
+      "mtime": 1783147415,
+      "sha256_16": "66d3dddf7034bf1c"
+    },
+    {
+      "path": "game-bonus-02-294436.mp3",
+      "size": 59136,
+      "mtime": 1782506042,
+      "sha256_16": "a819cdf23d1bd4c7"
+    },
+    {
+      "path": "glass-crack-363162.mp3",
+      "size": 27167,
+      "mtime": 1782506042,
+      "sha256_16": "ca20b992055f9c3d"
+    },
+    {
+      "path": "hit_fx_sprite_atlas.png",
+      "size": 936702,
+      "mtime": 1782508546,
+      "sha256_16": "812fb08c863d7a3b"
+    },
+    {
+      "path": "hotkey_engine.py",
+      "size": 13455,
+      "mtime": 1782506042,
+      "sha256_16": "d1e0272c9373609f"
+    },
+    {
+      "path": "level-up-08-402152.mp3",
+      "size": 154644,
+      "mtime": 1782506042,
+      "sha256_16": "90fd7b507192ad47"
+    },
+    {
+      "path": "player_utils.py",
+      "size": 1577,
+      "mtime": 1782506042,
+      "sha256_16": "db187369fbeb3735"
+    },
+    {
+      "path": "profile.json",
+      "size": 7360,
+      "mtime": 1782506042,
+      "sha256_16": "3e5ae0acca953ed7"
+    },
+    {
+      "path": "runtime_support.py",
+      "size": 6011,
+      "mtime": 1782506042,
+      "sha256_16": "201ff96354a0946c"
+    },
+    {
+      "path": "screen_capture.py",
+      "size": 4761,
+      "mtime": 1782506042,
+      "sha256_16": "661d69627f9321e0"
+    },
+    {
+      "path": "screen_watcher.py",
+      "size": 14410,
+      "mtime": 1782506042,
+      "sha256_16": "eb1cf64a032c74ad"
+    },
+    {
+      "path": "spectator_log_watcher.py",
+      "size": 219887,
+      "mtime": 1783147520,
+      "sha256_16": "f46bbf9b783aa725"
+    },
+    {
+      "path": "stun.wav",
+      "size": 589964,
+      "mtime": 1782506042,
+      "sha256_16": "b550374e93953808"
+    },
+    {
+      "path": "timer_controls.qml",
+      "size": 772,
+      "mtime": 1782506042,
+      "sha256_16": "ca9365afe022b85c"
+    },
+    {
+      "path": "timer_ui.qml",
+      "size": 394735,
+      "mtime": 1782506042,
+      "sha256_16": "880a05efe050611e"
+    },
+    {
+      "path": "timerauto.py",
+      "size": 1064047,
+      "mtime": 1783148406,
+      "sha256_16": "b9f317d375f8629f"
+    },
+    {
+      "path": "ting-sound-197759.mp3",
+      "size": 70560,
+      "mtime": 1782506042,
+      "sha256_16": "8f6fd9a7f82cf0e3"
+    },
+    {
+      "path": "update_manager.py",
+      "size": 2235,
+      "mtime": 1782506042,
+      "sha256_16": "76fdf7ab343eab01"
+    },
+    {
+      "path": "image/1768223582106-aae50c47-2a61-4229-9fb4-13048dfa62f6.png",
+      "size": 586791,
+      "mtime": 1782506042,
+      "sha256_16": "93bc1ed3d5b5a48e"
+    },
+    {
+      "path": "image/Screenshot 2026-01-16 at 07.43.08.JPG",
+      "size": 45622,
+      "mtime": 1782506042,
+      "sha256_16": "de107c91f16cd4fb"
+    },
+    {
+      "path": "image/target_silhouette_overlay.png",
+      "size": 97222,
+      "mtime": 1782506042,
+      "sha256_16": "b44d0f4d6fe59895"
+    },
+    {
+      "path": "image/effects/flame.png",
+      "size": 4329,
+      "mtime": 1782506042,
+      "sha256_16": "3e489b88407e1ffe"
+    },
+    {
+      "path": "image/effects/smoke.png",
+      "size": 4242,
+      "mtime": 1782506042,
+      "sha256_16": "8ef8c85778b2eb59"
+    },
+    {
+      "path": "image/effects/spark.png",
+      "size": 295,
+      "mtime": 1782506042,
+      "sha256_16": "d5c4efd1e452b0c7"
+    },
+    {
+      "path": "image/flags/default_jp.png",
+      "size": 2866,
+      "mtime": 1782506042,
+      "sha256_16": "e5b2c360c925f128"
+    },
+    {
+      "path": "image/flags/default_kr.png",
+      "size": 7260,
+      "mtime": 1782506042,
+      "sha256_16": "d3a6cd83d24894af"
+    },
+    {
+      "path": "image/players/BURBAR_5eb42bcd.png",
+      "size": 62893,
+      "mtime": 1782506042,
+      "sha256_16": "9cc636da06eece67"
+    },
+    {
+      "path": "image/players/BURBAR_88b37cc9.png",
+      "size": 66514,
+      "mtime": 1782506042,
+      "sha256_16": "3c61a98ddf7bdf25"
+    },
+    {
+      "path": "image/players/BURBAR_da439d7e.png",
+      "size": 62893,
+      "mtime": 1782506042,
+      "sha256_16": "9cc636da06eece67"
+    },
+    {
+      "path": "image/players/CUSHOLD_c311e3b9.png",
+      "size": 66514,
+      "mtime": 1782506042,
+      "sha256_16": "3c61a98ddf7bdf25"
+    },
+    {
+      "path": "image/players/DANIEL_ed759120.png",
+      "size": 190461,
+      "mtime": 1782506042,
+      "sha256_16": "717bdcbfa509d86d"
+    },
+    {
+      "path": "image/players/EUNSEOG_I_429e0dc8.jpg",
+      "size": 54393,
+      "mtime": 1782506042,
+      "sha256_16": "2e050da05d9a52a0"
+    },
+    {
+      "path": "image/players/EXADATA_24450039.png",
+      "size": 1947695,
+      "mtime": 1782506042,
+      "sha256_16": "3b90b7e206def09e"
+    },
+    {
+      "path": "image/players/FINDYOURWAYHOME_09e1502e.png",
+      "size": 278176,
+      "mtime": 1782506042,
+      "sha256_16": "307b3104302f4d75"
+    },
+    {
+      "path": "image/players/FINDYOURWAYHOME_6826dda2.png",
+      "size": 307531,
+      "mtime": 1782506042,
+      "sha256_16": "2cc4996db7ea8954"
+    },
+    {
+      "path": "image/players/FINDYOURWAYHOME_843691cf.png",
+      "size": 278176,
+      "mtime": 1782506042,
+      "sha256_16": "307b3104302f4d75"
+    },
+    {
+      "path": "image/players/FR456ZZDQ_761e17c0.png",
+      "size": 1882105,
+      "mtime": 1782506042,
+      "sha256_16": "7c1f1a2ad32f19a8"
+    },
+    {
+      "path": "image/players/GANAAN_8f824add.png",
+      "size": 338412,
+      "mtime": 1782506042,
+      "sha256_16": "7b852e493f50d16d"
+    },
+    {
+      "path": "image/players/GARCIA_009d1b2f.png",
+      "size": 1237536,
+      "mtime": 1782506042,
+      "sha256_16": "6287c9b508dd8c46"
+    },
+    {
+      "path": "image/players/GOMAK.KOREA_b3e1e784.png",
+      "size": 186367,
+      "mtime": 1782506042,
+      "sha256_16": "0fd30424da8d23c4"
+    },
+    {
+      "path": "image/players/INGOD_8aaeb423.png",
+      "size": 53343,
+      "mtime": 1782506042,
+      "sha256_16": "9b42655849265ea7"
+    },
+    {
+      "path": "image/players/JOEY012_00c16607.png",
+      "size": 86308,
+      "mtime": 1782506042,
+      "sha256_16": "caec879b4289c2b2"
+    },
+    {
+      "path": "image/players/KINDBLUE_efbb6182.png",
+      "size": 392131,
+      "mtime": 1782506042,
+      "sha256_16": "1821bc072a19a7fd"
+    },
+    {
+      "path": "image/players/KOREATONG_32a874b0.png",
+      "size": 64019,
+      "mtime": 1782506042,
+      "sha256_16": "6185fdcdfc091bc9"
+    },
+    {
+      "path": "image/players/LELELL4_97bc8056.png",
+      "size": 60399,
+      "mtime": 1782506042,
+      "sha256_16": "7e898ea3e830d3db"
+    },
+    {
+      "path": "image/players/MANGORING_b30bb959.png",
+      "size": 125479,
+      "mtime": 1782506042,
+      "sha256_16": "dcecc05b5b3d7183"
+    },
+    {
+      "path": "image/players/MINGU_bfb6e990.png",
+      "size": 373414,
+      "mtime": 1782506042,
+      "sha256_16": "d0aea65f0c048b93"
+    },
+    {
+      "path": "image/players/MR.JAKE.PUAL_7340c138.png",
+      "size": 4913020,
+      "mtime": 1782506042,
+      "sha256_16": ""
+    },
+    {
+      "path": "image/players/MYWEATHER_16c725f9.png",
+      "size": 453900,
+      "mtime": 1782506042,
+      "sha256_16": "bfa969b89122b35c"
+    },
+    {
+      "path": "image/players/NEW_4fa28d21.png",
+      "size": 62893,
+      "mtime": 1782506042,
+      "sha256_16": "9cc636da06eece67"
+    },
+    {
+      "path": "image/players/NEW_6cb181a4.png",
+      "size": 53343,
+      "mtime": 1782506042,
+      "sha256_16": "9b42655849265ea7"
+    },
+    {
+      "path": "image/players/NEW_834243be.png",
+      "size": 64019,
+      "mtime": 1782506042,
+      "sha256_16": "6185fdcdfc091bc9"
+    },
+    {
+      "path": "image/players/NEW_d634f194.png",
+      "size": 60399,
+      "mtime": 1782506042,
+      "sha256_16": "7e898ea3e830d3db"
+    },
+    {
+      "path": "image/players/NEW_dca0772d.png",
+      "size": 84859,
+      "mtime": 1782506042,
+      "sha256_16": "769b372e6c1b47f0"
+    },
+    {
+      "path": "image/players/PEACH_6a6cc7e7.png",
+      "size": 229039,
+      "mtime": 1782506042,
+      "sha256_16": "3db7264467298873"
+    },
+    {
+      "path": "image/players/PHYDON_ec82da83.png",
+      "size": 153092,
+      "mtime": 1782506042,
+      "sha256_16": "a83e077138357fe1"
+    },
+    {
+      "path": "image/players/PRAIRIEDOG_506fdc9e.png",
+      "size": 1187783,
+      "mtime": 1782506042,
+      "sha256_16": "85c38af56c1ace4c"
+    },
+    {
+      "path": "image/players/URKGVEONG_e26b67d7.png",
+      "size": 79261,
+      "mtime": 1782506042,
+      "sha256_16": "fb6f581e3267ed87"
+    },
+    {
+      "path": "image/players/VASILIY.LOMACHENKO_5c1bcf54.png",
+      "size": 84859,
+      "mtime": 1782506042,
+      "sha256_16": "769b372e6c1b47f0"
+    },
+    {
+      "path": "image/players/WOWBOW_f1ca6bb0.png",
+      "size": 275117,
+      "mtime": 1782506042,
+      "sha256_16": "428207dfad53223e"
+    },
+    {
+      "path": "level/1.png",
+      "size": 107117,
+      "mtime": 1782506042,
+      "sha256_16": "8a2c6765d7265405"
+    },
+    {
+      "path": "level/2.png",
+      "size": 114161,
+      "mtime": 1782506042,
+      "sha256_16": "fc759c1a408169a2"
+    },
+    {
+      "path": "level/3.png",
+      "size": 117065,
+      "mtime": 1782506042,
+      "sha256_16": "b42d63fa55e73a39"
+    },
+    {
+      "path": "level/4.png",
+      "size": 114529,
+      "mtime": 1782506042,
+      "sha256_16": "76d4dff857f9ee02"
+    },
+    {
+      "path": "level/5.png",
+      "size": 128846,
+      "mtime": 1782506042,
+      "sha256_16": "ef20345672a39c71"
+    },
+    {
+      "path": "level/6.png",
+      "size": 153800,
+      "mtime": 1782506042,
+      "sha256_16": "ccd10a87aef770c2"
+    },
+    {
+      "path": "level/7.png",
+      "size": 116864,
+      "mtime": 1782506042,
+      "sha256_16": "4d6ae8302d7ed3cd"
+    },
+    {
+      "path": "presets/overlay/#U6e72#Uacd5#Ub0af.json",
+      "size": 2852,
+      "mtime": 1782506042,
+      "sha256_16": "75c343c0f047c984"
+    },
+    {
+      "path": "presets/overlay/260612.json",
+      "size": 4519,
+      "mtime": 1782506042,
+      "sha256_16": "2ede73fb7a1731e9"
+    },
+    {
+      "path": "presets/overlay/zfn.json",
+      "size": 4197,
+      "mtime": 1782506042,
+      "sha256_16": "e3aebbe06f62048c"
+    }
+  ],
+  "count": 136
+}

@@ -39,3 +39,9 @@ installer/*.tmp
 .idea/
 Thumbs.db
 Desktop.ini
+.agents/
+.codex/
+backend_found.txt
+backend_usages.txt
+latest.json
+*.bak

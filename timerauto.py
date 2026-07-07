@@ -19,15 +19,16 @@ import logging
 import traceback
 import re
 import tempfile
+import fnmatch
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from datetime import datetime
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from collections import deque
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 UPDATE_FEED_URL = "https://github.com/koreatong1102/timerauto/releases/download/latest/latest.json"
 
 # Ensure a non-native Qt Quick Controls style for QML customization.
@@ -71,12 +72,10 @@ try:
     import winsound
 except Exception:
     winsound = None
-try:
-    import pyautogui
-    _PYAUTO_KEYS = sorted(set(pyautogui.KEYBOARD_KEYS))
-except Exception:
-    pyautogui = None
-    _PYAUTO_KEYS = []
+# Avoid importing pyautogui during startup. It can be relatively slow and is
+# only needed when executing keyboard/mouse actions. UI key pickers fall back to
+# the WinAPI key map, and actions.py lazily imports pyautogui on first use.
+_PYAUTO_KEYS = []
 
 # --- GUI ---
 from PyQt6.QtCore import Qt, QTimer, QEvent, pyqtSignal, QObject, pyqtProperty, pyqtSlot, QSize, QPointF, QPoint, QMetaObject, Q_ARG, QUrl, QAbstractNativeEventFilter
@@ -131,6 +130,7 @@ _MEDIAPIPE_IMPORT_ERROR = None
 
 from actions import ActionRunner
 from browser_overlay import BrowserOverlayServer
+from browser_overlay_sync import BrowserOverlaySync
 from hotkey_engine import build_vk_map, GlobalHotkeys, press_vk_once
 from screen_capture import (
     capture_monitor_np,
@@ -155,6 +155,46 @@ from player_utils import (
     player_similarity_for_match as _player_similarity_for_match,
 )
 
+from app_paths import (
+    get_app_base_dir,
+    app_path,
+    normalize_app_path,
+    to_app_rel,
+    resolve_spectatorlog_path,
+    resolve_player_image_path,
+)
+from config_model import (
+    Rect,
+    TriggerConfig,
+    OCRConfig,
+    PaletteConfig,
+    AppConfig,
+    default_win_effects,
+    _normalize_win_effects_paths,
+    _normalize_player_country,
+    _player_image_path_for_gid,
+    _player_flag_path_for_gid,
+    _player_country_for_gid,
+    _default_overlay_style_round,
+    _default_overlay_style_time,
+    _default_overlay_style_blue_name,
+    _default_overlay_style_red_name,
+    _default_overlay_style_arena,
+    _default_browser_text_styles,
+    _normalize_overlay_style,
+    _normalize_browser_text_styles,
+    _normalize_player_mask,
+    _merge_dict,
+    _normalize_hex_color,
+    migrate_action_keys,
+    sync_action_keys,
+    prune_actions,
+)
+from runtime_support import resolve_config_path, _setup_logging
+from update_manager import _parse_version, _download_file, _file_sha256, _write_update_script
+from diagnostics import diagnostics as DIAG
+from ai_project_snapshot import export_project_snapshot
+
 _EASYOCR_READERS: Dict[Tuple[str, ...], "EasyOCRReader"] = {}
 _EASYOCR_LOCK = threading.Lock()
 _TEMPLATE_CACHE: Dict[Tuple[str, int, int], np.ndarray] = {}
@@ -163,126 +203,10 @@ _MP_SELFIE = None
 _MP_LOCK = threading.Lock()
 _NO_UPDATE = object()
 
-_APP_BASE_DIR = None
 
 
-def get_app_base_dir() -> str:
-    global _APP_BASE_DIR
-    if _APP_BASE_DIR:
-        return _APP_BASE_DIR
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(os.path.abspath(sys.executable))
-    elif "__file__" in globals():
-        base = os.path.dirname(os.path.abspath(__file__))
-    else:
-        base = os.getcwd()
-    _APP_BASE_DIR = base
-    return base
 
 
-def app_path(*parts: str) -> str:
-    return os.path.join(get_app_base_dir(), *parts)
-
-
-def normalize_app_path(path: str) -> str:
-    if not path:
-        return path
-    path = os.path.expanduser(path)
-    if os.path.isabs(path):
-        return path
-    return os.path.join(get_app_base_dir(), path)
-
-
-def to_app_rel(path: str) -> str:
-    if not path:
-        return path
-    try:
-        base = get_app_base_dir()
-        abs_path = os.path.abspath(path)
-        base_abs = os.path.abspath(base)
-        rel = os.path.relpath(abs_path, base_abs)
-        if not rel.startswith("..") and not os.path.isabs(rel):
-            return rel
-    except Exception:
-        pass
-    return path
-
-
-def resolve_spectatorlog_path(path: str = "") -> str:
-    raw = str(path or "").strip()
-    if raw:
-        base = normalize_app_path(raw)
-    else:
-        base = app_path("ThrillOfTheFight2", "SpectatorLog")
-    base = os.path.abspath(base)
-    if os.path.basename(base).lower() == "spectatorlog":
-        return base
-    child = os.path.join(base, "SpectatorLog")
-    if os.path.isdir(child):
-        return child
-    return base
-
-
-def resolve_player_image_path(path: str) -> str:
-    if not path:
-        return ""
-    path = normalize_app_path(path)
-    if os.path.exists(path):
-        return path
-    base_name = os.path.basename(path)
-    candidates = [
-        app_path("image", "players", base_name),
-        app_path("image", base_name),
-    ]
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-    stem = os.path.splitext(base_name)[0]
-    gid_prefix = stem.rsplit("_", 1)[0].upper().strip() if "_" in stem else stem.upper().strip()
-    if gid_prefix:
-        players_dir = app_path("image", "players")
-        try:
-            for name in os.listdir(players_dir):
-                cand_stem, cand_ext = os.path.splitext(name)
-                if cand_ext.lower() not in (".png", ".jpg", ".jpeg", ".bmp"):
-                    continue
-                if not cand_stem.upper().startswith(gid_prefix + "_"):
-                    continue
-                candidate = os.path.join(players_dir, name)
-                if os.path.exists(candidate):
-                    return candidate
-        except Exception:
-            pass
-    return path
-
-
-def _normalize_win_effects_paths(data: Optional[dict]) -> dict:
-    raw = dict(data or {})
-    burst = dict(raw.get("burst", {}) or {})
-    if "sfx_path" in burst:
-        burst["sfx_path"] = to_app_rel(str(burst.get("sfx_path", "") or ""))
-    raw["burst"] = burst
-    fail = dict(raw.get("fail", {}) or {})
-    if "sfx_path" in fail:
-        fail["sfx_path"] = to_app_rel(str(fail.get("sfx_path", "") or ""))
-    raw["fail"] = fail
-    nameplates = dict(raw.get("nameplates", {}) or {})
-    imgs = nameplates.get("images", [])
-    if isinstance(imgs, list):
-        nameplates["images"] = [to_app_rel(str(p or "")) for p in imgs]
-    raw["nameplates"] = nameplates
-    return raw
-
-
-def _normalize_config_paths(raw: dict) -> dict:
-    out = dict(raw or {})
-    if "players_images" in out and isinstance(out.get("players_images"), dict):
-        out["players_images"] = {str(k): to_app_rel(str(v)) for k, v in (out.get("players_images") or {}).items()}
-    if "players_flags" in out and isinstance(out.get("players_flags"), dict):
-        out["players_flags"] = {str(k): to_app_rel(str(v)) for k, v in (out.get("players_flags") or {}).items()}
-    if "win_effects" in out and isinstance(out.get("win_effects"), dict):
-        out["win_effects"] = _normalize_win_effects_paths(out.get("win_effects"))
-    return out
 
 
 def _suppress_qt_window_warnings():
@@ -382,11 +306,6 @@ def _store_player_image(gid: str, src_path: str) -> str:
         return to_app_rel(src_path)
 
 
-def _normalize_player_country(value: object) -> str:
-    raw = str(value or "").strip().upper()
-    if raw in ("JP", "JPN", "JAPAN", "?쇰낯"):
-        return "JP"
-    return "KR"
 
 
 def _store_player_flag(gid: str, src_path: str) -> str:
@@ -414,309 +333,22 @@ def _store_player_flag(gid: str, src_path: str) -> str:
 # -----------------------------
 # Config / Data
 # -----------------------------
-@dataclass
-class Rect:
-    x: int = 0
-    y: int = 0
-    w: int = 0
-    h: int = 0
-
-    def valid(self) -> bool:
-        return self.w > 0 and self.h > 0
 
 
-@dataclass
-class TriggerConfig:
-    enabled: bool = True
-    target_bgr: Tuple[int, int, int] = (0, 255, 0)  # default green
-    tolerance: int = 35
-    consecutive_needed: int = 6
-    window_frames: int = 8
-    cooldown_sec: float = 2.0
-    action_cooldown_sec: float = 5.0
 
 
-@dataclass
-class OCRConfig:
-    samples: int = 2
-    allow_chars: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-    unknown_label: str = "UNKNOWN"
-    sim_threshold: int = 75     # ???(?? ??(??)?)(?? ??(??))?リ옇???泥???(?? ??(??)?)(?? ??(??))????㉱??)
-    require_gap: int = 0        # ???(?? ??(??)?)(?? ??(??))?リ옇???泥???(?? ??(??)?)(?? ??(??))????㉱??)
 
 
-@dataclass
-class PaletteConfig:
-    # Player image palette extraction settings.
-    frames: int = 3            # Number of sampled frames.
-    k_colors: int = 5          # Number of dominant colors.
-    mask_thresh: float = 0.5   # mediapipe person-mask threshold.
-    max_pixels: int = 12000    # Max pixels used for kmeans.
-    min_v_cut: int = 10        # Ignore very dark pixels.
 
 
-def default_win_effects() -> Dict[str, object]:
-    return {
-        "stages": [
-            {"min": 3, "color": "#B9C7D6", "opacity": 0.45, "pulse": 1.04},
-            {"min": 6, "color": "#4F7BFF", "opacity": 0.6, "pulse": 1.08},
-            {"min": 9, "color": "#7A3FFF", "opacity": 0.75, "pulse": 1.12},
-            {"min": 12, "color": "#12C48B", "opacity": 0.85, "pulse": 1.15},
-            {"min": 16, "color": "#FFB100", "opacity": 0.9, "pulse": 1.18},
-            {"min": 21, "color": "#FF2B2B", "opacity": 0.95, "pulse": 1.22},
-            {"min": 30, "color": "#F8FAFC", "opacity": 1.0, "pulse": 1.26},
-        ],
-        "aura": {
-            "enabled": True,
-            "frame_padding": 12,
-            "outer_padding": 14,
-            "border1": 2,
-            "border2": 1,
-            "border3": 1,
-            "border_color": "",
-            "border_opacity": 0.6,
-            "border_effect_enabled": True,
-            "backdrop_enabled": True,
-            "backdrop_color": "#000000",
-            "backdrop_opacity": 0.25,
-            "backdrop_pad": 8,
-            "frame_spark_emit": 6,
-            "frame_spark_size": 8,
-            "frame_spark_size_var": 6,
-            "frame_spark_pace": 40,
-            "flame_emit": 12,
-            "smoke_emit": 6,
-            "spark_emit": 10,
-            "flame_size": 20,
-            "flame_size_var": 14,
-            "smoke_size": 36,
-            "smoke_size_var": 20,
-            "spark_size": 10,
-            "spark_size_var": 8,
-            "turbulence": 18,
-            "blur_radius": 0,
-            "core": {
-                "emit_mul": 8.0,
-                "life": 1200,
-                "life_var": 220,
-                "size_mul": 0.5,
-                "size_var_mul": 0.12,
-                "size_var_add": 1,
-                "angle_var": 6,
-                "speed": 120,
-                "speed_var": 15,
-                "accel": 30,
-                "accel_var": 8,
-                "accel_mag_var": 12,
-                "color_var": 0.04,
-                "alpha": 0.98,
-                "alpha_var": 0.08,
-                "rot_var": 0,
-                "turb_mul": 0.15,
-            },
-            "body": {
-                "emit_mul": 6.0,
-                "life": 1500,
-                "life_var": 260,
-                "size_mul": 0.7,
-                "size_var_mul": 0.18,
-                "size_var_add": 1,
-                "angle_var": 8,
-                "speed": 85,
-                "speed_var": 15,
-                "accel": 22,
-                "accel_var": 10,
-                "accel_mag_var": 12,
-                "color_var": 0.06,
-                "alpha": 0.85,
-                "alpha_var": 0.1,
-                "rot_var": 2,
-            },
-            "glow": {
-                "emit_mul": 1.2,
-                "life": 1700,
-                "life_var": 320,
-                "size_mul": 0.6,
-                "size_var_mul": 0.2,
-                "size_var_add": 2,
-                "angle_var": 8,
-                "speed": 40,
-                "speed_var": 12,
-                "color_var": 0.08,
-                "alpha": 0.22,
-                "alpha_var": 0.08,
-                "rot_var": 6,
-                "turb_mul": 0.35,
-            },
-            "wisps": {
-                "emit_mul": 0.8,
-                "life": 1800,
-                "life_var": 360,
-                "size_mul": 0.55,
-                "size_var_mul": 0.18,
-                "size_var_add": 2,
-                "angle_var": 7,
-                "speed": 32,
-                "speed_var": 10,
-                "color_var": 0.1,
-                "alpha": 0.12,
-                "alpha_var": 0.06,
-                "rot_var": 6,
-            },
-            "spark": {
-                "emit_mul": 0.05,
-                "life": 520,
-                "life_var": 360,
-                "size_mul": 0.6,
-                "size_var_mul": 0.2,
-                "angle_var": 18,
-                "speed": 150,
-                "speed_var": 45,
-                "color_var": 0.1,
-                "alpha": 0.2,
-                "alpha_var": 0.08,
-                "rot_var": 0,
-            },
-        },
-        "inner": {
-            "dust": {"enabled": True, "min": 3, "opacity": 0.12, "interval": 140},
-            "hud": {"enabled": True, "min": 6, "opacity": 0.5, "speed": 10000},
-            "electric": {"enabled": True, "min": 9, "interval": 100, "opacity_min": 0.3, "opacity_max": 0.9},
-            "core": {"enabled": True, "min": 12, "size": 0.35, "opacity_max": 0.5, "period": 900},
-            "chrono": {"enabled": True, "min": 30, "opacity": 1.0, "speed": 1500},
-        },
-        "burst": {
-            "milestones": [3, 6, 9, 12, 16, 21, 30],
-            "sfx_enabled": False,
-            "sfx_path": "",
-        },
-        "fail": {
-            "enabled": True,
-            "overlay_opacity": 0.65,
-            "tint": "#000000",
-            "sfx_enabled": False,
-            "sfx_path": "",
-        },
-        "nameplates": {
-            "enabled": True,
-            "milestones": [3, 6, 9, 12, 16, 21, 30],
-            "images": [],
-            "width": 110,
-            "height": 30,
-            "scale": 1.0,
-            "gap": 6,
-            "side_blue": "left",
-            "side_red": "right",
-        },
-        "portrait": {
-            "zoom": 1.25,
-            "offset_x": 0.0,
-            "offset_y": -0.08,
-        },
-        "win_text": {
-            "enabled": True,
-            "format": "W{n}",
-            "size_scale": 0.18,
-            "size_min": 11,
-            "size_max": 18,
-            "offset_ratio": 0.22,
-            "base_color": "#d6dbe0",
-            "highlight_color": "#f8fbff",
-            "outline_color": "#2b2f34",
-            "shadow_color": "#0b0f14",
-            "shadow_opacity": 0.6,
-            "highlight_height": 0.55,
-        },
-    }
 
 
-def _migrate_win_effects_legacy(merged: Dict[str, object], raw_win_effects: Optional[Dict[str, object]]) -> Dict[str, object]:
-    out = _merge_dict(default_win_effects(), merged or {})
-    raw_we = raw_win_effects or {}
-    inner_raw = raw_we.get("inner", {}) if isinstance(raw_we, dict) else {}
-    inner = out.get("inner", {}) if isinstance(out.get("inner", {}), dict) else {}
-    core = inner.get("core", {}) if isinstance(inner.get("core", {}), dict) else {}
-
-    # Legacy compatibility: older presets commonly used scanlines at 12+ and core at 30+.
-    # If legacy scanlines exist and core is still at old threshold, shift core to the old 12+ band.
-    legacy_scan = inner_raw.get("scanlines", {}) if isinstance(inner_raw, dict) else {}
-    if isinstance(legacy_scan, dict):
-        try:
-            core_min = int(core.get("min", 12))
-        except Exception:
-            core_min = 12
-        if core_min >= 30:
-            try:
-                core["min"] = int(legacy_scan.get("min", 12))
-            except Exception:
-                core["min"] = 12
-    inner["core"] = core
-    out["inner"] = inner
-    return out
 
 
-def _player_image_path_for_gid(cfg: "AppConfig", gid: str) -> str:
-    gid_key = str(gid or "").upper().strip()
-    if not gid_key:
-        return ""
-    direct = str((cfg.players_images or {}).get(gid_key, "") or "").strip()
-    if direct:
-        return direct
-    name = str((cfg.players or {}).get(gid_key, "") or "").strip()
-    if not name:
-        return ""
-    for other_gid, other_name in (cfg.players or {}).items():
-        if str(other_gid or "").upper().strip() == gid_key:
-            continue
-        if str(other_name or "").strip() != name:
-            continue
-        inherited = str((cfg.players_images or {}).get(str(other_gid or "").upper().strip(), "") or "").strip()
-        if inherited:
-            return inherited
-    return ""
 
 
-def _player_flag_path_for_gid(cfg: "AppConfig", gid: str) -> str:
-    gid_key = str(gid or "").upper().strip()
-    if not gid_key:
-        return ""
-    direct = str((cfg.players_flags or {}).get(gid_key, "") or "").strip()
-    if direct:
-        return direct
-    country = _player_country_for_gid(cfg, gid_key)
-    name = str((cfg.players or {}).get(gid_key, "") or "").strip()
-    if not name:
-        return _default_player_flag_path(country)
-    for other_gid, other_name in (cfg.players or {}).items():
-        other_key = str(other_gid or "").upper().strip()
-        if other_key == gid_key:
-            continue
-        if str(other_name or "").strip() != name:
-            continue
-        if _player_country_for_gid(cfg, other_key) != country:
-            continue
-        inherited = str((cfg.players_flags or {}).get(other_key, "") or "").strip()
-        if inherited:
-            return inherited
-    return _default_player_flag_path(country)
 
 
-def _player_country_for_gid(cfg: "AppConfig", gid: str) -> str:
-    gid_key = str(gid or "").upper().strip()
-    if not gid_key:
-        return "KR"
-    countries = cfg.players_countries or {}
-    if gid_key in countries:
-        return _normalize_player_country(countries.get(gid_key, "KR"))
-    name = str((cfg.players or {}).get(gid_key, "") or "").strip()
-    if name:
-        for other_gid, other_name in (cfg.players or {}).items():
-            other_key = str(other_gid or "").upper().strip()
-            if other_key == gid_key:
-                continue
-            if str(other_name or "").strip() == name and other_key in countries:
-                return _normalize_player_country(countries.get(other_key, "KR"))
-    return "KR"
 
 
 def _make_spectator_log_watcher(cfg: "AppConfig") -> SpectatorLogWatcher:
@@ -728,803 +360,32 @@ def _make_spectator_log_watcher(cfg: "AppConfig") -> SpectatorLogWatcher:
     )
 
 
-def _default_player_flag_path(country: object) -> str:
-    code = _normalize_player_country(country)
-    name = "default_jp.png" if code == "JP" else "default_kr.png"
-    path = app_path("image", "flags", name)
-    if os.path.exists(path):
-        return to_app_rel(path)
-    return ""
 
 
-def _merge_dict(base: Dict[str, object], override: Dict[str, object]) -> Dict[str, object]:
-    out = dict(base or {})
-    for k, v in (override or {}).items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = _merge_dict(out.get(k, {}), v)
-        else:
-            out[k] = v
-    return out
 
 
-def _normalize_hex_color(color: str) -> str:
-    c = str(color or "").strip()
-    if c.startswith("#") and len(c) == 9:
-        # Strip alpha from #AARRGGBB -> #RRGGBB
-        return "#" + c[3:]
-    return c
 
 
-def _normalize_player_mask(mask: str) -> str:
-    v = str(mask or "").strip().lower()
-    if v in ("circle", "round", "?먰삎"):
-        return "circle"
-    if v in ("hex", "hexagon"):
-        return "hex"
-    return "square"
 
 
-def _normalize_mouse_actions(actions_by_event: Dict[str, List[dict]], default_monitor: int) -> Dict[str, List[dict]]:
-    def _fix_action(action: dict) -> dict:
-        atype = str(action.get("type", "")).lower()
-        if atype in ("mouse_move", "mouse_click", "mouse_down", "mouse_up"):
-            use_monitor = bool(action.get("use_monitor", False))
-            action["use_monitor"] = use_monitor
-            if use_monitor:
-                try:
-                    action["monitor"] = int(action.get("monitor", default_monitor))
-                except Exception:
-                    action["monitor"] = int(default_monitor)
-            else:
-                action.pop("monitor", None)
-        return action
-
-    out = {}
-    for ev, acts in (actions_by_event or {}).items():
-        out[ev] = [(_fix_action(dict(a)) if isinstance(a, dict) else a) for a in (acts or [])]
-    return out
 
 
-def _default_overlay_style_round() -> Dict[str, object]:
-    return {
-        "bg_color": "#bfa57a",
-        "bg_opacity": 1.0,
-        "border_color": "#5b4631",
-        "border_opacity": 1.0,
-        "border_width": 2,
-        "text_color": "#3a2a1d",
-        "text_opacity": 1.0,
-        "font_family": "Bahnschrift",
-        "font_size": 0,
-        "font_bold": True,
-        "font_weight": 700,
-    }
 
 
-def _default_overlay_style_time() -> Dict[str, object]:
-    return {
-        "bg_color": "#3a3a3a",
-        "bg_opacity": 1.0,
-        "border_color": "#1a1a1a",
-        "border_opacity": 1.0,
-        "border_width": 2,
-        "text_color": "#ffffff",
-        "text_opacity": 1.0,
-        "rest_text_color": "#ff5a5a",
-        "rest_text_opacity": 1.0,
-        "font_family": "Bahnschrift",
-        "font_size": 0,
-        "font_bold": True,
-        "font_weight": 700,
-    }
 
 
-def _default_overlay_style_blue_name() -> Dict[str, object]:
-    return {
-        "bg_color": "#2d5ed0",
-        "bg_opacity": 1.0,
-        "border_color": "#1b3f8a",
-        "border_opacity": 1.0,
-        "border_width": 1,
-        "text_color": "#ffffff",
-        "text_opacity": 1.0,
-        "font_family": "Noto Sans KR",
-        "font_size": 0,
-        "font_bold": True,
-        "font_weight": 900,
-        "badge_enabled": True,
-        "badge_color": "#3b82f6",
-        "badge_width": 10,
-        "badge_height": 14,
-        "badge_side": "left",
-    }
 
 
-def _default_overlay_style_red_name() -> Dict[str, object]:
-    return {
-        "bg_color": "#d14b4b",
-        "bg_opacity": 1.0,
-        "border_color": "#8f2d2d",
-        "border_opacity": 1.0,
-        "border_width": 1,
-        "text_color": "#ffffff",
-        "text_opacity": 1.0,
-        "font_family": "Noto Sans KR",
-        "font_size": 0,
-        "font_bold": True,
-        "font_weight": 900,
-        "badge_enabled": True,
-        "badge_color": "#ef4444",
-        "badge_width": 10,
-        "badge_height": 14,
-        "badge_side": "right",
-    }
 
 
-def _default_overlay_style_arena() -> Dict[str, object]:
-    return {
-        "bg_color": "#222222",
-        "bg_opacity": 1.0,
-        "border_color": "#555555",
-        "border_opacity": 1.0,
-        "border_width": 1,
-        "text_color": "#ffffff",
-        "text_opacity": 1.0,
-        "font_family": "Malgun Gothic",
-        "font_size": 0,
-        "font_bold": True,
-        "font_weight": 700,
-    }
 
 
-def _default_browser_text_styles() -> Dict[str, Dict[str, object]]:
-    base = {
-        "bg_color": "transparent",
-        "bg_opacity": 0.0,
-        "border_color": "#000000",
-        "border_opacity": 1.0,
-        "border_width": 0,
-        "text_color": "#f8fafc",
-        "text_opacity": 1.0,
-        "font_family": "Bahnschrift Condensed",
-        "font_size": 0,
-        "font_bold": True,
-        "font_weight": 900,
-    }
-    return {
-        "time": dict(base, text_color="#f7fbff", text_opacity=1.0, font_size=54, border_color="#b91c2b", border_width=5),
-        "total": dict(base, text_color="#f4f7fb", text_opacity=0.95, font_size=12),
-        "dmg": dict(base, text_color="#e8eef7", text_opacity=0.86, font_size=12),
-        "combo": dict(base, text_color="#f4f7fb", text_opacity=1.0, font_size=22, border_color="#111827", border_width=1),
-        "recent": dict(base, text_color="#edf5ff", text_opacity=0.94, font_size=23),
-    }
 
 
-def _normalize_overlay_style(raw: Optional[dict], default: Dict[str, object]) -> Dict[str, object]:
-    out = dict(default)
-    if not isinstance(raw, dict):
-        return out
-    for k, v in raw.items():
-        if k in ("bg_opacity", "border_opacity", "text_opacity"):
-            try:
-                out[k] = float(v)
-            except Exception:
-                continue
-        elif k in ("border_width", "font_size", "font_weight"):
-            try:
-                out[k] = int(v)
-            except Exception:
-                continue
-        elif k in ("font_bold",):
-            out[k] = bool(v)
-        else:
-            out[k] = v
-    return out
 
 
-def _normalize_browser_text_styles(raw: Optional[dict]) -> Dict[str, Dict[str, object]]:
-    defaults = _default_browser_text_styles()
-    raw = raw if isinstance(raw, dict) else {}
-    return {key: _normalize_overlay_style(raw.get(key), default) for key, default in defaults.items()}
 
 
-@dataclass
-class AppConfig:
-    monitor_index: int = 1  # mss: 1..N
-    trigger_monitor_index: int = 1  # mss: 1..N (trigger pixel)
-    roi_monitors: Dict[str, int] = field(default_factory=dict)
-    coords_global: bool = True
-
-    roi_hotkey: str = "F9"
-    pixel_hotkey: str = "F10"
-    detect_hotkey: str = "F11"
-    trigger_pixel_hotkey: str = "F8"
-    action_pick_hotkey: str = "F7"
-    action_test_hotkey: str = "F6"
-    chapter_anchor_epoch: float = 0.0
-    chapter_offset_sec: int = 0
-    chapter_dedupe_sec: int = 20
-    chapter_output_dir: str = ""
-    chapter_nickname_only: bool = False
-    chapter_hide_time: bool = False
-    spectatorlog_enabled: bool = False
-    spectatorlog_path: str = ""
-    spectatorlog_poll_ms: int = 250
-    spectatorlog_sync_timer: bool = False
-    spectatorlog_sync_players: bool = True
-    spectatorlog_intro_backspace: bool = True
-    spectatorlog_intro_backspace_target_title: str = ""
-    spectatorlog_intro_backspace_activate: bool = True
-    spectatorlog_intro_backspace_restore: bool = True
-    spectator_commentary_enabled: bool = False
-    spectator_commentary_mode: str = "standard"
-    spectator_commentary_min_damage: float = 25.0
-    spectator_hit_effect_damage: float = 45.0
-    spectator_commentary_cooldown_sec: float = 6.0
-    spectator_commentary_voice: str = "ko-KR-SunHiNeural"
-    spectator_caster_voice: str = "ko-KR-InJoonNeural"
-    spectator_commentary_rate: int = 200
-    spectator_commentary_volume: float = 100.0
-    spectator_commentary_pitch: int = 0
-    spectator_replay_speed: float = 1.0
-    spectator_replay_real_time: bool = False
-    spectator_recent_text_size: int = 23
-    spectator_stun_sfx_path: str = ""
-    spectator_knockdown_sfx_path: str = ""
-    spectator_tko_sfx_path: str = ""
-    spectator_sfx_playback_rate: float = 1.0
-
-    roi_trigger: Rect = field(default_factory=Rect)
-    roi_blue_name: Rect = field(default_factory=Rect)
-    roi_red_name: Rect = field(default_factory=Rect)
-    roi_arena_name: Rect = field(default_factory=Rect)
-    roi_round_info: Rect = field(default_factory=Rect)
-    roi_round_time: Rect = field(default_factory=Rect)
-
-    # Browser overlay output and QML preview controls.
-    roi_left_player: Rect = field(default_factory=Rect)
-    roi_right_player: Rect = field(default_factory=Rect)
-    roi_koth_winner_blue: Rect = field(default_factory=Rect)
-    roi_koth_winner_red: Rect = field(default_factory=Rect)
-
-    trigger: TriggerConfig = field(default_factory=TriggerConfig)
-    ocr: OCRConfig = field(default_factory=OCRConfig)
-    palette: PaletteConfig = field(default_factory=PaletteConfig)
-    timer_total_rounds: int = 3
-    timer_round_sec: int = 180
-    timer_rest_sec: int = 60
-    timer_rest_30s_tts_enabled: bool = True
-    timer_rest_30s_tts_rate: int = 200
-    timer_current_round: int = 1
-    timer_seconds_left: int = 180
-    overlay_bg_color: str = "transparent"
-    overlay_bg_opacity: float = 0.0
-    overlay_ui_scale: float = 1.0
-    overlay_timer_font_size: int = 54
-    overlay_timer_x: int = 0
-    overlay_timer_y: int = 0
-    overlay_round_font_size: int = 11
-    overlay_round_x: int = 0
-    overlay_round_y: int = 0
-    overlay_preset: str = "classic"
-    overlay_player_mask: str = "square"
-    overlay_show_round: bool = True
-    overlay_show_time: bool = True
-    overlay_show_blue_img: bool = True
-    overlay_show_blue_name: bool = True
-    overlay_show_red_img: bool = True
-    overlay_show_red_name: bool = True
-    overlay_show_arena_name: bool = True
-    overlay_show_flags: bool = True
-    overlay_show_cinematic: bool = True
-    overlay_vs_bg_path: str = ""
-    overlay_vs_bg_opacity: float = 1.0
-    overlay_vs_bg_by_arena: Dict[str, str] = field(default_factory=dict)
-    overlay_vs_hold_sec: float = 2.85
-    browser_overlay_scale: float = 1.0
-    browser_overlay_poll_ms: int = 50
-    browser_overlay_output_only: bool = True
-    qml_preview_enabled: bool = True
-    overlay_style_round: Dict[str, object] = field(default_factory=_default_overlay_style_round)
-    overlay_style_time: Dict[str, object] = field(default_factory=_default_overlay_style_time)
-    overlay_style_blue_name: Dict[str, object] = field(default_factory=_default_overlay_style_blue_name)
-    overlay_style_red_name: Dict[str, object] = field(default_factory=_default_overlay_style_red_name)
-    overlay_style_arena: Dict[str, object] = field(default_factory=_default_overlay_style_arena)
-    browser_text_styles: Dict[str, Dict[str, object]] = field(default_factory=_default_browser_text_styles)
-    action_cooldown_sec: float = 5.0
-    action_cooldowns: Dict[str, float] = field(default_factory=dict)
-    action_edge_triggers: Dict[str, bool] = field(default_factory=dict)
-    capture_player_images: bool = True
-
-    # GameID -> DisplayName
-    players: Dict[str, str] = field(default_factory=dict)
-    players_images: Dict[str, str] = field(default_factory=dict)
-    players_countries: Dict[str, str] = field(default_factory=dict)
-    players_flags: Dict[str, str] = field(default_factory=dict)
-    current_blue_id: str = ""
-    current_red_id: str = ""
-    current_blue_registered: bool = False
-    current_red_registered: bool = False
-    current_blue_valid: bool = False
-    current_red_valid: bool = False
-    koth_enabled: bool = False
-    koth_champion_id: str = ""
-    koth_streak: int = 0
-    koth_min_score: int = 75
-    layout: Dict[str, Dict[str, int]] = field(default_factory=dict)
-    actions: Dict[str, List[dict]] = field(default_factory=dict)
-    pixel_rules: List[dict] = field(default_factory=list)
-    win_effects: Dict[str, object] = field(default_factory=default_win_effects)
-
-    @staticmethod
-    def from_json(path: str) -> "AppConfig":
-        if not os.path.exists(path):
-            return AppConfig()
-        with open(path, "r", encoding="utf-8-sig") as f:
-            raw = json.load(f)
-        raw = _normalize_config_paths(raw)
-
-        def rect_from(d: dict) -> Rect:
-            return Rect(**{k: int(d.get(k, 0)) for k in ["x", "y", "w", "h"]})
-
-        cfg = AppConfig()
-        cfg.monitor_index = int(raw.get("monitor_index", 1))
-        cfg.trigger_monitor_index = int(raw.get("trigger_monitor_index", cfg.monitor_index))
-        cfg.roi_monitors = {str(k): int(v) for k, v in (raw.get("roi_monitors", {}) or {}).items()}
-        cfg.coords_global = bool(raw.get("coords_global", False))
-        cfg.roi_hotkey = str(raw.get("roi_hotkey", "F9"))
-        cfg.pixel_hotkey = str(raw.get("pixel_hotkey", "F10"))
-        cfg.detect_hotkey = str(raw.get("detect_hotkey", "F11"))
-        cfg.trigger_pixel_hotkey = str(raw.get("trigger_pixel_hotkey", "F8"))
-        cfg.action_pick_hotkey = str(raw.get("action_pick_hotkey", "F7"))
-        cfg.action_test_hotkey = str(raw.get("action_test_hotkey", "F6"))
-        try:
-            cfg.chapter_anchor_epoch = float(raw.get("chapter_anchor_epoch", 0.0) or 0.0)
-        except Exception:
-            cfg.chapter_anchor_epoch = 0.0
-        cfg.chapter_offset_sec = int(raw.get("chapter_offset_sec", 0))
-        cfg.chapter_dedupe_sec = int(raw.get("chapter_dedupe_sec", 20))
-        cfg.chapter_output_dir = str(raw.get("chapter_output_dir", "") or "")
-        cfg.chapter_nickname_only = bool(raw.get("chapter_nickname_only", False))
-        cfg.chapter_hide_time = bool(raw.get("chapter_hide_time", False))
-        cfg.spectatorlog_enabled = bool(raw.get("spectatorlog_enabled", False))
-        cfg.spectatorlog_path = str(raw.get("spectatorlog_path", "") or "")
-        cfg.spectatorlog_sync_timer = bool(raw.get("spectatorlog_sync_timer", False))
-        cfg.spectatorlog_sync_players = bool(raw.get("spectatorlog_sync_players", True))
-        cfg.spectatorlog_intro_backspace = bool(raw.get("spectatorlog_intro_backspace", True))
-        cfg.spectatorlog_intro_backspace_target_title = str(raw.get("spectatorlog_intro_backspace_target_title", "") or "")
-        cfg.spectatorlog_intro_backspace_activate = bool(raw.get("spectatorlog_intro_backspace_activate", True))
-        cfg.spectatorlog_intro_backspace_restore = bool(raw.get("spectatorlog_intro_backspace_restore", True))
-        cfg.spectator_commentary_enabled = bool(raw.get("spectator_commentary_enabled", False))
-        cfg.spectator_commentary_mode = str(raw.get("spectator_commentary_mode", "standard") or "standard")
-        cfg.spectator_commentary_voice = str(raw.get("spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
-        cfg.spectator_caster_voice = str(raw.get("spectator_caster_voice", "ko-KR-InJoonNeural") or "ko-KR-InJoonNeural")
-        cfg.spectator_stun_sfx_path = str(raw.get("spectator_stun_sfx_path", "") or "")
-        cfg.spectator_knockdown_sfx_path = str(raw.get("spectator_knockdown_sfx_path", "") or "")
-        cfg.spectator_tko_sfx_path = str(raw.get("spectator_tko_sfx_path", "") or "")
-        try:
-            cfg.spectator_sfx_playback_rate = float(raw.get("spectator_sfx_playback_rate", 1.0) or 1.0)
-        except Exception:
-            cfg.spectator_sfx_playback_rate = 1.0
-        try:
-            cfg.spectator_commentary_min_damage = float(raw.get("spectator_commentary_min_damage", 25.0) or 25.0)
-        except Exception:
-            cfg.spectator_commentary_min_damage = 25.0
-        try:
-            cfg.spectator_hit_effect_damage = float(raw.get("spectator_hit_effect_damage", 45.0) or 45.0)
-        except Exception:
-            cfg.spectator_hit_effect_damage = 45.0
-        try:
-            cfg.spectator_commentary_cooldown_sec = float(raw.get("spectator_commentary_cooldown_sec", 6.0) or 6.0)
-        except Exception:
-            cfg.spectator_commentary_cooldown_sec = 6.0
-        try:
-            cfg.spectator_commentary_rate = max(80, min(320, int(raw.get("spectator_commentary_rate", 200) or 200)))
-        except Exception:
-            cfg.spectator_commentary_rate = 200
-        try:
-            cfg.spectator_commentary_volume = max(0.0, min(100.0, float(raw.get("spectator_commentary_volume", 100.0) or 100.0)))
-        except Exception:
-            cfg.spectator_commentary_volume = 100.0
-        try:
-            cfg.spectator_commentary_pitch = max(-100, min(100, int(raw.get("spectator_commentary_pitch", 0) or 0)))
-        except Exception:
-            cfg.spectator_commentary_pitch = 0
-        try:
-            cfg.spectator_replay_speed = float(raw.get("spectator_replay_speed", 1.0) or 1.0)
-        except Exception:
-            cfg.spectator_replay_speed = 1.0
-        cfg.spectator_replay_real_time = bool(raw.get("spectator_replay_real_time", False))
-        try:
-            cfg.spectator_recent_text_size = max(10, min(80, int(raw.get("spectator_recent_text_size", 23) or 23)))
-        except Exception:
-            cfg.spectator_recent_text_size = 23
-        try:
-            cfg.spectatorlog_poll_ms = max(100, min(5000, int(raw.get("spectatorlog_poll_ms", 250) or 250)))
-        except Exception:
-            cfg.spectatorlog_poll_ms = 250
-
-        cfg.roi_trigger = rect_from(raw.get("roi_trigger", {}))
-        cfg.roi_blue_name = rect_from(raw.get("roi_blue_name", {}))
-        cfg.roi_red_name = rect_from(raw.get("roi_red_name", {}))
-        cfg.roi_arena_name = rect_from(raw.get("roi_arena_name", {}))
-        cfg.roi_round_info = rect_from(raw.get("roi_round_info", {}))
-        cfg.roi_round_time = rect_from(raw.get("roi_round_time", {}))
-
-        cfg.roi_left_player = rect_from(raw.get("roi_left_player", {}))
-        cfg.roi_right_player = rect_from(raw.get("roi_right_player", {}))
-        cfg.roi_koth_winner_blue = rect_from(raw.get("roi_koth_winner_blue", {}))
-        cfg.roi_koth_winner_red = rect_from(raw.get("roi_koth_winner_red", {}))
-
-        tr = raw.get("trigger", {})
-        cfg.trigger = TriggerConfig(
-            enabled=bool(tr.get("enabled", True)),
-            target_bgr=tuple(tr.get("target_bgr", [0, 255, 0])),
-            tolerance=int(tr.get("tolerance", 35)),
-            consecutive_needed=int(tr.get("consecutive_needed", 6)),
-            window_frames=int(tr.get("window_frames", 8)),
-            cooldown_sec=float(tr.get("cooldown_sec", 2.0)),
-            action_cooldown_sec=float(tr.get("action_cooldown_sec", 5.0)),
-        )
-
-        oc = raw.get("ocr", {})
-        cfg.ocr = OCRConfig(
-            samples=int(oc.get("samples", 2)),
-            allow_chars=str(oc.get("allow_chars", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")),
-            unknown_label=str(oc.get("unknown_label", "UNKNOWN")),
-            sim_threshold=int(oc.get("sim_threshold", 75)),
-            require_gap=int(oc.get("require_gap", 0)),
-        )
-
-        pc = raw.get("palette", {})
-        cfg.palette = PaletteConfig(
-            frames=int(pc.get("frames", 3)),
-            k_colors=int(pc.get("k_colors", 5)),
-            mask_thresh=float(pc.get("mask_thresh", 0.5)),
-            max_pixels=int(pc.get("max_pixels", 12000)),
-            min_v_cut=int(pc.get("min_v_cut", 10)),
-        )
-        cfg.timer_total_rounds = int(raw.get("timer_total_rounds", 3))
-        cfg.timer_round_sec = int(raw.get("timer_round_sec", 180))
-        cfg.timer_rest_sec = int(raw.get("timer_rest_sec", 60))
-        cfg.timer_rest_30s_tts_enabled = bool(raw.get("timer_rest_30s_tts_enabled", True))
-        cfg.timer_rest_30s_tts_rate = int(raw.get("timer_rest_30s_tts_rate", 200))
-        cfg.timer_current_round = int(raw.get("timer_current_round", 1))
-        cfg.timer_seconds_left = int(raw.get("timer_seconds_left", cfg.timer_round_sec))
-
-        cfg.overlay_bg_color = _normalize_hex_color(str(raw.get("overlay_bg_color", "transparent")))
-        try:
-            if "overlay_bg_opacity" in raw:
-                cfg.overlay_bg_opacity = float(raw.get("overlay_bg_opacity", 0.0))
-            else:
-                cfg.overlay_bg_opacity = 1.0 if cfg.overlay_bg_color and cfg.overlay_bg_color != "transparent" else 0.0
-        except Exception:
-            cfg.overlay_bg_opacity = 0.0
-        try:
-            cfg.overlay_ui_scale = float(raw.get("overlay_ui_scale", 1.0))
-        except Exception:
-            cfg.overlay_ui_scale = 1.0
-        try:
-            cfg.overlay_timer_font_size = max(24, min(96, int(raw.get("overlay_timer_font_size", 54) or 54)))
-        except Exception:
-            cfg.overlay_timer_font_size = 54
-        try:
-            cfg.overlay_timer_x = max(-160, min(160, int(raw.get("overlay_timer_x", 0) or 0)))
-        except Exception:
-            cfg.overlay_timer_x = 0
-        try:
-            cfg.overlay_timer_y = max(-80, min(120, int(raw.get("overlay_timer_y", 0) or 0)))
-        except Exception:
-            cfg.overlay_timer_y = 0
-        try:
-            cfg.overlay_round_font_size = max(6, min(40, int(raw.get("overlay_round_font_size", 11) or 11)))
-        except Exception:
-            cfg.overlay_round_font_size = 11
-        try:
-            cfg.overlay_round_x = max(-160, min(160, int(raw.get("overlay_round_x", 0) or 0)))
-        except Exception:
-            cfg.overlay_round_x = 0
-        try:
-            cfg.overlay_round_y = max(-80, min(120, int(raw.get("overlay_round_y", 0) or 0)))
-        except Exception:
-            cfg.overlay_round_y = 0
-        cfg.overlay_preset = str(raw.get("overlay_preset", "classic") or "classic").strip().lower()
-        if cfg.overlay_preset not in ("classic", "tekken8"):
-            cfg.overlay_preset = "classic"
-        cfg.overlay_player_mask = _normalize_player_mask(raw.get("overlay_player_mask", "square"))
-        cfg.overlay_show_round = bool(raw.get("overlay_show_round", True))
-        cfg.overlay_show_time = bool(raw.get("overlay_show_time", True))
-        cfg.overlay_show_blue_img = bool(raw.get("overlay_show_blue_img", True))
-        cfg.overlay_show_blue_name = bool(raw.get("overlay_show_blue_name", True))
-        cfg.overlay_show_red_img = bool(raw.get("overlay_show_red_img", True))
-        cfg.overlay_show_red_name = bool(raw.get("overlay_show_red_name", True))
-        cfg.overlay_show_arena_name = bool(raw.get("overlay_show_arena_name", True))
-        cfg.overlay_show_flags = bool(raw.get("overlay_show_flags", True))
-        cfg.overlay_show_cinematic = bool(raw.get("overlay_show_cinematic", True))
-        cfg.overlay_vs_bg_path = str(raw.get("overlay_vs_bg_path", "") or "")
-        try:
-            cfg.overlay_vs_bg_opacity = max(0.0, min(1.0, float(raw.get("overlay_vs_bg_opacity", 1.0) or 1.0)))
-        except Exception:
-            cfg.overlay_vs_bg_opacity = 1.0
-        cfg.overlay_vs_bg_by_arena = {str(k): str(v) for k, v in (raw.get("overlay_vs_bg_by_arena", {}) or {}).items()}
-        try:
-            cfg.overlay_vs_hold_sec = max(0.5, min(15.0, float(raw.get("overlay_vs_hold_sec", 2.85) or 2.85)))
-        except Exception:
-            cfg.overlay_vs_hold_sec = 2.85
-        try:
-            cfg.browser_overlay_scale = max(0.25, min(4.0, float(raw.get("browser_overlay_scale", 1.0) or 1.0)))
-        except Exception:
-            cfg.browser_overlay_scale = 1.0
-        try:
-            cfg.browser_overlay_poll_ms = max(16, min(1000, int(raw.get("browser_overlay_poll_ms", 50) or 50)))
-        except Exception:
-            cfg.browser_overlay_poll_ms = 50
-        cfg.browser_overlay_output_only = bool(raw.get("browser_overlay_output_only", True))
-        cfg.qml_preview_enabled = bool(raw.get("qml_preview_enabled", True))
-        cfg.overlay_style_round = _normalize_overlay_style(raw.get("overlay_style_round"), _default_overlay_style_round())
-        cfg.overlay_style_time = _normalize_overlay_style(raw.get("overlay_style_time"), _default_overlay_style_time())
-        cfg.overlay_style_blue_name = _normalize_overlay_style(raw.get("overlay_style_blue_name"), _default_overlay_style_blue_name())
-        cfg.overlay_style_red_name = _normalize_overlay_style(raw.get("overlay_style_red_name"), _default_overlay_style_red_name())
-        cfg.overlay_style_arena = _normalize_overlay_style(raw.get("overlay_style_arena"), _default_overlay_style_arena())
-        cfg.browser_text_styles = _normalize_browser_text_styles(raw.get("browser_text_styles"))
-        cfg.capture_player_images = bool(raw.get("capture_player_images", True))
-
-        cfg.action_cooldown_sec = float(raw.get("action_cooldown_sec", 5.0))
-        cfg.action_cooldowns = {str(k): float(v) for k, v in (raw.get("action_cooldowns", {}) or {}).items()}
-        cfg.action_edge_triggers = {str(k): bool(v) for k, v in (raw.get("action_edge_triggers", {}) or {}).items()}
-        if bool(tr.get("edge_trigger", False)) and "on_trigger" not in cfg.action_edge_triggers:
-            cfg.action_edge_triggers["on_trigger"] = True
-
-        cfg.players = {str(k).upper(): str(v) for k, v in raw.get("players", {}).items()}
-        cfg.players_images = {str(k).upper(): str(v) for k, v in raw.get("players_images", {}).items()}
-        cfg.players_countries = {
-            str(k).upper(): _normalize_player_country(v)
-            for k, v in (raw.get("players_countries", {}) or {}).items()
-        }
-        cfg.players_flags = {str(k).upper(): str(v) for k, v in (raw.get("players_flags", {}) or {}).items()}
-        for gid in cfg.players.keys():
-            cfg.players_countries.setdefault(str(gid).upper(), "KR")
-            cfg.players_flags.setdefault(str(gid).upper(), "")
-        cfg.current_blue_id = str(raw.get("current_blue_id", "") or "").upper().strip()
-        cfg.current_red_id = str(raw.get("current_red_id", "") or "").upper().strip()
-        cfg.current_blue_registered = bool(raw.get("current_blue_registered", False))
-        cfg.current_red_registered = bool(raw.get("current_red_registered", False))
-        cfg.current_blue_valid = bool(raw.get("current_blue_valid", False))
-        cfg.current_red_valid = bool(raw.get("current_red_valid", False))
-        cfg.koth_enabled = bool(raw.get("koth_enabled", False))
-        cfg.koth_champion_id = str(raw.get("koth_champion_id", "") or "").upper().strip()
-        cfg.koth_streak = max(0, int(raw.get("koth_streak", 0) or 0))
-        cfg.koth_min_score = max(0, min(100, int(raw.get("koth_min_score", 75) or 75)))
-        cfg.layout = raw.get("layout", {}) or {}
-        cfg.actions = raw.get("actions", {}) or {}
-
-        if not cfg.coords_global:
-            # Convert stored local coords to global coords once.
-            try:
-                if cfg.roi_trigger.valid():
-                    tmon = int(raw.get("trigger_monitor_index", cfg.monitor_index))
-                    cfg.roi_trigger = rect_local_to_global(tmon, cfg.roi_trigger)
-            except Exception:
-                pass
-
-            try:
-                for key, mon in list(cfg.roi_monitors.items()):
-                    rect = getattr(cfg, key, None)
-                    if isinstance(rect, Rect) and rect.valid():
-                        setattr(cfg, key, rect_local_to_global(int(mon), rect))
-            except Exception:
-                pass
-            cfg.roi_monitors = {}
-
-            try:
-                for rule in cfg.pixel_rules or []:
-                    mode = str(rule.get("mode", "pixel"))
-                    mon = int(rule.get("monitor_index", cfg.monitor_index))
-                    if mode == "roi":
-                        rr = rule.get("roi", {}) or {}
-                        rect = Rect(
-                            x=int(rr.get("x", 0)),
-                            y=int(rr.get("y", 0)),
-                            w=int(rr.get("w", 0)),
-                            h=int(rr.get("h", 0)),
-                        )
-                        if rect.valid():
-                            g = rect_local_to_global(mon, rect)
-                            rule["roi"] = {"x": g.x, "y": g.y, "w": g.w, "h": g.h}
-                    else:
-                        x = int(rule.get("x", 0))
-                        y = int(rule.get("y", 0))
-                        gx, gy = xy_local_to_global(mon, x, y)
-                        rule["x"] = int(gx)
-                        rule["y"] = int(gy)
-                    if "monitor_index" in rule:
-                        rule.pop("monitor_index", None)
-            except Exception:
-                pass
-
-            try:
-                for ev, acts in list(cfg.actions.items()):
-                    new_acts = []
-                    for act in acts or []:
-                        if not isinstance(act, dict):
-                            new_acts.append(act)
-                            continue
-                        atype = str(act.get("type", "")).lower()
-                        if atype in ("mouse_move", "mouse_click", "mouse_down", "mouse_up"):
-                            if act.get("use_monitor") is False:
-                                new_acts.append(act)
-                                continue
-                            mon = int(act.get("monitor", cfg.monitor_index))
-                            try:
-                                x = int(act.get("x"))
-                                y = int(act.get("y"))
-                            except Exception:
-                                x = None
-                                y = None
-                            if x is not None and y is not None:
-                                gx, gy = xy_local_to_global(mon, x, y)
-                                act["x"] = int(gx)
-                                act["y"] = int(gy)
-                            act["use_monitor"] = False
-                            act.pop("monitor", None)
-                        new_acts.append(act)
-                    cfg.actions[ev] = new_acts
-            except Exception:
-                pass
-
-            cfg.coords_global = True
-
-        cfg.actions = _normalize_mouse_actions(cfg.actions, cfg.monitor_index)
-        raw_pixel_rules = raw.get("pixel_rules", []) or []
-        norm_pixel_rules = []
-        for i, rule in enumerate(raw_pixel_rules):
-            r = dict(rule or {})
-            if not r.get("id"):
-                r["id"] = f"pixel_{uuid.uuid4().hex}"
-            if not r.get("name"):
-                r["name"] = f"rule{i+1}"
-            norm_pixel_rules.append(r)
-        cfg.pixel_rules = norm_pixel_rules
-
-        # Sound detection was removed; legacy sound config is intentionally ignored.
-        raw_win_effects = raw.get("win_effects", {}) or {}
-        cfg.win_effects = _migrate_win_effects_legacy(
-            _merge_dict(default_win_effects(), raw_win_effects),
-            raw_win_effects,
-        )
-        cfg.actions = migrate_action_keys(cfg.actions, cfg.pixel_rules)
-        cfg.actions = sync_action_keys(cfg.actions, cfg.pixel_rules)
-        cfg.actions = prune_actions(cfg.actions, cfg.pixel_rules)
-        return cfg
-
-    def to_json(self, path: str) -> None:
-        self.actions = sync_action_keys(self.actions, self.pixel_rules)
-        self.actions = prune_actions(self.actions, self.pixel_rules)
-        raw = {
-            "monitor_index": self.monitor_index,
-            "trigger_monitor_index": self.trigger_monitor_index,
-            "roi_monitors": self.roi_monitors,
-            "coords_global": self.coords_global,
-            "roi_hotkey": self.roi_hotkey,
-            "pixel_hotkey": self.pixel_hotkey,
-            "detect_hotkey": self.detect_hotkey,
-            "trigger_pixel_hotkey": self.trigger_pixel_hotkey,
-            "action_pick_hotkey": self.action_pick_hotkey,
-            "action_test_hotkey": self.action_test_hotkey,
-            "chapter_anchor_epoch": float(self.chapter_anchor_epoch or 0.0),
-            "chapter_offset_sec": int(self.chapter_offset_sec),
-            "chapter_dedupe_sec": int(self.chapter_dedupe_sec),
-            "chapter_output_dir": str(self.chapter_output_dir or ""),
-            "chapter_nickname_only": bool(self.chapter_nickname_only),
-            "chapter_hide_time": bool(self.chapter_hide_time),
-            "spectatorlog_enabled": bool(self.spectatorlog_enabled),
-            "spectatorlog_path": to_app_rel(str(self.spectatorlog_path or "")),
-            "spectatorlog_poll_ms": int(self.spectatorlog_poll_ms or 250),
-            "spectatorlog_sync_timer": bool(self.spectatorlog_sync_timer),
-            "spectatorlog_sync_players": bool(self.spectatorlog_sync_players),
-            "spectatorlog_intro_backspace": bool(self.spectatorlog_intro_backspace),
-            "spectatorlog_intro_backspace_target_title": str(self.spectatorlog_intro_backspace_target_title or ""),
-            "spectatorlog_intro_backspace_activate": bool(self.spectatorlog_intro_backspace_activate),
-            "spectatorlog_intro_backspace_restore": bool(self.spectatorlog_intro_backspace_restore),
-            "spectator_commentary_enabled": bool(self.spectator_commentary_enabled),
-            "spectator_commentary_mode": str(self.spectator_commentary_mode or "standard"),
-            "spectator_commentary_min_damage": float(self.spectator_commentary_min_damage or 25.0),
-            "spectator_hit_effect_damage": float(self.spectator_hit_effect_damage or 45.0),
-            "spectator_commentary_cooldown_sec": float(self.spectator_commentary_cooldown_sec or 6.0),
-            "spectator_commentary_voice": str(self.spectator_commentary_voice or "ko-KR-SunHiNeural"),
-            "spectator_caster_voice": str(self.spectator_caster_voice or "ko-KR-InJoonNeural"),
-            "spectator_commentary_rate": int(self.spectator_commentary_rate or 200),
-            "spectator_commentary_volume": float(self.spectator_commentary_volume if self.spectator_commentary_volume is not None else 100.0),
-            "spectator_commentary_pitch": int(self.spectator_commentary_pitch or 0),
-            "spectator_replay_speed": float(self.spectator_replay_speed or 1.0),
-            "spectator_replay_real_time": bool(self.spectator_replay_real_time),
-            "spectator_recent_text_size": int(self.spectator_recent_text_size or 23),
-            "spectator_stun_sfx_path": to_app_rel(str(self.spectator_stun_sfx_path or "")),
-            "spectator_knockdown_sfx_path": to_app_rel(str(self.spectator_knockdown_sfx_path or "")),
-            "spectator_tko_sfx_path": to_app_rel(str(self.spectator_tko_sfx_path or "")),
-            "spectator_sfx_playback_rate": float(self.spectator_sfx_playback_rate or 1.0),
-            "roi_trigger": asdict(self.roi_trigger),
-            "roi_blue_name": asdict(self.roi_blue_name),
-            "roi_red_name": asdict(self.roi_red_name),
-            "roi_arena_name": asdict(self.roi_arena_name),
-            "roi_round_info": asdict(self.roi_round_info),
-            "roi_round_time": asdict(self.roi_round_time),
-            "roi_left_player": asdict(self.roi_left_player),
-            "roi_right_player": asdict(self.roi_right_player),
-            "roi_koth_winner_blue": asdict(self.roi_koth_winner_blue),
-            "roi_koth_winner_red": asdict(self.roi_koth_winner_red),
-            "trigger": asdict(self.trigger),
-            "ocr": asdict(self.ocr),
-            "palette": asdict(self.palette),
-            "timer_total_rounds": self.timer_total_rounds,
-            "timer_round_sec": self.timer_round_sec,
-            "timer_rest_sec": self.timer_rest_sec,
-            "timer_rest_30s_tts_enabled": bool(self.timer_rest_30s_tts_enabled),
-            "timer_rest_30s_tts_rate": int(self.timer_rest_30s_tts_rate),
-            "timer_current_round": self.timer_current_round,
-            "timer_seconds_left": self.timer_seconds_left,
-            "overlay_bg_color": self.overlay_bg_color,
-            "overlay_bg_opacity": self.overlay_bg_opacity,
-            "overlay_ui_scale": self.overlay_ui_scale,
-            "overlay_timer_font_size": int(self.overlay_timer_font_size or 54),
-            "overlay_timer_x": int(self.overlay_timer_x or 0),
-            "overlay_timer_y": int(self.overlay_timer_y or 0),
-            "overlay_round_font_size": int(self.overlay_round_font_size or 11),
-            "overlay_round_x": int(self.overlay_round_x or 0),
-            "overlay_round_y": int(self.overlay_round_y or 0),
-            "overlay_preset": self.overlay_preset,
-            "overlay_player_mask": self.overlay_player_mask,
-            "overlay_show_round": self.overlay_show_round,
-            "overlay_show_time": self.overlay_show_time,
-            "overlay_show_blue_img": self.overlay_show_blue_img,
-            "overlay_show_blue_name": self.overlay_show_blue_name,
-            "overlay_show_red_img": self.overlay_show_red_img,
-            "overlay_show_red_name": self.overlay_show_red_name,
-            "overlay_show_arena_name": self.overlay_show_arena_name,
-            "overlay_show_flags": self.overlay_show_flags,
-            "overlay_show_cinematic": self.overlay_show_cinematic,
-            "overlay_vs_bg_path": to_app_rel(str(self.overlay_vs_bg_path or "")),
-            "overlay_vs_bg_opacity": float(self.overlay_vs_bg_opacity if self.overlay_vs_bg_opacity is not None else 1.0),
-            "overlay_vs_bg_by_arena": {str(k): to_app_rel(str(v)) for k, v in (self.overlay_vs_bg_by_arena or {}).items()},
-            "overlay_vs_hold_sec": float(self.overlay_vs_hold_sec if self.overlay_vs_hold_sec is not None else 2.85),
-            "browser_overlay_scale": float(self.browser_overlay_scale if self.browser_overlay_scale is not None else 1.0),
-            "browser_overlay_poll_ms": int(self.browser_overlay_poll_ms or 50),
-            "browser_overlay_output_only": bool(self.browser_overlay_output_only),
-            "qml_preview_enabled": bool(self.qml_preview_enabled),
-            "overlay_style_round": self.overlay_style_round,
-            "overlay_style_time": self.overlay_style_time,
-            "overlay_style_blue_name": self.overlay_style_blue_name,
-            "overlay_style_red_name": self.overlay_style_red_name,
-            "overlay_style_arena": self.overlay_style_arena,
-            "browser_text_styles": self.browser_text_styles,
-            "capture_player_images": self.capture_player_images,
-            "action_cooldown_sec": self.action_cooldown_sec,
-            "action_cooldowns": self.action_cooldowns,
-            "action_edge_triggers": self.action_edge_triggers,
-            "players": self.players,
-            "players_images": {str(k): to_app_rel(v) for k, v in (self.players_images or {}).items()},
-            "players_countries": {
-                str(k): _normalize_player_country(v)
-                for k, v in (self.players_countries or {}).items()
-            },
-            "players_flags": {str(k): to_app_rel(v) for k, v in (self.players_flags or {}).items()},
-            "current_blue_id": str(self.current_blue_id or ""),
-            "current_red_id": str(self.current_red_id or ""),
-            "current_blue_registered": bool(self.current_blue_registered),
-            "current_red_registered": bool(self.current_red_registered),
-            "current_blue_valid": bool(self.current_blue_valid),
-            "current_red_valid": bool(self.current_red_valid),
-            "koth_enabled": bool(self.koth_enabled),
-            "koth_champion_id": str(self.koth_champion_id or ""),
-            "koth_streak": int(self.koth_streak or 0),
-            "koth_min_score": int(self.koth_min_score or 75),
-            "layout": self.layout,
-            "actions": self.actions,
-            "pixel_rules": self.pixel_rules,
-            "win_effects": _normalize_win_effects_paths(self.win_effects),
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
 
 
 # -----------------------------
@@ -2385,6 +1246,27 @@ def qimage_to_bgr(qimg: QImage) -> Optional[np.ndarray]:
         return None
 
 
+def safe_cv2_imread(path: str, flags: int = cv2.IMREAD_UNCHANGED) -> Optional[np.ndarray]:
+    """Read images safely on Windows unicode paths and avoid OpenCV console spam.
+
+    OpenCV's cv2.imread can fail noisily when the app lives under a Korean/non-ASCII
+    folder path. np.fromfile + cv2.imdecode handles those paths correctly and does
+    not print repeated loadsave.cpp warnings.
+    """
+    try:
+        if not path or not os.path.isfile(path):
+            return None
+        data = np.fromfile(path, dtype=np.uint8)
+        if data is None or data.size == 0:
+            return None
+        img = cv2.imdecode(data, flags)
+        if img is None or getattr(img, "size", 0) == 0:
+            return None
+        return img
+    except Exception:
+        return None
+
+
 # -----------------------------
 # ROI Selection Dialog (drag)
 # -----------------------------
@@ -2755,14 +1637,14 @@ class PixelPickOverlay(QWidget):
         return super().closeEvent(event)
 
     def mousePressEvent(self, event):
-        # ?????곗쨮 ?類ㅼ젟??? ??놁벉
+        # 오버레이 메시지 영역은 클릭으로 이동하지 않음
         return
 
 
 class ActionMiniDialog(QDialog):
     def __init__(self, parent: QWidget, action: Optional[dict] = None, default_pos: Optional[Tuple[int, int]] = None):
         super().__init__(parent)
-        self.setWindowTitle("?≪뀡 ?ㅼ젙")
+        self.setWindowTitle("액션 설정")
         self.resize(520, 260)
         self.cfg = getattr(parent, "cfg", None)
         self._action = dict(action or {"type": "delay_ms", "ms": 100})
@@ -2804,7 +1686,7 @@ class ActionMiniDialog(QDialog):
         self.pg_delay = QWidget()
         r = QHBoxLayout(self.pg_delay)
         self.sp_delay = QDoubleSpinBox(); self.sp_delay.setRange(0.0, 60.0); self.sp_delay.setSingleStep(0.1)
-        r.addWidget(QLabel("吏??s):")); r.addWidget(self.sp_delay); r.addStretch(1)
+        r.addWidget(QLabel("지연(s):")); r.addWidget(self.sp_delay); r.addStretch(1)
         self.stack.addWidget(self.pg_delay)
 
         self.pg_key = QWidget()
@@ -2813,14 +1695,14 @@ class ActionMiniDialog(QDialog):
         key_items = _PYAUTO_KEYS or list(build_vk_map().keys())
         self.cmb_key.addItems(key_items)
         self.sp_hold = QSpinBox(); self.sp_hold.setRange(0, 5000)
-        r.addWidget(QLabel("??")); r.addWidget(self.cmb_key)
-        r.addWidget(QLabel("???ms):")); r.addWidget(self.sp_hold)
+        r.addWidget(QLabel("키")); r.addWidget(self.cmb_key)
+        r.addWidget(QLabel("누름(ms):")); r.addWidget(self.sp_hold)
         self.stack.addWidget(self.pg_key)
 
         self.pg_hotkey = QWidget()
         r = QHBoxLayout(self.pg_hotkey)
         self.txt_hotkey = QLineEdit()
-        self.txt_hotkey.setPlaceholderText("?? ctrl,shift,a")
+        self.txt_hotkey.setPlaceholderText("예: ctrl,shift,a")
         r.addWidget(QLabel("핫키 조합:")); r.addWidget(self.txt_hotkey, 1)
         self.stack.addWidget(self.pg_hotkey)
 
@@ -2828,7 +1710,7 @@ class ActionMiniDialog(QDialog):
         r = QHBoxLayout(self.pg_type)
         self.txt_type = QLineEdit()
         self.sp_interval = QSpinBox(); self.sp_interval.setRange(0, 2000)
-        r.addWidget(QLabel("?띿뒪??")); r.addWidget(self.txt_type, 1)
+        r.addWidget(QLabel("텍스트:")); r.addWidget(self.txt_type, 1)
         r.addWidget(QLabel("간격(ms):")); r.addWidget(self.sp_interval)
         self.stack.addWidget(self.pg_type)
 
@@ -2847,7 +1729,7 @@ class ActionMiniDialog(QDialog):
         btn_pick.clicked.connect(self._pick_mouse)
         r.addWidget(QLabel("X:")); r.addWidget(self.sp_x)
         r.addWidget(QLabel("Y:")); r.addWidget(self.sp_y)
-        r.addWidget(QLabel("?대룞(ms):")); r.addWidget(self.sp_move_ms)
+        r.addWidget(QLabel("이동(ms):")); r.addWidget(self.sp_move_ms)
         r.addWidget(self.chk_mouse_mon); r.addWidget(self.sp_mouse_mon)
         r.addWidget(btn_pick)
         self.stack.addWidget(self.pg_mouse)
@@ -2871,7 +1753,7 @@ class ActionMiniDialog(QDialog):
         r.addWidget(self.chk_click_mon); r.addWidget(self.sp_click_mon)
         r.addWidget(btn_pick)
         r.addWidget(QLabel("버튼:")); r.addWidget(self.cmb_btn)
-        r.addWidget(QLabel("?잛닔:")); r.addWidget(self.sp_clicks)
+        r.addWidget(QLabel("횟수:")); r.addWidget(self.sp_clicks)
         r.addWidget(QLabel("간격(ms):")); r.addWidget(self.sp_click_gap)
         self.stack.addWidget(self.pg_click)
 
@@ -2880,7 +1762,7 @@ class ActionMiniDialog(QDialog):
         self.sp_round = QSpinBox(); self.sp_round.setRange(1, 99)
         self.sp_total = QSpinBox(); self.sp_total.setRange(1, 99)
         self.sp_sec = QSpinBox(); self.sp_sec.setRange(1, 3600)
-        r.addWidget(QLabel("?꾩옱 ?쇱슫??")); r.addWidget(self.sp_round)
+        r.addWidget(QLabel("현재 라운드:")); r.addWidget(self.sp_round)
         r.addWidget(QLabel("총 라운드:")); r.addWidget(self.sp_total)
         r.addWidget(QLabel("초:")); r.addWidget(self.sp_sec)
         self.stack.addWidget(self.pg_timer)
@@ -2896,7 +1778,7 @@ class ActionMiniDialog(QDialog):
         self.cmb_voice_mode.addItem("\uC601\uC5B4 \uC6B0\uC120", "en")
         self.sp_tts_repeat = QSpinBox(); self.sp_tts_repeat.setRange(1, 10); self.sp_tts_repeat.setValue(1)
         r.addWidget(QLabel("\uD14D\uC2A4\uD2B8:")); r.addWidget(self.txt_tts, 1)
-        r.addWidget(QLabel("?띾룄:")); r.addWidget(self.sp_rate)
+        r.addWidget(QLabel("속도:")); r.addWidget(self.sp_rate)
         r.addWidget(QLabel("볼륨(%):")); r.addWidget(self.sp_vol)
         r.addWidget(QLabel("\uC74C\uC131:")); r.addWidget(self.cmb_voice_mode)
         r.addWidget(QLabel("\uD69F\uC218:")); r.addWidget(self.sp_tts_repeat)
@@ -2910,7 +1792,7 @@ class ActionMiniDialog(QDialog):
         delay_row = QHBoxLayout()
         self.sp_pre = QDoubleSpinBox(); self.sp_pre.setRange(0.0, 60.0); self.sp_pre.setSingleStep(0.1)
         self.sp_post = QDoubleSpinBox(); self.sp_post.setRange(0.0, 60.0); self.sp_post.setSingleStep(0.1)
-        delay_row.addWidget(QLabel("?좏뻾 吏??s):")); delay_row.addWidget(self.sp_pre)
+        delay_row.addWidget(QLabel("선행 지연(s):")); delay_row.addWidget(self.sp_pre)
         delay_row.addSpacing(12)
         delay_row.addWidget(QLabel("\uD6C4\uB51C\uB808\uC774(s):")); delay_row.addWidget(self.sp_post)
         delay_row.addStretch(1)
@@ -3249,7 +2131,7 @@ class PixelActionDialog(QDialog):
         self.lx = int(gx)
         self.ly = int(gy)
         self.bgr = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
-        self.setWindowTitle("?쎌? ?좏깮")
+        self.setWindowTitle("색상 선택")
         self.resize(360, 300)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         self._default_pos = (self.lx, self.ly)
@@ -3745,7 +2627,7 @@ class Controller(QObject):
         result = self._read_player_palettes()
         if result:
             self.ui_update.emit(result)
-        self.status_update.emit("?붾젅???낅뜲?댄듃 ?꾨즺")
+        self.status_update.emit("팔레트 업데이트 완료")
 
     def run_koth_winner_ocr(self):
         if not bool(getattr(self.cfg, "koth_enabled", False)):
@@ -3989,7 +2871,7 @@ class Controller(QObject):
         except Exception:
             pass
         try:
-            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            img = safe_cv2_imread(path, cv2.IMREAD_UNCHANGED)
         except Exception:
             img = None
         if img is None:
@@ -4170,71 +3052,6 @@ def observe_unique(items: List[str]) -> List[str]:
     return out
 
 
-def migrate_action_keys(actions: Dict[str, List[dict]],
-                        pixel_rules: List[dict]) -> Dict[str, List[dict]]:
-    updated = dict(actions or {})
-    for rule in pixel_rules or []:
-        name = str(rule.get("name") or "")
-        rid = str(rule.get("id") or "")
-        if not rid:
-            continue
-        new_key = f"pixel_id:{rid}"
-        old_key = f"pixel:{name}"
-        if old_key in updated and new_key not in updated:
-            updated[new_key] = copy.deepcopy(updated[old_key])
-        if new_key in updated and old_key not in updated:
-            updated[old_key] = copy.deepcopy(updated[new_key])
-    return updated
-
-
-def sync_action_keys(actions: Dict[str, List[dict]],
-                     pixel_rules: List[dict]) -> Dict[str, List[dict]]:
-    synced = dict(actions or {})
-    for rule in pixel_rules or []:
-        name = str(rule.get("name") or "").strip()
-        rid = str(rule.get("id") or "").strip()
-        if not name or not rid:
-            continue
-        name_key = f"pixel:{name}"
-        id_key = f"pixel_id:{rid}"
-        if name_key in synced:
-            src = synced[name_key]
-        elif id_key in synced:
-            src = synced[id_key]
-        else:
-            continue
-        synced[name_key] = copy.deepcopy(src)
-        synced[id_key] = copy.deepcopy(src)
-    return synced
-
-
-def prune_actions(actions: Dict[str, List[dict]],
-                  pixel_rules: List[dict]) -> Dict[str, List[dict]]:
-    pixel_names = {str(rule.get("name") or "").strip() for rule in (pixel_rules or [])}
-    pixel_names.discard("")
-    pixel_ids = {str(rule.get("id") or "").strip() for rule in (pixel_rules or [])}
-    pixel_ids.discard("")
-
-    pruned: Dict[str, List[dict]] = {}
-    for key, value in (actions or {}).items():
-        if key.startswith("sound_id:"):
-            continue
-        if key.startswith("pixel_id:"):
-            pid = key.split(":", 1)[1]
-            if pid in pixel_ids:
-                pruned[key] = value
-            continue
-        if key.startswith("sound:"):
-            continue
-        if key.startswith("pixel:"):
-            name = key.split(":", 1)[1]
-            if name in pixel_names:
-                pruned[key] = value
-            continue
-        pruned[key] = value
-    return pruned
-
-
 # -----------------------------
 # GUI: Palette widgets
 # -----------------------------
@@ -4385,6 +3202,8 @@ class TimerBackend(QObject):
     runningChanged = pyqtSignal(bool)
     effectSettingsChanged = pyqtSignal()
     overlayBgColorChanged = pyqtSignal()
+    overlayUiBgOpacityChanged = pyqtSignal()
+    overlayWindowOpacityChanged = pyqtSignal()
     overlayUiScaleChanged = pyqtSignal()
     overlayPresetChanged = pyqtSignal()
     overlayResetRequested = pyqtSignal()
@@ -4404,6 +3223,7 @@ class TimerBackend(QObject):
     vsIntroBackspaceEnabledChanged = pyqtSignal()
     overlayStyleChanged = pyqtSignal()
     qmlPreviewEnabledChanged = pyqtSignal()
+    qmlEffectsEnabledChanged = pyqtSignal()
     broadcastSyncActiveChanged = pyqtSignal()
     screenDetectRunningChanged = pyqtSignal()
     ocrDetectRunningChanged = pyqtSignal()
@@ -4468,6 +3288,8 @@ class TimerBackend(QObject):
         self._effect_settings = default_win_effects()
         self._overlay_bg_color = "transparent"
         self._overlay_bg_opacity = 0.0
+        self._overlay_ui_bg_opacity = 0.75
+        self._overlay_window_opacity = 1.0
         self._overlay_ui_scale = 1.0
         self._overlay_preset = "classic"
         self._overlay_player_mask = "square"
@@ -4499,6 +3321,7 @@ class TimerBackend(QObject):
             "arena": _default_overlay_style_arena(),
         }
         self._qml_preview_enabled = True
+        self._qml_effects_enabled = False
         self._broadcast_sync_active = False
         self._screen_detect_running = False
         self._ocr_detect_running = False
@@ -4559,6 +3382,14 @@ class TimerBackend(QObject):
     @pyqtProperty(float, notify=overlayBgColorChanged)
     def overlayBgOpacity(self) -> float:
         return float(self._overlay_bg_opacity)
+
+    @pyqtProperty(float, notify=overlayUiBgOpacityChanged)
+    def overlayUiBgOpacity(self) -> float:
+        return float(self._overlay_ui_bg_opacity)
+
+    @pyqtProperty(float, notify=overlayWindowOpacityChanged)
+    def overlayWindowOpacity(self) -> float:
+        return float(self._overlay_window_opacity)
 
     @pyqtProperty(float, notify=overlayUiScaleChanged)
     def overlayUiScale(self) -> float:
@@ -4875,6 +3706,17 @@ class TimerBackend(QObject):
             return
         self._qml_preview_enabled = v
         self.qmlPreviewEnabledChanged.emit()
+
+    @pyqtProperty(bool, notify=qmlEffectsEnabledChanged)
+    def qmlEffectsEnabled(self) -> bool:
+        return bool(getattr(self, "_qml_effects_enabled", False))
+
+    def set_qml_effects_enabled(self, enabled: bool):
+        v = bool(enabled)
+        if v == bool(getattr(self, "_qml_effects_enabled", False)):
+            return
+        self._qml_effects_enabled = v
+        self.qmlEffectsEnabledChanged.emit()
 
     def set_status(self, s: str):
         if s is None:
@@ -5311,6 +4153,37 @@ class TimerBackend(QObject):
         # QML-friendly camelCase alias
         self.set_overlay_bg_opacity(opacity)
 
+    @pyqtSlot(float)
+    def set_overlay_ui_bg_opacity(self, opacity: Optional[float]):
+        try:
+            v = float(opacity if opacity is not None else 0.75)
+        except Exception:
+            v = 0.75
+        v = max(0.0, min(1.0, v))
+        if abs(float(self._overlay_ui_bg_opacity or 0.0) - v) > 0.0001:
+            self._overlay_ui_bg_opacity = v
+            self.overlayUiBgOpacityChanged.emit()
+
+    @pyqtSlot(float)
+    def setOverlayUiBgOpacity(self, opacity: Optional[float]):
+        self.set_overlay_ui_bg_opacity(opacity)
+
+    @pyqtSlot(float)
+    def set_overlay_window_opacity(self, opacity: Optional[float]):
+        try:
+            v = float(opacity if opacity is not None else 1.0)
+        except Exception:
+            v = 1.0
+        # 0.0이면 창을 다시 잡기 힘들어서 최소 20%는 남긴다.
+        v = max(0.2, min(1.0, v))
+        if v != self._overlay_window_opacity:
+            self._overlay_window_opacity = v
+            self.overlayWindowOpacityChanged.emit()
+
+    @pyqtSlot(float)
+    def setOverlayWindowOpacity(self, opacity: Optional[float]):
+        self.set_overlay_window_opacity(opacity)
+
     def set_overlay_player_mask(self, mask: Optional[str]):
         v = _normalize_player_mask(mask)
         if v != self._overlay_player_mask:
@@ -5640,8 +4513,133 @@ class TimerBackend(QObject):
             self._qtimer.stop()
 
     @pyqtSlot()
+    def _diagnostic_folder(self) -> str:
+        try:
+            folder = app_path("diagnostics")
+        except Exception:
+            folder = os.path.abspath(os.path.join(os.getcwd(), "diagnostics"))
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception:
+            pass
+        return folder
+
+    def _diagnostic_app_state(self) -> dict:
+        try:
+            overlay_state = {}
+            if getattr(self, "browser_overlay", None) is not None:
+                try:
+                    snap = self.browser_overlay.snapshot()
+                    overlay_state = {
+                        "seq": snap.get("seq"),
+                        "events_tail": list((snap.get("events") or [])[-12:]),
+                        "blueHasImage": bool(snap.get("blueHasImage")),
+                        "redHasImage": bool(snap.get("redHasImage")),
+                        "blueName": snap.get("blueName"),
+                        "redName": snap.get("redName"),
+                    }
+                except Exception:
+                    overlay_state = {"error": "overlay snapshot failed"}
+            backend = getattr(getattr(self, "timer_win", None), "_backend", None)
+            return {
+                "app_version": APP_VERSION,
+                "cfg_path": self.cfg_path,
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "timer": {
+                    "round": int(getattr(self.cfg, "timer_current_round", 1) or 1),
+                    "total_rounds": int(getattr(self.cfg, "timer_total_rounds", 3) or 3),
+                    "seconds_left": int(getattr(self.cfg, "timer_seconds_left", 0) or 0),
+                    "round_sec": int(getattr(self.cfg, "timer_round_sec", 180) or 180),
+                    "rest_sec": int(getattr(self.cfg, "timer_rest_sec", 60) or 60),
+                },
+                "spectatorlog": {
+                    "enabled": bool(getattr(self.cfg, "spectatorlog_enabled", False)),
+                    "running": bool(getattr(self, "spectator_watcher", None) and self.spectator_watcher.is_running()),
+                    "path": str(getattr(self.cfg, "spectatorlog_path", "") or ""),
+                    "resolved_path": self._diagnostic_spectator_root(),
+                    "blackbox_enabled": bool(getattr(self.cfg, "spectatorlog_blackbox_enabled", False)),
+                    "blackbox_dir": str(getattr(self.cfg, "spectatorlog_blackbox_dir", "SpectatorLogArchive") or "SpectatorLogArchive"),
+                    "blackbox_mode": str(getattr(self.cfg, "spectatorlog_blackbox_mode", "smart") or "smart"),
+                },
+                "players": {
+                    "blue_id": str(getattr(self, "_current_blue_id", "") or ""),
+                    "red_id": str(getattr(self, "_current_red_id", "") or ""),
+                    "blue_registered": bool(getattr(self, "_current_blue_registered", False)),
+                    "red_registered": bool(getattr(self, "_current_red_registered", False)),
+                },
+                "detectors": {
+                    "screen_running": bool(self._screen_detection_running() if self._screen_detection_running else False),
+                    "log_running": bool(self._log_detection_running() if self._log_detection_running else False),
+                },
+                "overlay": overlay_state,
+                "backend_state": {
+                    "exists": bool(backend is not None),
+                },
+                "diagnostics": DIAG.summary(mask_sensitive=True),
+            }
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def _diagnostic_spectator_root(self) -> str:
+        try:
+            return resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
+        except Exception:
+            return ""
+
+    def _diagnostic_mark_incident(self, note: str = "") -> object:
+        item = DIAG.mark_incident(note or "사용자 문제 발생 표시")
+        try:
+            self.timer_win.set_status("진단: 문제 발생 시점 표시 완료")
+        except Exception:
+            pass
+        return item
+
+    def _diagnostic_export_zip(self) -> str:
+        try:
+            DIAG.set_options(
+                enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
+                max_events=max(500, int(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 500),
+                raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
+                mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
+            )
+        except Exception:
+            pass
+        root = self._diagnostic_spectator_root()
+        overlay_snapshot = {}
+        try:
+            if getattr(self, "browser_overlay", None) is not None:
+                overlay_snapshot = self.browser_overlay.snapshot()
+        except Exception:
+            overlay_snapshot = {"error": "snapshot failed"}
+        path = DIAG.export_zip(
+            self._diagnostic_folder(),
+            app_state=self._diagnostic_app_state(),
+            cfg_snapshot=getattr(self.cfg, "__dict__", {}),
+            spectator_root=root,
+            overlay_snapshot=overlay_snapshot,
+            mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
+            raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
+        )
+        try:
+            self.timer_win.set_status(f"진단 ZIP 생성: {os.path.basename(path)}")
+        except Exception:
+            pass
+        return path
+
+    def _diagnostic_open_folder(self) -> str:
+        return self._diagnostic_folder()
+
+    def _diagnostic_copy_state(self) -> str:
+        return DIAG.current_state_text(self._diagnostic_app_state())
+
+    @pyqtSlot()
     def open_settings(self):
         self.open_settings_requested.emit()
+
+    @pyqtSlot()
+    def openSettings(self):
+        # QML-friendly camelCase alias.
+        self.open_settings()
 
     @pyqtSlot()
     def check_updates(self):
@@ -5894,6 +4892,7 @@ class QmlTimerWindow(QObject):
         self._provider = PlayerImageProvider()
         self._cinematic_provider = PlayerImageProvider()
         self._qml_preview_enabled = True
+        self._qml_effects_enabled = False
         self._provider.set_mask_shape(getattr(cfg, "overlay_player_mask", "square"))
         self._cinematic_provider.set_mask_shape(getattr(cfg, "overlay_player_mask", "square"))
         self._blue_image_sig = None
@@ -5991,6 +4990,7 @@ class QmlTimerWindow(QObject):
         self._sync_main_overlay_geometry()
         self._sync_cinematic_geometry()
         self.set_qml_preview_enabled(bool(getattr(cfg, "qml_preview_enabled", True)))
+        self.set_qml_effects_enabled(bool(getattr(cfg, "qml_effects_enabled", False)))
 
         self._ctrl = None
 
@@ -6451,9 +5451,16 @@ class QmlTimerWindow(QObject):
         self._backend.set_overlay_bg_color(color or "transparent")
 
     @pyqtSlot(float)
-    @pyqtSlot(float)
     def set_overlay_bg_opacity(self, opacity: Optional[float]):
         self._backend.set_overlay_bg_opacity(opacity if opacity is not None else 0.0)
+
+    @pyqtSlot(float)
+    def set_overlay_ui_bg_opacity(self, opacity: Optional[float]):
+        self._backend.set_overlay_ui_bg_opacity(opacity if opacity is not None else 0.75)
+
+    @pyqtSlot(float)
+    def set_overlay_window_opacity(self, opacity: Optional[float]):
+        self._backend.set_overlay_window_opacity(opacity if opacity is not None else 1.0)
 
     def set_qml_preview_enabled(self, enabled: bool):
         enabled = bool(enabled)
@@ -6481,6 +5488,14 @@ class QmlTimerWindow(QObject):
         self._sync_main_overlay_input_transparency()
         if enabled and not was_enabled:
             self._sync_main_overlay_geometry()
+
+    def set_qml_effects_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        self._qml_effects_enabled = enabled
+        try:
+            self._backend.set_qml_effects_enabled(enabled)
+        except Exception:
+            pass
 
 
     def is_running(self) -> bool:
@@ -6579,9 +5594,9 @@ class TimerWindow(QMainWindow):
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.setStyleSheet("background:#222; border:1px solid #333;")
 
-        self.btn_start = QPushButton("??대㉧ ?쒖옉/?쇱떆?뺤?")
+        self.btn_start = QPushButton("타이머 시작/일시정지")
         self.btn_reset = QPushButton("타이머 리셋")
-        self.btn_gear = QPushButton("?ㅼ젙")
+        self.btn_gear = QPushButton("설정")
 
         self.total_rounds = 3
         self.current_round = 1
@@ -7199,6 +6214,7 @@ class EditPlayerDialog(QDialog):
         self._name = name
         self._flag_path = flag_path or ""
         self._on_flag_pick = on_flag_pick
+        self.setStyleSheet("QWidget{font-family:'Malgun Gothic','맑은 고딕','Segoe UI',sans-serif;}")
 
         lay = QVBoxLayout()
 
@@ -7213,8 +6229,9 @@ class EditPlayerDialog(QDialog):
 
         form.addWidget(QLabel("국적"), 2, 0)
         self.cmb_country = QComboBox()
-        self.cmb_country.addItem("?쒓뎅", "KR")
-        self.cmb_country.addItem("?쇰낯", "JP")
+        self.cmb_country.setStyleSheet("QComboBox,QAbstractItemView{font-family:'Malgun Gothic','맑은 고딕','Segoe UI',sans-serif;}")
+        self.cmb_country.addItem("한국", "KR")
+        self.cmb_country.addItem("일본", "JP")
         idx = self.cmb_country.findData(_normalize_player_country(country))
         self.cmb_country.setCurrentIndex(idx if idx >= 0 else 0)
         form.addWidget(self.cmb_country, 2, 1)
@@ -7283,7 +6300,7 @@ class ProfileEditDialog(QDialog):
         on_flag: Callable[[str], str],
     ):
         super().__init__(parent)
-        self.setWindowTitle("?꾨줈???섏젙")
+        self.setWindowTitle("프로필 수정")
         self._gid = gid
         self._name = name
         self._img_path = img_path
@@ -7293,6 +6310,7 @@ class ProfileEditDialog(QDialog):
         self._on_image = on_image
         self._on_paste = on_paste
         self._on_flag = on_flag
+        self.setStyleSheet("QWidget{font-family:'Malgun Gothic','맑은 고딕','Segoe UI',sans-serif;}")
 
         lay = QHBoxLayout()
         self.avatar_btn = AvatarButton(self, 96, img_path, self._edit_image)
@@ -7310,7 +6328,7 @@ class ProfileEditDialog(QDialog):
         body.addWidget(self.lbl_country)
 
         btn_row = QHBoxLayout()
-        btn_edit = QPushButton("?됰꽕???꾩씠???섏젙")
+        btn_edit = QPushButton("프로필 설정")
         btn_edit.clicked.connect(self._edit_profile)
         btn_row.addWidget(btn_edit)
         body.addLayout(btn_row)
@@ -7388,8 +6406,9 @@ class OverlayProfileDialog(QDialog):
         self._on_delete = on_delete
         self._mode = mode
         self._existing_names = [str(v or "").strip() for v in (existing_names or []) if str(v or "").strip()]
+        self.setStyleSheet("QWidget{font-family:'Malgun Gothic','맑은 고딕','Segoe UI',sans-serif;}")
 
-        title = "?꾨줈???깅줉" if mode == "register" else "?꾨줈???섏젙"
+        title = "프로필 등록" if mode == "register" else "프로필 수정"
         self.setWindowTitle(title)
 
         lay = QVBoxLayout()
@@ -7416,15 +6435,16 @@ class OverlayProfileDialog(QDialog):
         info.addLayout(row_name)
         info.addWidget(QLabel("\uAD6D\uC801"))
         self.cmb_country = QComboBox()
-        self.cmb_country.addItem("?쒓뎅", "KR")
-        self.cmb_country.addItem("?쇰낯", "JP")
+        self.cmb_country.setStyleSheet("QComboBox,QAbstractItemView{font-family:'Malgun Gothic','맑은 고딕','Segoe UI',sans-serif;}")
+        self.cmb_country.addItem("한국", "KR")
+        self.cmb_country.addItem("일본", "JP")
         cidx = self.cmb_country.findData(self._country)
         self.cmb_country.setCurrentIndex(cidx if cidx >= 0 else 0)
         info.addWidget(self.cmb_country)
         if self._mode == "register" and self._existing_names:
             info.addWidget(QLabel("\uAE30\uC874 \uB2C9\uB124\uC784 \uC120\uD0DD"))
             self.cmb_existing_name = QComboBox()
-            self.cmb_existing_name.addItem("吏곸젒 ?낅젰")
+            self.cmb_existing_name.addItem("직접 입력")
             seen = set()
             for nm in sorted(self._existing_names, key=lambda s: s.lower()):
                 key = nm.lower()
@@ -7585,8 +6605,8 @@ class OverlayProfileDialog(QDialog):
             return
         resp = QMessageBox.question(
             self,
-            "ID ??젣",
-            f"{gid} ?꾩씠?붾? ??젣?좉퉴??",
+            "ID 삭제",
+            f"{gid} 아이디를 삭제할까요?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if resp != QMessageBox.StandardButton.Yes:
@@ -7625,6 +6645,11 @@ class SettingsDialog(QDialog):
         log_detection_start: Optional[Callable[[], None]] = None,
         log_detection_stop: Optional[Callable[[], None]] = None,
         log_detection_running: Optional[Callable[[], bool]] = None,
+        diagnostic_mark_incident: Optional[Callable[[str], object]] = None,
+        diagnostic_export_zip: Optional[Callable[[], str]] = None,
+        diagnostic_open_folder: Optional[Callable[[], str]] = None,
+        diagnostic_copy_state: Optional[Callable[[], str]] = None,
+        diagnostic_project_snapshot: Optional[Callable[[], str]] = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("설정")
@@ -7665,6 +6690,11 @@ class SettingsDialog(QDialog):
         self._log_detection_start = log_detection_start or detection_start
         self._log_detection_stop = log_detection_stop or detection_stop
         self._log_detection_running = log_detection_running or detection_running
+        self._diagnostic_mark_incident = diagnostic_mark_incident
+        self._diagnostic_export_zip = diagnostic_export_zip
+        self._diagnostic_open_folder = diagnostic_open_folder
+        self._diagnostic_copy_state = diagnostic_copy_state
+        self._diagnostic_project_snapshot = diagnostic_project_snapshot
         timer_target = self._timer_win or getattr(self.controller, "timer_win", None)
         if timer_target is None:
             timer_target = _NoopTimerWindow()
@@ -7673,26 +6703,13 @@ class SettingsDialog(QDialog):
         self._tts_test_players: Dict[str, Any] = {}
         self._tts_test_files: Dict[str, List[str]] = {"analyst": [], "caster": []}
         self._tts_test_busy: Dict[str, bool] = {"analyst": False, "caster": False}
-        self._spectator_sfx_audio_out = QAudioOutput() if HAS_QTMULTIMEDIA and QAudioOutput else None
-        self._spectator_sfx_player = QMediaPlayer() if HAS_QTMULTIMEDIA and QMediaPlayer else None
-        if self._spectator_sfx_player is not None and self._spectator_sfx_audio_out is not None:
-            try:
-                self._spectator_sfx_player.setAudioOutput(self._spectator_sfx_audio_out)
-                self._spectator_sfx_audio_out.setVolume(1.0)
-            except Exception:
-                pass
-        if HAS_QTMULTIMEDIA and QMediaPlayer and QAudioOutput:
-            for role in ("analyst", "caster"):
-                try:
-                    audio_out = QAudioOutput()
-                    player = QMediaPlayer()
-                    player.setAudioOutput(audio_out)
-                    audio_out.setVolume(1.0)
-                    player.mediaStatusChanged.connect(lambda status, r=role: self._on_tts_test_media_status(r, status))
-                    self._tts_test_audio_outs[role] = audio_out
-                    self._tts_test_players[role] = player
-                except Exception:
-                    pass
+        self._commentary_test_script_token: Optional[object] = None
+        self._commentary_test_script_queue = deque()
+        self._commentary_test_script_name: str = ""
+        # Build-release exe에서 설정창 열 때 Qt Multimedia 백엔드 로딩이 GUI를 멈출 수 있어
+        # 사운드/TTS 테스트 플레이어는 버튼을 눌렀을 때만 지연 생성한다.
+        self._spectator_sfx_audio_out = None
+        self._spectator_sfx_player = None
         try:
             logging.info(
                 "SETTINGS_ACTION_RUNNER shared=%s id=%s",
@@ -7731,6 +6748,7 @@ class SettingsDialog(QDialog):
         self.tab_pixels = QWidget()
         self.tab_automation = QWidget()
         self.tab_effects = QWidget()
+        self.tab_diagnostics = QWidget()
 
         self.tabs.addTab(self.tab_quick, "주요설정")
         self.tabs.addTab(self.tab_players, "플레이어")
@@ -7740,6 +6758,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.tab_tests, "테스트")
         self.tabs.addTab(self.tab_legacy, "레거시 OCR")
         self.tabs.addTab(self.tab_effects, "연승 이펙트")
+        self.tabs.addTab(self.tab_diagnostics, "진단")
 
         self.btn_apply = QPushButton("적용")
         self.btn_save = QPushButton("저장")
@@ -7783,6 +6802,7 @@ class SettingsDialog(QDialog):
         self._build_timer()
         self._build_ocr()
         self._build_effects()
+        self._build_diagnostics()
         self._build_actions()
         self._build_pixels()
         self._build_automation()
@@ -7805,10 +6825,6 @@ class SettingsDialog(QDialog):
 
         self._sync_watcher_labels()
         QApplication.instance().installEventFilter(self)
-
-    def closeEvent(self, event):
-        QApplication.instance().removeEventFilter(self)
-        return super().closeEvent(event)
 
     def _sync_watcher_labels(self):
         if hasattr(self, "lbl_pixel_state") and self.watcher:
@@ -8161,170 +7177,6 @@ class SettingsDialog(QDialog):
                     return i
         return int(self.cfg.monitor_index)
 
-    def _monitor_to_local(self, monitor_index: int, x: int, y: int) -> tuple[int, int]:
-        with mss.mss() as sct:
-            mons = sct.monitors
-            if monitor_index < 1 or monitor_index >= len(mons):
-                return x, y
-            mon = mons[monitor_index]
-            return int(x - mon["left"]), int(y - mon["top"])
-
-    def _monitor_to_local(self, monitor_index: int, x: int, y: int) -> tuple[int, int]:
-        with mss.mss() as sct:
-            mons = sct.monitors
-            if monitor_index < 1 or monitor_index >= len(mons):
-                return x, y
-            mon = mons[monitor_index]
-            return int(x - mon["left"]), int(y - mon["top"])
-
-    def _monitor_to_local(self, monitor_index: int, x: int, y: int) -> tuple[int, int]:
-        with mss.mss() as sct:
-            mons = sct.monitors
-            if monitor_index < 1 or monitor_index >= len(mons):
-                return x, y
-            mon = mons[monitor_index]
-            return int(x - mon["left"]), int(y - mon["top"])
-
-    def _monitor_to_local(self, monitor_index: int, x: int, y: int) -> tuple[int, int]:
-        with mss.mss() as sct:
-            mons = sct.monitors
-            if monitor_index < 1 or monitor_index >= len(mons):
-                return x, y
-            mon = mons[monitor_index]
-            return int(x - mon["left"]), int(y - mon["top"])
-
-    def _vk_from_key_name(self, name: str) -> Optional[int]:
-        if not name:
-            return None
-        key = name.upper()
-        if key.startswith("F") and key[1:].isdigit():
-            n = int(key[1:])
-            if 1 <= n <= 12:
-                return 0x70 + (n - 1)
-        if len(key) == 1:
-            ch = key[0]
-            if "A" <= ch <= "Z":
-                return ord(ch)
-            if "0" <= ch <= "9":
-                return 0x30 + int(ch)
-        return None
-
-    def _parse_hotkey(self, seq: str) -> Optional[Tuple[int, dict]]:
-        if not seq:
-            return None
-        parts = [p for p in seq.replace(" ", "").split("+") if p]
-        mods = {"ctrl": False, "alt": False, "shift": False}
-        key_part = ""
-        for part in parts:
-            up = part.upper()
-            if up in ("CTRL", "CONTROL"):
-                mods["ctrl"] = True
-            elif up == "ALT":
-                mods["alt"] = True
-            elif up == "SHIFT":
-                mods["shift"] = True
-            else:
-                key_part = up
-        vk = self._vk_from_key_name(key_part)
-        if vk is None:
-            return None
-        return vk, mods
-
-    def _hotkey_info(self, seq: str) -> Optional[Tuple[int, dict]]:
-        if seq in self._hotkey_cache:
-            return self._hotkey_cache[seq]
-        info = self._parse_hotkey(seq)
-        self._hotkey_cache[seq] = info
-        return info
-
-    def _vk_from_key_name(self, name: str) -> Optional[int]:
-        if not name:
-            return None
-        key = name.upper()
-        if key.startswith("F") and key[1:].isdigit():
-            n = int(key[1:])
-            if 1 <= n <= 12:
-                return 0x70 + (n - 1)
-        if len(key) == 1:
-            ch = key[0]
-            if "A" <= ch <= "Z":
-                return ord(ch)
-            if "0" <= ch <= "9":
-                return 0x30 + int(ch)
-        return None
-
-    def _parse_hotkey(self, seq: str) -> Optional[Tuple[int, dict]]:
-        if not seq:
-            return None
-        parts = [p for p in seq.replace(" ", "").split("+") if p]
-        mods = {"ctrl": False, "alt": False, "shift": False}
-        key_part = ""
-        for part in parts:
-            up = part.upper()
-            if up in ("CTRL", "CONTROL"):
-                mods["ctrl"] = True
-            elif up == "ALT":
-                mods["alt"] = True
-            elif up == "SHIFT":
-                mods["shift"] = True
-            else:
-                key_part = up
-        vk = self._vk_from_key_name(key_part)
-        if vk is None:
-            return None
-        return vk, mods
-
-    def _hotkey_info(self, seq: str) -> Optional[Tuple[int, dict]]:
-        if seq in self._hotkey_cache:
-            return self._hotkey_cache[seq]
-        info = self._parse_hotkey(seq)
-        self._hotkey_cache[seq] = info
-        return info
-
-    def _vk_from_key_name(self, name: str) -> Optional[int]:
-        if not name:
-            return None
-        key = name.upper()
-        if key.startswith("F") and key[1:].isdigit():
-            n = int(key[1:])
-            if 1 <= n <= 12:
-                return 0x70 + (n - 1)
-        if len(key) == 1:
-            ch = key[0]
-            if "A" <= ch <= "Z":
-                return ord(ch)
-            if "0" <= ch <= "9":
-                return 0x30 + int(ch)
-        return None
-
-    def _parse_hotkey(self, seq: str) -> Optional[Tuple[int, dict]]:
-        if not seq:
-            return None
-        parts = [p for p in seq.replace(" ", "").split("+") if p]
-        mods = {"ctrl": False, "alt": False, "shift": False}
-        key_part = ""
-        for part in parts:
-            up = part.upper()
-            if up in ("CTRL", "CONTROL"):
-                mods["ctrl"] = True
-            elif up == "ALT":
-                mods["alt"] = True
-            elif up == "SHIFT":
-                mods["shift"] = True
-            else:
-                key_part = up
-        vk = self._vk_from_key_name(key_part)
-        if vk is None:
-            return None
-        return vk, mods
-
-    def _hotkey_info(self, seq: str) -> Optional[Tuple[int, dict]]:
-        if seq in self._hotkey_cache:
-            return self._hotkey_cache[seq]
-        info = self._parse_hotkey(seq)
-        self._hotkey_cache[seq] = info
-        return info
-
     def _vk_from_key_name(self, name: str) -> Optional[int]:
         if not name:
             return None
@@ -8634,14 +7486,19 @@ class SettingsDialog(QDialog):
             self.cfg.browser_overlay_scale = max(0.25, min(4.0, float(self.sp_browser_overlay_scale.value()) / 100.0))
         if hasattr(self, "chk_browser_overlay_output_only"):
             self.cfg.browser_overlay_output_only = bool(self.chk_browser_overlay_output_only.isChecked())
+        if hasattr(self, "sp_browser_fullscreen_fx_intensity"):
+            self.cfg.browser_fullscreen_fx_intensity = max(0.0, min(3.0, float(self.sp_browser_fullscreen_fx_intensity.value()) / 100.0))
         if hasattr(self, "chk_qml_preview_enabled"):
             self.cfg.qml_preview_enabled = bool(self.chk_qml_preview_enabled.isChecked())
+        if hasattr(self, "chk_qml_effects_enabled"):
+            self.cfg.qml_effects_enabled = bool(self.chk_qml_effects_enabled.isChecked())
         try:
             if self.controller and hasattr(self.controller, "_browser_overlay_timer"):
                 interval = max(16, min(1000, int(getattr(self.cfg, "browser_overlay_poll_ms", 50) or 50)))
                 self.controller._browser_overlay_timer.setInterval(interval)
             if self.controller and hasattr(self.controller, "timer_win"):
                 self.controller.timer_win.set_qml_preview_enabled(bool(getattr(self.cfg, "qml_preview_enabled", True)))
+                self.controller.timer_win.set_qml_effects_enabled(bool(getattr(self.cfg, "qml_effects_enabled", False)))
                 self.controller.timer_win.set_overlay_visibility(
                     cinematic_visible=(bool(getattr(self.cfg, "overlay_show_cinematic", True)) and not bool(getattr(self.cfg, "browser_overlay_output_only", True)))
                 )
@@ -8651,6 +7508,165 @@ class SettingsDialog(QDialog):
 
     # ---- Quick tab ----
     # ---- Quick tab ----
+    def _build_diagnostics(self):
+        lay = QVBoxLayout()
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        group = QGroupBox("진단 / 버그 리포트")
+        grid = QGridLayout(group)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+
+        self.chk_diagnostics_enabled = QCheckBox("앱 흐름 기록 켜기")
+        self.chk_diagnostics_enabled.setChecked(bool(getattr(self.cfg, "diagnostics_enabled", True)))
+        self.chk_diagnostics_enabled.setToolTip("켜두면 최근 앱 흐름, 로그 파싱, 오버레이 전송 기록을 메모리에 보관합니다. 문제 생겼을 때 진단 ZIP에 들어갑니다.")
+        grid.addWidget(self.chk_diagnostics_enabled, 0, 0, 1, 2)
+
+        self.chk_diagnostics_mask = QCheckBox("개인정보/경로 가리고 내보내기")
+        self.chk_diagnostics_mask.setChecked(bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)))
+        self.chk_diagnostics_mask.setToolTip("진단 ZIP 생성 시 사용자 폴더 경로와 민감해 보이는 값을 최대한 가립니다.")
+        grid.addWidget(self.chk_diagnostics_mask, 0, 2, 1, 2)
+
+        self.sp_diagnostics_minutes = QSpinBox()
+        self.sp_diagnostics_minutes.setRange(1, 120)
+        self.sp_diagnostics_minutes.setValue(int(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10))
+        self.sp_diagnostics_minutes.setToolTip("최근 몇 분 정도의 앱 흐름을 보관할지 정합니다. 실제 저장은 이벤트 개수 기준 ring buffer입니다.")
+        grid.addWidget(QLabel("최근 기록 보관"), 1, 0)
+        grid.addWidget(self.sp_diagnostics_minutes, 1, 1)
+        grid.addWidget(QLabel("분"), 1, 2)
+
+        self.sp_diagnostics_raw_lines = QSpinBox()
+        self.sp_diagnostics_raw_lines.setRange(20, 2000)
+        self.sp_diagnostics_raw_lines.setValue(int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120))
+        self.sp_diagnostics_raw_lines.setToolTip("진단 ZIP에 넣을 SpectatorLog 원본 파일별 최근 줄 수입니다.")
+        grid.addWidget(QLabel("원본 로그 샘플"), 2, 0)
+        grid.addWidget(self.sp_diagnostics_raw_lines, 2, 1)
+        grid.addWidget(QLabel("줄"), 2, 2)
+
+        self.btn_diag_mark = QPushButton("문제 발생 표시")
+        self.btn_diag_mark.setToolTip("방송/테스트 중 이상한 순간에 누르면 그 시점이 recent_trace에 표시됩니다.")
+        self.btn_diag_mark.clicked.connect(self._diagnostics_mark_incident_clicked)
+        grid.addWidget(self.btn_diag_mark, 3, 0)
+
+        self.btn_diag_export = QPushButton("진단 ZIP 생성")
+        self.btn_diag_export.setToolTip("최근 앱 흐름, 설정, 오버레이 상태, SpectatorLog 샘플을 ZIP 하나로 묶습니다.")
+        self.btn_diag_export.clicked.connect(self._diagnostics_export_clicked)
+        grid.addWidget(self.btn_diag_export, 3, 1)
+
+        self.btn_diag_copy = QPushButton("현재 상태 복사")
+        self.btn_diag_copy.setToolTip("채팅에 바로 붙여넣을 수 있는 짧은 상태 요약을 클립보드에 복사합니다.")
+        self.btn_diag_copy.clicked.connect(self._diagnostics_copy_clicked)
+        grid.addWidget(self.btn_diag_copy, 3, 2)
+
+        self.btn_diag_open = QPushButton("진단 폴더 열기")
+        self.btn_diag_open.setToolTip("생성된 진단 ZIP이 저장되는 폴더를 엽니다.")
+        self.btn_diag_open.clicked.connect(self._diagnostics_open_clicked)
+        grid.addWidget(self.btn_diag_open, 3, 3)
+
+        self.btn_project_snapshot = QPushButton("프로젝트 전체 스냅샷 생성")
+        self.btn_project_snapshot.setToolTip("새 채팅이나 다른 AI가 프로그램 전체 구조를 파악할 수 있게 AI 인수인계 ZIP을 만듭니다.")
+        self.btn_project_snapshot.clicked.connect(self._diagnostics_project_snapshot_clicked)
+        grid.addWidget(self.btn_project_snapshot, 4, 0, 1, 2)
+
+        self.lbl_diag_status = QLabel("진단 ZIP은 버그 상황용, 프로젝트 스냅샷은 새 채팅 인수인계/전체 파악용입니다.")
+        self.lbl_diag_status.setWordWrap(True)
+        grid.addWidget(self.lbl_diag_status, 5, 0, 1, 4)
+
+        guide = QTextEdit()
+        guide.setReadOnly(True)
+        guide.setMinimumHeight(160)
+        guide.setPlainText(
+            "사용 흐름:\n"
+            "1) 이상한 장면이 나오면 [문제 발생 표시]를 누름\n"
+            "2) 테스트/방송 끝나고 [진단 ZIP 생성]을 누름\n"
+            "3) 생성된 ZIP을 채팅에 업로드\n\n"
+            "진단 ZIP 안에는 recent_trace.jsonl, app_state.json, settings_snapshot.json, "
+            "raw_log_samples, spectator_format_detected.json 등이 들어갑니다.\n"
+            "초상화/피격 이펙트, 로그 파싱, 타이머 꼬임, 해설 지연 같은 문제를 추적하기 위한 기능입니다.\n\n"
+            "[프로젝트 전체 스냅샷 생성]은 새 채팅에서 전체 구조를 파악하게 하는 AI 인수인계 ZIP입니다. "
+            "CHAT_HANDOFF.md, PROJECT_OVERVIEW.md, ARCHITECTURE.md, CODE_INDEX.json 등이 들어갑니다."
+        )
+        lay.addWidget(group)
+        lay.addWidget(guide)
+        lay.addStretch(1)
+        self.tab_diagnostics.setLayout(lay)
+
+    def _diagnostics_apply_options(self):
+        try:
+            self.cfg.diagnostics_enabled = bool(self.chk_diagnostics_enabled.isChecked())
+            self.cfg.diagnostics_mask_sensitive = bool(self.chk_diagnostics_mask.isChecked())
+            self.cfg.diagnostics_trace_minutes = int(self.sp_diagnostics_minutes.value())
+            self.cfg.diagnostics_raw_sample_lines = int(self.sp_diagnostics_raw_lines.value())
+            try:
+                DIAG.set_options(
+                    enabled=self.cfg.diagnostics_enabled,
+                    max_events=max(500, int(self.cfg.diagnostics_trace_minutes) * 500),
+                    raw_sample_lines=self.cfg.diagnostics_raw_sample_lines,
+                    mask_sensitive=self.cfg.diagnostics_mask_sensitive,
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _diagnostics_mark_incident_clicked(self):
+        self._diagnostics_apply_options()
+        note = "사용자 문제 발생 표시"
+        try:
+            if self._diagnostic_mark_incident:
+                self._diagnostic_mark_incident(note)
+            else:
+                DIAG.mark_incident(note)
+            self.lbl_diag_status.setText("문제 발생 시점 표시 완료. 이제 진단 ZIP을 만들면 이 시점이 같이 들어갑니다.")
+        except Exception as e:
+            self.lbl_diag_status.setText(f"문제 발생 표시 실패: {e}")
+
+    def _diagnostics_export_clicked(self):
+        self._diagnostics_apply_options()
+        try:
+            path = self._diagnostic_export_zip() if self._diagnostic_export_zip else ""
+            if path:
+                self.lbl_diag_status.setText(f"진단 ZIP 생성 완료: {path}")
+                QMessageBox.information(self, "진단 ZIP 생성", f"진단 ZIP을 만들었습니다.\n\n{path}")
+            else:
+                self.lbl_diag_status.setText("진단 ZIP 생성 실패: 경로 없음")
+        except Exception as e:
+            self.lbl_diag_status.setText(f"진단 ZIP 생성 실패: {e}")
+            QMessageBox.warning(self, "진단 ZIP 생성 실패", str(e))
+
+    def _diagnostics_copy_clicked(self):
+        self._diagnostics_apply_options()
+        try:
+            text = self._diagnostic_copy_state() if self._diagnostic_copy_state else DIAG.current_state_text({})
+            QApplication.clipboard().setText(str(text or ""))
+            self.lbl_diag_status.setText("현재 상태 요약을 클립보드에 복사했습니다.")
+        except Exception as e:
+            self.lbl_diag_status.setText(f"상태 복사 실패: {e}")
+
+    def _diagnostics_project_snapshot_clicked(self):
+        self._diagnostics_apply_options()
+        try:
+            path = self._diagnostic_project_snapshot() if self._diagnostic_project_snapshot else ""
+            if path:
+                self.lbl_diag_status.setText(f"프로젝트 스냅샷 생성 완료: {path}")
+                QMessageBox.information(self, "프로젝트 전체 스냅샷 생성", f"AI 인수인계용 프로젝트 스냅샷을 만들었습니다.\n\n{path}")
+            else:
+                self.lbl_diag_status.setText("프로젝트 스냅샷 생성 실패: 경로 없음")
+        except Exception as e:
+            self.lbl_diag_status.setText(f"프로젝트 스냅샷 생성 실패: {e}")
+            QMessageBox.warning(self, "프로젝트 스냅샷 생성 실패", str(e))
+
+    def _diagnostics_open_clicked(self):
+        self._diagnostics_apply_options()
+        try:
+            folder = self._diagnostic_open_folder() if self._diagnostic_open_folder else ""
+            if folder:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+                self.lbl_diag_status.setText(f"진단 폴더 열기: {folder}")
+        except Exception as e:
+            self.lbl_diag_status.setText(f"진단 폴더 열기 실패: {e}")
+
     def _build_quick(self):
         lay = QVBoxLayout()
         log_lay = QVBoxLayout()
@@ -8873,7 +7889,40 @@ class SettingsDialog(QDialog):
         self._refresh_chapter_status_label()
         log_lay.addWidget(chapter_group)
 
-        spectator_group = QGroupBox("ThrillOfTheFight2 SpectatorLog 연동")
+        blackbox_group = QGroupBox("관전툴 로그 전체 기록 / 블랙박스")
+        blackbox_lay = QGridLayout(blackbox_group)
+        self.chk_spectatorlog_blackbox_enabled = QCheckBox("SpectatorLog 폴더 전체 기록 켜기")
+        self.chk_spectatorlog_blackbox_enabled.setChecked(bool(getattr(self.cfg, "spectatorlog_blackbox_enabled", False)))
+        self.chk_spectatorlog_blackbox_enabled.setToolTip("켜면 SpectatorLog 폴더 안의 모든 파일 생성/수정/삭제를 원본 그대로 기록합니다. 평소에는 OFF 권장.")
+        self.chk_spectatorlog_blackbox_enabled.setStyleSheet("font-weight:700; color:#facc15;")
+        blackbox_lay.addWidget(self.chk_spectatorlog_blackbox_enabled, 0, 0, 1, 2)
+        self.cmb_spectatorlog_blackbox_mode = QComboBox()
+        self.cmb_spectatorlog_blackbox_mode.addItem("light", "light")
+        self.cmb_spectatorlog_blackbox_mode.addItem("smart", "smart")
+        self.cmb_spectatorlog_blackbox_mode.addItem("full", "full")
+        _bb_mode = str(getattr(self.cfg, "spectatorlog_blackbox_mode", "smart") or "smart").strip().lower()
+        _bb_idx = self.cmb_spectatorlog_blackbox_mode.findData(_bb_mode)
+        self.cmb_spectatorlog_blackbox_mode.setCurrentIndex(_bb_idx if _bb_idx >= 0 else 1)
+        self.cmb_spectatorlog_blackbox_mode.setToolTip("smart 권장. 카메라/글러브/머리 같은 고빈도 파일은 샘플링 저장합니다.")
+        blackbox_lay.addWidget(QLabel("기록 모드"), 0, 2)
+        blackbox_lay.addWidget(self.cmb_spectatorlog_blackbox_mode, 0, 3)
+        self.btn_spectatorlog_blackbox_open = QPushButton("기록 폴더 열기")
+        self.btn_spectatorlog_blackbox_open.setToolTip("SpectatorLogArchive 폴더를 엽니다. 기록이 꺼져 있어도 폴더 확인은 가능합니다.")
+        blackbox_lay.addWidget(self.btn_spectatorlog_blackbox_open, 0, 4)
+        blackbox_lay.addWidget(QLabel("기록 폴더"), 1, 0)
+        self.le_spectatorlog_blackbox_dir = QLineEdit(str(getattr(self.cfg, "spectatorlog_blackbox_dir", "SpectatorLogArchive") or "SpectatorLogArchive"))
+        self.le_spectatorlog_blackbox_dir.setPlaceholderText("SpectatorLogArchive")
+        self.le_spectatorlog_blackbox_dir.setMaximumWidth(720)
+        self.le_spectatorlog_blackbox_dir.setToolTip("블랙박스 세션 폴더가 저장될 위치입니다. 상대 경로면 프로그램 폴더 기준입니다.")
+        blackbox_lay.addWidget(self.le_spectatorlog_blackbox_dir, 1, 1, 1, 4)
+        self.lbl_spectatorlog_blackbox_hint = QLabel("기본 OFF. 관전툴 로그 포맷 분석할 때만 켜세요. 원본 로그 파일에는 시간/메타데이터를 붙이지 않고 그대로 저장합니다.")
+        self.lbl_spectatorlog_blackbox_hint.setWordWrap(True)
+        self.lbl_spectatorlog_blackbox_hint.setStyleSheet("color:#9ca3af;")
+        blackbox_lay.addWidget(self.lbl_spectatorlog_blackbox_hint, 2, 0, 1, 5)
+        blackbox_lay.setColumnStretch(1, 1)
+        log_lay.addWidget(blackbox_group)
+
+        spectator_group = QGroupBox("ThrillOfTheFight2 SpectatorLog 연동 / 리플레이 / 피격 이펙트")
         spectator_lay = QGridLayout(spectator_group)
         self.chk_spectatorlog_enabled = QCheckBox("SpectatorLog 사용")
         self.chk_spectatorlog_enabled.setChecked(bool(getattr(self.cfg, "spectatorlog_enabled", False)))
@@ -8915,7 +7964,27 @@ class SettingsDialog(QDialog):
         self.sp_spectatorlog_poll.setRange(100, 5000)
         self.sp_spectatorlog_poll.setSingleStep(50)
         self.sp_spectatorlog_poll.setValue(int(getattr(self.cfg, "spectatorlog_poll_ms", 250) or 250))
+        self.sp_spectatorlog_poll.setToolTip("파일 변경 감지를 끈 경우에만 사용하는 직접 확인 간격입니다.")
         spectator_lay.addWidget(self.sp_spectatorlog_poll, 7, 1)
+        self.chk_spectatorlog_file_watch = QCheckBox("파일 변경 감지 사용")
+        self.chk_spectatorlog_file_watch.setChecked(bool(getattr(self.cfg, "spectatorlog_file_watch_enabled", True)))
+        self.chk_spectatorlog_file_watch.setToolTip("켜면 로그 파일이 바뀌는 즉시 읽고, 읽기 간격은 백업 확인용으로만 동작합니다.")
+        spectator_lay.addWidget(self.chk_spectatorlog_file_watch, 7, 2, 1, 2)
+        spectator_lay.addWidget(QLabel("변경 안정화(ms)"), 8, 0)
+        self.sp_spectatorlog_debounce = QSpinBox()
+        self.sp_spectatorlog_debounce.setRange(0, 500)
+        self.sp_spectatorlog_debounce.setSingleStep(5)
+        self.sp_spectatorlog_debounce.setValue(int(getattr(self.cfg, "spectatorlog_debounce_ms", 35) or 35))
+        self.sp_spectatorlog_debounce.setToolTip("로그 파일 쓰기가 끝날 시간을 아주 짧게 기다립니다. 너무 크면 반응이 느려집니다.")
+        spectator_lay.addWidget(self.sp_spectatorlog_debounce, 8, 1)
+        spectator_lay.addWidget(QLabel("백업 확인(ms)"), 8, 2)
+        self.sp_spectatorlog_backup_poll = QSpinBox()
+        self.sp_spectatorlog_backup_poll.setRange(250, 10000)
+        self.sp_spectatorlog_backup_poll.setSingleStep(250)
+        self.sp_spectatorlog_backup_poll.setValue(int(getattr(self.cfg, "spectatorlog_backup_poll_ms", 1500) or 1500))
+        self.sp_spectatorlog_backup_poll.setToolTip("파일 변경 이벤트를 놓쳤을 때를 대비한 느린 백업 확인 간격입니다.")
+        spectator_lay.addWidget(self.sp_spectatorlog_backup_poll, 8, 3)
+
         self.btn_spectatorlog_test_blue_stun= QPushButton("블루 스턴 테스트")
         self.btn_spectatorlog_test_red_stun= QPushButton("레드 스턴 테스트")
         self.btn_spectatorlog_test_blue_kd= QPushButton("블루 KD 테스트")
@@ -8923,6 +7992,7 @@ class SettingsDialog(QDialog):
         self.btn_spectatorlog_test_blue_tko= QPushButton("블루 TKO 테스트")
         self.btn_spectatorlog_test_red_tko= QPushButton("레드 TKO 테스트")
         self.btn_spectatorlog_test_damage= QPushButton("데미지 표시 테스트")
+        self.btn_spectatorlog_test_hit_fx_sprite = QPushButton("폭발 피격 테스트")
         self.btn_spectatorlog_test_hp= QPushButton("게이지 테스트")
         self.btn_spectatorlog_test_blue_combo= QPushButton("블루 콤보 테스트")
         self.btn_spectatorlog_test_red_combo= QPushButton("레드 콤보 테스트")
@@ -8931,10 +8001,21 @@ class SettingsDialog(QDialog):
         self.btn_spectatorlog_test_timer_state= QPushButton("타이머 상태 테스트")
         self.btn_spectatorlog_test_vs_intro= QPushButton("VS 오버레이 테스트")
         self.btn_spectatorlog_test_full_demo = QPushButton("전체 HUD 데모")
+        self.btn_spectatorlog_test_round_report = QPushButton("라운드 리포트 테스트")
         self.btn_spectatorlog_replay_last = QPushButton("과거 로그 리플레이")
         self.btn_spectatorlog_replay_stop = QPushButton("리플레이 중지")
         self.btn_spectatorlog_clear_damage = QPushButton("데미지 초기화")
         self.btn_spectator_commentary_tts_test = QPushButton("자동해설 TTS 테스트")
+        self.btn_spectator_commentary_full_test = QPushButton("자동해설 종합 테스트")
+        self.btn_spectator_commentary_duo_test = QPushButton("듀오 해설 테스트")
+        self.btn_spectator_commentary_down_test = QPushButton("다운 멘트 테스트")
+        self.btn_spectator_commentary_summary_test = QPushButton("요약 멘트 테스트")
+        self.btn_spectator_commentary_stop_test = QPushButton("해설 테스트 중지")
+        self.btn_spectator_commentary_full_test_tab = QPushButton("자동해설 종합 테스트")
+        self.btn_spectator_commentary_duo_test_tab = QPushButton("듀오 해설 테스트")
+        self.btn_spectator_commentary_down_test_tab = QPushButton("다운 멘트 테스트")
+        self.btn_spectator_commentary_summary_test_tab = QPushButton("요약 멘트 테스트")
+        self.btn_spectator_commentary_stop_test_tab = QPushButton("해설 테스트 중지")
         spectator_test_group = QGroupBox("SpectatorLog / HUD 테스트")
         spectator_test_lay = QGridLayout(spectator_test_group)
         spectator_test_lay.addWidget(self.btn_spectatorlog_test_blue_stun, 0, 0)
@@ -8947,14 +8028,21 @@ class SettingsDialog(QDialog):
         spectator_test_lay.addWidget(self.btn_spectatorlog_test_blue_tko, 1, 3)
         spectator_test_lay.addWidget(self.btn_spectatorlog_test_red_tko, 2, 0)
         spectator_test_lay.addWidget(self.btn_spectatorlog_test_damage, 2, 1)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_replay_last, 2, 2)
+        spectator_test_lay.addWidget(self.btn_spectatorlog_test_hit_fx_sprite, 2, 2)
         spectator_test_lay.addWidget(self.btn_spectatorlog_test_hp, 2, 3)
+        spectator_test_lay.addWidget(self.btn_spectatorlog_replay_last, 7, 0, 1, 2)
         spectator_test_lay.addWidget(self.btn_spectatorlog_test_lives, 3, 0)
         spectator_test_lay.addWidget(self.btn_spectatorlog_test_timer_state, 3, 1)
         spectator_test_lay.addWidget(self.btn_spectatorlog_replay_stop, 3, 2)
         spectator_test_lay.addWidget(self.btn_spectatorlog_clear_damage, 3, 3)
         spectator_test_lay.addWidget(self.btn_spectatorlog_test_vs_intro, 4, 0)
         spectator_test_lay.addWidget(self.btn_spectatorlog_test_full_demo, 4, 1)
+        spectator_test_lay.addWidget(self.btn_spectatorlog_test_round_report, 4, 2, 1, 2)
+        spectator_test_lay.addWidget(self.btn_spectator_commentary_full_test_tab, 5, 0, 1, 2)
+        spectator_test_lay.addWidget(self.btn_spectator_commentary_duo_test_tab, 5, 2)
+        spectator_test_lay.addWidget(self.btn_spectator_commentary_down_test_tab, 5, 3)
+        spectator_test_lay.addWidget(self.btn_spectator_commentary_summary_test_tab, 6, 0, 1, 2)
+        spectator_test_lay.addWidget(self.btn_spectator_commentary_stop_test_tab, 6, 2, 1, 2)
         test_lay_outer.addWidget(spectator_test_group)
         sound_group = QGroupBox("자동해설 TTS / Spectator 효과음")
         sound_lay = QGridLayout(sound_group)
@@ -9019,63 +8107,242 @@ class SettingsDialog(QDialog):
         self.sp_spectator_replay_speed.setSingleStep(0.5)
         self.sp_spectator_replay_speed.setDecimals(1)
         self.sp_spectator_replay_speed.setValue(float(getattr(self.cfg, "spectator_replay_speed", 1.0) or 1.0))
-        spectator_lay.addWidget(QLabel("리플레이 배속"), 8, 0)
-        spectator_lay.addWidget(self.sp_spectator_replay_speed, 8, 1)
+        spectator_lay.addWidget(QLabel("리플레이 배속"), 9, 0)
+        spectator_lay.addWidget(self.sp_spectator_replay_speed, 9, 1)
         self.chk_spectator_replay_real_time = QCheckBox("리플레이 실제 시간")
         self.chk_spectator_replay_real_time.setChecked(bool(getattr(self.cfg, "spectator_replay_real_time", False)))
         self.chk_spectator_replay_real_time.setToolTip("켜면 damage_events.txt 시간 간격을 압축하지 않고 그대로 재생합니다.")
-        spectator_lay.addWidget(self.chk_spectator_replay_real_time, 8, 2)
+        spectator_lay.addWidget(self.chk_spectator_replay_real_time, 9, 2)
         self.sp_spectator_hit_effect_damage = QDoubleSpinBox()
         self.sp_spectator_hit_effect_damage.setRange(0.0, 300.0)
         self.sp_spectator_hit_effect_damage.setSingleStep(1.0)
         self.sp_spectator_hit_effect_damage.setDecimals(1)
         self.sp_spectator_hit_effect_damage.setSuffix(" dmg")
         self.sp_spectator_hit_effect_damage.setValue(float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0))
-        spectator_lay.addWidget(QLabel("피격 이펙트 기준"), 8, 3)
-        spectator_lay.addWidget(self.sp_spectator_hit_effect_damage, 8, 4)
+        self.sp_spectator_hit_effect_damage.setToolTip("이 값 이상 데미지일 때 피격 이펙트가 뜹니다. 0이면 모든 타격에 표시합니다. 스턴/다운/TKO는 이 값보다 낮아도 표시됩니다.")
+        spectator_lay.addWidget(QLabel("피격 이펙트 발동 데미지"), 9, 3)
+        spectator_lay.addWidget(self.sp_spectator_hit_effect_damage, 9, 4)
+        self.cb_spectator_hit_fx_color_preset = QComboBox()
+        self.cb_spectator_hit_fx_color_preset.addItem("기본", "classic")
+        self.cb_spectator_hit_fx_color_preset.addItem("아이스/파이어", "icefire")
+        self.cb_spectator_hit_fx_color_preset.addItem("네온", "neon")
+        self.cb_spectator_hit_fx_color_preset.addItem("커스텀", "custom")
+        _fx_preset = str(getattr(self.cfg, "spectator_hit_effect_color_preset", "classic") or "classic").strip().lower()
+        _fx_idx = self.cb_spectator_hit_fx_color_preset.findData(_fx_preset)
+        self.cb_spectator_hit_fx_color_preset.setCurrentIndex(_fx_idx if _fx_idx >= 0 else 0)
+        spectator_lay.addWidget(QLabel("피격 이펙트 컬러"), 10, 2)
+        spectator_lay.addWidget(self.cb_spectator_hit_fx_color_preset, 10, 3)
+        self.le_spectator_hit_fx_color_low = QLineEdit(str(getattr(self.cfg, "spectator_hit_effect_color_low", "#38bdf8") or "#38bdf8"))
+        self.le_spectator_hit_fx_color_mid = QLineEdit(str(getattr(self.cfg, "spectator_hit_effect_color_mid", "#fb923c") or "#fb923c"))
+        self.le_spectator_hit_fx_color_high = QLineEdit(str(getattr(self.cfg, "spectator_hit_effect_color_high", "#f87171") or "#f87171"))
+        self.le_spectator_hit_fx_color_weak = QLineEdit(str(getattr(self.cfg, "spectator_hit_effect_color_weak", "#facc15") or "#facc15"))
+        self.le_spectator_hit_fx_color_stun = QLineEdit(str(getattr(self.cfg, "spectator_hit_effect_color_stun", "#ef4444") or "#ef4444"))
+        for _le in (self.le_spectator_hit_fx_color_low, self.le_spectator_hit_fx_color_mid, self.le_spectator_hit_fx_color_high, self.le_spectator_hit_fx_color_weak, self.le_spectator_hit_fx_color_stun):
+            _le.setVisible(False)
+        self.btn_spectator_hit_fx_color_low = QPushButton()
+        self.btn_spectator_hit_fx_color_mid = QPushButton()
+        self.btn_spectator_hit_fx_color_high = QPushButton()
+        self.btn_spectator_hit_fx_color_weak = QPushButton()
+        self.btn_spectator_hit_fx_color_stun = QPushButton()
+        self._set_hit_fx_color_button(self.btn_spectator_hit_fx_color_low, self.le_spectator_hit_fx_color_low.text())
+        self._set_hit_fx_color_button(self.btn_spectator_hit_fx_color_mid, self.le_spectator_hit_fx_color_mid.text())
+        self._set_hit_fx_color_button(self.btn_spectator_hit_fx_color_high, self.le_spectator_hit_fx_color_high.text())
+        self._set_hit_fx_color_button(self.btn_spectator_hit_fx_color_weak, self.le_spectator_hit_fx_color_weak.text())
+        self._set_hit_fx_color_button(self.btn_spectator_hit_fx_color_stun, self.le_spectator_hit_fx_color_stun.text())
+        spectator_lay.addWidget(QLabel("Low"), 11, 0)
+        spectator_lay.addWidget(self.btn_spectator_hit_fx_color_low, 11, 1)
+        spectator_lay.addWidget(QLabel("Mid"), 11, 2)
+        spectator_lay.addWidget(self.btn_spectator_hit_fx_color_mid, 11, 3)
+        spectator_lay.addWidget(QLabel("High"), 11, 4)
+        spectator_lay.addWidget(self.btn_spectator_hit_fx_color_high, 11, 5)
+        spectator_lay.addWidget(QLabel("Weak"), 12, 0)
+        spectator_lay.addWidget(self.btn_spectator_hit_fx_color_weak, 12, 1)
+        spectator_lay.addWidget(QLabel("Stun/Down"), 12, 2)
+        spectator_lay.addWidget(self.btn_spectator_hit_fx_color_stun, 12, 3)
+        self.sp_spectator_hit_fx_duration = QSpinBox()
+        self.sp_spectator_hit_fx_duration.setRange(80, 1200)
+        self.sp_spectator_hit_fx_duration.setSingleStep(10)
+        self.sp_spectator_hit_fx_duration.setSuffix(" ms")
+        self.sp_spectator_hit_fx_duration.setValue(int(getattr(self.cfg, "spectator_hit_effect_duration_ms", 170) or 170))
+        spectator_lay.addWidget(QLabel("이펙트 시간"), 13, 0)
+        spectator_lay.addWidget(self.sp_spectator_hit_fx_duration, 13, 1)
+        self.sp_spectator_hit_fx_pop = QSpinBox()
+        self.sp_spectator_hit_fx_pop.setRange(30, 280)
+        self.sp_spectator_hit_fx_pop.setSingleStep(5)
+        self.sp_spectator_hit_fx_pop.setSuffix(" ms")
+        self.sp_spectator_hit_fx_pop.setValue(int(getattr(self.cfg, "spectator_hit_effect_pop_ms", 58) or 58))
+        self.sp_spectator_hit_fx_pop.setToolTip("첫 프레임이 팍 터지는 속도입니다. 짧을수록 더 순간적으로 폭발합니다.")
+        spectator_lay.addWidget(QLabel("팍 터지는 시간"), 13, 2)
+        spectator_lay.addWidget(self.sp_spectator_hit_fx_pop, 13, 3)
+        self.sp_spectator_hit_fx_base_size = QSpinBox()
+        self.sp_spectator_hit_fx_base_size.setRange(24, 240)
+        self.sp_spectator_hit_fx_base_size.setSingleStep(2)
+        self.sp_spectator_hit_fx_base_size.setSuffix(" px")
+        self.sp_spectator_hit_fx_base_size.setValue(int(getattr(self.cfg, "spectator_hit_effect_base_size", 86) or 86))
+        spectator_lay.addWidget(QLabel("기본 크기"), 13, 4)
+        spectator_lay.addWidget(self.sp_spectator_hit_fx_base_size, 13, 5)
+        self.sp_spectator_hit_fx_damage_scale = QDoubleSpinBox()
+        self.sp_spectator_hit_fx_damage_scale.setRange(0.0, 3.0)
+        self.sp_spectator_hit_fx_damage_scale.setSingleStep(0.05)
+        self.sp_spectator_hit_fx_damage_scale.setDecimals(2)
+        self.sp_spectator_hit_fx_damage_scale.setValue(float(getattr(self.cfg, "spectator_hit_effect_damage_scale", 0.42) or 0.42))
+        spectator_lay.addWidget(QLabel("데미지 크기배수"), 17, 0)
+        spectator_lay.addWidget(self.sp_spectator_hit_fx_damage_scale, 17, 1)
+        self.sp_spectator_hit_fx_ring_width = QSpinBox()
+        self.sp_spectator_hit_fx_ring_width.setRange(1, 20)
+        self.sp_spectator_hit_fx_ring_width.setSingleStep(1)
+        self.sp_spectator_hit_fx_ring_width.setSuffix(" px")
+        self.sp_spectator_hit_fx_ring_width.setValue(int(getattr(self.cfg, "spectator_hit_effect_ring_width", 4) or 4))
+        spectator_lay.addWidget(QLabel("링 두께"), 14, 0)
+        spectator_lay.addWidget(self.sp_spectator_hit_fx_ring_width, 14, 1)
+        self.sp_spectator_hit_fx_opacity = QDoubleSpinBox()
+        self.sp_spectator_hit_fx_opacity.setRange(0.05, 1.5)
+        self.sp_spectator_hit_fx_opacity.setSingleStep(0.05)
+        self.sp_spectator_hit_fx_opacity.setDecimals(2)
+        self.sp_spectator_hit_fx_opacity.setValue(float(getattr(self.cfg, "spectator_hit_effect_opacity", 1.0) or 1.0))
+        spectator_lay.addWidget(QLabel("전체 투명도/강도"), 14, 2)
+        spectator_lay.addWidget(self.sp_spectator_hit_fx_opacity, 14, 3)
+        self.sp_spectator_hit_fx_glow = QDoubleSpinBox()
+        self.sp_spectator_hit_fx_glow.setRange(0.0, 3.0)
+        self.sp_spectator_hit_fx_glow.setSingleStep(0.05)
+        self.sp_spectator_hit_fx_glow.setDecimals(2)
+        self.sp_spectator_hit_fx_glow.setValue(float(getattr(self.cfg, "spectator_hit_effect_glow", 1.0) or 1.0))
+        spectator_lay.addWidget(QLabel("글로우 강도"), 14, 4)
+        spectator_lay.addWidget(self.sp_spectator_hit_fx_glow, 14, 5)
+        self.sp_spectator_hit_fx_fill_opacity = QDoubleSpinBox()
+        self.sp_spectator_hit_fx_fill_opacity.setRange(0.0, 1.5)
+        self.sp_spectator_hit_fx_fill_opacity.setSingleStep(0.05)
+        self.sp_spectator_hit_fx_fill_opacity.setDecimals(2)
+        self.sp_spectator_hit_fx_fill_opacity.setValue(float(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0) or 1.0))
+        spectator_lay.addWidget(QLabel("중앙 채움 강도"), 15, 0)
+        spectator_lay.addWidget(self.sp_spectator_hit_fx_fill_opacity, 15, 1)
+        self.chk_spectator_hit_fx_show_text = QCheckBox("데미지 숫자 표시")
+        self.chk_spectator_hit_fx_show_text.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_show_text", True)))
+        spectator_lay.addWidget(self.chk_spectator_hit_fx_show_text, 15, 2)
+        self.sp_spectator_hit_fx_text_scale = QDoubleSpinBox()
+        self.sp_spectator_hit_fx_text_scale.setRange(0.5, 2.0)
+        self.sp_spectator_hit_fx_text_scale.setSingleStep(0.1)
+        self.sp_spectator_hit_fx_text_scale.setDecimals(1)
+        self.sp_spectator_hit_fx_text_scale.setValue(float(getattr(self.cfg, "spectator_hit_effect_text_scale", 1.0) or 1.0))
+        spectator_lay.addWidget(QLabel("숫자 크기배수"), 15, 4)
+        spectator_lay.addWidget(self.sp_spectator_hit_fx_text_scale, 15, 5)
+        self.chk_spectator_hit_fx_fast_emit = QCheckBox("피격 Fast Path")
+        self.chk_spectator_hit_fx_fast_emit.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_fast_emit", True)))
+        self.chk_spectator_hit_fx_fast_emit.setToolTip("damage_events 새 줄이 감지되면 해설/요약/통계 처리 전에 피격 이펙트만 먼저 보냅니다.")
+        spectator_lay.addWidget(self.chk_spectator_hit_fx_fast_emit, 16, 0, 1, 2)
+        self.chk_spectator_hit_fx_latency_log = QCheckBox("피격 지연 로그")
+        self.chk_spectator_hit_fx_latency_log.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)))
+        self.chk_spectator_hit_fx_latency_log.setToolTip("damage_events 감지 → overlay push → 브라우저 실행 시점을 로그/콘솔에 남깁니다.")
+        spectator_lay.addWidget(self.chk_spectator_hit_fx_latency_log, 16, 2, 1, 2)
+        self.chk_spectator_hit_fx_sprite_enabled = QCheckBox("폭발 스프라이트")
+        self.chk_spectator_hit_fx_sprite_enabled.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_sprite_enabled", True)))
+        self.chk_spectator_hit_fx_sprite_enabled.setToolTip("철권식 짧은 폭발 sprite atlas를 미리 로드해 피격 위치에 즉시 재생합니다.")
+        spectator_lay.addWidget(self.chk_spectator_hit_fx_sprite_enabled, 16, 4)
+        self.chk_spectator_hit_fx_ring_enabled = QCheckBox("기존 링 같이 표시")
+        self.chk_spectator_hit_fx_ring_enabled.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_ring_enabled", False)))
+        self.chk_spectator_hit_fx_ring_enabled.setToolTip("폭발 sprite 위에 기존 원형 링/글로우도 같이 표시합니다. 끄면 sprite만 남습니다.")
+        spectator_lay.addWidget(self.chk_spectator_hit_fx_ring_enabled, 16, 5)
         sound_lay.addWidget(self.btn_spectator_commentary_tts_test, 10, 5)
+        sound_lay.addWidget(self.btn_spectator_commentary_full_test, 11, 0, 1, 2)
+        sound_lay.addWidget(self.btn_spectator_commentary_duo_test, 11, 2)
+        sound_lay.addWidget(self.btn_spectator_commentary_down_test, 11, 3)
+        sound_lay.addWidget(self.btn_spectator_commentary_summary_test, 11, 4)
+        sound_lay.addWidget(self.btn_spectator_commentary_stop_test, 11, 5)
         self.sp_spectator_recent_text_size = QSpinBox()
         self.sp_spectator_recent_text_size.setRange(10, 80)
         self.sp_spectator_recent_text_size.setSuffix(" px")
         self.sp_spectator_recent_text_size.setValue(int(getattr(self.cfg, "spectator_recent_text_size", 23) or 23))
-        spectator_lay.addWidget(QLabel("타격 텍스트 크기"), 9, 0)
-        spectator_lay.addWidget(self.sp_spectator_recent_text_size, 9, 1)
+        spectator_lay.addWidget(QLabel("타격 텍스트 크기"), 10, 0)
+        spectator_lay.addWidget(self.sp_spectator_recent_text_size, 10, 1)
         self.sp_spectator_sfx_rate = QDoubleSpinBox()
         self.sp_spectator_sfx_rate.setRange(0.5, 2.0)
         self.sp_spectator_sfx_rate.setSingleStep(0.1)
         self.sp_spectator_sfx_rate.setDecimals(2)
         self.sp_spectator_sfx_rate.setSuffix("x")
         self.sp_spectator_sfx_rate.setValue(float(getattr(self.cfg, "spectator_sfx_playback_rate", 1.0) or 1.0))
-        sound_lay.addWidget(QLabel("효과음 배속"), 11, 2)
-        sound_lay.addWidget(self.sp_spectator_sfx_rate, 11, 3)
+        sound_lay.addWidget(QLabel("효과음 배속"), 12, 2)
+        sound_lay.addWidget(self.sp_spectator_sfx_rate, 12, 3)
         self.le_spectator_stun_sfx = QLineEdit(str(getattr(self.cfg, "spectator_stun_sfx_path", "") or ""))
         self.le_spectator_stun_sfx.setPlaceholderText("스턴 효과음 WAV/MP3")
-        self.btn_spectator_stun_sfx_pick = QPushButton("李얘린")
+        self.btn_spectator_stun_sfx_pick = QPushButton("찾기")
         self.btn_spectator_stun_sfx_test = QPushButton("테스트")
-        sound_lay.addWidget(QLabel(""), 12, 0)
-        sound_lay.addWidget(self.le_spectator_stun_sfx, 12, 1, 1, 3)
-        sound_lay.addWidget(self.btn_spectator_stun_sfx_pick, 12, 4)
-        sound_lay.addWidget(self.btn_spectator_stun_sfx_test, 12, 5)
+        sound_lay.addWidget(QLabel("스턴 효과음"), 13, 0)
+        sound_lay.addWidget(self.le_spectator_stun_sfx, 13, 1, 1, 3)
+        sound_lay.addWidget(self.btn_spectator_stun_sfx_pick, 13, 4)
+        sound_lay.addWidget(self.btn_spectator_stun_sfx_test, 13, 5)
         self.le_spectator_kd_sfx = QLineEdit(str(getattr(self.cfg, "spectator_knockdown_sfx_path", "") or ""))
         self.le_spectator_kd_sfx.setPlaceholderText("넉다운 효과음 WAV/MP3")
-        self.btn_spectator_kd_sfx_pick = QPushButton("李얘린")
+        self.btn_spectator_kd_sfx_pick = QPushButton("찾기")
         self.btn_spectator_kd_sfx_test = QPushButton("테스트")
-        sound_lay.addWidget(QLabel(""), 13, 0)
-        sound_lay.addWidget(self.le_spectator_kd_sfx, 13, 1, 1, 3)
-        sound_lay.addWidget(self.btn_spectator_kd_sfx_pick, 13, 4)
-        sound_lay.addWidget(self.btn_spectator_kd_sfx_test, 13, 5)
+        sound_lay.addWidget(QLabel("다운 효과음"), 14, 0)
+        sound_lay.addWidget(self.le_spectator_kd_sfx, 14, 1, 1, 3)
+        sound_lay.addWidget(self.btn_spectator_kd_sfx_pick, 14, 4)
+        sound_lay.addWidget(self.btn_spectator_kd_sfx_test, 14, 5)
         self.le_spectator_tko_sfx = QLineEdit(str(getattr(self.cfg, "spectator_tko_sfx_path", "") or ""))
         self.le_spectator_tko_sfx.setPlaceholderText("TKO 효과음 WAV/MP3")
-        self.btn_spectator_tko_sfx_pick = QPushButton("李얘린")
+        self.btn_spectator_tko_sfx_pick = QPushButton("찾기")
         self.btn_spectator_tko_sfx_test = QPushButton("테스트")
-        sound_lay.addWidget(QLabel(""), 14, 0)
-        sound_lay.addWidget(self.le_spectator_tko_sfx, 14, 1, 1, 3)
-        sound_lay.addWidget(self.btn_spectator_tko_sfx_pick, 14, 4)
-        sound_lay.addWidget(self.btn_spectator_tko_sfx_test, 14, 5)
+        sound_lay.addWidget(QLabel("종료 효과음"), 15, 0)
+        sound_lay.addWidget(self.le_spectator_tko_sfx, 15, 1, 1, 3)
+        sound_lay.addWidget(self.btn_spectator_tko_sfx_pick, 15, 4)
+        sound_lay.addWidget(self.btn_spectator_tko_sfx_test, 15, 5)
+        spectator_group.setToolTip("위쪽은 SpectatorLog 읽기 설정, 아래쪽은 리플레이 / 피격 이펙트 설정입니다.")
+        _spectator_tips = {
+            self.chk_spectatorlog_enabled: "TOTF2 SpectatorLog 폴더를 읽어서 HUD를 자동으로 움직입니다.",
+            self.chk_spectatorlog_sync_players: "로그에 나온 선수 이름으로 좌/우 선수 정보를 자동 갱신합니다.",
+            self.chk_spectatorlog_sync_timer: "로그에서 라운드 시간/상태를 읽어 타이머를 자동으로 맞춥니다.",
+            self.le_spectatorlog_path: "damage_events.txt 등이 저장되는 SpectatorLog 폴더를 넣습니다.",
+            self.btn_spectatorlog_browse: "SpectatorLog 폴더를 찾아서 바로 넣습니다.",
+            self.sp_spectatorlog_poll: "파일 변경 감지를 끈 경우 직접 확인하는 간격입니다.",
+            self.sp_spectatorlog_debounce: "로그 기록이 완전히 끝난 뒤 읽기까지 잠깐 기다리는 시간입니다.",
+            self.sp_spectatorlog_backup_poll: "이벤트를 놓친 경우를 대비한 느린 백업 확인 간격입니다.",
+            self.chk_spectatorlog_blackbox_enabled: "관전툴 로그 포맷 분석이 필요할 때만 켭니다. 원본 로그는 그대로 저장하고 메타데이터는 events.jsonl에 따로 저장합니다.",
+            self.le_spectatorlog_blackbox_dir: "블랙박스 기록 세션이 쌓일 폴더입니다. 기본값은 SpectatorLogArchive입니다.",
+            self.cmb_spectatorlog_blackbox_mode: "light는 가볍게, smart는 권장, full은 디버그용입니다.",
+            self.btn_spectatorlog_blackbox_open: "기록 폴더를 파일 탐색기로 엽니다.",
+            self.sp_spectator_replay_speed: "과거 로그 리플레이를 몇 배속으로 보여줄지 정합니다.",
+            self.chk_spectator_replay_real_time: "켜면 리플레이가 실제 경기 시간 간격을 그대로 따라갑니다.",
+            self.sp_spectator_recent_text_size: "좌우에 뜨는 최근 타격 텍스트의 글자 크기입니다.",
+            self.sp_spectator_hit_effect_damage: "이 수치 이상 데미지에서만 피격 이펙트를 띄웁니다. 0이면 모든 타격에 표시됩니다.",
+            self.cb_spectator_hit_fx_color_preset: "피격 이펙트 전체 색 조합을 빠르게 바꿉니다.",
+            self.btn_spectator_hit_fx_color_low: "약한 타격 색입니다.",
+            self.btn_spectator_hit_fx_color_mid: "중간 타격 색입니다.",
+            self.btn_spectator_hit_fx_color_high: "강한 타격 색입니다.",
+            self.btn_spectator_hit_fx_color_weak: "약타/연속타용 보조 색입니다.",
+            self.btn_spectator_hit_fx_color_stun: "스턴/다운/TKO 계열 색입니다.",
+            self.sp_spectator_hit_fx_duration: "폭발 피격 이펙트가 전체적으로 남아있는 시간입니다.",
+            self.sp_spectator_hit_fx_pop: "첫 프레임이 얼마나 빠르게 팍 터질지 정합니다. 짧을수록 더 순간 폭발 느낌입니다.",
+            self.sp_spectator_hit_fx_base_size: "피격 이펙트 기본 크기입니다.",
+            self.sp_spectator_hit_fx_damage_scale: "데미지가 클수록 이펙트가 얼마나 더 커질지 정합니다.",
+            self.sp_spectator_hit_fx_ring_width: "원형 링을 같이 쓸 때 링 두께입니다.",
+            self.sp_spectator_hit_fx_opacity: "피격 이펙트 전체 강도/투명도입니다.",
+            self.sp_spectator_hit_fx_glow: "폭발 외곽 불빛 강도입니다.",
+            self.sp_spectator_hit_fx_fill_opacity: "폭발 중심부 채움 강도입니다.",
+            self.chk_spectator_hit_fx_show_text: "피격 위치에 데미지 숫자를 같이 띄웁니다.",
+            self.sp_spectator_hit_fx_text_scale: "데미지 숫자 크기 배수입니다.",
+            self.chk_spectator_hit_fx_fast_emit: "로그를 읽자마자 피격 이펙트만 먼저 보내 반응 속도를 높입니다.",
+            self.chk_spectator_hit_fx_latency_log: "피격 이펙트가 얼마나 빨리 나가는지 콘솔/로그에 기록합니다.",
+            self.chk_spectator_hit_fx_sprite_enabled: "화염 폭발 느낌의 스프라이트 이펙트를 켭니다.",
+            self.chk_spectator_hit_fx_ring_enabled: "폭발 위에 원형 링도 같이 표시합니다."
+        }
+        for _w, _tip in _spectator_tips.items():
+            try:
+                _w.setToolTip(_tip)
+            except Exception:
+                pass
+        for _btn, _tip in (
+            (self.btn_spectatorlog_test_hit_fx_sprite, "현재 피격 이펙트 설정을 바로 미리 봅니다."),
+            (self.btn_spectatorlog_test_damage, "데미지 숫자/피격 텍스트 표시를 미리 봅니다."),
+            (self.btn_spectatorlog_replay_last, "방금 읽은 로그를 다시 재생합니다."),
+            (self.btn_spectatorlog_replay_stop, "진행 중인 리플레이 데모를 중지합니다."),
+            (self.btn_spectatorlog_test_full_demo, "게이지, 콤보, 다운, 리포트까지 한 번에 데모합니다.")
+        ):
+            _btn.setToolTip(_tip)
+
         self.lbl_spectatorlog_state = QLabel("")
         self.lbl_spectatorlog_state.setStyleSheet("color:#667085;")
         self.lbl_spectatorlog_state.setWordWrap(True)
-        spectator_lay.addWidget(self.lbl_spectatorlog_state, 15, 0, 1, 6)
+        spectator_lay.addWidget(self.lbl_spectatorlog_state, 17, 0, 1, 6)
         self.chk_spectatorlog_enabled.stateChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_spectatorlog_state()))
         self.chk_spectatorlog_sync_players.stateChanged.connect(self._schedule_apply)
         self.chk_spectatorlog_sync_timer.stateChanged.connect(self._schedule_apply)
@@ -9085,6 +8352,13 @@ class SettingsDialog(QDialog):
         self.chk_spectatorlog_backspace_restore.stateChanged.connect(self._schedule_apply)
         self.le_spectatorlog_path.textChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_spectatorlog_state()))
         self.sp_spectatorlog_poll.valueChanged.connect(self._schedule_apply)
+        self.chk_spectatorlog_file_watch.stateChanged.connect(self._schedule_apply)
+        self.sp_spectatorlog_debounce.valueChanged.connect(self._schedule_apply)
+        self.sp_spectatorlog_backup_poll.valueChanged.connect(self._schedule_apply)
+        self.chk_spectatorlog_blackbox_enabled.stateChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_spectatorlog_state()))
+        self.cmb_spectatorlog_blackbox_mode.currentIndexChanged.connect(self._schedule_apply)
+        self.le_spectatorlog_blackbox_dir.textChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_spectatorlog_state()))
+        self.btn_spectatorlog_blackbox_open.clicked.connect(self._open_spectatorlog_blackbox_dir)
         self.btn_spectatorlog_test_blue_stun.clicked.connect(lambda: self._test_spectator_stun("blue"))
         self.btn_spectatorlog_test_red_stun.clicked.connect(lambda: self._test_spectator_stun("red"))
         self.btn_spectatorlog_test_blue_kd.clicked.connect(lambda: self._test_spectator_effect("blue", "knockdown"))
@@ -9092,6 +8366,7 @@ class SettingsDialog(QDialog):
         self.btn_spectatorlog_test_blue_tko.clicked.connect(lambda: self._test_spectator_effect("blue", "tko"))
         self.btn_spectatorlog_test_red_tko.clicked.connect(lambda: self._test_spectator_effect("red", "tko"))
         self.btn_spectatorlog_test_damage.clicked.connect(self._test_spectator_damage)
+        self.btn_spectatorlog_test_hit_fx_sprite.clicked.connect(self._test_spectator_hit_fx_sprite)
         self.btn_spectatorlog_test_hp.clicked.connect(self._test_spectator_hp_gauge)
         self.btn_spectatorlog_test_blue_combo.clicked.connect(lambda: self._test_spectator_combo("blue"))
         self.btn_spectatorlog_test_red_combo.clicked.connect(lambda: self._test_spectator_combo("red"))
@@ -9100,10 +8375,21 @@ class SettingsDialog(QDialog):
         self.btn_spectatorlog_test_timer_state.clicked.connect(self._test_spectator_timer_state)
         self.btn_spectatorlog_test_vs_intro.clicked.connect(self._test_spectator_vs_intro)
         self.btn_spectatorlog_test_full_demo.clicked.connect(self._test_spectator_full_demo)
+        self.btn_spectatorlog_test_round_report.clicked.connect(self._test_spectator_round_report)
         self.btn_spectatorlog_replay_last.clicked.connect(self._test_spectator_last_log)
         self.btn_spectatorlog_replay_stop.clicked.connect(self._stop_spectator_hud_demo)
         self.btn_spectatorlog_clear_damage.clicked.connect(self._clear_spectator_damage)
         self.btn_spectator_commentary_tts_test.clicked.connect(self._test_spectator_commentary_tts)
+        self.btn_spectator_commentary_full_test.clicked.connect(self._test_spectator_commentary_full_suite)
+        self.btn_spectator_commentary_duo_test.clicked.connect(self._test_spectator_commentary_duo_suite)
+        self.btn_spectator_commentary_down_test.clicked.connect(self._test_spectator_commentary_down_suite)
+        self.btn_spectator_commentary_summary_test.clicked.connect(self._test_spectator_commentary_summary_suite)
+        self.btn_spectator_commentary_stop_test.clicked.connect(self._stop_spectator_commentary_test_script)
+        self.btn_spectator_commentary_full_test_tab.clicked.connect(self._test_spectator_commentary_full_suite)
+        self.btn_spectator_commentary_duo_test_tab.clicked.connect(self._test_spectator_commentary_duo_suite)
+        self.btn_spectator_commentary_down_test_tab.clicked.connect(self._test_spectator_commentary_down_suite)
+        self.btn_spectator_commentary_summary_test_tab.clicked.connect(self._test_spectator_commentary_summary_suite)
+        self.btn_spectator_commentary_stop_test_tab.clicked.connect(self._stop_spectator_commentary_test_script)
         self.btn_spectator_stun_sfx_pick.clicked.connect(lambda: self._pick_spectator_sfx(self.le_spectator_stun_sfx))
         self.btn_spectator_kd_sfx_pick.clicked.connect(lambda: self._pick_spectator_sfx(self.le_spectator_kd_sfx))
         self.btn_spectator_tko_sfx_pick.clicked.connect(lambda: self._pick_spectator_sfx(self.le_spectator_tko_sfx))
@@ -9116,6 +8402,31 @@ class SettingsDialog(QDialog):
         self.cmb_spectator_caster_voice.currentIndexChanged.connect(self._schedule_apply)
         self.sp_spectator_commentary_damage.valueChanged.connect(self._schedule_apply)
         self.sp_spectator_hit_effect_damage.valueChanged.connect(self._schedule_apply)
+        self.cb_spectator_hit_fx_color_preset.currentIndexChanged.connect(self._schedule_apply)
+        self.le_spectator_hit_fx_color_low.textChanged.connect(self._schedule_apply)
+        self.le_spectator_hit_fx_color_mid.textChanged.connect(self._schedule_apply)
+        self.le_spectator_hit_fx_color_high.textChanged.connect(self._schedule_apply)
+        self.le_spectator_hit_fx_color_weak.textChanged.connect(self._schedule_apply)
+        self.le_spectator_hit_fx_color_stun.textChanged.connect(self._schedule_apply)
+        self.btn_spectator_hit_fx_color_low.clicked.connect(lambda: self._pick_spectator_hit_fx_color(self.le_spectator_hit_fx_color_low, self.btn_spectator_hit_fx_color_low, "Low 피격 색상"))
+        self.btn_spectator_hit_fx_color_mid.clicked.connect(lambda: self._pick_spectator_hit_fx_color(self.le_spectator_hit_fx_color_mid, self.btn_spectator_hit_fx_color_mid, "Mid 피격 색상"))
+        self.btn_spectator_hit_fx_color_high.clicked.connect(lambda: self._pick_spectator_hit_fx_color(self.le_spectator_hit_fx_color_high, self.btn_spectator_hit_fx_color_high, "High 피격 색상"))
+        self.btn_spectator_hit_fx_color_weak.clicked.connect(lambda: self._pick_spectator_hit_fx_color(self.le_spectator_hit_fx_color_weak, self.btn_spectator_hit_fx_color_weak, "Weak 피격 색상"))
+        self.btn_spectator_hit_fx_color_stun.clicked.connect(lambda: self._pick_spectator_hit_fx_color(self.le_spectator_hit_fx_color_stun, self.btn_spectator_hit_fx_color_stun, "Stun/Down 피격 색상"))
+        self.sp_spectator_hit_fx_duration.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_hit_fx_base_size.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_hit_fx_damage_scale.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_hit_fx_ring_width.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_hit_fx_opacity.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_hit_fx_glow.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_hit_fx_fill_opacity.valueChanged.connect(self._schedule_apply)
+        self.chk_spectator_hit_fx_show_text.stateChanged.connect(self._schedule_apply)
+        self.sp_spectator_hit_fx_text_scale.valueChanged.connect(self._schedule_apply)
+        self.chk_spectator_hit_fx_fast_emit.stateChanged.connect(self._schedule_apply)
+        self.chk_spectator_hit_fx_latency_log.stateChanged.connect(self._schedule_apply)
+        self.chk_spectator_hit_fx_sprite_enabled.stateChanged.connect(self._schedule_apply)
+        self.chk_spectator_hit_fx_ring_enabled.stateChanged.connect(self._schedule_apply)
+        self.sp_spectator_hit_fx_pop.valueChanged.connect(self._schedule_apply)
         self.sp_spectator_commentary_cooldown.valueChanged.connect(self._schedule_apply)
         self.sp_spectator_commentary_rate.valueChanged.connect(self._schedule_apply)
         self.sp_spectator_commentary_volume.valueChanged.connect(self._schedule_apply)
@@ -9245,10 +8556,72 @@ class SettingsDialog(QDialog):
         ]
         ok = os.path.isdir(root) and all(os.path.exists(p) for p in needed)
         state = "ON" if enabled else "OFF"
+        bb_enabled = bool(self.chk_spectatorlog_blackbox_enabled.isChecked()) if hasattr(self, "chk_spectatorlog_blackbox_enabled") else bool(getattr(self.cfg, "spectatorlog_blackbox_enabled", False))
+        bb_state = "BB REC" if bb_enabled else "BB OFF"
         if ok:
-            self.lbl_spectatorlog_state.setText(f"{state} | 인식 폴더: {root}")
+            self.lbl_spectatorlog_state.setText(f"{state} | {bb_state} | 인식 폴더: {root}")
         else:
-            self.lbl_spectatorlog_state.setText(f"{state} | 폴더/필수 파일 확인 필요: {root}")
+            self.lbl_spectatorlog_state.setText(f"{state} | {bb_state} | 폴더/필수 파일 확인 필요: {root}")
+
+    def _open_spectatorlog_blackbox_dir(self):
+        raw = ""
+        try:
+            if hasattr(self, "le_spectatorlog_blackbox_dir"):
+                raw = str(self.le_spectatorlog_blackbox_dir.text() or "").strip()
+            if not raw:
+                raw = str(getattr(self.cfg, "spectatorlog_blackbox_dir", "SpectatorLogArchive") or "SpectatorLogArchive")
+            path = normalize_app_path(raw)
+            os.makedirs(path, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(path)))
+        except Exception as exc:
+            try:
+                QMessageBox.warning(self, "기록 폴더 열기 실패", str(exc))
+            except Exception:
+                pass
+
+    def _set_hit_fx_color_button(self, button, value: str) -> None:
+        try:
+            color = _normalize_hex_color(str(value or "#ffffff").strip() or "#ffffff")
+        except Exception:
+            color = "#ffffff"
+        try:
+            button.setText(color.upper())
+            button.setStyleSheet(
+                "QPushButton {"
+                f"background:{color};"
+                "color:#111827;"
+                "border:1px solid #334155;"
+                "border-radius:6px;"
+                "font-weight:700;"
+                "padding:4px 8px;"
+                "}"
+            )
+            button.setProperty("color_hex", color)
+        except Exception:
+            pass
+
+    def _pick_spectator_hit_fx_color(self, line_edit, button, title: str = "색상 선택") -> None:
+        try:
+            current = _normalize_hex_color(str(line_edit.text() or button.property("color_hex") or "#ffffff"))
+        except Exception:
+            current = "#ffffff"
+        try:
+            color = QColorDialog.getColor(QColor(current), self, title)
+            if not color.isValid():
+                return
+            value = color.name(QColor.HexRgb)
+            line_edit.setText(value)
+            self._set_hit_fx_color_button(button, value)
+            try:
+                if hasattr(self, "cb_spectator_hit_fx_color_preset"):
+                    idx = self.cb_spectator_hit_fx_color_preset.findData("custom")
+                    if idx >= 0:
+                        self.cb_spectator_hit_fx_color_preset.setCurrentIndex(idx)
+            except Exception:
+                pass
+            self._schedule_apply()
+        except Exception:
+            logging.exception("SPECTATOR_HIT_FX_COLOR_PICK_FAIL")
 
     def _pick_spectator_sfx(self, line_edit: QLineEdit):
         current = str(line_edit.text() or "").strip() if line_edit is not None else ""
@@ -9288,6 +8661,44 @@ class SettingsDialog(QDialog):
             return
         self._play_spectator_sfx(kind, show_warning=True)
 
+    def _ensure_spectator_sfx_player(self) -> bool:
+        if self._spectator_sfx_player is not None and self._spectator_sfx_audio_out is not None:
+            return True
+        if not HAS_QTMULTIMEDIA or QMediaPlayer is None or QAudioOutput is None:
+            return False
+        try:
+            self._spectator_sfx_audio_out = QAudioOutput()
+            self._spectator_sfx_player = QMediaPlayer()
+            self._spectator_sfx_player.setAudioOutput(self._spectator_sfx_audio_out)
+            self._spectator_sfx_audio_out.setVolume(1.0)
+            return True
+        except Exception:
+            self._spectator_sfx_audio_out = None
+            self._spectator_sfx_player = None
+            logging.debug("SETTINGS_SFX_PLAYER_INIT_FAIL", exc_info=True)
+            return False
+
+    def _ensure_tts_test_player(self, role: str) -> bool:
+        role = "caster" if str(role or "").lower() == "caster" else "analyst"
+        if (getattr(self, "_tts_test_players", {}) or {}).get(role) is not None and (getattr(self, "_tts_test_audio_outs", {}) or {}).get(role) is not None:
+            return True
+        if not HAS_QTMULTIMEDIA or QMediaPlayer is None or QAudioOutput is None:
+            return False
+        try:
+            audio_out = QAudioOutput()
+            player = QMediaPlayer()
+            player.setAudioOutput(audio_out)
+            audio_out.setVolume(1.0)
+            player.mediaStatusChanged.connect(lambda status, r=role: self._on_tts_test_media_status(r, status))
+            self._tts_test_audio_outs[role] = audio_out
+            self._tts_test_players[role] = player
+            return True
+        except Exception:
+            logging.debug("SETTINGS_TTS_PLAYER_INIT_FAIL role=%s", role, exc_info=True)
+            self._tts_test_audio_outs.pop(role, None)
+            self._tts_test_players.pop(role, None)
+            return False
+
     def _play_spectator_sfx(self, kind: str, show_warning: bool = False):
         raw = self._spectator_sfx_path(kind)
         if not raw:
@@ -9308,7 +8719,8 @@ class SettingsDialog(QDialog):
         ext = str(resolved).lower().strip()
         ok = False
         if ext.endswith((".wav", ".mp3")):
-            ok = _play_media_sfx(self._spectator_sfx_player, self._spectator_sfx_audio_out, resolved, playback_rate=playback_rate)
+            if self._ensure_spectator_sfx_player():
+                ok = _play_media_sfx(self._spectator_sfx_player, self._spectator_sfx_audio_out, resolved, playback_rate=playback_rate)
         if not ok and ext.endswith(".wav"):
             ok = _play_win_effect_sfx(resolved)
         if not ok and show_warning:
@@ -9328,6 +8740,30 @@ class SettingsDialog(QDialog):
             logging.exception("BROWSER_OVERLAY_PUSH_FAIL kind=%s payload=%s", kind, payload)
         return False
 
+    def _emit_spectator_test_update(self, payload: dict) -> bool:
+        """Route Settings test-tab HUD changes through the same path as SpectatorLog.
+
+        In browser-output-only mode the QML overlay methods are intentionally
+        mostly bypassed, so calling only TimerWindow methods makes many test
+        buttons appear broken in OBS.  Emitting controller.ui_update keeps QML
+        preview and browser overlay behavior aligned.
+        """
+        try:
+            data = dict(payload or {})
+            if not data:
+                return False
+            if self.controller is not None and hasattr(self.controller, "ui_update"):
+                self.controller.ui_update.emit(data)
+                return True
+        except Exception:
+            logging.exception("SPECTATOR_TEST_UI_UPDATE_FAIL payload=%s", payload)
+        return False
+
+    def _test_set_spectator_info(self, info: dict, extra: Optional[dict] = None) -> bool:
+        data = dict(extra or {})
+        data["spectator_log_info"] = dict(info or {})
+        return self._emit_spectator_test_update(data)
+
     def _test_spectator_stun(self, side: str):
         tw = self._spectator_timer_target()
         if tw is None:
@@ -9336,7 +8772,9 @@ class SettingsDialog(QDialog):
         try:
             side = str(side or "blue")
             tw.trigger_stun_flash(side)
-            self._play_spectator_sfx("stun", show_warning=False)
+            self._emit_spectator_test_update({
+                "spectator_effect_events": [{"side": side, "kind": "stun"}],
+            })
             if bool(getattr(self.cfg, "spectator_commentary_enabled", False)):
                 self._speak_tts_test_qt("크게 흔들립니다!", role="analyst")
         except Exception as e:
@@ -9351,7 +8789,9 @@ class SettingsDialog(QDialog):
             side = str(side or "blue")
             kind = str(kind or "stun")
             tw.trigger_spectator_effect(side, kind)
-            self._play_spectator_sfx(kind, show_warning=False)
+            self._emit_spectator_test_update({
+                "spectator_effect_events": [{"side": side, "kind": kind}],
+            })
         except Exception as e:
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
 
@@ -9373,9 +8813,19 @@ class SettingsDialog(QDialog):
                     _player_flag_path_for_gid(self.cfg, bid),
                     _player_flag_path_for_gid(self.cfg, rid),
                 )
+                self._emit_spectator_test_update({
+                    "blue_player_id": bid,
+                    "red_player_id": rid,
+                    "blue_name": bname if blue_raw else "",
+                    "red_name": rname if red_raw else "",
+                    "blue_player_registered": breg,
+                    "red_player_registered": rreg,
+                    "blue_player_valid": bvalid,
+                    "red_player_valid": rvalid,
+                })
                 loaded = True
-            b_img = cv2.imread(os.path.join(root, "blue", "portrait.png"), cv2.IMREAD_UNCHANGED)
-            r_img = cv2.imread(os.path.join(root, "red", "portrait.png"), cv2.IMREAD_UNCHANGED)
+            b_img = safe_cv2_imread(os.path.join(root, "blue", "portrait.png"), cv2.IMREAD_UNCHANGED)
+            r_img = safe_cv2_imread(os.path.join(root, "red", "portrait.png"), cv2.IMREAD_UNCHANGED)
             if b_img is not None or r_img is not None:
                 tw.set_player_images(b_img if b_img is not None else _NO_UPDATE, r_img if r_img is not None else _NO_UPDATE)
                 tw.set_overlay_visibility(
@@ -9384,6 +8834,14 @@ class SettingsDialog(QDialog):
                     red_img_visible=True,
                     red_name_visible=True,
                 )
+                self._emit_spectator_test_update({
+                    "blue_player_img": b_img if b_img is not None else _NO_UPDATE,
+                    "red_player_img": r_img if r_img is not None else _NO_UPDATE,
+                    "overlay_show_blue_img": True,
+                    "overlay_show_red_img": True,
+                    "overlay_show_blue_name": True,
+                    "overlay_show_red_name": True,
+                })
                 loaded = True
         except Exception:
             logging.exception("SPECTATOR_TEST_PROFILE_LOAD_FAIL")
@@ -9399,11 +8857,19 @@ class SettingsDialog(QDialog):
                 self.apply_only(silent=True)
             except Exception:
                 pass
-            self._load_spectatorlog_players_for_test(tw)
+            loaded_players = self._load_spectatorlog_players_for_test(tw)
+            if not loaded_players:
+                try:
+                    tw.set_names("BLUE TEST", "RED TEST")
+                except Exception:
+                    pass
+            vs_payload = {"vs_intro_event": {"source": "settings_test"}}
+            if not loaded_players:
+                vs_payload.update({"blue_name": "BLUE TEST", "red_name": "RED TEST"})
+            self._emit_spectator_test_update(vs_payload)
             if hasattr(tw, "_backend") and hasattr(tw._backend, "test_vs_intro"):
                 tw._backend.test_vs_intro()
             else:
-                tw.set_names("BLUE TEST", "RED TEST")
                 self._push_browser_overlay_event("vs")
             if bool(getattr(self.cfg, "spectator_commentary_enabled", False)):
                 helper = _make_spectator_log_watcher(self.cfg)
@@ -9418,10 +8884,10 @@ class SettingsDialog(QDialog):
             return
         try:
             tw.set_spectator_damage(123.4, 98.7)
-            tw.set_spectator_log_info({
+            info = {
                 "match_text": "",
                 "recent_hit_text": "",
-                                "blue_recent_hit_text": "Straight 32",
+                "blue_recent_hit_text": "Straight 32",
                 "red_recent_hit_text": "훅 28\n복부",
                 "blue_punishment_text": "MID 42%  LONG 18%",
                 "red_punishment_text": "MID 36%  LONG 22%",
@@ -9431,11 +8897,91 @@ class SettingsDialog(QDialog):
                 "red_punishment_long": 22.0,
                 "blue_meta_text": "테스트 블루 HUD",
                 "red_meta_text": "테스트 레드 HUD",
+            }
+            tw.set_spectator_log_info(info)
+            dmg = max(1.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0))
+            self._test_set_spectator_info(info, {
+                "blue_round_damage_dealt": 123.4,
+                "red_round_damage_dealt": 98.7,
+                "spectator_hit_effect_events": [{
+                    "side": "red",
+                    "attacker_side": "blue",
+                    "punch": "Straight",
+                    "damage": dmg,
+                }],
             })
-            dmg = max(45.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0))
             tw.trigger_hit_impact("red", dmg)
-            QTimer.singleShot(280, lambda d=dmg: tw.trigger_hit_impact("blue", d))
+            def _blue_damage_step(d=dmg):
+                tw.trigger_hit_impact("blue", d)
+                self._emit_spectator_test_update({
+                    "spectator_hit_effect_events": [{
+                        "side": "blue",
+                        "attacker_side": "red",
+                        "punch": "Hook",
+                        "damage": d,
+                        "weak_point": "Body",
+                    }]
+                })
+            QTimer.singleShot(280, _blue_damage_step)
         except Exception as e:
+            QMessageBox.warning(self, "경고", "설정을 확인하세요.")
+
+    def _test_spectator_hit_fx_sprite(self):
+        tw = self._spectator_timer_target()
+        if tw is None:
+            QMessageBox.warning(self, "경고", "설정을 확인하세요.")
+            return
+        try:
+            dmg = max(60.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0) + 20.0)
+            now_key = int(time.time() * 1000)
+            def _impact(side: str, attacker: str, damage: float, kind: str = ""):
+                key = "settings_sprite_%s_%d" % (side, int(time.time() * 1000))
+                ev = {
+                    "side": side,
+                    "attacker_side": attacker,
+                    "punch": "Straight" if side == "red" else "Hook",
+                    "damage": float(damage),
+                    "screen_x": 0.5,
+                    "screen_y": 0.5,
+                    "screenX": 0.5,
+                    "screenY": 0.5,
+                    "weak_point": "Head",
+                    "effect_kind": kind,
+                    "hitfx_key": key,
+                    "hitfxKey": key,
+                    "event_time": time.time(),
+                    "eventTime": time.time(),
+                }
+                # Direct browser event: settings test must appear even if the SpectatorLog controller path is idle.
+                try:
+                    self._push_browser_overlay_event(
+                        "impact",
+                        side=side,
+                        damage=float(damage),
+                        effectKind=kind,
+                        attackerSide=attacker,
+                        punch=str(ev.get("punch") or ""),
+                        weakPoint="Head",
+                        coordSource="settings_test_center",
+                        gloveHand="",
+                        screenX=0.5,
+                        screenY=0.5,
+                        eventTime=float(ev.get("event_time") or 0.0),
+                        hitfxKey=key,
+                        pushPerfMs=time.perf_counter() * 1000.0,
+                    )
+                except Exception:
+                    logging.exception("HITFX_SETTINGS_DIRECT_PUSH_FAIL")
+                # Also send through the normal controller path so QML/preview state stays aligned.
+                self._emit_spectator_test_update({"spectator_hit_effect_events": [ev]})
+                try:
+                    tw.trigger_hit_impact(side, float(damage))
+                except Exception:
+                    pass
+            _impact("red", "blue", dmg, "")
+            QTimer.singleShot(260, lambda: _impact("blue", "red", dmg + 12.0, "stun"))
+        except Exception:
+            logging.exception("HITFX_SETTINGS_TEST_FAIL")
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
 
     def _test_spectator_hp_gauge(self):
@@ -9444,7 +8990,7 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
             return
         try:
-            tw.set_spectator_log_info({
+            info = {
                 "match_text": "",
                 "recent_hit_text": "",
                 "blue_recent_hit_text": "",
@@ -9457,9 +9003,11 @@ class SettingsDialog(QDialog):
                 "red_punishment_long": 62.0,
                 "blue_round_knockdowns": 1,
                 "red_round_knockdowns": 2,
-                                "blue_meta_text": "Gauge test",
-                                "red_meta_text": "Gauge test",
-            })
+                "blue_meta_text": "Gauge test",
+                "red_meta_text": "Gauge test",
+            }
+            tw.set_spectator_log_info(info)
+            self._test_set_spectator_info(info)
         except Exception as e:
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
 
@@ -9489,24 +9037,30 @@ class SettingsDialog(QDialog):
             info[f"{side}_combo_damage_text"] = "96 DAMAGE"
             info[f"{side}_recent_hit_text"] = "Hit 24"
             tw.set_spectator_log_info(info)
-            if self.controller:
-                self.controller.ui_update.emit({"spectator_log_info": info})
+            self._test_set_spectator_info(info, {
+                "spectator_hit_effect_events": [{
+                    "side": receiver,
+                    "attacker_side": side,
+                    "punch": "Combo",
+                    "damage": 48.0,
+                }]
+            })
             tw.trigger_hit_impact(receiver, 48.0)
             self._push_browser_overlay_event("hit", side=receiver, damage=48.0)
-            self._speak_tts_test_qt("Good combo hit.", role="analyst")
+            self._speak_tts_test_qt("좋은 콤보가 적중합니다", role="analyst")
             def _browser_combo_step2():
-                if still_active() and self.controller:
-                    self.controller.ui_update.emit({"spectator_log_info": {
+                if still_active():
+                    self._test_set_spectator_info({
                         f"{side}_combo_hit_text": "4 HIT COMBO",
                         f"{side}_combo_damage_text": "127 DAMAGE",
                         f"{side}_recent_hit_text": "Straight 31",
-                    }})
+                    })
             def _browser_combo_clear():
-                if still_active() and self.controller:
-                    self.controller.ui_update.emit({"spectator_log_info": {
+                if still_active():
+                    self._test_set_spectator_info({
                         f"{side}_combo_hit_text": "",
                         f"{side}_combo_damage_text": "",
-                    }})
+                    })
             QTimer.singleShot(700, _browser_combo_step2)
             QTimer.singleShot(1450, _browser_combo_clear)
             QTimer.singleShot(700, lambda: still_active() and tw.set_spectator_log_info({
@@ -9531,27 +9085,25 @@ class SettingsDialog(QDialog):
             def still_active() -> bool:
                 cur = getattr(self, "_hud_demo_token", None)
                 return token is None or cur is token
-            tw.set_spectator_log_info({
+            info = {
                 "match_text": "",
                 "recent_hit_text": "",
                 "blue_combo_hit_text": "COUNTER",
                 "blue_combo_damage_text": "46 DAMAGE",
                 "red_combo_hit_text": "",
                 "red_combo_damage_text": "",
-                                "blue_recent_hit_text": "Straight 46",
+                "blue_recent_hit_text": "Straight 46",
                 "red_recent_hit_text": "",
+            }
+            tw.set_spectator_log_info(info)
+            self._test_set_spectator_info(info, {
+                "spectator_hit_effect_events": [{
+                    "side": "red",
+                    "attacker_side": "blue",
+                    "punch": "Counter",
+                    "damage": 46.0,
+                }]
             })
-            if self.controller:
-                self.controller.ui_update.emit({"spectator_log_info": {
-                    "match_text": "",
-                    "recent_hit_text": "",
-                    "blue_combo_hit_text": "COUNTER",
-                    "blue_combo_damage_text": "46 DAMAGE",
-                    "red_combo_hit_text": "",
-                    "red_combo_damage_text": "",
-                    "blue_recent_hit_text": "Straight 46",
-                    "red_recent_hit_text": "",
-                }})
             tw.trigger_hit_impact("red", 46.0)
             self._push_browser_overlay_event("counter", side="blue", damage=46.0)
             self._speak_tts_test_qt("카운터가 적중됩니다!", role="analyst")
@@ -9563,8 +9115,7 @@ class SettingsDialog(QDialog):
                     "blue_combo_damage_text": "",
                 }
                 tw.set_spectator_log_info(clear_info)
-                if self.controller:
-                    self.controller.ui_update.emit({"spectator_log_info": clear_info})
+                self._test_set_spectator_info(clear_info)
             QTimer.singleShot(1500, _counter_clear)
         except Exception as e:
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
@@ -9589,8 +9140,7 @@ class SettingsDialog(QDialog):
                         "red_round_knockdowns": r,
                     }
                     tw.set_spectator_log_info(info)
-                    if self.controller:
-                        self.controller.ui_update.emit({"spectator_log_info": info})
+                    self._test_set_spectator_info(info)
                 QTimer.singleShot(delay, _apply_lives)
         except Exception as e:
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
@@ -9611,8 +9161,16 @@ class SettingsDialog(QDialog):
                 if not active():
                     return
                 try:
+                    total_rounds = int(getattr(self.cfg, "timer_total_rounds", 3) or 3)
                     tw.set_log_rest_mode(bool(rest))
-                    tw.set_round_time(int(round_no), int(getattr(self.cfg, "timer_total_rounds", 3) or 3), int(seconds_left))
+                    tw.set_round_time(int(round_no), total_rounds, int(seconds_left))
+                    self._emit_spectator_test_update({
+                        "round_current": int(round_no),
+                        "round_total": total_rounds,
+                        "seconds_left": int(seconds_left),
+                        "spectator_rest_mode": bool(rest),
+                        "spectator_time_mode": str(state),
+                    })
                     logging.info(
                         "SPECTATOR_TIMER_TEST state=%s rest=%s round=%s seconds_left=%s",
                         state,
@@ -9642,6 +9200,203 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
 
+    def _test_spectator_round_report(self):
+        """Show the Round Report v2 card without requiring SpectatorLog files.
+
+        This is intentionally synthetic: it lets the user tune the browser overlay
+        design, portrait layout, decisive-moment block, and body heatmap without
+        waiting for a real round break or preparing damage_events.txt.
+        """
+        tw = self._spectator_timer_target()
+        if tw is None:
+            QMessageBox.warning(self, "경고", "설정을 확인하세요.")
+            return
+        try:
+            try:
+                self.apply_only(silent=True)
+            except Exception:
+                pass
+
+            # Keep current in-app names when available, but never depend on logs.
+            backend = getattr(tw, "_backend", None)
+            blue_name = str(getattr(backend, "_blue_name", "") or "").strip() or "BLUE TEST"
+            red_name = str(getattr(backend, "_red_name", "") or "").strip() or "RED TEST"
+            if blue_name.upper() == "BLUE":
+                blue_name = "BLUE TEST"
+            if red_name.upper() == "RED":
+                red_name = "RED TEST"
+            try:
+                tw.set_names(blue_name, red_name)
+            except Exception:
+                pass
+
+            round_no = 2
+            try:
+                total_rounds = int(getattr(self.cfg, "timer_total_rounds", 3) or 3)
+            except Exception:
+                total_rounds = 3
+            try:
+                tw.set_log_rest_mode(True)
+                tw.set_round_time(round_no, total_rounds, int(getattr(self.cfg, "timer_rest_sec", 60) or 60))
+            except Exception:
+                pass
+
+            payload = {
+                "round": round_no,
+                "leader": "blue",
+                "leaderName": blue_name,
+                "summaryLine": "다운 장면과 턱 피격이 라운드 인상을 크게 바꿨습니다.",
+                "roundTag": "DOWN ROUND",
+                "displayMs": 22000,
+                "bestShot": {
+                    "attacker": "blue",
+                    "receiver": "red",
+                    "attackerName": blue_name,
+                    "receiverName": red_name,
+                    "damage": 82,
+                    "punch": "스트레이트",
+                    "weak": "턱",
+                    "effect": "knockdown",
+                    "time": 126.4,
+                },
+                "decisiveMoment": {
+                    "attacker": "blue",
+                    "receiver": "red",
+                    "attackerName": blue_name,
+                    "receiverName": red_name,
+                    "damage": 82,
+                    "punch": "스트레이트",
+                    "weak": "턱",
+                    "effect": "knockdown",
+                    "time": 126.4,
+                },
+                "blue": {
+                    "name": blue_name,
+                    "landed": 24,
+                    "damage": 214,
+                    "bigHits": 3,
+                    "knockdowns": 1,
+                    "tkos": 0,
+                    "stuns": 1,
+                    "punchTop": [
+                        {"key": "cross", "label": "스트레이트", "count": 6, "damage": 128},
+                        {"key": "jab", "label": "잽", "count": 9, "damage": 54},
+                        {"key": "hook", "label": "훅", "count": 4, "damage": 32},
+                    ],
+                    "punchBreakdown": [
+                        {"key": "jab", "shortLabel": "JAB", "label": "잽", "count": 9, "damage": 54},
+                        {"key": "cross", "shortLabel": "CROSS", "label": "스트레이트", "count": 6, "damage": 128},
+                        {"key": "hook", "shortLabel": "HOOK", "label": "훅", "count": 4, "damage": 32},
+                        {"key": "upper", "shortLabel": "UPPER", "label": "어퍼", "count": 2, "damage": 18},
+                        {"key": "over", "shortLabel": "OVER", "label": "오버핸드", "count": 1, "damage": 10},
+                        {"key": "other", "shortLabel": "OTHER", "label": "기타", "count": 2, "damage": 12},
+                    ],
+                    "weakReceivedTop": [
+                        {"label": "명치", "count": 2, "damage": 44},
+                        {"label": "간", "count": 1, "damage": 22},
+                        {"label": "왼쪽 관자놀이", "count": 1, "damage": 18},
+                    ],
+                    "weakReceivedAll": [
+                        {"label": "명치", "count": 2, "damage": 44},
+                        {"label": "간", "count": 1, "damage": 22},
+                        {"label": "왼쪽 관자놀이", "count": 1, "damage": 18},
+                        {"label": "턱", "count": 1, "damage": 14},
+                    ],
+                    "allHits": [
+                        {"screenX": 0.32, "screenY": 0.59, "damage": 16, "weak": "명치", "punch": "훅", "effect": "hit"},
+                        {"screenX": 0.30, "screenY": 0.64, "damage": 18, "weak": "간", "punch": "바디 훅", "effect": "hit"},
+                        {"screenX": 0.29, "screenY": 0.42, "damage": 14, "weak": "왼쪽 관자놀이", "punch": "훅", "effect": "hit"},
+                        {"screenX": 0.33, "screenY": 0.50, "damage": 10, "weak": "턱", "punch": "잽", "effect": "hit"},
+                        {"screenX": 0.31, "screenY": 0.55, "damage": 9, "weak": "", "punch": "잽", "effect": "hit"},
+                        {"screenX": 0.35, "screenY": 0.57, "damage": 11, "weak": "", "punch": "스트레이트", "effect": "hit"},
+                        {"screenX": 0.28, "screenY": 0.61, "damage": 8, "weak": "", "punch": "훅", "effect": "hit"},
+                        {"screenX": 0.34, "screenY": 0.46, "damage": 7, "weak": "", "punch": "잽", "effect": "hit"},
+                    ],
+                },
+                "red": {
+                    "name": red_name,
+                    "landed": 17,
+                    "damage": 151,
+                    "bigHits": 1,
+                    "knockdowns": 0,
+                    "tkos": 0,
+                    "stuns": 0,
+                    "punchTop": [
+                        {"key": "hook", "label": "훅", "count": 6, "damage": 72},
+                        {"key": "jab", "label": "잽", "count": 5, "damage": 31},
+                        {"key": "upper", "label": "어퍼", "count": 2, "damage": 28},
+                    ],
+                    "punchBreakdown": [
+                        {"key": "jab", "shortLabel": "JAB", "label": "잽", "count": 5, "damage": 31},
+                        {"key": "cross", "shortLabel": "CROSS", "label": "스트레이트", "count": 1, "damage": 9},
+                        {"key": "hook", "shortLabel": "HOOK", "label": "훅", "count": 6, "damage": 72},
+                        {"key": "upper", "shortLabel": "UPPER", "label": "어퍼", "count": 2, "damage": 28},
+                        {"key": "over", "shortLabel": "OVER", "label": "오버핸드", "count": 1, "damage": 7},
+                        {"key": "other", "shortLabel": "OTHER", "label": "기타", "count": 2, "damage": 4},
+                    ],
+                    "weakReceivedTop": [
+                        {"label": "턱", "count": 4, "damage": 126},
+                        {"label": "오른쪽 관자놀이", "count": 2, "damage": 58},
+                        {"label": "코", "count": 1, "damage": 18},
+                    ],
+                    "weakReceivedAll": [
+                        {"label": "턱", "count": 4, "damage": 126},
+                        {"label": "오른쪽 관자놀이", "count": 2, "damage": 58},
+                        {"label": "코", "count": 1, "damage": 18},
+                        {"label": "명치", "count": 1, "damage": 16},
+                    ],
+                    "allHits": [
+                        {"screenX": 0.58, "screenY": 0.50, "damage": 32, "weak": "턱", "punch": "스트레이트", "effect": "knockdown"},
+                        {"screenX": 0.60, "screenY": 0.45, "damage": 22, "weak": "오른쪽 관자놀이", "punch": "훅", "effect": "hit"},
+                        {"screenX": 0.57, "screenY": 0.41, "damage": 18, "weak": "코", "punch": "잽", "effect": "hit"},
+                        {"screenX": 0.56, "screenY": 0.60, "damage": 16, "weak": "명치", "punch": "바디 잽", "effect": "hit"},
+                        {"screenX": 0.55, "screenY": 0.53, "damage": 12, "weak": "", "punch": "잽", "effect": "hit"},
+                        {"screenX": 0.62, "screenY": 0.54, "damage": 14, "weak": "", "punch": "스트레이트", "effect": "hit"},
+                        {"screenX": 0.59, "screenY": 0.58, "damage": 9, "weak": "", "punch": "훅", "effect": "hit"},
+                        {"screenX": 0.61, "screenY": 0.47, "damage": 11, "weak": "", "punch": "잽", "effect": "hit"},
+                        {"screenX": 0.58, "screenY": 0.64, "damage": 8, "weak": "", "punch": "바디 훅", "effect": "hit"},
+                    ],
+                },
+            }
+
+            info = {
+                "match_text": "ROUND REPORT TEST",
+                "recent_hit_text": "",
+                "blue_recent_hit_text": "Straight 82\n턱",
+                "red_recent_hit_text": "Hook 36\n명치",
+                "blue_combo_hit_text": "",
+                "blue_combo_damage_text": "",
+                "red_combo_hit_text": "",
+                "red_combo_damage_text": "",
+                "blue_round_knockdowns": 1,
+                "red_round_knockdowns": 0,
+                "blue_punishment_mid": 42.0,
+                "red_punishment_mid": 68.0,
+                "blue_punishment_long": 18.0,
+                "red_punishment_long": 44.0,
+                "blue_punishment_text": "MID 42%  LONG 18%",
+                "red_punishment_text": "MID 68%  LONG 44%",
+            }
+            update = {
+                "blue_name": blue_name,
+                "red_name": red_name,
+                "round_current": round_no,
+                "round_total": total_rounds,
+                "seconds_left": int(getattr(self.cfg, "timer_rest_sec", 60) or 60),
+                "spectator_rest_mode": True,
+                "spectator_log_info": info,
+                "blue_round_damage_dealt": float(payload["blue"].get("damage", 0) or 0),
+                "red_round_damage_dealt": float(payload["red"].get("damage", 0) or 0),
+                "spectator_round_report": payload,
+            }
+            emitted = self._emit_spectator_test_update(update)
+            if not emitted:
+                self._push_browser_overlay_event("round_report", **payload)
+            self._noop_status("라운드 리포트 테스트 표시")
+        except Exception as e:
+            logging.exception("SPECTATOR_ROUND_REPORT_TEST_FAIL")
+            QMessageBox.warning(self, "경고", "라운드 리포트 테스트에 실패했습니다.")
+
     def _test_spectator_full_demo(self):
         tw = self._spectator_timer_target()
         if tw is None:
@@ -9666,6 +9421,29 @@ class SettingsDialog(QDialog):
                     fn()
             QTimer.singleShot(max(0, int(delay_ms)), _wrapped)
 
+        def emit_info(info: dict, extra: Optional[dict] = None):
+            self._test_set_spectator_info(dict(info or {}), dict(extra or {}))
+
+        def emit_damage(info: dict, blue_total: float, red_total: float, side: str, attacker: str, punch: str, damage: float, weak: str = ""):
+            payload = {
+                "blue_round_damage_dealt": float(blue_total),
+                "red_round_damage_dealt": float(red_total),
+                "spectator_hit_effect_events": [{
+                    "side": str(side),
+                    "attacker_side": str(attacker),
+                    "punch": str(punch),
+                    "damage": float(damage),
+                    "weak_point": str(weak or ""),
+                }],
+            }
+            emit_info(info, payload)
+
+        def emit_effect(side: str, kind: str, info: Optional[dict] = None):
+            self._emit_spectator_test_update({
+                "spectator_log_info": dict(info or {}),
+                "spectator_effect_events": [{"side": str(side), "kind": str(kind)}],
+            })
+
         try:
             tw.set_names("BLUE TEST", "RED TEST")
             tw.set_round_time(1, 3, 180)
@@ -9679,7 +9457,8 @@ class SettingsDialog(QDialog):
             elif hasattr(tw, "_backend"):
                 safe(250, tw._backend.request_round_intro)
             safe(250, lambda: self._push_browser_overlay_event("round_intro", round=1))
-            tw.set_spectator_log_info({
+            safe(250, lambda: self._emit_spectator_test_update({"round_intro_event": {"round": 1}}))
+            initial_info = {
                 "match_text": "",
                 "recent_hit_text": "",
                 "blue_recent_hit_text": "",
@@ -9694,17 +9473,39 @@ class SettingsDialog(QDialog):
                 "red_punishment_long": 0.0,
                 "blue_round_knockdowns": 0,
                 "red_round_knockdowns": 0,
+            }
+            tw.set_spectator_log_info(initial_info)
+            emit_info(initial_info, {
+                "blue_name": "BLUE TEST",
+                "red_name": "RED TEST",
+                "round_current": 1,
+                "round_total": 3,
+                "seconds_left": 180,
+                "blue_round_damage_dealt": 0.0,
+                "red_round_damage_dealt": 0.0,
+                "blue_damage_dealt": 0.0,
+                "red_damage_dealt": 0.0,
+                "spectator_sp_reset": True,
+                "spectator_match_stats_reset": True,
             })
             safe(1000, lambda: tw.set_spectator_damage(42, 18))
             safe(1000, lambda: hasattr(tw, "set_spectator_total_damage") and tw.set_spectator_total_damage(42, 18))
             safe(1000, lambda: tw.set_spectator_log_info({
-                                "blue_recent_hit_text": "Hit 18",
+                "blue_recent_hit_text": "Hit 18",
                 "red_recent_hit_text": "",
                 "blue_punishment_mid": 18.0,
                 "red_punishment_mid": 8.0,
                 "blue_punishment_long": 6.0,
                 "red_punishment_long": 4.0,
             }))
+            safe(1000, lambda: emit_damage({
+                "blue_recent_hit_text": "Hit 18",
+                "red_recent_hit_text": "",
+                "blue_punishment_mid": 18.0,
+                "red_punishment_mid": 8.0,
+                "blue_punishment_long": 6.0,
+                "red_punishment_long": 4.0,
+            }, 42, 18, "red", "blue", "Hit", 42.0))
             safe(1100, lambda: tw.trigger_hit_impact("red", 42.0))
             safe(4200, lambda: self._test_spectator_combo("blue"))
             safe(7600, lambda: tw.set_spectator_damage(74, 61))
@@ -9716,16 +9517,23 @@ class SettingsDialog(QDialog):
                 "blue_punishment_long": 12.0,
                 "red_punishment_long": 10.0,
             }))
+            safe(7600, lambda: emit_damage({
+                "red_recent_hit_text": "훅 43\n명치",
+                "blue_punishment_mid": 34.0,
+                "red_punishment_mid": 24.0,
+                "blue_punishment_long": 12.0,
+                "red_punishment_long": 10.0,
+            }, 74, 61, "blue", "red", "훅", 43.0, "명치"))
             safe(7700, lambda: tw.trigger_hit_impact("blue", 43.0))
             safe(10800, lambda: self._test_spectator_counter())
             safe(13500, lambda: self._test_spectator_combo("red"))
             safe(16500, lambda: tw.trigger_spectator_effect("red", "stun"))
-            safe(16500, lambda: self._play_spectator_sfx("stun", show_warning=False))
+            safe(16500, lambda: emit_effect("red", "stun"))
             safe(16500, lambda: bool(getattr(self.cfg, "spectator_commentary_enabled", False)) and self._speak_tts_test_qt("크게 흔들립니다!", role="analyst"))
             safe(19000, lambda: tw.set_spectator_damage(142, 109))
             safe(19000, lambda: hasattr(tw, "set_spectator_total_damage") and tw.set_spectator_total_damage(142, 109))
             safe(19000, lambda: tw.set_spectator_log_info({
-                                "blue_recent_hit_text": "Uppercut 68",
+                "blue_recent_hit_text": "Uppercut 68",
                 "red_recent_hit_text": "",
                 "blue_punishment_mid": 62.0,
                 "red_punishment_mid": 74.0,
@@ -9733,14 +9541,27 @@ class SettingsDialog(QDialog):
                 "red_punishment_long": 38.0,
                 "red_round_knockdowns": 1,
             }))
+            safe(19000, lambda: emit_damage({
+                "blue_recent_hit_text": "Uppercut 68",
+                "red_recent_hit_text": "",
+                "blue_punishment_mid": 62.0,
+                "red_punishment_mid": 74.0,
+                "blue_punishment_long": 27.0,
+                "red_punishment_long": 38.0,
+                "red_round_knockdowns": 1,
+            }, 142, 109, "red", "blue", "Uppercut", 68.0))
             safe(19100, lambda: tw.trigger_hit_impact("red", 68.0))
             safe(21500, lambda: tw.set_spectator_log_info({
                 "red_round_knockdowns": 2,
                 "red_punishment_mid": 88.0,
                 "red_punishment_long": 55.0,
             }))
+            safe(21500, lambda: emit_effect("red", "knockdown", {
+                "red_round_knockdowns": 2,
+                "red_punishment_mid": 88.0,
+                "red_punishment_long": 55.0,
+            }))
             safe(21500, lambda: tw.trigger_spectator_effect("red", "knockdown"))
-            safe(21500, lambda: self._play_spectator_sfx("knockdown", show_warning=False))
             safe(21500, lambda: bool(getattr(self.cfg, "spectator_commentary_enabled", False)) and self._speak_tts_test_qt("레드 테스트, 다운 당합니다", role="caster"))
             safe(25500, lambda: tw.set_spectator_log_info({
                 "red_round_knockdowns": 1,
@@ -9748,10 +9569,24 @@ class SettingsDialog(QDialog):
                 "blue_punishment_mid": 80.0,
                 "blue_punishment_long": 48.0,
             }))
+            safe(25500, lambda: emit_info({
+                "red_round_knockdowns": 1,
+                "blue_round_knockdowns": 1,
+                "blue_punishment_mid": 80.0,
+                "blue_punishment_long": 48.0,
+            }))
+            safe(25600, lambda: emit_effect("blue", "knockdown"))
             safe(25600, lambda: tw.trigger_spectator_effect("blue", "knockdown"))
-            safe(25600, lambda: self._play_spectator_sfx("knockdown", show_warning=False))
             safe(25600, lambda: bool(getattr(self.cfg, "spectator_commentary_enabled", False)) and self._speak_tts_test_qt("블루 테스트, 다운 당합니다", role="caster"))
             safe(30000, lambda: tw.set_spectator_log_info({
+                "blue_round_knockdowns": 0,
+                "red_round_knockdowns": 0,
+                "blue_combo_hit_text": "",
+                "blue_combo_damage_text": "",
+                "red_combo_hit_text": "",
+                "red_combo_damage_text": "",
+            }))
+            safe(30000, lambda: emit_info({
                 "blue_round_knockdowns": 0,
                 "red_round_knockdowns": 0,
                 "blue_combo_hit_text": "",
@@ -9771,28 +9606,214 @@ class SettingsDialog(QDialog):
 
     def _stop_spectator_hud_demo(self):
         self._spectator_replay_token = None
+        self._spectator_replay_state = None
         self._hud_demo_token = None
         tw = self._spectator_timer_target()
         if tw is not None:
             try:
                 tw._backend.set_hud_demo_running(False)
-                tw.set_spectator_log_info({
+                clear_info = {
                     "blue_combo_hit_text": "",
                     "blue_combo_damage_text": "",
                     "red_combo_hit_text": "",
                     "red_combo_damage_text": "",
-                })
+                }
+                tw.set_spectator_log_info(clear_info)
+                self._test_set_spectator_info(clear_info)
             except Exception:
                 pass
         self._noop_status("HUD \uB370\uBAA8/\uD14C\uC2A4\uD2B8 \uC0C1\uD0DC \uCD08\uAE30\uD654 \uC644\uB8CC")
+
+    def _stop_spectator_commentary_test_script(self):
+        self._commentary_test_script_token = None
+        try:
+            self._commentary_test_script_queue.clear()
+        except Exception:
+            self._commentary_test_script_queue = deque()
+        try:
+            for role, player in (getattr(self, "_tts_test_players", {}) or {}).items():
+                try:
+                    player.stop()
+                except Exception:
+                    pass
+                self._tts_test_busy[str(role)] = False
+            old_files = []
+            for role in ("analyst", "caster"):
+                old_files.extend(list((getattr(self, "_tts_test_files", {}) or {}).get(role, []) or []))
+                self._tts_test_files[role] = []
+            for path in old_files:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._noop_status("자동해설 테스트 중지")
+
+    def _start_spectator_commentary_script(self, name: str, steps: List[dict]):
+        try:
+            self.apply_only(silent=True)
+        except Exception:
+            pass
+        self._stop_spectator_commentary_test_script()
+        token = object()
+        self._commentary_test_script_token = token
+        self._commentary_test_script_name = str(name or "자동해설 테스트")
+        self._commentary_test_script_queue = deque(list(steps or []))
+        self._noop_status(f"{self._commentary_test_script_name} 시작")
+        QTimer.singleShot(0, lambda t=token: self._run_next_spectator_commentary_script_step(t))
+
+
+    def _schedule_tts_test_followup(self, text: str, role: str = "analyst", delay_ms: int = 1050, token=None):
+        text = str(text or "").strip()
+        if not text:
+            return
+        role = "caster" if str(role or "").lower() == "caster" else "analyst"
+        try:
+            delay_ms = max(0, min(8000, int(delay_ms or 1050)))
+        except Exception:
+            delay_ms = 1050
+
+        def _attempt(remaining: int = 4):
+            try:
+                if token is not None and getattr(self, "_commentary_test_script_token", None) is not token:
+                    logging.info("TTS_TEST_FOLLOWUP_CANCELLED role=%s text=%s", role, text)
+                    return
+                # 듀오 테스트도 실제 자동해설처럼 역할별 독립 재생한다.
+                # 캐스터가 아직 말하고 있어도 해설자 후속 멘트는 별도 플레이어로 들어간다.
+                if bool((getattr(self, "_tts_test_busy", {}) or {}).get(role, False)):
+                    if remaining > 0:
+                        QTimer.singleShot(260, lambda r=remaining - 1: _attempt(r))
+                    else:
+                        logging.info("TTS_TEST_FOLLOWUP_SKIP_BUSY role=%s text=%s", role, text)
+                    return
+                self._speak_tts_test_qt(text, role=role)
+                logging.info("TTS_TEST_DUO_FOLLOWUP role=%s text=%s", role, text)
+            except Exception:
+                logging.exception("TTS_TEST_DUO_FOLLOWUP_FAIL")
+
+        QTimer.singleShot(delay_ms, lambda: _attempt(4))
+
+    def _run_next_spectator_commentary_script_step(self, token):
+        if getattr(self, "_commentary_test_script_token", None) is not token:
+            return
+        try:
+            if bool((getattr(self, "_tts_test_busy", {}) or {}).get("caster", False)) or bool((getattr(self, "_tts_test_busy", {}) or {}).get("analyst", False)):
+                QTimer.singleShot(180, lambda t=token: self._run_next_spectator_commentary_script_step(t))
+                return
+            if not self._commentary_test_script_queue:
+                name = str(getattr(self, "_commentary_test_script_name", "자동해설 테스트") or "자동해설 테스트")
+                self._commentary_test_script_token = None
+                self._noop_status(f"{name} 완료")
+                return
+            step = dict(self._commentary_test_script_queue.popleft() or {})
+            text = str(step.get("text", "") or "").strip()
+            role = "caster" if str(step.get("role", "analyst") or "analyst").lower() == "caster" else "analyst"
+            post_ms = int(step.get("post_ms", 900) or 900)
+            rate_override = step.get("rate_override", None)
+            pitch_override = step.get("pitch_override", None)
+            action = step.get("action", None)
+            if callable(action):
+                try:
+                    action()
+                except Exception:
+                    logging.exception("COMMENTARY_SCRIPT_TEST_ACTION_FAIL")
+            if text:
+                self._speak_tts_test_qt(text, role=role, rate_override=rate_override, pitch_override=pitch_override)
+            follow_text = str(step.get("followup_text", "") or step.get("duo_text", "") or "").strip()
+            if follow_text:
+                try:
+                    follow_delay = int(step.get("followup_delay_ms", step.get("duo_delay_ms", 1050)) or 1050)
+                except Exception:
+                    follow_delay = 1050
+                follow_role = str(step.get("followup_role", "analyst") or "analyst")
+                self._schedule_tts_test_followup(follow_text, role=follow_role, delay_ms=follow_delay, token=token)
+            QTimer.singleShot(max(180, post_ms), lambda t=token: self._run_next_spectator_commentary_script_step(t))
+        except Exception:
+            logging.exception("COMMENTARY_SCRIPT_TEST_STEP_FAIL")
+            self._commentary_test_script_token = None
+            self._noop_status("자동해설 테스트 실패")
+
+    def _test_spectator_commentary_full_suite(self):
+        steps = [
+            {"role": "caster", "text": "RFC 자동해설 종합 테스트 시작합니다.", "post_ms": 900},
+            {"role": "caster", "text": "경기 시작합니다!", "post_ms": 700},
+            {"role": "analyst", "text": "초반은 거리 싸움부터 봐야 합니다.", "post_ms": 900},
+            {"role": "caster", "text": "눈치게임입니다.", "followup_text": "둘 다 먼저 가긴 싫죠.", "followup_delay_ms": 950, "post_ms": 650},
+            {"role": "caster", "text": "앞손 싸움입니다.", "followup_text": "앞손이 오늘 바쁩니다.", "followup_delay_ms": 950, "post_ms": 650},
+            {"role": "analyst", "text": "카운터가 정확합니다.", "post_ms": 800},
+            {"role": "analyst", "text": "데미지가 쌓이고 있습니다.", "post_ms": 850},
+            {"role": "caster", "text": "다니엘, 다운입니다!", "post_ms": 700},
+            {"role": "analyst", "text": "충격이 큽니다.", "post_ms": 650},
+            {"role": "analyst", "text": "버텨야 합니다.", "post_ms": 650},
+            {"role": "caster", "text": "경기 계속됩니다!", "post_ms": 700},
+            {"role": "caster", "text": "라운드 종료, 휴식 시간입니다.", "post_ms": 850},
+            {"role": "analyst", "text": "네리가 이번 라운드 유효타에서 앞섰습니다.", "post_ms": 1000},
+            {"role": "analyst", "text": "후반에는 압박이 살아났고, 받은 데미지도 쌓였습니다.", "post_ms": 1100},
+            {"role": "analyst", "text": "다음 라운드는 초반 수비 정리가 중요합니다.", "post_ms": 1000},
+            {"role": "caster", "text": "경기 종료됩니다!", "post_ms": 700},
+            {"role": "analyst", "text": "스코어카드 기준으로는 네리가 앞선 경기였습니다.", "post_ms": 1000},
+            {"role": "analyst", "text": "자동해설 종합 테스트 완료입니다.", "post_ms": 700},
+        ]
+        self._start_spectator_commentary_script("자동해설 종합 테스트", steps)
+
+
+    def _test_spectator_commentary_duo_suite(self):
+        steps = [
+            {"role": "caster", "text": "듀오 해설 테스트 시작합니다.", "post_ms": 800},
+            {"role": "caster", "text": "잠시 소강상태입니다.", "followup_text": "둘 다 먼저 가긴 싫죠.", "followup_delay_ms": 950, "post_ms": 700},
+            {"role": "caster", "text": "눈치게임입니다.", "followup_text": "서로 오라고만 합니다.", "followup_delay_ms": 900, "post_ms": 700},
+            {"role": "caster", "text": "앞손 싸움입니다.", "followup_text": "앞손이 오늘 바쁩니다.", "followup_delay_ms": 900, "post_ms": 700},
+            {"role": "caster", "text": "크게 휘둘렀지만 빗나갑니다.", "followup_text": "폼은 멋졌습니다.", "followup_delay_ms": 950, "post_ms": 850},
+            {"role": "caster", "text": "라운드 막판입니다.", "followup_text": "막판엔 한 방입니다.", "followup_delay_ms": 900, "post_ms": 750},
+            {"role": "caster", "text": "위험 상황은 드립 없이 갑니다.", "post_ms": 800},
+            {"role": "caster", "text": "다니엘, 다운입니다!", "post_ms": 650},
+            {"role": "analyst", "text": "충격이 큽니다.", "post_ms": 700},
+            {"role": "caster", "text": "듀오 해설 테스트 완료입니다.", "post_ms": 700},
+        ]
+        self._start_spectator_commentary_script("듀오 해설 테스트", steps)
+
+    def _test_spectator_commentary_down_suite(self):
+        steps = [
+            {"role": "caster", "text": "다운 멘트 테스트 시작합니다.", "post_ms": 800},
+            {"role": "caster", "text": "다니엘, 다운입니다!", "post_ms": 650},
+            {"role": "analyst", "text": "충격이 큽니다.", "post_ms": 600},
+            {"role": "analyst", "text": "아직 끝난 건 아닙니다.", "post_ms": 750},
+            {"role": "caster", "text": "경기 계속됩니다!", "post_ms": 750},
+            {"role": "caster", "text": "다니엘, 다시 다운입니다!", "post_ms": 650},
+            {"role": "analyst", "text": "이건 정말 큽니다.", "post_ms": 600},
+            {"role": "analyst", "text": "수비가 먼저입니다.", "post_ms": 700},
+            {"role": "caster", "text": "다시 일어납니다!", "post_ms": 700},
+            {"role": "caster", "text": "다니엘, 세 번째 다운입니다!", "post_ms": 650},
+            {"role": "caster", "text": "여기서 멈춥니다!", "post_ms": 650},
+            {"role": "caster", "text": "경기 종료됩니다!", "post_ms": 700},
+            {"role": "analyst", "text": "승부가 갈렸습니다.", "post_ms": 700},
+        ]
+        self._start_spectator_commentary_script("다운 멘트 테스트", steps)
+
+    def _test_spectator_commentary_summary_suite(self):
+        steps = [
+            {"role": "caster", "text": "요약 멘트 테스트 시작합니다.", "post_ms": 800},
+            {"role": "caster", "text": "라운드 종료, 휴식 시간입니다.", "post_ms": 850},
+            {"role": "analyst", "text": "다니엘이 이번 라운드 초반 유효타에서 앞섰습니다.", "post_ms": 1050},
+            {"role": "analyst", "text": "중반 이후에는 네리의 압박이 살아났습니다.", "post_ms": 1000},
+            {"role": "analyst", "text": "바디 데미지가 쌓인 건 다음 라운드에도 영향을 줄 수 있습니다.", "post_ms": 1100},
+            {"role": "analyst", "text": "눈치싸움이 길었지만, 점수에 남을 장면은 있었습니다.", "post_ms": 1100},
+            {"role": "analyst", "text": "다음 라운드는 첫 교전이 중요합니다.", "post_ms": 950},
+            {"role": "caster", "text": "경기 종료됩니다!", "post_ms": 750},
+            {"role": "analyst", "text": "스코어카드 기준으로는 접전이었습니다.", "post_ms": 950},
+            {"role": "analyst", "text": "후반 정타와 다운 장면이 승부를 갈랐습니다.", "post_ms": 1000},
+            {"role": "analyst", "text": "요약 멘트 테스트 완료입니다.", "post_ms": 700},
+        ]
+        self._start_spectator_commentary_script("요약 멘트 테스트", steps)
 
     def _test_spectator_commentary_tts(self):
         try:
             self.apply_only(silent=True)
         except Exception:
             pass
-        self._speak_tts_test_qt("Strong strike.", role="analyst")
-        QTimer.singleShot(900, lambda: self._speak_tts_test_qt("블루, 다운 당합니다", role="caster"))
+        self._speak_tts_test_qt("정타가 들어갑니다.", role="analyst")
+        QTimer.singleShot(900, lambda: self._speak_tts_test_qt("다니엘, 다운입니다!", role="caster"))
 
     def _fill_edge_voice_combo(self, combo: QComboBox):
         combo.addItem("한국어 여성 - SunHi", "ko-KR-SunHiNeural")
@@ -9835,6 +9856,7 @@ class SettingsDialog(QDialog):
 
     def _speak_tts_test_qt(self, text: str, role: str = "analyst", rate_override: Optional[int] = None, pitch_override: Optional[int] = None):
         role = "caster" if str(role or "").lower() == "caster" else "analyst"
+        self._ensure_tts_test_player(role)
         player = (getattr(self, "_tts_test_players", {}) or {}).get(role)
         audio_out = (getattr(self, "_tts_test_audio_outs", {}) or {}).get(role)
         if bool((getattr(self, "_tts_test_busy", {}) or {}).get(role, False)):
@@ -10005,7 +10027,7 @@ class SettingsDialog(QDialog):
             logging.warning("TTS_TEST_FAIL %s", msg)
         except Exception:
             pass
-        QMessageBox.warning(self, "경고", "설정을 확인하세요.")
+        QMessageBox.warning(self, "자동해설 TTS 테스트 실패", msg)
 
     def _test_spectator_last_log(self):
         tw = self._spectator_timer_target()
@@ -10098,6 +10120,7 @@ class SettingsDialog(QDialog):
             "token": time.time(),
         }
         self._spectator_replay_token = replay_state["token"]
+        self._spectator_replay_state = replay_state
         try:
             tw._backend.set_hud_demo_running(True)
         except Exception:
@@ -10154,6 +10177,8 @@ class SettingsDialog(QDialog):
                     replay_state["last_fight_seconds"] = int(shown)
                     rest = False
                     mode = "fight_sync"
+                replay_state["current_seconds_left"] = int(shown)
+                replay_state["current_rest_mode"] = bool(rest)
                 tw.set_log_rest_mode(bool(rest))
                 tw.set_round_time(int(replay_state.get("round_no") or 1), replay_total_rounds, int(shown))
                 logging.info(
@@ -10173,6 +10198,7 @@ class SettingsDialog(QDialog):
             if idx >= len(events):
                 self._noop_status("과거 로그 리플레이 완료")
                 self._spectator_replay_token = None
+                self._spectator_replay_state = None
                 try:
                     tw._backend.set_hud_demo_running(False)
                 except Exception:
@@ -10269,7 +10295,7 @@ class SettingsDialog(QDialog):
                             combo_info[f"{attacker_side}_combo_hit_text"] = f"{combo_count} HIT COMBO"
                             combo_info[f"{attacker_side}_combo_damage_text"] = f"{int(round(combo_damage))} DAMAGE"
                             if prev_count < 2:
-                                combo_info["_combo_commentary_text"] = "Good combo hit."
+                                combo_info["_combo_commentary_text"] = "좋은 콤보가 적중합니다"
                     if counter_hit:
                         combo_info[f"{attacker_side}_combo_hit_text"] = "COUNTER"
                         combo_info[f"{attacker_side}_combo_damage_text"] = f"{int(round(damage))} DAMAGE"
@@ -10285,9 +10311,31 @@ class SettingsDialog(QDialog):
                 tw.set_spectator_total_damage(replay_state["blue_dealt"], replay_state["red_dealt"])
                 tw.set_spectator_damage(replay_state["blue_dealt"], replay_state["red_dealt"])
                 tw.set_spectator_log_info(log_info)
+                replay_payload = {
+                    "round_current": int(replay_state.get("round_no") or 1),
+                    "round_total": int(replay_total_rounds),
+                    "seconds_left": int(replay_state.get("current_seconds_left", 0) or 0),
+                    "spectator_rest_mode": bool(replay_state.get("current_rest_mode", False)),
+                    "blue_round_damage_dealt": replay_state["blue_dealt"],
+                    "red_round_damage_dealt": replay_state["red_dealt"],
+                    "blue_damage_dealt": replay_state["blue_dealt"],
+                    "red_damage_dealt": replay_state["red_dealt"],
+                    "spectator_hit_effect_events": [{
+                        "side": receiver_side,
+                        "attacker_side": attacker_side,
+                        "punch": str(ev.get("punch") or "Hit"),
+                        "damage": damage,
+                        "weak_point": str(ev.get("weak_point") or ""),
+                        "effect_kind": kind,
+                    }],
+                }
+                if kind:
+                    replay_payload["spectator_effect_events"] = [{"side": receiver_side, "kind": kind}]
+                emitted = self._test_set_spectator_info(log_info, replay_payload)
                 if kind:
                     tw.trigger_spectator_effect(receiver_side, kind)
-                    self._play_spectator_sfx(kind, show_warning=False)
+                    if not emitted:
+                        self._play_spectator_sfx(kind, show_warning=False)
                 try:
                     hit_threshold = max(0.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0))
                 except Exception:
@@ -10303,14 +10351,16 @@ class SettingsDialog(QDialog):
                 effect_events = [{"side": receiver_side, "kind": kind}] if kind else []
                 if counter_hit and bool(getattr(self.cfg, "spectator_commentary_enabled", False)):
                     self._speak_tts_test_qt("카운터가 적중됩니다!", role="analyst")
-                elif str(combo_info.pop("_combo_commentary_text", "") or "").strip() and bool(getattr(self.cfg, "spectator_commentary_enabled", False)):
-                    self._speak_tts_test_qt("Good combo hit.", role="analyst")
-                else:
+                else_combo_text = str(combo_info.pop("_combo_commentary_text", "") or "").strip()
+                if not counter_hit and else_combo_text and bool(getattr(self.cfg, "spectator_commentary_enabled", False)):
+                    self._speak_tts_test_qt(else_combo_text, role="analyst")
+                elif not counter_hit:
                     commentary, role = helper._build_fight_summary_commentary([ev_for_summary], effect_events, path)
                     if commentary and bool(getattr(self.cfg, "spectator_commentary_enabled", False)):
                         self._speak_tts_test_qt(commentary, role=role)
             except Exception as e:
                 self._spectator_replay_token = None
+                self._spectator_replay_state = None
                 try:
                     tw._backend.set_hud_demo_running(False)
                 except Exception:
@@ -10333,9 +10383,28 @@ class SettingsDialog(QDialog):
                 tw._backend.reset_spectator_sp()
             tw.set_spectator_total_damage(0, 0)
             tw.set_spectator_damage(0, 0)
-            tw.set_spectator_log_info({
+            clear_info = {
                 "blue_round_knockdowns": 0,
                 "red_round_knockdowns": 0,
+                "blue_punishment_mid": 0.0,
+                "red_punishment_mid": 0.0,
+                "blue_punishment_long": 0.0,
+                "red_punishment_long": 0.0,
+                "blue_combo_hit_text": "",
+                "blue_combo_damage_text": "",
+                "red_combo_hit_text": "",
+                "red_combo_damage_text": "",
+                "blue_recent_hit_text": "",
+                "red_recent_hit_text": "",
+            }
+            tw.set_spectator_log_info(clear_info)
+            self._test_set_spectator_info(clear_info, {
+                "blue_round_damage_dealt": 0.0,
+                "red_round_damage_dealt": 0.0,
+                "blue_damage_dealt": 0.0,
+                "red_damage_dealt": 0.0,
+                "spectator_sp_reset": True,
+                "spectator_match_stats_reset": True,
             })
         except Exception as e:
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
@@ -10366,6 +10435,7 @@ class SettingsDialog(QDialog):
         self.txt_new_name.setPlaceholderText("")
         _tt(self.txt_new_name, "표시할 선수 닉네임을 입력합니다.")
         self.cmb_new_country = QComboBox()
+        self.cmb_new_country.setStyleSheet("QComboBox,QAbstractItemView{font-family:'Malgun Gothic','맑은 고딕','Segoe UI',sans-serif;}")
         self.cmb_new_country.addItem("한국", "KR")
         self.cmb_new_country.addItem("일본", "JP")
         _tt(self.cmb_new_country, "선수 국적을 선택합니다. 기본값은 한국입니다.")
@@ -10438,6 +10508,13 @@ class SettingsDialog(QDialog):
         self.cmb_players_avatar.currentIndexChanged.connect(self._reload_players_cards)
         _tt(self.cmb_players_avatar, "선수 카드의 초상화 모양을 선택합니다.")
         view_row.addWidget(self.cmb_players_avatar)
+        view_row.addWidget(QLabel("초상화 우선:"))
+        self.cmb_portrait_priority = QComboBox()
+        self.cmb_portrait_priority.addItem("로그", "log")
+        self.cmb_portrait_priority.addItem("프로필", "profile")
+        self.cmb_portrait_priority.currentIndexChanged.connect(self._schedule_apply)
+        _tt(self.cmb_portrait_priority, "자동 로그 동기화 시 초상화 선택 기준입니다. 기본은 로그 초상화입니다.")
+        view_row.addWidget(self.cmb_portrait_priority)
         view_row.addWidget(QLabel("정렬:"))
         self.cmb_players_sort = QComboBox()
         self.cmb_players_sort.addItems(["ID", "닉네임"])
@@ -11240,6 +11317,13 @@ class SettingsDialog(QDialog):
                     self.controller.timer_win.set_qml_preview_enabled(self.cfg.qml_preview_enabled)
             except Exception:
                 pass
+        if hasattr(self, "chk_qml_effects_enabled"):
+            self.cfg.qml_effects_enabled = bool(self.chk_qml_effects_enabled.isChecked())
+            try:
+                if self.controller and getattr(self.controller, "timer_win", None):
+                    self.controller.timer_win.set_qml_effects_enabled(self.cfg.qml_effects_enabled)
+            except Exception:
+                pass
         try:
             if self.controller:
                 self.controller.ui_update.emit({
@@ -11260,6 +11344,7 @@ class SettingsDialog(QDialog):
                     "overlay_round_y": int(getattr(self.cfg, "overlay_round_y", 0) or 0),
                     "browser_overlay_output_only": self.cfg.browser_overlay_output_only,
                     "qml_preview_enabled": self.cfg.qml_preview_enabled,
+                    "qml_effects_enabled": self.cfg.qml_effects_enabled,
                 })
         except Exception:
             pass
@@ -11500,6 +11585,7 @@ class SettingsDialog(QDialog):
             "overlay_show_cinematic": show_cinematic,
             "browser_overlay_scale": float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),
             "browser_overlay_output_only": bool(getattr(self.cfg, "browser_overlay_output_only", True)),
+            "qml_effects_enabled": bool(getattr(self.cfg, "qml_effects_enabled", False)),
             "overlay_style": {
                 "round": style_round,
                 "time": style_time,
@@ -12312,12 +12398,21 @@ class SettingsDialog(QDialog):
         self.sp_browser_overlay_poll.setSuffix(" ms")
         self.sp_browser_overlay_poll.setValue(max(16, min(1000, int(getattr(self.cfg, "browser_overlay_poll_ms", 50) or 50))))
         self.sp_browser_overlay_poll.valueChanged.connect(lambda _v: self._apply_browser_overlay_settings())
+        self.sp_browser_fullscreen_fx_intensity = QSpinBox()
+        self.sp_browser_fullscreen_fx_intensity.setRange(0, 300)
+        self.sp_browser_fullscreen_fx_intensity.setSingleStep(10)
+        self.sp_browser_fullscreen_fx_intensity.setSuffix("%")
+        self.sp_browser_fullscreen_fx_intensity.setValue(int(max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6))) * 100))
+        self.sp_browser_fullscreen_fx_intensity.valueChanged.connect(lambda _v: self._apply_browser_overlay_settings())
         self.chk_browser_overlay_output_only = QCheckBox("전체화면 효과는 OBS 브라우저에만 표시")
         self.chk_browser_overlay_output_only.setChecked(bool(getattr(self.cfg, "browser_overlay_output_only", True)))
         self.chk_browser_overlay_output_only.stateChanged.connect(lambda _s: self._apply_browser_overlay_settings())
         self.chk_qml_preview_enabled = QCheckBox("QML HUD 미리보기 사용")
         self.chk_qml_preview_enabled.setChecked(bool(getattr(self.cfg, "qml_preview_enabled", True)))
         self.chk_qml_preview_enabled.stateChanged.connect(lambda _s: self._apply_browser_overlay_settings())
+        self.chk_qml_effects_enabled = QCheckBox("QML 이펙트 사용")
+        self.chk_qml_effects_enabled.setChecked(bool(getattr(self.cfg, "qml_effects_enabled", False)))
+        self.chk_qml_effects_enabled.stateChanged.connect(lambda _s: self._apply_browser_overlay_settings())
         is_browser_running = bool(self.controller and getattr(self.controller, "browser_overlay", None))
         self.lbl_browser_overlay_status = QLabel("")
         self.lbl_browser_overlay_status.setStyleSheet("color:#0f766e;font-weight:700;" if is_browser_running else "color:#64748b;")
@@ -12329,10 +12424,14 @@ class SettingsDialog(QDialog):
         browser_lay.addWidget(self.sp_browser_overlay_poll, 1, 1)
         browser_lay.addWidget(QLabel("상태"), 1, 2)
         browser_lay.addWidget(self.lbl_browser_overlay_status, 1, 3, 1, 2)
+        browser_lay.addWidget(QLabel("전체화면 효과 강도"), 1, 5)
+        browser_lay.addWidget(self.sp_browser_fullscreen_fx_intensity, 1, 6)
         browser_lay.addWidget(self.chk_browser_overlay_output_only, 2, 0, 1, 6)
         browser_lay.addWidget(self.chk_qml_preview_enabled, 3, 0, 1, 6)
+        browser_lay.addWidget(self.chk_qml_effects_enabled, 4, 0, 1, 6)
         _tt(self.le_browser_overlay_url, "OBS 브라우저 소스 주소입니다. timerauto 실행 중에 사용하세요.")
         _tt(self.sp_browser_overlay_poll, "timerauto 상태를 OBS 브라우저 소스에 갱신하는 주기입니다. 짧을수록 반응은 빠르지만 CPU 사용량이 늘 수 있습니다.")
+        _tt(self.sp_browser_fullscreen_fx_intensity, "다운/KO/TKO 때 브라우저 화면 전체를 덮는 플래시와 충격 효과의 강도입니다.")
         _tt(self.chk_browser_overlay_output_only, "Show fullscreen effects only in the OBS browser source, not on the local Qt overlay.")
         _tt(self.chk_qml_preview_enabled, "끄면 로컬 QML HUD 창을 숨기고 OBS 브라우저 오버레이만 렌더링합니다.")
         overlay_lay.addWidget(browser_group)
@@ -12881,7 +12980,7 @@ class SettingsDialog(QDialog):
         self.cmb_timer_preset.clear()
         self.cmb_timer_preset.addItem("선택", "")
         self._timer_presets = {}
-        self._timer_presets["?꾩옱 ?ㅼ젙"] = {
+        self._timer_presets["현재 설정"] = {
             "timer_total_rounds": int(self.cfg.timer_total_rounds),
             "timer_round_sec": int(self.cfg.timer_round_sec),
             "timer_rest_sec": int(self.cfg.timer_rest_sec),
@@ -13902,12 +14001,6 @@ class SettingsDialog(QDialog):
         except Exception:
             self._timer_apply_armed_until = 0.0
         self._schedule_apply()
-
-    def _clear_layout(self, layout: QGridLayout):
-        while layout.count():
-            item = layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
 
     def _queue_reload_players_cards(self):
         # Let IME composition settle first so Korean search updates immediately.
@@ -16786,6 +16879,18 @@ class SettingsDialog(QDialog):
             self.cfg.spectatorlog_path = str(self.le_spectatorlog_path.text() or "").strip()
         if hasattr(self, "sp_spectatorlog_poll"):
             self.cfg.spectatorlog_poll_ms = int(self.sp_spectatorlog_poll.value())
+        if hasattr(self, "chk_spectatorlog_file_watch"):
+            self.cfg.spectatorlog_file_watch_enabled = bool(self.chk_spectatorlog_file_watch.isChecked())
+        if hasattr(self, "sp_spectatorlog_debounce"):
+            self.cfg.spectatorlog_debounce_ms = int(self.sp_spectatorlog_debounce.value())
+        if hasattr(self, "sp_spectatorlog_backup_poll"):
+            self.cfg.spectatorlog_backup_poll_ms = int(self.sp_spectatorlog_backup_poll.value())
+        if hasattr(self, "chk_spectatorlog_blackbox_enabled"):
+            self.cfg.spectatorlog_blackbox_enabled = bool(self.chk_spectatorlog_blackbox_enabled.isChecked())
+        if hasattr(self, "le_spectatorlog_blackbox_dir"):
+            self.cfg.spectatorlog_blackbox_dir = str(self.le_spectatorlog_blackbox_dir.text() or "").strip() or "SpectatorLogArchive"
+        if hasattr(self, "cmb_spectatorlog_blackbox_mode"):
+            self.cfg.spectatorlog_blackbox_mode = str(self.cmb_spectatorlog_blackbox_mode.currentData() or "smart")
         if hasattr(self, "chk_spectator_commentary"):
             self.cfg.spectator_commentary_enabled = bool(self.chk_spectator_commentary.isChecked())
         if hasattr(self, "cmb_spectator_commentary_mode"):
@@ -16798,6 +16903,45 @@ class SettingsDialog(QDialog):
             self.cfg.spectator_commentary_min_damage = float(self.sp_spectator_commentary_damage.value())
         if hasattr(self, "sp_spectator_hit_effect_damage"):
             self.cfg.spectator_hit_effect_damage = float(self.sp_spectator_hit_effect_damage.value())
+        if hasattr(self, "cb_spectator_hit_fx_color_preset"):
+            self.cfg.spectator_hit_effect_color_preset = str(self.cb_spectator_hit_fx_color_preset.currentData() or "classic")
+        if hasattr(self, "le_spectator_hit_fx_color_low"):
+            self.cfg.spectator_hit_effect_color_low = _normalize_hex_color(str(self.le_spectator_hit_fx_color_low.text() or "#38bdf8").strip() or "#38bdf8")
+        if hasattr(self, "le_spectator_hit_fx_color_mid"):
+            self.cfg.spectator_hit_effect_color_mid = _normalize_hex_color(str(self.le_spectator_hit_fx_color_mid.text() or "#fb923c").strip() or "#fb923c")
+        if hasattr(self, "le_spectator_hit_fx_color_high"):
+            self.cfg.spectator_hit_effect_color_high = _normalize_hex_color(str(self.le_spectator_hit_fx_color_high.text() or "#f87171").strip() or "#f87171")
+        if hasattr(self, "le_spectator_hit_fx_color_weak"):
+            self.cfg.spectator_hit_effect_color_weak = _normalize_hex_color(str(self.le_spectator_hit_fx_color_weak.text() or "#facc15").strip() or "#facc15")
+        if hasattr(self, "le_spectator_hit_fx_color_stun"):
+            self.cfg.spectator_hit_effect_color_stun = _normalize_hex_color(str(self.le_spectator_hit_fx_color_stun.text() or "#ef4444").strip() or "#ef4444")
+        if hasattr(self, "sp_spectator_hit_fx_duration"):
+            self.cfg.spectator_hit_effect_duration_ms = int(self.sp_spectator_hit_fx_duration.value())
+            self.cfg.spectator_hit_effect_pop_ms = int(self.sp_spectator_hit_fx_pop.value())
+        if hasattr(self, "sp_spectator_hit_fx_base_size"):
+            self.cfg.spectator_hit_effect_base_size = int(self.sp_spectator_hit_fx_base_size.value())
+        if hasattr(self, "sp_spectator_hit_fx_damage_scale"):
+            self.cfg.spectator_hit_effect_damage_scale = float(self.sp_spectator_hit_fx_damage_scale.value())
+        if hasattr(self, "sp_spectator_hit_fx_ring_width"):
+            self.cfg.spectator_hit_effect_ring_width = int(self.sp_spectator_hit_fx_ring_width.value())
+        if hasattr(self, "sp_spectator_hit_fx_opacity"):
+            self.cfg.spectator_hit_effect_opacity = float(self.sp_spectator_hit_fx_opacity.value())
+        if hasattr(self, "sp_spectator_hit_fx_glow"):
+            self.cfg.spectator_hit_effect_glow = float(self.sp_spectator_hit_fx_glow.value())
+        if hasattr(self, "sp_spectator_hit_fx_fill_opacity"):
+            self.cfg.spectator_hit_effect_fill_opacity = float(self.sp_spectator_hit_fx_fill_opacity.value())
+        if hasattr(self, "chk_spectator_hit_fx_show_text"):
+            self.cfg.spectator_hit_effect_show_text = bool(self.chk_spectator_hit_fx_show_text.isChecked())
+        if hasattr(self, "sp_spectator_hit_fx_text_scale"):
+            self.cfg.spectator_hit_effect_text_scale = float(self.sp_spectator_hit_fx_text_scale.value())
+        if hasattr(self, "chk_spectator_hit_fx_fast_emit"):
+            self.cfg.spectator_hit_effect_fast_emit = bool(self.chk_spectator_hit_fx_fast_emit.isChecked())
+        if hasattr(self, "chk_spectator_hit_fx_latency_log"):
+            self.cfg.spectator_hit_effect_latency_log = bool(self.chk_spectator_hit_fx_latency_log.isChecked())
+        if hasattr(self, "chk_spectator_hit_fx_sprite_enabled"):
+            self.cfg.spectator_hit_effect_sprite_enabled = bool(self.chk_spectator_hit_fx_sprite_enabled.isChecked())
+        if hasattr(self, "chk_spectator_hit_fx_ring_enabled"):
+            self.cfg.spectator_hit_effect_ring_enabled = bool(self.chk_spectator_hit_fx_ring_enabled.isChecked())
         if hasattr(self, "sp_spectator_commentary_cooldown"):
             self.cfg.spectator_commentary_cooldown_sec = float(self.sp_spectator_commentary_cooldown.value())
         if hasattr(self, "sp_spectator_commentary_rate"):
@@ -16820,6 +16964,23 @@ class SettingsDialog(QDialog):
             self.cfg.spectator_knockdown_sfx_path = str(self.le_spectator_kd_sfx.text() or "").strip()
         if hasattr(self, "le_spectator_tko_sfx"):
             self.cfg.spectator_tko_sfx_path = str(self.le_spectator_tko_sfx.text() or "").strip()
+        if hasattr(self, "chk_diagnostics_enabled"):
+            self.cfg.diagnostics_enabled = bool(self.chk_diagnostics_enabled.isChecked())
+        if hasattr(self, "chk_diagnostics_mask"):
+            self.cfg.diagnostics_mask_sensitive = bool(self.chk_diagnostics_mask.isChecked())
+        if hasattr(self, "sp_diagnostics_minutes"):
+            self.cfg.diagnostics_trace_minutes = int(self.sp_diagnostics_minutes.value())
+        if hasattr(self, "sp_diagnostics_raw_lines"):
+            self.cfg.diagnostics_raw_sample_lines = int(self.sp_diagnostics_raw_lines.value())
+        try:
+            DIAG.set_options(
+                enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
+                max_events=max(500, int(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 500),
+                raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
+                mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
+            )
+        except Exception:
+            pass
 
         # trigger
         self.cfg.trigger.target_bgr = (int(self.sp_b.value()), int(self.sp_g.value()), int(self.sp_r.value()))
@@ -16843,6 +17004,8 @@ class SettingsDialog(QDialog):
         self.cfg.palette.mask_thresh = float(self.sp_mask.value()) / 100.0
         if hasattr(self, "chk_capture_players"):
             self.cfg.capture_player_images = bool(self.chk_capture_players.isChecked())
+            if hasattr(self, "cmb_portrait_priority"):
+                self.cfg.portrait_source_priority = str(self.cmb_portrait_priority.currentData() or "log")
 
         # timer
         lock_until = float(getattr(self.cfg, "_timer_lock_until", 0.0) or 0.0)
@@ -16912,6 +17075,13 @@ class SettingsDialog(QDialog):
                     self.controller.timer_win.set_qml_preview_enabled(self.cfg.qml_preview_enabled)
             except Exception:
                 pass
+        if hasattr(self, "chk_qml_effects_enabled"):
+            self.cfg.qml_effects_enabled = bool(self.chk_qml_effects_enabled.isChecked())
+            try:
+                if self.controller and getattr(self.controller, "timer_win", None):
+                    self.controller.timer_win.set_qml_effects_enabled(self.cfg.qml_effects_enabled)
+            except Exception:
+                pass
         if hasattr(self, "cmb_overlay_avatar"):
             self.cfg.overlay_player_mask = self._overlay_mask_from_ui()
         if hasattr(self, "chk_overlay_round"):
@@ -16964,6 +17134,8 @@ class SettingsDialog(QDialog):
                     "overlay_show_flags": self.cfg.overlay_show_flags,
                     "overlay_show_cinematic": self.cfg.overlay_show_cinematic,
                     "browser_overlay_output_only": self.cfg.browser_overlay_output_only,
+                    "browser_fullscreen_fx_intensity": self.cfg.browser_fullscreen_fx_intensity,
+                    "qml_effects_enabled": self.cfg.qml_effects_enabled,
                     "spectator_recent_text_size": self.cfg.spectator_recent_text_size,
                     "overlay_style": {
                         "round": self.cfg.overlay_style_round,
@@ -16995,8 +17167,18 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "적용", "설정이 적용되었습니다.")
 
     def closeEvent(self, event):
+        # SettingsDialog is installed as a QApplication event filter for
+        # quick mouse/keyboard picking.  A later auto-apply closeEvent used to
+        # override the original cleanup-only closeEvent, leaving the filter
+        # alive after the dialog closed.  Keep both responsibilities here.
         try:
             self.apply_only(silent=True)
+        except Exception:
+            pass
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
         except Exception:
             pass
         super().closeEvent(event)
@@ -17147,6 +17329,11 @@ class SettingsDialog(QDialog):
             self.sp_mask.setValue(int(self.cfg.palette.mask_thresh * 100))
         if hasattr(self, "chk_capture_players"):
             self.chk_capture_players.setChecked(bool(getattr(self.cfg, "capture_player_images", True)))
+        if hasattr(self, "cmb_portrait_priority"):
+            try:
+                self.cmb_portrait_priority.setCurrentIndex(1 if str(getattr(self.cfg, "portrait_source_priority", "log") or "log").lower() == "profile" else 0)
+            except Exception:
+                self.cmb_portrait_priority.setCurrentIndex(0)
         if hasattr(self, "sp_timer_total"):
             self.sp_timer_total.setValue(int(self.cfg.timer_total_rounds))
         if hasattr(self, "sp_timer_current"):
@@ -17189,6 +17376,19 @@ class SettingsDialog(QDialog):
             self.le_spectatorlog_path.setText(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
         if hasattr(self, "sp_spectatorlog_poll"):
             self.sp_spectatorlog_poll.setValue(int(getattr(self.cfg, "spectatorlog_poll_ms", 250) or 250))
+        if hasattr(self, "chk_spectatorlog_file_watch"):
+            self.chk_spectatorlog_file_watch.setChecked(bool(getattr(self.cfg, "spectatorlog_file_watch_enabled", True)))
+        if hasattr(self, "sp_spectatorlog_debounce"):
+            self.sp_spectatorlog_debounce.setValue(int(getattr(self.cfg, "spectatorlog_debounce_ms", 35) or 35))
+        if hasattr(self, "sp_spectatorlog_backup_poll"):
+            self.sp_spectatorlog_backup_poll.setValue(int(getattr(self.cfg, "spectatorlog_backup_poll_ms", 1500) or 1500))
+        if hasattr(self, "chk_spectatorlog_blackbox_enabled"):
+            self.chk_spectatorlog_blackbox_enabled.setChecked(bool(getattr(self.cfg, "spectatorlog_blackbox_enabled", False)))
+        if hasattr(self, "le_spectatorlog_blackbox_dir"):
+            self.le_spectatorlog_blackbox_dir.setText(str(getattr(self.cfg, "spectatorlog_blackbox_dir", "SpectatorLogArchive") or "SpectatorLogArchive"))
+        if hasattr(self, "cmb_spectatorlog_blackbox_mode"):
+            idx = self.cmb_spectatorlog_blackbox_mode.findData(str(getattr(self.cfg, "spectatorlog_blackbox_mode", "smart") or "smart"))
+            self.cmb_spectatorlog_blackbox_mode.setCurrentIndex(idx if idx >= 0 else 1)
         if hasattr(self, "chk_spectator_commentary"):
             self.chk_spectator_commentary.setChecked(bool(getattr(self.cfg, "spectator_commentary_enabled", False)))
         if hasattr(self, "cmb_spectator_commentary_mode"):
@@ -17204,6 +17404,57 @@ class SettingsDialog(QDialog):
             self.sp_spectator_commentary_damage.setValue(float(getattr(self.cfg, "spectator_commentary_min_damage", 25.0) or 25.0))
         if hasattr(self, "sp_spectator_hit_effect_damage"):
             self.sp_spectator_hit_effect_damage.setValue(float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0))
+        if hasattr(self, "cb_spectator_hit_fx_color_preset"):
+            _fx_preset = str(getattr(self.cfg, "spectator_hit_effect_color_preset", "classic") or "classic").strip().lower()
+            _fx_idx = self.cb_spectator_hit_fx_color_preset.findData(_fx_preset)
+            self.cb_spectator_hit_fx_color_preset.setCurrentIndex(_fx_idx if _fx_idx >= 0 else 0)
+        if hasattr(self, "le_spectator_hit_fx_color_low"):
+            self.le_spectator_hit_fx_color_low.setText(str(getattr(self.cfg, "spectator_hit_effect_color_low", "#38bdf8") or "#38bdf8"))
+            if hasattr(self, "btn_spectator_hit_fx_color_low"):
+                self._set_hit_fx_color_button(self.btn_spectator_hit_fx_color_low, self.le_spectator_hit_fx_color_low.text())
+        if hasattr(self, "le_spectator_hit_fx_color_mid"):
+            self.le_spectator_hit_fx_color_mid.setText(str(getattr(self.cfg, "spectator_hit_effect_color_mid", "#fb923c") or "#fb923c"))
+            if hasattr(self, "btn_spectator_hit_fx_color_mid"):
+                self._set_hit_fx_color_button(self.btn_spectator_hit_fx_color_mid, self.le_spectator_hit_fx_color_mid.text())
+        if hasattr(self, "le_spectator_hit_fx_color_high"):
+            self.le_spectator_hit_fx_color_high.setText(str(getattr(self.cfg, "spectator_hit_effect_color_high", "#f87171") or "#f87171"))
+            if hasattr(self, "btn_spectator_hit_fx_color_high"):
+                self._set_hit_fx_color_button(self.btn_spectator_hit_fx_color_high, self.le_spectator_hit_fx_color_high.text())
+        if hasattr(self, "le_spectator_hit_fx_color_weak"):
+            self.le_spectator_hit_fx_color_weak.setText(str(getattr(self.cfg, "spectator_hit_effect_color_weak", "#facc15") or "#facc15"))
+            if hasattr(self, "btn_spectator_hit_fx_color_weak"):
+                self._set_hit_fx_color_button(self.btn_spectator_hit_fx_color_weak, self.le_spectator_hit_fx_color_weak.text())
+        if hasattr(self, "le_spectator_hit_fx_color_stun"):
+            self.le_spectator_hit_fx_color_stun.setText(str(getattr(self.cfg, "spectator_hit_effect_color_stun", "#ef4444") or "#ef4444"))
+            if hasattr(self, "btn_spectator_hit_fx_color_stun"):
+                self._set_hit_fx_color_button(self.btn_spectator_hit_fx_color_stun, self.le_spectator_hit_fx_color_stun.text())
+        if hasattr(self, "sp_spectator_hit_fx_duration"):
+            self.sp_spectator_hit_fx_duration.setValue(int(getattr(self.cfg, "spectator_hit_effect_duration_ms", 170) or 170))
+            self.sp_spectator_hit_fx_pop.setValue(int(getattr(self.cfg, "spectator_hit_effect_pop_ms", 58) or 58))
+        if hasattr(self, "sp_spectator_hit_fx_base_size"):
+            self.sp_spectator_hit_fx_base_size.setValue(int(getattr(self.cfg, "spectator_hit_effect_base_size", 86) or 86))
+        if hasattr(self, "sp_spectator_hit_fx_damage_scale"):
+            self.sp_spectator_hit_fx_damage_scale.setValue(float(getattr(self.cfg, "spectator_hit_effect_damage_scale", 0.42) or 0.42))
+        if hasattr(self, "sp_spectator_hit_fx_ring_width"):
+            self.sp_spectator_hit_fx_ring_width.setValue(int(getattr(self.cfg, "spectator_hit_effect_ring_width", 4) or 4))
+        if hasattr(self, "sp_spectator_hit_fx_opacity"):
+            self.sp_spectator_hit_fx_opacity.setValue(float(getattr(self.cfg, "spectator_hit_effect_opacity", 1.0) or 1.0))
+        if hasattr(self, "sp_spectator_hit_fx_glow"):
+            self.sp_spectator_hit_fx_glow.setValue(float(getattr(self.cfg, "spectator_hit_effect_glow", 1.0) or 1.0))
+        if hasattr(self, "sp_spectator_hit_fx_fill_opacity"):
+            self.sp_spectator_hit_fx_fill_opacity.setValue(float(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0) or 1.0))
+        if hasattr(self, "chk_spectator_hit_fx_show_text"):
+            self.chk_spectator_hit_fx_show_text.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_show_text", True)))
+        if hasattr(self, "sp_spectator_hit_fx_text_scale"):
+            self.sp_spectator_hit_fx_text_scale.setValue(float(getattr(self.cfg, "spectator_hit_effect_text_scale", 1.0) or 1.0))
+        if hasattr(self, "chk_spectator_hit_fx_fast_emit"):
+            self.chk_spectator_hit_fx_fast_emit.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_fast_emit", True)))
+        if hasattr(self, "chk_spectator_hit_fx_latency_log"):
+            self.chk_spectator_hit_fx_latency_log.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)))
+        if hasattr(self, "chk_spectator_hit_fx_sprite_enabled"):
+            self.chk_spectator_hit_fx_sprite_enabled.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_sprite_enabled", True)))
+        if hasattr(self, "chk_spectator_hit_fx_ring_enabled"):
+            self.chk_spectator_hit_fx_ring_enabled.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_ring_enabled", False)))
         if hasattr(self, "sp_spectator_commentary_cooldown"):
             self.sp_spectator_commentary_cooldown.setValue(float(getattr(self.cfg, "spectator_commentary_cooldown_sec", 6.0) or 6.0))
         if hasattr(self, "sp_spectator_commentary_rate"):
@@ -17291,8 +17542,12 @@ class SettingsDialog(QDialog):
             self.sp_browser_overlay_poll.setValue(max(16, min(1000, int(getattr(self.cfg, "browser_overlay_poll_ms", 50) or 50))))
         if hasattr(self, "chk_browser_overlay_output_only"):
             self.chk_browser_overlay_output_only.setChecked(bool(getattr(self.cfg, "browser_overlay_output_only", True)))
+        if hasattr(self, "sp_browser_fullscreen_fx_intensity"):
+            self.sp_browser_fullscreen_fx_intensity.setValue(int(max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6))) * 100))
         if hasattr(self, "chk_qml_preview_enabled"):
             self.chk_qml_preview_enabled.setChecked(bool(getattr(self.cfg, "qml_preview_enabled", True)))
+        if hasattr(self, "chk_qml_effects_enabled"):
+            self.chk_qml_effects_enabled.setChecked(bool(getattr(self.cfg, "qml_effects_enabled", False)))
         if hasattr(self, "le_browser_overlay_url"):
             browser_url = "http://127.0.0.1:17872/overlay"
             try:
@@ -17371,6 +17626,7 @@ class SettingsDialog(QDialog):
 # -----------------------------
 class MainApp(QObject):
     _ocr_actions_ready = pyqtSignal()
+    _log_stop_finished = pyqtSignal()
     _update_metadata_ready = pyqtSignal(dict, bool)
     _update_error_ready = pyqtSignal(str, bool)
     _update_download_ready = pyqtSignal(str)
@@ -17378,10 +17634,21 @@ class MainApp(QObject):
     def __init__(self, cfg_path: str):
         super().__init__()
         self._update_metadata_ready.connect(self._handle_update_metadata)
+        self._log_stop_finished.connect(self._finish_log_detector_stop)
         self._update_error_ready.connect(self._finish_update_check_error)
         self._update_download_ready.connect(self._confirm_apply_update)
         self.cfg_path = cfg_path
         self.cfg = AppConfig.from_json(cfg_path)
+        try:
+            DIAG.set_options(
+                enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
+                max_events=max(500, int(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 500),
+                raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
+                mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
+            )
+            DIAG.record("app_start", app_version=APP_VERSION, cfg_path=cfg_path)
+        except Exception:
+            pass
         # Chapter anchor is session-scoped runtime state.
         # Reset stale persisted anchor on app start to avoid forced ON state.
         try:
@@ -17400,7 +17667,12 @@ class MainApp(QObject):
         self.timer_win.set_qml_preview_enabled(bool(getattr(self.cfg, "qml_preview_enabled", True)))
         self.browser_overlay = BrowserOverlayServer(17872, no_update=_NO_UPDATE, path_resolver=normalize_app_path)
         self.browser_overlay.start()
-        self._browser_overlay_image_revs = {"blue": -1, "red": -1}
+        self.browser_overlay_sync = BrowserOverlaySync(
+            self.cfg,
+            self.timer_win,
+            self.browser_overlay,
+            self._sync_browser_overlay_player_assets,
+        )
         self._browser_sp_ratio = {"blue": 1.0, "red": 1.0}
         self._browser_sp_last_damage = {"blue": 0.0, "red": 0.0}
         self._browser_sp_recovery_delay = {"blue": 0.0, "red": 0.0}
@@ -17410,8 +17682,9 @@ class MainApp(QObject):
         self._browser_knockdown_round_key = None
         self._browser_overlay_timer = QTimer()
         self._browser_overlay_timer.setInterval(max(16, min(1000, int(getattr(self.cfg, "browser_overlay_poll_ms", 50) or 50))))
-        self._browser_overlay_timer.timeout.connect(self._publish_browser_overlay_state)
+        self._browser_overlay_timer.timeout.connect(self.browser_overlay_sync.publish)
         self._browser_overlay_timer.start()
+        self._push_initial_browser_overlay_settings()
         self.timer_win.set_broadcast_sync_active(float(getattr(self.cfg, "chapter_anchor_epoch", 0.0) or 0.0) > 0.0)
         self.timer_win.set_timer_settings(
             self.cfg.timer_total_rounds,
@@ -17423,6 +17696,7 @@ class MainApp(QObject):
         self.timer_win.set_effect_settings(self.cfg.win_effects)
         self.timer_win.set_overlay_bg_color(self.cfg.overlay_bg_color)
         self.timer_win.set_overlay_bg_opacity(self.cfg.overlay_bg_opacity)
+        self.timer_win.set_overlay_window_opacity(getattr(self.cfg, "overlay_window_opacity", 1.0))
         try:
             self.timer_win._backend.overlayResetRequested.connect(self._on_timer_reset_cleanup)
         except Exception:
@@ -17485,6 +17759,7 @@ class MainApp(QObject):
         self._commentary_players: Dict[str, Any] = {}
         self._commentary_tts_files: Dict[str, List[str]] = {"analyst": [], "caster": []}
         self._commentary_tts_busy: Dict[str, bool] = {"analyst": False, "caster": False}
+        self._commentary_followup_epoch: Dict[str, int] = {"analyst": 0, "caster": 0}
         self._commentary_tts_cache_dir = os.path.join(tempfile.gettempdir(), "timerauto_tts_cache")
         self._commentary_tts_cache_lock = threading.Lock()
         try:
@@ -17507,6 +17782,8 @@ class MainApp(QObject):
         self.controller = Controller(self.cfg)
         self.watcher = ScreenWatcher(self.cfg)
         self.spectator_watcher = _make_spectator_log_watcher(self.cfg)
+        self._log_detector_transition = False
+        self._log_detector_stopping = False
         self.action_runner = ActionRunner(self.controller, self.timer_win, self.timer_win.set_status)
         QTimer.singleShot(1800, self._prewarm_commentary_tts_cache)
         try:
@@ -17531,6 +17808,8 @@ class MainApp(QObject):
         self.timer_win._backend.overlayVisibilityRequested.connect(self._on_overlay_visibility_request)
         self.timer_win._backend.overlayUiScaleChanged.connect(self._on_overlay_ui_scale_changed)
         self.timer_win._backend.overlayBgColorChanged.connect(self._on_overlay_bg_changed)
+        self.timer_win._backend.overlayUiBgOpacityChanged.connect(self._on_overlay_ui_bg_opacity_changed)
+        self.timer_win._backend.overlayWindowOpacityChanged.connect(self._on_overlay_window_opacity_changed)
         self.timer_win._backend.trigger_test_requested.connect(self._test_trigger_once)
         self.timer_win._backend.profileRegisterRequested.connect(self._open_overlay_profile_register)
         self.timer_win._backend.profileEditRequested.connect(self._open_overlay_profile_edit)
@@ -17647,11 +17926,102 @@ class MainApp(QObject):
             except Exception:
                 pass
 
+    def _split_commentary_tts_sentences(self, text: str) -> List[str]:
+        text = re.sub(r"\s+", " ", str(text or "").strip())
+        if not text:
+            return []
+        parts = [p.strip() for p in re.split(r"(?<=[.!?。！？])\s+", text) if p.strip()]
+        if len(parts) <= 1:
+            # Korean TTS summaries often use sentence-like spacing without Western punctuation.
+            tmp = re.sub(r"(습니다|입니다|네요|군요|죠|요|다)([.。]?)\s+", r"\1\2|", text)
+            parts = [p.strip() for p in tmp.split("|") if p.strip()]
+        out: List[str] = []
+        for p in parts or [text]:
+            p = p.strip()
+            if not p:
+                continue
+            if len(p) <= 110:
+                out.append(p)
+                continue
+            # Fallback split for very long sentence-like chunks.
+            chunk = ""
+            for seg in re.split(r"(,|，| 그리고 | 하지만 | 반면 | 다만 )", p):
+                if not seg:
+                    continue
+                nxt = (chunk + seg).strip()
+                if len(nxt) >= 80 and chunk:
+                    out.append(chunk.strip(" ,，"))
+                    chunk = seg.strip()
+                else:
+                    chunk = nxt
+            if chunk.strip():
+                out.append(chunk.strip(" ,，"))
+        return out[:8]
+
+    def _estimate_commentary_sentence_ms(self, text: str) -> int:
+        # Conservative Korean TTS length estimate. Only used to space queued recap sentences.
+        n = len(str(text or ""))
+        return int(max(1100, min(5200, 650 + n * 72)))
+
+    def _schedule_commentary_round_summary_tts(self, text: str, role: str = "analyst", delay_ms: int = 0):
+        sentences = self._split_commentary_tts_sentences(text)
+        if not sentences:
+            return
+        role = "caster" if str(role or "").lower() == "caster" else "analyst"
+        try:
+            epoch = getattr(self, "_commentary_followup_epoch", None)
+            if isinstance(epoch, dict):
+                # Cancel older summary followups, but do not stop current media here.
+                epoch[role] = int(epoch.get(role, 0) or 0) + 1
+        except Exception:
+            pass
+        offset = max(0, int(delay_ms or 0))
+        for sentence in sentences:
+            self._schedule_commentary_followup_tts(sentence, role, delay_ms=offset, retries=8)
+            offset += self._estimate_commentary_sentence_ms(sentence)
+        logging.info("COMMENTARY_TTS_ROUND_SUMMARY_QUEUE role=%s sentences=%s delay_ms=%s", role, len(sentences), delay_ms)
+
+    def _schedule_commentary_followup_tts(self, text: str, role: str = "analyst", delay_ms: int = 2400, retries: int = 5):
+        text = str(text or "").strip()
+        if not text:
+            return
+        role = "caster" if str(role or "").lower() == "caster" else "analyst"
+        try:
+            token = int((getattr(self, "_commentary_followup_epoch", {}) or {}).get(role, 0) or 0)
+        except Exception:
+            token = 0
+
+        def _attempt(remaining: int):
+            try:
+                try:
+                    current_token = int((getattr(self, "_commentary_followup_epoch", {}) or {}).get(role, 0) or 0)
+                except Exception:
+                    current_token = 0
+                if current_token != token:
+                    logging.info("COMMENTARY_TTS_FOLLOWUP_CANCELLED role=%s text=%s", role, text)
+                    return
+                busy = getattr(self, "_commentary_tts_busy", {}) or {}
+                # 역할별 독립 재생 정책: 캐스터와 해설자는 서로 막지 않는다.
+                # 단, 같은 역할이 이미 말하는 중이면 후속 멘트는 잠깐 재시도한다.
+                if bool(busy.get(role, False)):
+                    if remaining > 0:
+                        QTimer.singleShot(900, lambda r=remaining - 1: _attempt(r))
+                    else:
+                        logging.info("COMMENTARY_TTS_FOLLOWUP_SKIP_BUSY role=%s text=%s", role, text)
+                    return
+                self._speak_commentary_tts(text, role)
+            except Exception:
+                logging.exception("COMMENTARY_TTS_FOLLOWUP_FAIL")
+
+        QTimer.singleShot(max(0, min(15000, int(delay_ms or 2400))), lambda: _attempt(max(0, int(retries or 0))))
+
     def _speak_commentary_tts(self, text: str, role: str = "analyst", rate_override: Optional[int] = None, pitch_override: Optional[int] = None):
         text = str(text or "").strip()
         if not text:
             return
         role = "caster" if str(role or "").lower() == "caster" else "analyst"
+        # 역할별 독립 재생 정책: 캐스터와 해설자는 서로 다른 QMediaPlayer로 재생하므로
+        # 서로 막거나 끊지 않는다. 같은 역할끼리만 겹침을 방지한다.
         if bool((getattr(self, "_commentary_tts_busy", {}) or {}).get(role, False)):
             logging.info("COMMENTARY_TTS_SKIP_BUSY role=%s text=%s", role, text)
             return
@@ -17698,6 +18068,7 @@ class MainApp(QObject):
             )
             return
 
+        request_started_at = time.time()
         def _worker():
             media_path = ""
             try:
@@ -17732,6 +18103,20 @@ class MainApp(QObject):
                         Q_ARG(str, role),
                     )
                     return
+                try:
+                    elapsed_gen = time.time() - float(request_started_at or time.time())
+                    urgent = bool(re.search(r"다운|쓰러|녹아웃|TKO|케이오|시작|종료|휴식|위험", text, re.IGNORECASE))
+                    if elapsed_gen > 3.2 and not urgent:
+                        logging.info("COMMENTARY_TTS_DROP_STALE role=%s elapsed=%.2f text=%s", role, elapsed_gen, text)
+                        QMetaObject.invokeMethod(
+                            self,
+                            "_clear_commentary_tts_busy",
+                            Qt.ConnectionType.QueuedConnection,
+                            Q_ARG(str, role),
+                        )
+                        return
+                except Exception:
+                    pass
                 QMetaObject.invokeMethod(
                     self,
                     "_play_commentary_tts_file",
@@ -17786,37 +18171,184 @@ class MainApp(QObject):
             volume = float(getattr(self.cfg, "spectator_commentary_volume", 100.0) or 100.0)
             pitch = int(getattr(self.cfg, "spectator_commentary_pitch", 0) or 0)
             jobs = []
-            for text in (
-                "Strong uppercut", "Strong overhand", "Hit to chin", "Hit to nose",
-                "Clean body shot", "Good counter", "Heavy damage", "Nice combo",
-            ):
-                jobs.append(("analyst", analyst_voice, text))
-            for text in (
+            analyst_lines = (
+                "둘 다 먼저 가긴 싫죠.",
+                "서로 오라고만 합니다.",
+                "눈치 싸움 길어집니다.",
+                "아직 간만 봅니다.",
+                "앞손이 오늘 바쁩니다.",
+                "잽 출근률 높습니다.",
+                "작은 잽도 귀찮습니다.",
+                "폼은 멋졌습니다.",
+                "공기는 맞았습니다.",
+                "방금은 안 맞았습니다.",
+                "이러면 피곤합니다.",
+                "수비가 바빠집니다.",
+                "팔은 많이 나갔습니다.",
+                "운동량은 확실합니다.",
+                "카운터가 정확하게 들어갑니다.",
+                "받아치는 타이밍이 좋았습니다.",
+                "반격이 정확했습니다.",
+                "들어오는 순간 받아쳤습니다.",
+                "상대 진입을 잘 읽었습니다.",
+                "좋은 반응이었습니다.",
+                "무리한 진입을 바로 받아칩니다.",
+                "상대 움직임을 읽고 정타를 만듭니다.",
+                "좋은 콤비네이션이었습니다.",
+                "연타가 이어집니다.",
+                "첫 타 이후 연결이 좋았습니다.",
+                "수비가 따라가지 못했습니다.",
+                "짧은 교전에서 연결이 깔끔했습니다.",
+                "한 번 열리자 후속타가 이어졌습니다.",
+                "공격 흐름이 끊기지 않습니다.",
+                "정타가 연속으로 들어갑니다.",
+                "잽 타이밍이 좋았습니다.",
+                "앞손이 정확하게 들어갑니다.",
+                "직선 타격이 정확하게 들어갑니다.",
+                "수비가 늦었습니다.",
+                "큰 타격이 들어갑니다.",
+                "데미지가 큽니다.",
+                "한 방 한 방의 데미지가 큽니다.",
+                "강하게 들어갔습니다.",
+                "정타를 만들어냅니다.",
+                "한 방의 충격이 큽니다.",
+                "턱 쪽 충격이 컸습니다.",
+                "턱에 정확하게 들어갔습니다.",
+                "바디에 제대로 들어갔습니다.",
+                "바디 충격이 큽니다.",
+                "관자놀이 쪽 충격이 큽니다.",
+                "머리 쪽 데미지가 큽니다.",
+                "얼굴 쪽 정타를 허용합니다.",
+                "얼굴 쪽 데미지가 쌓입니다.",
+                "압박이 계속됩니다.",
+                "데미지가 쌓이고 있습니다.",
+                "체력 부담이 커지고 있습니다.",
+                "위험 구간에 들어갑니다.",
+                "회복할 시간이 필요합니다.",
+                "데미지 부담이 상당히 커졌습니다.",
+                "짧은 시간에 데미지가 크게 쌓였습니다.",
+                "공격 주도권을 잡고 있습니다.",
+                "수비 부담이 커지고 있습니다.",
+                "정타 허용이 많아지고 있습니다.",
+                "턱 쪽 정타가 반복되고 있습니다.",
+                "바디 데미지가 쌓이고 있습니다.",
+                "머리 쪽 충격이 쌓입니다.",
+                "얼굴 쪽 데미지가 계속 쌓입니다.",
+                "다운 장면이 라운드 흐름을 크게 바꿨습니다.",
+                "크게 흔들리는 장면이 있었습니다.",
+                "바디 데미지가 쌓인 라운드였습니다.",
+                "후반에는 압박이 살아나면서 분위기가 바뀌었습니다.",
+                "이번 라운드는 서로 정타를 주고받은 라운드였습니다.",
+                "다음 라운드는 정타 허용을 줄이는 게 중요합니다.",
+                "지금은 회복 시간을 어떻게 쓰느냐가 중요합니다.",
+                "정타가 잠시 끊긴 만큼, 호흡을 다시 잡는 구간입니다.",
+                "데미지 부담이 있는 쪽은 무리한 진입을 피해야 합니다.",
+                "잠깐의 소강상태지만, 체력 회복에는 중요한 시간입니다.",
+                "이 구간은 거리 조절이 중요합니다.",
+                "무리하게 들어가면 카운터 위험이 있습니다.",
+                "서로 먼저 실수하지 않으려는 흐름입니다.",
+                "지금은 첫 진입보다 이후 수비 반응이 중요합니다.",
+            )
+            caster_lines = (
+                "잠시 소강상태입니다.",
+                "서로 타이밍을 봅니다.",
+                "아직 아무도 안 들어갑니다.",
+                "거리 싸움이 이어집니다.",
+                "눈치게임입니다.",
+                "서로 간만 봅니다.",
+                "잠깐 멈췄습니다.",
+                "라운드 막판입니다.",
+                "마지막 교전이 중요합니다.",
+                "막판입니다, 한 방 조심해야 합니다.",
+                "경기 시작합니다!",
+                "1라운드 시작합니다",
+                "2라운드 시작합니다",
+                "마지막 라운드, 3라운드 시작합니다",
+                "1라운드 종료, 휴식 시간입니다",
+                "2라운드 종료, 휴식 시간입니다",
+                "마지막 라운드 종료, 경기 결과를 기다립니다",
                 "크게 흔들립니다!",
-                "블루, 다운 당합니다", "레드, 다운 당합니다",
-                "블루, 테크니컬 녹아웃 당합니다", "레드, 테크니컬 녹아웃 당합니다",
-            ):
+                "위험합니다!",
+                "충격이 큽니다!",
+                "다운 당합니다!",
+                "쓰러집니다!",
+                "테크니컬 녹아웃입니다!",
+                "심판이 경기를 멈춥니다!",
+                "경기가 끝납니다!",
+                "잠시 소강상태입니다.",
+                "서로 거리를 재고 있습니다.",
+                "두 선수, 다시 타이밍을 보고 있습니다.",
+                "정타가 잠시 끊겼습니다.",
+                "다음 진입 타이밍을 보고 있습니다.",
+                "중앙을 두고 다시 기회를 봅니다.",
+                "서로 쉽게 들어가지 않습니다.",
+                "큰 교전 전의 짧은 소강상태입니다.",
+                "라운드 막판입니다, 마지막 교전이 중요합니다.",
+                "남은 시간이 많지 않습니다.",
+                "막판 한 번의 정타가 인상에 남을 수 있습니다.",
+                "마지막 진입 타이밍을 보고 있습니다.",
+            )
+            for text in analyst_lines:
+                jobs.append(("analyst", analyst_voice, text))
+            for text in caster_lines:
                 jobs.append(("caster", caster_voice, text))
+            # 현재 SpectatorLog에 선수명이 이미 잡혀 있으면 큰 사건 이름 포함 멘트도 미리 캐시한다.
+            try:
+                root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
+                current_names = []
+                for side in ("blue", "red"):
+                    try:
+                        name_path = os.path.join(root, side, "name.txt")
+                        raw_name = open(name_path, "r", encoding="utf-8-sig", errors="ignore").read().strip()
+                    except Exception:
+                        raw_name = ""
+                    raw_name = re.split(r"[\s\.,_#@\-]+", str(raw_name or "").strip(), maxsplit=1)[0].strip()
+                    raw_name = re.sub(r"[^0-9A-Za-z가-힣]+", "", raw_name).strip()
+                    if raw_name and len(raw_name) > 3 and not re.search(r"\d", raw_name):
+                        current_names.append(raw_name)
+                for name in list(dict.fromkeys(current_names))[:2]:
+                    for tail in ("크게 흔들립니다!", "위험합니다!", "다운 당합니다!", "쓰러집니다!", "테크니컬 녹아웃입니다!"):
+                        jobs.append(("caster", caster_voice, f"{name}, {tail}"))
+            except Exception:
+                pass
 
             def _worker():
                 warmed = 0
-                for role, voice, text in jobs:
+                skipped = 0
+                failed = 0
+                # Console-safe prewarm: Edge TTS/network failures can otherwise spam the console
+                # for every candidate line at startup. Stop after a few failures and let normal
+                # on-demand caching handle the rest. Existing cache files are still used instantly.
+                max_failures = 3
+                max_jobs = 16
+                for role, voice, text in list(jobs)[:max_jobs]:
                     try:
                         path = self._commentary_tts_cache_path(text, role, voice, rate, volume, pitch)
                         if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+                            skipped += 1
                             continue
-                        if self.action_runner._edge_save_cli(
+                        ok = self.action_runner._edge_save_cli(
                             text,
                             path,
                             voice,
                             self.action_runner._edge_rate(rate),
                             self.action_runner._edge_volume(volume),
                             self.action_runner._edge_pitch(pitch),
-                        ):
+                        )
+                        if ok:
                             warmed += 1
-                    except Exception:
-                        pass
-                logging.info("COMMENTARY_TTS_PREWARM_DONE count=%s", warmed)
+                            failed = 0
+                        else:
+                            failed += 1
+                            if failed >= max_failures:
+                                logging.warning("COMMENTARY_TTS_PREWARM_STOP failed=%s warmed=%s skipped=%s", failed, warmed, skipped)
+                                break
+                    except Exception as e:
+                        failed += 1
+                        if failed >= max_failures:
+                            logging.warning("COMMENTARY_TTS_PREWARM_STOP err=%s warmed=%s skipped=%s", e, warmed, skipped)
+                            break
+                logging.info("COMMENTARY_TTS_PREWARM_DONE warmed=%s skipped=%s failed=%s jobs=%s", warmed, skipped, failed, min(len(jobs), max_jobs))
 
             threading.Thread(target=_worker, daemon=True).start()
         except Exception as e:
@@ -17874,6 +18406,46 @@ class MainApp(QObject):
                 self._commentary_tts_busy[role] = False
         except Exception:
             pass
+
+    def _stop_commentary_tts_role(self, role: str, reason: str = ""):
+        try:
+            role = "caster" if str(role or "").lower() == "caster" else "analyst"
+            try:
+                epoch = getattr(self, "_commentary_followup_epoch", None)
+                if isinstance(epoch, dict):
+                    epoch[role] = int(epoch.get(role, 0) or 0) + 1
+            except Exception:
+                pass
+            keep_current_sentence = (role == "analyst" and str(reason or "").lower() == "round_start")
+            player = (getattr(self, "_commentary_players", {}) or {}).get(role)
+            if player is not None and not keep_current_sentence:
+                try:
+                    player.stop()
+                except Exception:
+                    pass
+            old = [] if keep_current_sentence else list((getattr(self, "_commentary_tts_files", {}) or {}).get(role, []) or [])
+            if not keep_current_sentence:
+                try:
+                    self._commentary_tts_files[role] = []
+                except Exception:
+                    pass
+            cache_dir = os.path.abspath(str(getattr(self, "_commentary_tts_cache_dir", "") or ""))
+            for path in old:
+                try:
+                    path_abs = os.path.abspath(str(path or ""))
+                    if cache_dir and os.path.dirname(path_abs) == cache_dir:
+                        continue
+                    os.remove(path_abs)
+                except Exception:
+                    pass
+            if not keep_current_sentence:
+                try:
+                    self._commentary_tts_busy[role] = False
+                except Exception:
+                    pass
+            logging.info("COMMENTARY_TTS_STOP role=%s reason=%s keep_current=%s", role, reason, keep_current_sentence)
+        except Exception:
+            logging.exception("COMMENTARY_TTS_STOP_FAIL")
 
     @pyqtSlot(str)
     def _clear_commentary_tts_busy(self, role: str):
@@ -19003,15 +19575,52 @@ class MainApp(QObject):
         )
 
     def _log_detection_running(self) -> bool:
+        # When the user clicks the log toggle while running, stop must not block the UI.
+        # During async shutdown we intentionally report "not running" immediately so the
+        # top overlay button and settings button do not stay red or accept another stop.
+        if bool(getattr(self, "_log_detector_stopping", False)):
+            return False
         return bool(getattr(self, "spectator_watcher", None) and self.spectator_watcher.is_running())
 
-    def _start_spectator_watcher_if_enabled(self):
+    def _set_spectatorlog_enabled_runtime(self, enabled: bool, *, save: bool = True) -> None:
+        enabled = bool(enabled)
+        try:
+            self.cfg.spectatorlog_enabled = enabled
+        except Exception:
+            pass
+        try:
+            if self.settings_dlg and hasattr(self.settings_dlg, "chk_spectatorlog_enabled"):
+                self.settings_dlg._suspend_apply = True
+                self.settings_dlg.chk_spectatorlog_enabled.setChecked(enabled)
+        except Exception:
+            pass
+        finally:
+            try:
+                if self.settings_dlg:
+                    self.settings_dlg._suspend_apply = False
+            except Exception:
+                pass
+        if save:
+            try:
+                self.cfg.to_json(self.cfg_path)
+            except Exception:
+                pass
+
+    def _start_spectator_watcher_if_enabled(self, *, force_enable: bool = False):
+        if force_enable and not bool(getattr(self.cfg, "spectatorlog_enabled", False)):
+            self._set_spectatorlog_enabled_runtime(True)
         if not bool(getattr(self.cfg, "spectatorlog_enabled", False)):
             if getattr(self, "spectator_watcher", None) and self.spectator_watcher.is_running():
-                self.spectator_watcher.stop()
+                # Do not stop the Windows directory watcher on the GUI thread.
+                self._stop_log_detector()
             return
         if getattr(self, "spectator_watcher", None) and not self.spectator_watcher.is_running():
             self.spectator_watcher.start()
+            try:
+                root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
+                self.timer_win.set_status(f"SpectatorLog 감시 시작: {root}")
+            except Exception:
+                pass
 
     def _start_screen_detector(self):
         if self.watcher:
@@ -19066,24 +19675,86 @@ class MainApp(QObject):
         self._update_backend_detect_flags()
 
     def _start_log_detector(self):
-        self._start_spectator_watcher_if_enabled()
+        if bool(getattr(self, "_log_detector_transition", False)):
+            try:
+                self.timer_win.set_status("SpectatorLog 감시 전환 중")
+            except Exception:
+                pass
+            return
+        self._log_detector_stopping = False
+        # Overlay/QML "log detect" start must also enable SpectatorLog on first-run
+        # release builds.  The public build intentionally does not ship SWa's
+        # config.json, so spectatorlog_enabled starts false unless we force it here.
+        self._start_spectator_watcher_if_enabled(force_enable=True)
         if self.settings_dlg:
             self.settings_dlg._sync_watcher_labels()
+            try:
+                self.settings_dlg._refresh_spectatorlog_state()
+            except Exception:
+                pass
         self._update_backend_detect_flags()
 
-    def _stop_log_detector(self):
-        if getattr(self, "spectator_watcher", None) and self.spectator_watcher.is_running():
-            self.spectator_watcher.stop()
+    def _finish_log_detector_stop(self):
+        self._log_detector_transition = False
+        self._log_detector_stopping = False
         if self.settings_dlg:
             self.settings_dlg._sync_watcher_labels()
+            try:
+                self.settings_dlg._refresh_spectatorlog_state()
+            except Exception:
+                pass
         self._update_backend_detect_flags()
+        try:
+            self.timer_win.set_status("SpectatorLog 감시 중지")
+        except Exception:
+            pass
+
+    def _stop_log_detector(self):
+        watcher = getattr(self, "spectator_watcher", None)
+        if bool(getattr(self, "_log_detector_transition", False)):
+            return
+        self._log_detector_transition = True
+        self._log_detector_stopping = True
+        # Treat the top menu toggle as a real off switch, not only a thread stop.
+        # This prevents Settings auto-apply from immediately starting the watcher again.
+        try:
+            self._set_spectatorlog_enabled_runtime(False)
+        except Exception:
+            pass
+        try:
+            self.timer_win._backend.set_log_detect_running(False)
+        except Exception:
+            pass
+        if self.settings_dlg:
+            self.settings_dlg._sync_watcher_labels()
+            try:
+                self.settings_dlg._refresh_spectatorlog_state()
+            except Exception:
+                pass
+        self._update_backend_detect_flags()
+
+        def _job():
+            try:
+                if watcher is not None:
+                    watcher.stop()
+            except Exception:
+                logging.exception("SPECTATORLOG_ASYNC_STOP_FAIL")
+            finally:
+                # Never block the GUI thread waiting for ReadDirectoryChangesW/handle cleanup.
+                try:
+                    self._log_stop_finished.emit()
+                except Exception:
+                    self._log_detector_transition = False
+                    self._log_detector_stopping = False
+
+        threading.Thread(target=_job, daemon=True).start()
 
     def _start_detectors(self):
         if self.watcher:
             self.watcher.set_detection_modes(trigger=True, pixel=True)
         if self.watcher and not self.watcher.is_running():
             self.watcher.start()
-        self._start_spectator_watcher_if_enabled()
+        self._start_spectator_watcher_if_enabled(force_enable=True)
         if self.settings_dlg:
             self.settings_dlg._sync_watcher_labels()
         self._update_backend_detect_flags()
@@ -19092,7 +19763,7 @@ class MainApp(QObject):
         if self.watcher and self.watcher.is_running():
             self.watcher.stop()
         if getattr(self, "spectator_watcher", None) and self.spectator_watcher.is_running():
-            self.spectator_watcher.stop()
+            self._stop_log_detector()
         if self.settings_dlg:
             self.settings_dlg._sync_watcher_labels()
         self._update_backend_detect_flags()
@@ -19126,6 +19797,12 @@ class MainApp(QObject):
         self._update_backend_detect_flags()
 
     def _toggle_log_detector(self):
+        if bool(getattr(self, "_log_detector_transition", False)):
+            try:
+                self.timer_win.set_status("SpectatorLog 감시 전환 중")
+            except Exception:
+                pass
+            return
         running = self._log_detection_running()
         if running:
             self._stop_log_detector()
@@ -19369,11 +20046,155 @@ class MainApp(QObject):
         except Exception:
             logging.exception("Failed to run rest-30s TTS")
 
+    def _diagnostic_folder(self) -> str:
+        try:
+            folder = app_path("diagnostics")
+        except Exception:
+            folder = os.path.abspath(os.path.join(os.getcwd(), "diagnostics"))
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception:
+            pass
+        return folder
+
+    def _diagnostic_spectator_root(self) -> str:
+        try:
+            return resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
+        except Exception:
+            return ""
+
+    def _diagnostic_app_state(self) -> dict:
+        try:
+            overlay_state = {}
+            if getattr(self, "browser_overlay", None) is not None:
+                try:
+                    snap = self.browser_overlay.snapshot()
+                    overlay_state = {
+                        "seq": snap.get("seq"),
+                        "events_tail": list((snap.get("events") or [])[-12:]),
+                        "blueHasImage": bool(snap.get("blueHasImage")),
+                        "redHasImage": bool(snap.get("redHasImage")),
+                        "blueName": snap.get("blueName"),
+                        "redName": snap.get("redName"),
+                    }
+                except Exception as exc:
+                    overlay_state = {"error": f"overlay snapshot failed: {exc}"}
+            backend = getattr(getattr(self, "timer_win", None), "_backend", None)
+            return {
+                "app_version": APP_VERSION,
+                "cfg_path": self.cfg_path,
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "timer": {
+                    "round": int(getattr(self.cfg, "timer_current_round", 1) or 1),
+                    "total_rounds": int(getattr(self.cfg, "timer_total_rounds", 3) or 3),
+                    "seconds_left": int(getattr(self.cfg, "timer_seconds_left", 0) or 0),
+                    "round_sec": int(getattr(self.cfg, "timer_round_sec", 180) or 180),
+                    "rest_sec": int(getattr(self.cfg, "timer_rest_sec", 60) or 60),
+                },
+                "spectatorlog": {
+                    "enabled": bool(getattr(self.cfg, "spectatorlog_enabled", False)),
+                    "running": bool(getattr(self, "spectator_watcher", None) and self.spectator_watcher.is_running()),
+                    "path": str(getattr(self.cfg, "spectatorlog_path", "") or ""),
+                    "resolved_path": self._diagnostic_spectator_root(),
+                },
+                "players": {
+                    "blue_id": str(getattr(self, "_current_blue_id", "") or ""),
+                    "red_id": str(getattr(self, "_current_red_id", "") or ""),
+                    "blue_registered": bool(getattr(self, "_current_blue_registered", False)),
+                    "red_registered": bool(getattr(self, "_current_red_registered", False)),
+                },
+                "detectors": {
+                    "screen_running": bool(self._screen_detection_running() if self._screen_detection_running else False),
+                    "log_running": bool(self._log_detection_running() if self._log_detection_running else False),
+                },
+                "overlay": overlay_state,
+                "backend_state": {"exists": bool(backend is not None)},
+                "diagnostics": DIAG.summary(mask_sensitive=True),
+            }
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def _diagnostic_mark_incident(self, note: str = "") -> object:
+        item = DIAG.mark_incident(note or "사용자 문제 발생 표시")
+        try:
+            self.timer_win.set_status("진단: 문제 발생 시점 표시 완료")
+        except Exception:
+            pass
+        return item
+
+    def _diagnostic_export_zip(self) -> str:
+        try:
+            DIAG.set_options(
+                enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
+                max_events=max(500, int(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 500),
+                raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
+                mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
+            )
+        except Exception:
+            pass
+        root = self._diagnostic_spectator_root()
+        overlay_snapshot = {}
+        try:
+            if getattr(self, "browser_overlay", None) is not None:
+                overlay_snapshot = self.browser_overlay.snapshot()
+        except Exception:
+            overlay_snapshot = {"error": "snapshot failed"}
+        path = DIAG.export_zip(
+            self._diagnostic_folder(),
+            app_state=self._diagnostic_app_state(),
+            cfg_snapshot=getattr(self.cfg, "__dict__", {}),
+            spectator_root=root,
+            overlay_snapshot=overlay_snapshot,
+            mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
+            raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
+        )
+        try:
+            self.timer_win.set_status(f"진단 ZIP 생성: {os.path.basename(path)}")
+        except Exception:
+            pass
+        return path
+
+    def _project_snapshot_export_zip(self) -> str:
+        try:
+            DIAG.set_options(
+                enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
+                max_events=max(500, int(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 500),
+                raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
+                mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
+            )
+        except Exception:
+            pass
+        try:
+            project_root = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            project_root = os.getcwd()
+        path = export_project_snapshot(
+            project_root,
+            self._diagnostic_folder(),
+            app_state=self._diagnostic_app_state(),
+            cfg_snapshot=getattr(self.cfg, "__dict__", {}),
+            spectator_root=self._diagnostic_spectator_root(),
+            mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
+            raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
+        )
+        try:
+            self.timer_win.set_status(f"프로젝트 스냅샷 생성: {os.path.basename(path)}")
+        except Exception:
+            pass
+        return path
+
+    def _diagnostic_open_folder(self) -> str:
+        return self._diagnostic_folder()
+
+    def _diagnostic_copy_state(self) -> str:
+        return DIAG.current_state_text(self._diagnostic_app_state())
+
     def open_settings(self):
         if self.settings_dlg and self.settings_dlg.isVisible():
             try:
                 if self.timer_win and hasattr(self.timer_win, "set_overlay_on_top"):
-                    self.timer_win.set_overlay_on_top(True)
+                    # Keep the overlay from covering the settings dialog while it is open.
+                    self.timer_win.set_overlay_on_top(False)
             except Exception:
                 pass
             self.settings_dlg.raise_()
@@ -19381,33 +20202,47 @@ class MainApp(QObject):
             return
         try:
             if self.timer_win and hasattr(self.timer_win, "set_overlay_on_top"):
-                self.timer_win.set_overlay_on_top(True)
+                # Temporarily drop the always-on-top overlay so the settings dialog is visible.
+                self.timer_win.set_overlay_on_top(False)
         except Exception:
             pass
-        self.settings_dlg = SettingsDialog(
-            None,
-            self.cfg,
-            self.controller,
-            self.watcher,
-            self.cfg_path,
-            self.timer_win,
-            chapter_sync_now=self._sync_chapter_anchor_now,
-            chapter_clear=self._clear_chapter_anchor,
-            chapter_export=self._export_chapter_txt,
-            chapter_open=self._open_chapter_txt,
-            chapter_status_getter=self._chapter_anchor_status,
-            action_runner=self.action_runner,
-            player_state_apply=self._apply_saved_player_state,
-            detection_start=self._start_detectors,
-            detection_stop=self._stop_detectors,
-            detection_running=self._detection_running,
-            screen_detection_start=self._start_screen_detector,
-            screen_detection_stop=self._stop_screen_detector,
-            screen_detection_running=self._screen_detection_running,
-            log_detection_start=self._start_log_detector,
-            log_detection_stop=self._stop_log_detector,
-            log_detection_running=self._log_detection_running,
-        )
+        try:
+            self.settings_dlg = SettingsDialog(
+                None,
+                self.cfg,
+                self.controller,
+                self.watcher,
+                self.cfg_path,
+                self.timer_win,
+                chapter_sync_now=self._sync_chapter_anchor_now,
+                chapter_clear=self._clear_chapter_anchor,
+                chapter_export=self._export_chapter_txt,
+                chapter_open=self._open_chapter_txt,
+                chapter_status_getter=self._chapter_anchor_status,
+                action_runner=self.action_runner,
+                player_state_apply=self._apply_saved_player_state,
+                detection_start=self._start_detectors,
+                detection_stop=self._stop_detectors,
+                detection_running=self._detection_running,
+                screen_detection_start=self._start_screen_detector,
+                screen_detection_stop=self._stop_screen_detector,
+                screen_detection_running=self._screen_detection_running,
+                log_detection_start=self._start_log_detector,
+                log_detection_stop=self._stop_log_detector,
+                log_detection_running=self._log_detection_running,
+                diagnostic_mark_incident=self._diagnostic_mark_incident,
+                diagnostic_export_zip=self._diagnostic_export_zip,
+                diagnostic_open_folder=self._diagnostic_open_folder,
+                diagnostic_copy_state=self._diagnostic_copy_state,
+                diagnostic_project_snapshot=self._project_snapshot_export_zip,
+            )
+        except Exception as e:
+            logging.exception("Failed to open settings dialog")
+            try:
+                QMessageBox.critical(None, "설정 오류", f"설정창을 열 수 없습니다.\n\n{e}")
+            except Exception:
+                pass
+            return
         self.settings_dlg.finished.connect(self.on_settings_closed)
         self.settings_dlg.show()
         try:
@@ -19418,11 +20253,18 @@ class MainApp(QObject):
 
     def on_settings_closed(self, _):
         try:
+            if self.timer_win and hasattr(self.timer_win, "set_overlay_on_top"):
+                self.timer_win.set_overlay_on_top(True)
+        except Exception:
+            pass
+        try:
             if bool(getattr(self.cfg, "spectatorlog_enabled", False)):
-                if self.watcher and self.watcher.is_running():
-                    self._start_spectator_watcher_if_enabled()
+                # SpectatorLog detection is independent from screen/OCR detection.
+                # Do not require ScreenWatcher to be running when settings are applied.
+                self._start_spectator_watcher_if_enabled()
             elif getattr(self, "spectator_watcher", None) and self.spectator_watcher.is_running():
-                self.spectator_watcher.stop()
+                # Settings can be closed from the GUI thread; keep SpectatorLog stop async.
+                self._stop_log_detector()
         except Exception:
             pass
         try:
@@ -19467,14 +20309,58 @@ class MainApp(QObject):
             if getattr(self, "browser_overlay", None) is not None:
                 if str(kind or "").lower() == "vs":
                     try:
-                        self._publish_browser_overlay_state()
+                        self.browser_overlay_sync.publish()
                     except Exception:
                         logging.exception("BROWSER_OVERLAY_PREPUBLISH_FAIL kind=%s", kind)
+                try:
+                    DIAG.record("overlay_event_request", kind=str(kind or ""), payload=payload)
+                except Exception:
+                    pass
                 self.browser_overlay.push_event(str(kind or ""), **payload)
                 return True
         except Exception:
             logging.exception("BROWSER_OVERLAY_PUSH_FAIL kind=%s payload=%s", kind, payload)
         return False
+
+    def _push_initial_browser_overlay_settings(self):
+        try:
+            overlay = getattr(self, "browser_overlay", None)
+            if overlay is None:
+                return
+            style_time = dict(getattr(self.cfg, "overlay_style_time", {}) or {})
+            style_round = dict(getattr(self.cfg, "overlay_style_round", {}) or {})
+            overlay.update(
+                overlayBgColor=str(getattr(self.cfg, "overlay_bg_color", "transparent") or "transparent"),
+                overlayBgOpacity=max(0.0, min(1.0, float(getattr(self.cfg, "overlay_bg_opacity", 0.0) or 0.0))),
+                overlayUiScale=float(getattr(self.cfg, "overlay_ui_scale", 1.0) or 1.0),
+                browserOverlayScale=float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),
+                browserFullscreenFxIntensity=max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6))),
+                overlayTimerFontSize=int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54),
+                overlayTimerX=int(getattr(self.cfg, "overlay_timer_x", 0) or 0),
+                overlayTimerY=int(getattr(self.cfg, "overlay_timer_y", 0) or 0),
+                overlayRoundFontSize=int(getattr(self.cfg, "overlay_round_font_size", 11) or 11),
+                overlayRoundX=int(getattr(self.cfg, "overlay_round_x", 0) or 0),
+                overlayRoundY=int(getattr(self.cfg, "overlay_round_y", 0) or 0),
+                overlayTimerOpacity=max(0.0, min(1.0, float(style_time.get("text_opacity", 1.0) or 1.0))),
+                overlayRoundOpacity=max(0.0, min(1.0, float(style_round.get("text_opacity", 1.0) or 1.0))),
+                browserTextStyles=_normalize_browser_text_styles(getattr(self.cfg, "browser_text_styles", {}) or {}),
+                showRound=bool(getattr(self.cfg, "overlay_show_round", True)),
+                showTime=bool(getattr(self.cfg, "overlay_show_time", True)),
+                showBlueImage=bool(getattr(self.cfg, "overlay_show_blue_img", True)),
+                showBlueName=bool(getattr(self.cfg, "overlay_show_blue_name", True)),
+                showRedImage=bool(getattr(self.cfg, "overlay_show_red_img", True)),
+                showRedName=bool(getattr(self.cfg, "overlay_show_red_name", True)),
+                showArenaName=bool(getattr(self.cfg, "overlay_show_arena_name", True)),
+                showFlags=bool(getattr(self.cfg, "overlay_show_flags", True)),
+                showCinematic=bool(getattr(self.cfg, "overlay_show_cinematic", True)),
+                vsBgOpacity=max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))),
+                overlayVsHoldMs=int(max(500, min(15000, float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85) * 1000))),
+            )
+            asset_update = self._sync_browser_overlay_player_assets({})
+            if asset_update:
+                overlay.update(**asset_update)
+        except Exception:
+            logging.exception("BROWSER_OVERLAY_INITIAL_SETTINGS_FAIL")
 
     def _reset_browser_overlay_sp(self) -> None:
         self._browser_sp_ratio = {"blue": 1.0, "red": 1.0}
@@ -19722,7 +20608,7 @@ class MainApp(QObject):
             pass
         try:
             if getattr(self, "browser_overlay", None):
-                self.browser_overlay.update(overlayBgOpacity=float(opacity))
+                self.browser_overlay.update(overlayBgColor=str(color or "transparent"), overlayBgOpacity=float(opacity))
         except Exception:
             pass
         if self.settings_dlg and hasattr(self.settings_dlg, "sl_overlay_opacity"):
@@ -19743,6 +20629,30 @@ class MainApp(QObject):
                         sl.blockSignals(False)
                 except Exception:
                     pass
+
+    def _on_overlay_ui_bg_opacity_changed(self):
+        try:
+            opacity = float(self.timer_win._backend.overlayUiBgOpacity)
+        except Exception:
+            opacity = 0.75
+        opacity = max(0.0, min(1.0, opacity))
+        try:
+            self.cfg.overlay_ui_bg_opacity = opacity
+            self.cfg.to_json(self.cfg_path)
+        except Exception:
+            pass
+
+    def _on_overlay_window_opacity_changed(self):
+        try:
+            opacity = float(self.timer_win._backend.overlayWindowOpacity)
+        except Exception:
+            opacity = 1.0
+        opacity = max(0.2, min(1.0, opacity))
+        try:
+            self.cfg.overlay_window_opacity = opacity
+            self.cfg.to_json(self.cfg_path)
+        except Exception:
+            pass
 
     def on_app_quit(self):
         try:
@@ -19791,9 +20701,14 @@ class MainApp(QObject):
     def check_for_updates(self, silent: bool = False):
         if getattr(self, "_update_check_busy", False):
             if not silent:
-                QMessageBox.information(None, "Update", "Update check is already running.")
+                self._show_update_message("information", "Update", "Update check is already running.")
             return
         self._update_check_busy = True
+        if not silent:
+            try:
+                self.timer_win.set_status("업데이트 확인 중...")
+            except Exception:
+                pass
 
         def _work():
             try:
@@ -19819,27 +20734,73 @@ class MainApp(QObject):
     def _finish_update_check_error(self, msg: str, silent: bool = False):
         self._update_check_busy = False
         if not silent:
-            QMessageBox.warning(None, "Update", f"Update check failed:\n{msg}")
+            self._show_update_message("warning", "Update", f"Update check failed:\n{msg}")
+
+    def _update_dialog_parent(self):
+        try:
+            if getattr(self, "settings_dlg", None) is not None and self.settings_dlg.isVisible():
+                return self.settings_dlg
+        except Exception:
+            pass
+        try:
+            active = QApplication.activeWindow()
+            if isinstance(active, QWidget):
+                return active
+        except Exception:
+            pass
+        return None
+
+    def _show_update_message(self, icon: str, title: str, text: str) -> QMessageBox.StandardButton:
+        box = QMessageBox(self._update_dialog_parent())
+        icon_name = str(icon or "").lower()
+        if icon_name == "warning":
+            box.setIcon(QMessageBox.Icon.Warning)
+        elif icon_name == "critical":
+            box.setIcon(QMessageBox.Icon.Critical)
+        else:
+            box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle(str(title or "Update"))
+        box.setText(str(text or ""))
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setDefaultButton(QMessageBox.StandardButton.Ok)
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        box.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        try:
+            box.raise_()
+            box.activateWindow()
+        except Exception:
+            pass
+        return box.exec()
+
+    def _ask_update_question(self, title: str, text: str) -> QMessageBox.StandardButton:
+        box = QMessageBox(self._update_dialog_parent())
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(str(title or "Update"))
+        box.setText(str(text or ""))
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        box.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        try:
+            box.raise_()
+            box.activateWindow()
+        except Exception:
+            pass
+        return box.exec()
 
     def _handle_update_metadata(self, meta: dict, silent: bool = False):
         latest = str(meta.get("latest") or "")
         if _parse_version(latest) <= _parse_version(APP_VERSION):
             self._update_check_busy = False
             if not silent:
-                QMessageBox.information(None, "Update", f"Already up to date.\nCurrent: {APP_VERSION}")
+                self._show_update_message("information", "Update", f"Already up to date.\nCurrent: {APP_VERSION}")
             return
         notes = str(meta.get("notes") or "")
         msg = f"A new version is available.\n\nCurrent: {APP_VERSION}\nLatest: {latest}"
         if notes:
             msg += f"\n\n{notes}"
         msg += "\n\nDownload it now?"
-        resp = QMessageBox.question(
-            None,
-            "Update",
-            msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
+        resp = self._ask_update_question("Update", msg)
         if resp != QMessageBox.StandardButton.Yes:
             self._update_check_busy = False
             return
@@ -19852,7 +20813,7 @@ class MainApp(QObject):
         if not url:
             self._finish_update_check_error("Missing download URL.")
             return
-        QMessageBox.information(None, "Update", "Downloading update. Please wait.")
+        self._show_update_message("information", "Update", "Downloading update. Please wait.")
 
         def _work():
             try:
@@ -19874,8 +20835,8 @@ class MainApp(QObject):
     def _confirm_apply_update(self, zip_path: str):
         self._update_check_busy = False
         if not getattr(sys, "frozen", False):
-            QMessageBox.information(
-                None,
+            self._show_update_message(
+                "information",
                 "Update",
                 f"Download and checksum verification completed.\nAutomatic replacement is disabled in development mode.\n\n{zip_path}",
             )
@@ -19885,15 +20846,9 @@ class MainApp(QObject):
             app_dir = os.path.dirname(exe_path)
             script = _write_update_script(zip_path, app_dir, exe_path)
         except Exception as e:
-            QMessageBox.warning(None, "Update", f"Failed to prepare update:\n{e}")
+            self._show_update_message("warning", "Update", f"Failed to prepare update:\n{e}")
             return
-        resp = QMessageBox.question(
-            None,
-            "Update",
-            "Download completed.\nClose TimerAuto and apply the update now?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
+        resp = self._ask_update_question("Update", "Download completed.\nClose TimerAuto and apply the update now?")
         if resp != QMessageBox.StandardButton.Yes:
             return
         try:
@@ -19901,7 +20856,7 @@ class MainApp(QObject):
             subprocess.Popen(["cmd", "/c", script], close_fds=True)
             QApplication.quit()
         except Exception as e:
-            QMessageBox.warning(None, "Update", f"Failed to launch updater:\n{e}")
+            self._show_update_message("warning", "Update", f"Failed to launch updater:\n{e}")
 
     def _global_pick_busy(self) -> bool:
         if self._quick_pick_active:
@@ -20180,6 +21135,11 @@ class MainApp(QObject):
                 log_detection_start=self._start_log_detector,
                 log_detection_stop=self._stop_log_detector,
                 log_detection_running=self._log_detection_running,
+                diagnostic_mark_incident=self._diagnostic_mark_incident,
+                diagnostic_export_zip=self._diagnostic_export_zip,
+                diagnostic_open_folder=self._diagnostic_open_folder,
+                diagnostic_copy_state=self._diagnostic_copy_state,
+                diagnostic_project_snapshot=self._project_snapshot_export_zip,
             )
             self.settings_dlg.finished.connect(self.on_settings_closed)
         dlg = PixelActionDialog(None, self.settings_dlg, gx, gy, bgr)
@@ -20397,6 +21357,75 @@ class MainApp(QObject):
             self._hotkey_last_fired["action_test"] = time.time()
             return
 
+    def _portrait_priority_mode(self) -> str:
+        mode = str(getattr(self.cfg, "portrait_source_priority", "log") or "log").strip().lower()
+        return "profile" if mode in ("profile", "profiles", "registered", "player", "players") else "log"
+
+    def _profile_portrait_path_for_gid(self, gid: str) -> str:
+        try:
+            return resolve_player_image_path(_player_image_path_for_gid(self.cfg, str(gid or "").upper().strip()))
+        except Exception:
+            return ""
+
+    def _log_portrait_path_for_side(self, side: str) -> str:
+        try:
+            root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
+            candidate = os.path.join(root, str(side or "").lower().strip(), "portrait.png")
+            return candidate if os.path.isfile(candidate) else ""
+        except Exception:
+            return ""
+
+    def _read_portrait_image_path(self, path: str):
+        try:
+            if path and os.path.isfile(path):
+                return safe_cv2_imread(path, cv2.IMREAD_UNCHANGED)
+        except Exception:
+            logging.debug("PORTRAIT_READ_FAIL path=%s", path, exc_info=True)
+        return None
+
+    def _resolve_portrait_image(self, side: str, gid: str, log_img=_NO_UPDATE):
+        """Return (image_or_none, source).
+        source is log/profile/empty/no_update. In log-priority mode profile image is not used as fallback.
+        """
+        mode = self._portrait_priority_mode()
+        side = str(side or "").lower().strip()
+        gid = str(gid or "").upper().strip()
+
+        def _valid_img(img):
+            try:
+                return img is not None and img is not _NO_UPDATE and getattr(img, "size", 0) > 0
+            except Exception:
+                return False
+
+        if mode == "profile":
+            profile_path = self._profile_portrait_path_for_gid(gid)
+            profile_img = self._read_portrait_image_path(profile_path) if profile_path else None
+            if _valid_img(profile_img):
+                logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=profile path=%s", side, profile_path)
+                return profile_img, "profile"
+            if _valid_img(log_img):
+                logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=log payload=1", side)
+                return log_img, "log"
+            log_path = self._log_portrait_path_for_side(side)
+            log_img2 = self._read_portrait_image_path(log_path) if log_path else None
+            if _valid_img(log_img2):
+                logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=log path=%s", side, log_path)
+                return log_img2, "log"
+            logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=empty", side)
+            return None, "empty"
+
+        # default: current match log portrait only. Do not fall back to registered profile photo.
+        if _valid_img(log_img):
+            logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=log payload=1", side)
+            return log_img, "log"
+        log_path = self._log_portrait_path_for_side(side)
+        log_img2 = self._read_portrait_image_path(log_path) if log_path else None
+        if _valid_img(log_img2):
+            logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=log path=%s", side, log_path)
+            return log_img2, "log"
+        logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=empty", side)
+        return None, "empty"
+
     def _sync_browser_overlay_player_assets(self, d: Optional[dict] = None) -> dict:
         update: Dict[str, Any] = {}
         try:
@@ -20446,21 +21475,20 @@ class MainApp(QObject):
                     continue
                 if side == "red" and "red_player_img" in d:
                     continue
-                if overlay.image_path(side):
+                id_key = "blue_player_id" if side == "blue" else "red_player_id"
+                name_key = "blue_name" if side == "blue" else "red_name"
+                # If a fresh player ID/name update arrived, do not keep an old
+                # browser image just because that side already has an image path.
+                # Reload from the registered profile image or SpectatorLog portrait.
+                if overlay.image_path(side) and id_key not in d and name_key not in d:
                     continue
-                path = resolve_player_image_path(_player_image_path_for_gid(self.cfg, gid))
-                if not path:
-                    try:
-                        root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
-                        candidate = os.path.join(root, side, "portrait.png")
-                        if os.path.isfile(candidate):
-                            path = candidate
-                    except Exception:
-                        path = ""
-                if path and os.path.isfile(path):
-                    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-                    if img is not None and getattr(img, "size", 0) > 0:
-                        overlay.set_image(side, img)
+                img, src = self._resolve_portrait_image(side, gid, _NO_UPDATE)
+                if img is not _NO_UPDATE and img is not None and getattr(img, "size", 0) > 0:
+                    overlay.set_image(side, img)
+                elif id_key in d or name_key in d:
+                    # Fresh fighter update but no portrait found: clear the old
+                    # side image instead of leaving a stale previous portrait.
+                    overlay.set_image(side, None)
             update["blueHasImage"] = bool(overlay.image_path("blue"))
             update["redHasImage"] = bool(overlay.image_path("red"))
             try:
@@ -20479,8 +21507,11 @@ class MainApp(QObject):
                 style_time = dict(getattr(self.cfg, "overlay_style_time", {}) or {})
                 style_round = dict(getattr(self.cfg, "overlay_style_round", {}) or {})
                 update.update({
+                    "overlayBgColor": str(getattr(self.cfg, "overlay_bg_color", "transparent") or "transparent"),
+                    "overlayBgOpacity": max(0.0, min(1.0, float(getattr(self.cfg, "overlay_bg_opacity", 0.0) or 0.0))),
                     "overlayUiScale": float(getattr(self.cfg, "overlay_ui_scale", 1.0) or 1.0),
                     "browserOverlayScale": float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),
+                    "browserFullscreenFxIntensity": max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6))),
                     "overlayTimerFontSize": int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54),
                     "overlayTimerX": int(getattr(self.cfg, "overlay_timer_x", 0) or 0),
                     "overlayTimerY": int(getattr(self.cfg, "overlay_timer_y", 0) or 0),
@@ -20489,6 +21520,28 @@ class MainApp(QObject):
                     "overlayRoundY": int(getattr(self.cfg, "overlay_round_y", 0) or 0),
                     "overlayTimerOpacity": max(0.0, min(1.0, float(style_time.get("text_opacity", 1.0) or 1.0))),
                     "overlayRoundOpacity": max(0.0, min(1.0, float(style_round.get("text_opacity", 1.0) or 1.0))),
+                    "vsBgOpacity": max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))),
+                    "overlayVsHoldMs": int(max(500, min(15000, float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85) * 1000))),
+                    "hitFxMinDamage": max(0.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0)),
+                    "hitFxColorPreset": str(getattr(self.cfg, "spectator_hit_effect_color_preset", "classic") or "classic"),
+                    "hitFxColorLow": str(getattr(self.cfg, "spectator_hit_effect_color_low", "#38bdf8") or "#38bdf8"),
+                    "hitFxColorMid": str(getattr(self.cfg, "spectator_hit_effect_color_mid", "#fb923c") or "#fb923c"),
+                    "hitFxColorHigh": str(getattr(self.cfg, "spectator_hit_effect_color_high", "#f87171") or "#f87171"),
+                    "hitFxColorWeak": str(getattr(self.cfg, "spectator_hit_effect_color_weak", "#facc15") or "#facc15"),
+                    "hitFxColorStun": str(getattr(self.cfg, "spectator_hit_effect_color_stun", "#ef4444") or "#ef4444"),
+                    "hitFxDurationMs": int(max(80, min(1200, int(getattr(self.cfg, "spectator_hit_effect_duration_ms", 170) or 170)))),
+                    "hitFxPopMs": int(max(30, min(280, int(getattr(self.cfg, "spectator_hit_effect_pop_ms", 58) or 58)))),
+                    "hitFxBaseSize": int(max(24, min(240, int(getattr(self.cfg, "spectator_hit_effect_base_size", 86) or 86)))),
+                    "hitFxDamageScale": float(max(0.0, min(3.0, float(getattr(self.cfg, "spectator_hit_effect_damage_scale", 0.42) or 0.42)))),
+                    "hitFxRingWidth": int(max(1, min(20, int(getattr(self.cfg, "spectator_hit_effect_ring_width", 4) or 4)))),
+                    "hitFxOpacity": float(max(0.05, min(1.5, float(getattr(self.cfg, "spectator_hit_effect_opacity", 1.0) or 1.0)))),
+                    "hitFxGlow": float(max(0.0, min(3.0, float(getattr(self.cfg, "spectator_hit_effect_glow", 1.0) or 1.0)))),
+                    "hitFxFillOpacity": float(max(0.0, min(1.5, float(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0) or 1.0)))),
+                    "hitFxShowText": bool(getattr(self.cfg, "spectator_hit_effect_show_text", True)),
+                    "hitFxTextScale": float(max(0.5, min(2.0, float(getattr(self.cfg, "spectator_hit_effect_text_scale", 1.0) or 1.0)))),
+                    "hitFxLatencyLog": bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)),
+                    "hitFxSpriteEnabled": bool(getattr(self.cfg, "spectator_hit_effect_sprite_enabled", True)),
+                    "hitFxRingEnabled": bool(getattr(self.cfg, "spectator_hit_effect_ring_enabled", False)),
                 })
             except Exception:
                 pass
@@ -20523,6 +21576,94 @@ class MainApp(QObject):
                     return current, max(0.0, base - current)
                 except Exception:
                     return 1.0, 0.0
+
+            impact_events_pushed = False
+
+            def _push_hit_impacts_fast():
+                nonlocal impact_events_pushed
+                if impact_events_pushed:
+                    return
+                impact_events_pushed = True
+                for ev in list(d.get("spectator_hit_effect_events") or []):
+                    ev = dict(ev or {})
+                    side = str(ev.get("side") or "")
+                    damage = _num(ev.get("damage", 0.0), 0.0)
+                    effect_kind = str(ev.get("effect_kind") or "").lower()
+                    threshold = max(0.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0))
+                    if effect_kind not in ("stun", "tko", "knockdown", "down") and damage < threshold:
+                        continue
+                    try:
+                        sx = float(ev.get("screen_x", ev.get("screenX")))
+                        sy = float(ev.get("screen_y", ev.get("screenY")))
+                    except Exception:
+                        continue
+                    try:
+                        now_perf_ms = time.perf_counter() * 1000.0
+                        seen = getattr(self, "_browser_hitfx_seen", None)
+                        if not isinstance(seen, dict):
+                            seen = {}
+                            self._browser_hitfx_seen = seen
+                        for _k, _at in list(seen.items()):
+                            try:
+                                if now_perf_ms - float(_at) > 1200.0:
+                                    seen.pop(_k, None)
+                            except Exception:
+                                seen.pop(_k, None)
+                        hitfx_key = str(ev.get("hitfx_key") or ev.get("hitfxKey") or "%s|%.2f|%.4f|%.4f|%.3f|%s" % (
+                            side, damage, sx, sy, _num(ev.get("event_time", ev.get("eventTime")), 0.0), str(ev.get("punch") or "")
+                        ))
+                        if hitfx_key in seen:
+                            continue
+                        seen[hitfx_key] = now_perf_ms
+                    except Exception:
+                        hitfx_key = ""
+                        now_perf_ms = time.perf_counter() * 1000.0
+                    try:
+                        if bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)):
+                            detect_perf_ms = ev.get("hitfx_detect_perf_ms", None)
+                            watcher_to_push = None
+                            try:
+                                watcher_to_push = now_perf_ms - float(detect_perf_ms)
+                            except Exception:
+                                watcher_to_push = None
+                            logging.info(
+                                "HITFX_LATENCY_PUSH key=%s side=%s dmg=%.2f x=%.4f y=%.4f fast=%s watcher_to_push_ms=%s",
+                                hitfx_key,
+                                side,
+                                damage,
+                                sx,
+                                sy,
+                                bool(d.get("_hitfx_fast_emit", False)),
+                                "" if watcher_to_push is None else ("%.1f" % watcher_to_push),
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        DIAG.record("hitfx_overlay_push_fast", side=side, damage=damage, x=sx, y=sy, effect_kind=effect_kind, key=hitfx_key)
+                    except Exception:
+                        pass
+                    overlay.push_event(
+                        "impact",
+                        side=side,
+                        damage=damage,
+                        effectKind=effect_kind,
+                        attackerSide=str(ev.get("attacker_side") or ""),
+                        punch=str(ev.get("punch") or ""),
+                        weakPoint=str(ev.get("weak_point") or ""),
+                        counterMult=_num(ev.get("counter_mult", ev.get("counterMult", 1.0)), 1.0),
+                        isCounter=bool(ev.get("is_counter") or ev.get("isCounter")),
+                        coordSource=str(ev.get("coord_source") or ""),
+                        gloveHand=str(ev.get("glove_hand") or ""),
+                        screenX=sx,
+                        screenY=sy,
+                        eventTime=_num(ev.get("event_time", ev.get("eventTime")), 0.0),
+                        hitfxKey=hitfx_key,
+                        pushPerfMs=now_perf_ms,
+                    )
+
+            # Absolute priority: push impact before image/name/report/state-heavy work.
+            if bool(getattr(self.cfg, "spectator_hit_effect_fast_emit", True)) and d.get("spectator_hit_effect_events"):
+                _push_hit_impacts_fast()
 
             update = {}
             if "blue_name" in d:
@@ -20680,8 +21821,12 @@ class MainApp(QObject):
                 "overlay_show_arena_name": "showArenaName",
                 "overlay_show_flags": "showFlags",
                 "overlay_show_cinematic": "showCinematic",
+                "overlay_bg_color": "overlayBgColor",
+                "overlay_bg_opacity": "overlayBgOpacity",
                 "overlay_ui_scale": "overlayUiScale",
                 "browser_overlay_scale": "browserOverlayScale",
+                "overlay_vs_bg_opacity": "vsBgOpacity",
+                "browser_fullscreen_fx_intensity": "browserFullscreenFxIntensity",
                 "overlay_timer_font_size": "overlayTimerFontSize",
                 "overlay_timer_x": "overlayTimerX",
                 "overlay_timer_y": "overlayTimerY",
@@ -20690,12 +21835,42 @@ class MainApp(QObject):
                 "overlay_round_y": "overlayRoundY",
                 "overlay_timer_opacity": "overlayTimerOpacity",
                 "overlay_round_opacity": "overlayRoundOpacity",
+                "spectator_hit_effect_damage": "hitFxMinDamage",
+                "spectator_hit_effect_color_preset": "hitFxColorPreset",
+                "spectator_hit_effect_color_low": "hitFxColorLow",
+                "spectator_hit_effect_color_mid": "hitFxColorMid",
+                "spectator_hit_effect_color_high": "hitFxColorHigh",
+                "spectator_hit_effect_color_weak": "hitFxColorWeak",
+                "spectator_hit_effect_color_stun": "hitFxColorStun",
+                "spectator_hit_effect_duration_ms": "hitFxDurationMs",
+                "spectator_hit_effect_pop_ms": "hitFxPopMs",
+                "spectator_hit_effect_base_size": "hitFxBaseSize",
+                "spectator_hit_effect_damage_scale": "hitFxDamageScale",
+                "spectator_hit_effect_ring_width": "hitFxRingWidth",
+                "spectator_hit_effect_opacity": "hitFxOpacity",
+                "spectator_hit_effect_glow": "hitFxGlow",
+                "spectator_hit_effect_fill_opacity": "hitFxFillOpacity",
+                "spectator_hit_effect_show_text": "hitFxShowText",
+                "spectator_hit_effect_text_scale": "hitFxTextScale",
+                "spectator_hit_effect_latency_log": "hitFxLatencyLog",
+                "spectator_hit_effect_sprite_enabled": "hitFxSpriteEnabled",
+                "spectator_hit_effect_ring_enabled": "hitFxRingEnabled",
             }
             for src, dst in setting_map.items():
                 if src in d:
                     update[dst] = d.get(src)
+            if "overlay_vs_hold_sec" in d:
+                try:
+                    update["overlayVsHoldMs"] = int(max(500, min(15000, float(d.get("overlay_vs_hold_sec", 2.85) or 2.85) * 1000)))
+                except Exception:
+                    pass
+            update.setdefault("overlayBgColor", str(getattr(self.cfg, "overlay_bg_color", "transparent") or "transparent"))
+            update.setdefault("overlayBgOpacity", max(0.0, min(1.0, float(getattr(self.cfg, "overlay_bg_opacity", 0.0) or 0.0))))
+            update.setdefault("vsBgOpacity", max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))))
+            update.setdefault("overlayVsHoldMs", int(max(500, min(15000, float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85) * 1000))))
             update.setdefault("showCinematic", bool(getattr(self.cfg, "overlay_show_cinematic", True)))
             update.setdefault("browserOverlayScale", float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0))
+            update.setdefault("browserFullscreenFxIntensity", max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6))))
             update.setdefault("overlayUiScale", float(getattr(self.cfg, "overlay_ui_scale", 1.0) or 1.0))
             update.setdefault("overlayTimerFontSize", int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54))
             update.setdefault("overlayTimerX", int(getattr(self.cfg, "overlay_timer_x", 0) or 0))
@@ -20703,6 +21878,26 @@ class MainApp(QObject):
             update.setdefault("overlayRoundFontSize", int(getattr(self.cfg, "overlay_round_font_size", 11) or 11))
             update.setdefault("overlayRoundX", int(getattr(self.cfg, "overlay_round_x", 0) or 0))
             update.setdefault("overlayRoundY", int(getattr(self.cfg, "overlay_round_y", 0) or 0))
+            update.setdefault("hitFxMinDamage", max(0.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0)))
+            update.setdefault("hitFxColorPreset", str(getattr(self.cfg, "spectator_hit_effect_color_preset", "classic") or "classic"))
+            update.setdefault("hitFxColorLow", str(getattr(self.cfg, "spectator_hit_effect_color_low", "#38bdf8") or "#38bdf8"))
+            update.setdefault("hitFxColorMid", str(getattr(self.cfg, "spectator_hit_effect_color_mid", "#fb923c") or "#fb923c"))
+            update.setdefault("hitFxColorHigh", str(getattr(self.cfg, "spectator_hit_effect_color_high", "#f87171") or "#f87171"))
+            update.setdefault("hitFxColorWeak", str(getattr(self.cfg, "spectator_hit_effect_color_weak", "#facc15") or "#facc15"))
+            update.setdefault("hitFxColorStun", str(getattr(self.cfg, "spectator_hit_effect_color_stun", "#ef4444") or "#ef4444"))
+            update.setdefault("hitFxDurationMs", int(max(80, min(1200, int(getattr(self.cfg, "spectator_hit_effect_duration_ms", 170) or 170)))))
+            update.setdefault("hitFxPopMs", int(max(30, min(280, int(getattr(self.cfg, "spectator_hit_effect_pop_ms", 58) or 58)))))
+            update.setdefault("hitFxBaseSize", int(max(24, min(240, int(getattr(self.cfg, "spectator_hit_effect_base_size", 86) or 86)))))
+            update.setdefault("hitFxDamageScale", float(max(0.0, min(3.0, float(getattr(self.cfg, "spectator_hit_effect_damage_scale", 0.42) or 0.42)))))
+            update.setdefault("hitFxRingWidth", int(max(1, min(20, int(getattr(self.cfg, "spectator_hit_effect_ring_width", 4) or 4)))))
+            update.setdefault("hitFxOpacity", float(max(0.05, min(1.5, float(getattr(self.cfg, "spectator_hit_effect_opacity", 1.0) or 1.0)))))
+            update.setdefault("hitFxGlow", float(max(0.0, min(3.0, float(getattr(self.cfg, "spectator_hit_effect_glow", 1.0) or 1.0)))))
+            update.setdefault("hitFxFillOpacity", float(max(0.0, min(1.5, float(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0) or 1.0)))))
+            update.setdefault("hitFxShowText", bool(getattr(self.cfg, "spectator_hit_effect_show_text", True)))
+            update.setdefault("hitFxTextScale", float(max(0.5, min(2.0, float(getattr(self.cfg, "spectator_hit_effect_text_scale", 1.0) or 1.0)))))
+            update.setdefault("hitFxLatencyLog", bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)))
+            update.setdefault("hitFxSpriteEnabled", bool(getattr(self.cfg, "spectator_hit_effect_sprite_enabled", True)))
+            update.setdefault("hitFxRingEnabled", bool(getattr(self.cfg, "spectator_hit_effect_ring_enabled", False)))
             try:
                 style_time = dict(getattr(self.cfg, "overlay_style_time", {}) or {})
                 style_round = dict(getattr(self.cfg, "overlay_style_round", {}) or {})
@@ -20712,30 +21907,68 @@ class MainApp(QObject):
                 pass
             overlay.update(**update)
 
+            # Fast path: screen hit FX must be emitted before heavy fullscreen/report events.
+            _push_hit_impacts_fast()
+
             if "round_intro_event" in d:
                 ev = dict(d.get("round_intro_event") or {})
                 overlay.push_event("round_intro", round=ev.get("round", ""))
             if "vs_intro_event" in d:
                 overlay.push_event("vs")
+            if bool(d.get("spectator_round_report_hide")):
+                try:
+                    overlay.push_event("round_report_hide")
+                except Exception:
+                    logging.exception("BROWSER_OVERLAY_ROUND_REPORT_HIDE_FAIL")
+            if "spectator_round_report" in d and isinstance(d.get("spectator_round_report"), dict):
+                report_payload = dict(d.get("spectator_round_report") or {})
+                try:
+                    overlay.push_event("round_report", **report_payload)
+                except Exception:
+                    logging.exception("BROWSER_OVERLAY_ROUND_REPORT_EVENT_FAIL")
+            if bool(d.get("spectator_lobby_hide")):
+                try:
+                    overlay.push_event("lobby_hide")
+                except Exception:
+                    logging.exception("BROWSER_OVERLAY_LOBBY_HIDE_FAIL")
+            # Stage57: lobby/scorecard/winner are kept as data sources only.
+            # The broadcast overlay shows them inside the integrated round/match
+            # report instead of separate floating cards.
+            if "spectator_lobby_overlay" in d and isinstance(d.get("spectator_lobby_overlay"), dict):
+                logging.debug("BROWSER_OVERLAY_LOBBY_CARD_SUPPRESSED")
+            if "spectator_scorecard" in d and isinstance(d.get("spectator_scorecard"), dict):
+                logging.debug("BROWSER_OVERLAY_SCORECARD_CARD_SUPPRESSED")
+            if "spectator_winner" in d and isinstance(d.get("spectator_winner"), dict):
+                logging.debug("BROWSER_OVERLAY_WINNER_CARD_SUPPRESSED")
             for side in list(d.get("stun_flash_sides") or []):
                 overlay.push_event("stun", side=str(side or ""))
             for ev in list(d.get("spectator_effect_events") or []):
                 ev = dict(ev or {})
                 overlay.push_event(str(ev.get("kind") or ""), side=str(ev.get("side") or ""))
-            for ev in list(d.get("spectator_hit_effect_events") or []):
-                ev = dict(ev or {})
-                side = str(ev.get("side") or "")
-                damage = _num(ev.get("damage", 0.0), 0.0)
-                kind = "stun" if str(ev.get("effect_kind") or "").lower() == "stun" else "hit"
-                overlay.push_event(kind, side=side, damage=damage)
+            _push_hit_impacts_fast()
         except Exception:
             logging.exception("BROWSER_OVERLAY_DIRECT_UPDATE_FAIL")
 
     def apply_ui_update(self, d: dict):
+        try:
+            DIAG.record(
+                "ui_update",
+                keys=sorted([str(k) for k in (d or {}).keys()]),
+                hit_effect_count=len(list((d or {}).get("spectator_hit_effect_events") or [])),
+                effect_count=len(list((d or {}).get("spectator_effect_events") or [])),
+                has_round_report=bool((d or {}).get("spectator_round_report")),
+                has_lobby=bool((d or {}).get("spectator_lobby_overlay")),
+                has_scorecard=bool((d or {}).get("spectator_scorecard")),
+                has_winner=bool((d or {}).get("spectator_winner")),
+                fast_emit=bool((d or {}).get("_hitfx_fast_emit", False)),
+            )
+        except Exception:
+            pass
         browser_output_only = bool(getattr(self.cfg, "browser_overlay_output_only", True))
         qml_visuals = not browser_output_only
         if browser_output_only:
             self._apply_browser_overlay_direct_update(d)
+        played_sfx = set()
         clear_match_overlay = bool(d.get("spectator_match_clear", False))
         reset_match_stats = bool(d.get("spectator_match_stats_reset", False))
         if ("blue_player_id" in d or "red_player_id" in d
@@ -20754,7 +21987,11 @@ class MainApp(QObject):
             if "red_player_valid" in d:
                 self._current_red_valid = bool(d.get("red_player_valid"))
             self._sync_current_players_to_config()
-            if qml_visuals:
+            # The app UI must keep showing the current player IDs even when
+            # OBS/browser output is the primary output path.  The previous
+            # browser_output_only gate caused the QML UI nameplate/profile IDs
+            # to stay stale while the browser overlay was updated.
+            try:
                 self.timer_win.set_player_info(
                     self._current_blue_id,
                     self._current_red_id,
@@ -20765,6 +22002,10 @@ class MainApp(QObject):
                 )
                 self._sync_current_player_flags_to_overlay()
                 self._sync_koth_streak_to_overlay()
+                # Portraits are now emitted only at bout start/player-change.
+                # Do not re-resolve the same SpectatorLog portrait on every name/id update.
+            except Exception:
+                logging.exception("PLAYER_INFO_UI_SYNC_FAIL")
         if "koth_winner_id" in d:
             self._apply_koth_winner(
                 d.get("koth_winner_id", ""),
@@ -20773,14 +22014,18 @@ class MainApp(QObject):
                 side=str(d.get("koth_winner_side", "") or ""),
             )
         if "blue_name" in d or "red_name" in d:
-            if qml_visuals:
+            try:
                 self.timer_win.set_names(
                     d.get("blue_name", None),
                     d.get("red_name", None),
                 )
+            except Exception:
+                logging.exception("PLAYER_NAME_UI_SYNC_FAIL")
         if "arena_name" in d:
-            if qml_visuals:
+            try:
                 self.timer_win.set_arena_name(d.get("arena_name", None))
+            except Exception:
+                logging.exception("ARENA_NAME_UI_SYNC_FAIL")
         if "spectator_recent_text_size" in d:
             try:
                 self.cfg.spectator_recent_text_size = int(d.get("spectator_recent_text_size", 23) or 23)
@@ -20803,10 +22048,18 @@ class MainApp(QObject):
                     d.get("red_palette", None),
                 )
         if "blue_player_img" in d or "red_player_img" in d:
-            blue_img = d["blue_player_img"] if "blue_player_img" in d else _NO_UPDATE
-            red_img = d["red_player_img"] if "red_player_img" in d else _NO_UPDATE
-            if qml_visuals:
+            blue_log_img = d["blue_player_img"] if "blue_player_img" in d else _NO_UPDATE
+            red_log_img = d["red_player_img"] if "red_player_img" in d else _NO_UPDATE
+            blue_img = _NO_UPDATE
+            red_img = _NO_UPDATE
+            if blue_log_img is not _NO_UPDATE:
+                blue_img, _src = self._resolve_portrait_image("blue", self._current_blue_id, blue_log_img)
+            if red_log_img is not _NO_UPDATE:
+                red_img, _src = self._resolve_portrait_image("red", self._current_red_id, red_log_img)
+            try:
                 self.timer_win.set_player_images(blue_img, red_img)
+            except Exception:
+                logging.exception("PLAYER_IMAGE_UI_SYNC_FAIL")
             try:
                 if blue_img is not _NO_UPDATE:
                     self.browser_overlay.set_image("blue", blue_img)
@@ -20835,30 +22088,42 @@ class MainApp(QObject):
         if "stun_flash_sides" in d:
             try:
                 for side in list(d.get("stun_flash_sides") or []):
+                    side = str(side or "")
                     if qml_visuals:
-                        self.timer_win.trigger_stun_flash(str(side or ""))
-                    self._play_spectator_sfx("stun")
+                        self.timer_win.trigger_stun_flash(side)
+                    sfx_key = ("stun", side.lower().strip())
+                    if sfx_key not in played_sfx:
+                        played_sfx.add(sfx_key)
+                        self._play_spectator_sfx("stun")
             except Exception:
                 pass
         if "spectator_effect_events" in d:
             try:
                 for ev in list(d.get("spectator_effect_events") or []):
                     kind = str((ev or {}).get("kind") or "")
+                    side = str((ev or {}).get("side") or "")
                     if qml_visuals:
                         self.timer_win.trigger_spectator_effect(
-                            str((ev or {}).get("side") or ""),
+                            side,
                             kind,
                         )
-                    self._play_spectator_sfx(kind)
+                    sfx_key = (kind.lower().strip(), side.lower().strip())
+                    if sfx_key not in played_sfx:
+                        played_sfx.add(sfx_key)
+                        self._play_spectator_sfx(kind)
             except Exception:
                 pass
         if "spectator_hit_effect_events" in d:
             try:
+                hit_threshold = max(0.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0))
                 for ev in list(d.get("spectator_hit_effect_events") or []):
-                    if str((ev or {}).get("effect_kind") or "").lower() == "stun":
+                    effect_kind = str((ev or {}).get("effect_kind") or "").lower()
+                    if effect_kind == "stun":
                         side = str((ev or {}).get("side") or "")
                         if qml_visuals:
                             self.timer_win.trigger_stun_flash(side)
+                        continue
+                    if effect_kind not in ("tko", "knockdown", "down") and float((ev or {}).get("damage", 0.0) or 0.0) < hit_threshold:
                         continue
                     if qml_visuals:
                         self.timer_win.trigger_hit_impact(
@@ -20923,6 +22188,23 @@ class MainApp(QObject):
                     )
             except Exception:
                 logging.exception("CHAPTER_VS_INTRO_APPEND_FAIL")
+        if "commentary_tts_stop_roles" in d:
+            try:
+                stop_reason = str(d.get("commentary_tts_stop_reason") or "")
+                roles = d.get("commentary_tts_stop_roles") or []
+                if isinstance(roles, str):
+                    roles = [roles]
+                for stop_role in list(roles or []):
+                    self._stop_commentary_tts_role(str(stop_role or "analyst"), stop_reason)
+            except Exception:
+                logging.exception("COMMENTARY_TTS_STOP_ROLES_APPLY_FAIL")
+        if "commentary_tts_stop_role" in d:
+            try:
+                stop_role = str(d.get("commentary_tts_stop_role") or "analyst")
+                stop_reason = str(d.get("commentary_tts_stop_reason") or "")
+                self._stop_commentary_tts_role(stop_role, stop_reason)
+            except Exception:
+                logging.exception("COMMENTARY_TTS_STOP_APPLY_FAIL")
         if "commentary_tts_text" in d:
             try:
                 text = str(d.get("commentary_tts_text") or "").strip()
@@ -20938,6 +22220,55 @@ class MainApp(QObject):
                     logging.info("COMMENTARY_TTS text=%s", text)
             except Exception:
                 pass
+        if "commentary_tts_round_summary_text" in d:
+            try:
+                summary_text = str(d.get("commentary_tts_round_summary_text") or "").strip()
+                if summary_text:
+                    try:
+                        delay_ms = int(d.get("commentary_tts_round_summary_delay_ms", 0) or 0)
+                    except Exception:
+                        delay_ms = 0
+                    summary_role = str(d.get("commentary_tts_round_summary_role") or "analyst")
+                    self._schedule_commentary_round_summary_tts(summary_text, summary_role, delay_ms=delay_ms)
+            except Exception:
+                logging.exception("COMMENTARY_TTS_ROUND_SUMMARY_QUEUE_FAIL")
+        if "commentary_tts_followup_text" in d:
+            try:
+                follow_text = str(d.get("commentary_tts_followup_text") or "").strip()
+                if follow_text:
+                    try:
+                        delay_ms = int(d.get("commentary_tts_followup_delay_ms", 1800) or 1800)
+                    except Exception:
+                        delay_ms = 1800
+                    follow_role = str(d.get("commentary_tts_followup_role") or "analyst")
+                    self._schedule_commentary_followup_tts(follow_text, follow_role, delay_ms=delay_ms, retries=6)
+                    logging.info("COMMENTARY_TTS_FOLLOWUP text=%s delay_ms=%s", follow_text, delay_ms)
+            except Exception:
+                pass
+        if "commentary_tts_followups" in d:
+            try:
+                followups = d.get("commentary_tts_followups") or []
+                if isinstance(followups, dict):
+                    followups = [followups]
+                for item in list(followups or []):
+                    if not isinstance(item, dict):
+                        continue
+                    follow_text = str(item.get("text") or item.get("commentary_tts_followup_text") or "").strip()
+                    if not follow_text:
+                        continue
+                    try:
+                        delay_ms = int(item.get("delay_ms", item.get("commentary_tts_followup_delay_ms", 1800)) or 1800)
+                    except Exception:
+                        delay_ms = 1800
+                    try:
+                        retries = int(item.get("retries", 3) or 3)
+                    except Exception:
+                        retries = 3
+                    follow_role = str(item.get("role") or item.get("commentary_tts_followup_role") or "analyst")
+                    self._schedule_commentary_followup_tts(follow_text, follow_role, delay_ms=delay_ms, retries=retries)
+                    logging.info("COMMENTARY_TTS_FOLLOWUP_LIST text=%s delay_ms=%s role=%s", follow_text, delay_ms, follow_role)
+            except Exception:
+                logging.exception("COMMENTARY_TTS_FOLLOWUP_LIST_APPLY_FAIL")
         if "round_current" in d or "round_total" in d or "seconds_left" in d:
             if "spectator_time_mode" in d:
                 try:
@@ -21047,7 +22378,8 @@ class MainApp(QObject):
                 or "overlay_show_arena_name" in d
                 or "overlay_show_flags" in d or "overlay_show_cinematic" in d
                 or "browser_overlay_scale" in d or "browser_overlay_output_only" in d
-                or "qml_preview_enabled" in d):
+                or "browser_fullscreen_fx_intensity" in d
+                or "qml_preview_enabled" in d or "qml_effects_enabled" in d):
             if "browser_overlay_scale" in d:
                 try:
                     self.cfg.browser_overlay_scale = max(0.25, min(4.0, float(d.get("browser_overlay_scale", 1.0) or 1.0)))
@@ -21055,10 +22387,21 @@ class MainApp(QObject):
                     self.cfg.browser_overlay_scale = 1.0
             if "browser_overlay_output_only" in d:
                 self.cfg.browser_overlay_output_only = bool(d.get("browser_overlay_output_only", True))
+            if "browser_fullscreen_fx_intensity" in d:
+                try:
+                    self.cfg.browser_fullscreen_fx_intensity = max(0.0, min(3.0, float(d.get("browser_fullscreen_fx_intensity", 1.6) or 1.6)))
+                except Exception:
+                    self.cfg.browser_fullscreen_fx_intensity = 1.6
             if "qml_preview_enabled" in d:
                 self.cfg.qml_preview_enabled = bool(d.get("qml_preview_enabled", True))
                 try:
                     self.timer_win.set_qml_preview_enabled(self.cfg.qml_preview_enabled)
+                except Exception:
+                    pass
+            if "qml_effects_enabled" in d:
+                self.cfg.qml_effects_enabled = bool(d.get("qml_effects_enabled", False))
+                try:
+                    self.timer_win.set_qml_effects_enabled(self.cfg.qml_effects_enabled)
                 except Exception:
                     pass
             if qml_visuals:
@@ -21106,6 +22449,15 @@ class MainApp(QObject):
                 self.cfg.overlay_vs_hold_sec = max(0.5, min(15.0, float(d.get("overlay_vs_hold_sec", getattr(self.cfg, "overlay_vs_hold_sec", 2.85)))))
             except Exception:
                 self.cfg.overlay_vs_hold_sec = 2.85
+            try:
+                if getattr(self, "browser_overlay", None):
+                    self.browser_overlay.update(**self._sync_browser_overlay_player_assets({}))
+                    self.browser_overlay.update(
+                        vsBgOpacity=float(self.cfg.overlay_vs_bg_opacity),
+                        overlayVsHoldMs=int(max(500, min(15000, float(self.cfg.overlay_vs_hold_sec) * 1000))),
+                    )
+            except Exception:
+                pass
             if qml_visuals:
                 self.timer_win._backend.set_overlay_vs_background(
                     self.cfg.overlay_vs_bg_path,
@@ -21194,106 +22546,6 @@ class MainApp(QObject):
         except Exception:
             pass
 
-    def _publish_browser_overlay_state(self):
-        try:
-            if bool(getattr(self.cfg, "browser_overlay_output_only", True)):
-                try:
-                    update = self._sync_browser_overlay_player_assets({})
-                    if update:
-                        self.browser_overlay.update(**update)
-                except Exception:
-                    pass
-                return
-            b = self.timer_win._backend
-            def _hp_pair(long_value: float, mid_value: float) -> Tuple[float, float]:
-                try:
-                    base = max(0.0, min(1.0, (100.0 - float(long_value or 0.0)) / 100.0))
-                    mid = max(0.0, min(1.0, float(mid_value or 0.0) / 100.0))
-                    current = max(0.0, min(1.0, base * (1.0 - mid)))
-                    return current, max(0.0, base - current)
-                except Exception:
-                    return 1.0, 0.0
-            blue_hp, blue_ghost = _hp_pair(getattr(b, "_blue_punishment_long", 0.0), getattr(b, "_blue_punishment_mid", 0.0))
-            red_hp, red_ghost = _hp_pair(getattr(b, "_red_punishment_long", 0.0), getattr(b, "_red_punishment_mid", 0.0))
-            try:
-                self.browser_overlay.set_asset_path("blueflag", str(getattr(b, "_blue_flag_source", "") or ""))
-                self.browser_overlay.set_asset_path("redflag", str(getattr(b, "_red_flag_source", "") or ""))
-                try:
-                    vs_bg_path = b._resolve_vs_background_path()
-                except Exception:
-                    vs_bg_path = str(getattr(b, "_overlay_vs_bg_path", "") or "")
-                self.browser_overlay.set_asset_path("vsbg", vs_bg_path)
-            except Exception:
-                pass
-            try:
-                revs = getattr(self, "_browser_overlay_image_revs", {})
-                for side in ("blue", "red"):
-                    rev = int(getattr(b, f"_{side}_image_rev", 0) or 0)
-                    if revs.get(side) != rev:
-                        img = self.timer_win._provider.image(side)
-                        self.browser_overlay.set_image(side, img)
-                        revs[side] = rev
-                self._browser_overlay_image_revs = revs
-            except Exception as e:
-                logging.debug("BROWSER_OVERLAY_IMAGE_SYNC skipped: %s", e)
-            self.browser_overlay.update(
-                timeText=str(getattr(b, "_time_text", "") or ""),
-                roundText=str(getattr(b, "_round_text", "") or ""),
-                blueName=str(getattr(b, "_blue_name", "") or ""),
-                redName=str(getattr(b, "_red_name", "") or ""),
-                arenaName=str(getattr(b, "_arena_name", "") or ""),
-                blueDamageText=str(getattr(b, "_blue_damage_text", "") or ""),
-                redDamageText=str(getattr(b, "_red_damage_text", "") or ""),
-                blueTotalDamageText=str(getattr(b, "_blue_total_damage_text", "0") or "0"),
-                redTotalDamageText=str(getattr(b, "_red_total_damage_text", "0") or "0"),
-                blueSpRatio=float(getattr(b, "_blue_sp_ratio", 1.0) or 0.0),
-                redSpRatio=float(getattr(b, "_red_sp_ratio", 1.0) or 0.0),
-                blueRoundKnockdowns=int(getattr(b, "_blue_round_knockdowns", 0) or 0),
-                redRoundKnockdowns=int(getattr(b, "_red_round_knockdowns", 0) or 0),
-                blueComboHitText=str(getattr(b, "_blue_combo_hit_text", "") or ""),
-                blueComboDamageText=str(getattr(b, "_blue_combo_damage_text", "") or ""),
-                redComboHitText=str(getattr(b, "_red_combo_hit_text", "") or ""),
-                redComboDamageText=str(getattr(b, "_red_combo_damage_text", "") or ""),
-                blueRecentHitText=str(getattr(b, "_blue_recent_hit_text", "") or ""),
-                redRecentHitText=str(getattr(b, "_red_recent_hit_text", "") or ""),
-                bluePunishmentMid=float(getattr(b, "_blue_punishment_mid", 0.0) or 0.0),
-                redPunishmentMid=float(getattr(b, "_red_punishment_mid", 0.0) or 0.0),
-                bluePunishmentLong=float(getattr(b, "_blue_punishment_long", 0.0) or 0.0),
-                redPunishmentLong=float(getattr(b, "_red_punishment_long", 0.0) or 0.0),
-                blueHpRatio=float(blue_hp),
-                redHpRatio=float(red_hp),
-                blueHpGhostRatio=float(blue_ghost),
-                redHpGhostRatio=float(red_ghost),
-                showRound=bool(getattr(b, "_overlay_show_round", True)),
-                showTime=bool(getattr(b, "_overlay_show_time", True)),
-                showBlueImage=bool(getattr(b, "_overlay_show_blue_img", True)),
-                showBlueName=bool(getattr(b, "_overlay_show_blue_name", True)),
-                showRedImage=bool(getattr(b, "_overlay_show_red_img", True)),
-                showRedName=bool(getattr(b, "_overlay_show_red_name", True)),
-                showArenaName=bool(getattr(b, "_overlay_show_arena_name", True)),
-                showFlags=bool(getattr(b, "_overlay_show_flags", True)),
-                showCinematic=bool(getattr(self.cfg, "overlay_show_cinematic", True)),
-                vsBgOpacity=float(max(0.0, min(1.0, float(getattr(b, "_overlay_vs_bg_opacity", 1.0) or 1.0)))),
-                overlayVsHoldMs=int(max(500, float(getattr(b, "_overlay_vs_hold_sec", 2.85) or 2.85) * 1000)),
-                overlayUiScale=float(getattr(b, "_overlay_ui_scale", 1.0) or 1.0),
-                browserOverlayScale=float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),
-                overlayTopPad=40,
-                overlayTimerFontSize=int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54),
-                overlayTimerX=int(getattr(self.cfg, "overlay_timer_x", 0) or 0),
-                overlayTimerY=int(getattr(self.cfg, "overlay_timer_y", 0) or 0),
-                overlayRoundFontSize=int(getattr(self.cfg, "overlay_round_font_size", 11) or 11),
-                overlayRoundX=int(getattr(self.cfg, "overlay_round_x", 0) or 0),
-                overlayRoundY=int(getattr(self.cfg, "overlay_round_y", 0) or 0),
-                spectatorRecentTextSize=int(getattr(b, "_spectator_recent_text_size", getattr(self.cfg, "spectator_recent_text_size", 23)) or 23),
-                browserTextStyles=_normalize_browser_text_styles(getattr(self.cfg, "browser_text_styles", {}) or {}),
-                blueImageRev=int(getattr(b, "_blue_image_rev", 0) or 0),
-                redImageRev=int(getattr(b, "_red_image_rev", 0) or 0),
-                blueHasImage=bool(self.browser_overlay.image_path("blue")),
-                redHasImage=bool(self.browser_overlay.image_path("red")),
-            )
-        except Exception:
-            pass
-
     def _clear_spectator_match_overlay(self):
         self._reset_spectator_match_stats(clear_recent=True)
         try:
@@ -21307,141 +22559,18 @@ class MainApp(QObject):
             self.timer_win.set_qml_preview_enabled(False)
 
 
-def resolve_config_path() -> str:
-    candidates: List[str] = []
-    if getattr(sys, "frozen", False):
-        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        candidates.append(os.path.join(exe_dir, "config.json"))
-    if "__file__" in globals():
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        candidates.append(os.path.join(script_dir, "config.json"))
-    candidates.append(os.path.join(get_app_base_dir(), "config.json"))
-    candidates.append(os.path.join(os.getcwd(), "config.json"))
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return candidates[0] if candidates else "config.json"
 
 
-def _setup_logging(cfg_path: str) -> str:
-    base_dir = os.path.dirname(os.path.abspath(cfg_path)) if cfg_path else get_app_base_dir()
-    log_dir = os.path.join(base_dir, "logs")
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-    except Exception:
-        log_dir = get_app_base_dir()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(log_dir, f"timerauto_{ts}.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
-    )
-
-    class _TeeStream:
-        def __init__(self, stream, log_file):
-            self._stream = stream
-            self._log_file = log_file
-
-        def write(self, s):
-            try:
-                self._stream.write(s)
-            except Exception:
-                pass
-            try:
-                self._log_file.write(s)
-            except Exception:
-                pass
-
-        def flush(self):
-            try:
-                self._stream.flush()
-            except Exception:
-                pass
-            try:
-                self._log_file.flush()
-            except Exception:
-                pass
-
-    try:
-        log_file = open(log_path, "a", encoding="utf-8", buffering=1)
-        sys.stdout = _TeeStream(sys.__stdout__, log_file)
-        sys.stderr = _TeeStream(sys.__stderr__, log_file)
-    except Exception:
-        pass
-
-    def _log_exception(exc_type, exc, tb):
-        logging.error("Unhandled exception", exc_info=(exc_type, exc, tb))
-        try:
-            traceback.print_exception(exc_type, exc, tb)
-        except Exception:
-            pass
-
-    sys.excepthook = _log_exception
-
-    def _thread_hook(args):
-        logging.error("Unhandled thread exception", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
-        try:
-            traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
-        except Exception:
-            pass
-
-    if hasattr(threading, "excepthook"):
-        threading.excepthook = _thread_hook
-
-    logging.info("Logging started: %s", log_path)
-    return log_path
 
 
-def _parse_version(value: Any) -> Tuple[int, ...]:
-    nums = [int(x) for x in re.findall(r"\d+", str(value or ""))]
-    return tuple(nums or [0])
 
 
-def _download_file(url: str, dst: str) -> None:
-    req = Request(url, headers={"User-Agent": "TimerAuto-Updater"})
-    with urlopen(req, timeout=60) as resp, open(dst, "wb") as f:
-        shutil.copyfileobj(resp, f)
 
 
-def _file_sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest().lower()
 
 
-def _write_update_script(zip_path: str, app_dir: str, exe_path: str) -> str:
-    script_path = os.path.join(tempfile.gettempdir(), "timerauto_apply_update.bat")
-    zip_path = os.path.abspath(zip_path)
-    app_dir = os.path.abspath(app_dir)
-    exe_path = os.path.abspath(exe_path)
-    exe_name = os.path.basename(exe_path)
-    extract_dir = os.path.join(tempfile.gettempdir(), "timerauto_update_extract")
-    lines = [
-        "@echo off",
-        "setlocal",
-        "timeout /t 2 /nobreak >nul",
-        ":waitloop",
-        f'tasklist /fi "imagename eq {exe_name}" | find /i "{exe_name}" >nul',
-        "if not errorlevel 1 (",
-        "  timeout /t 1 /nobreak >nul",
-        "  goto waitloop",
-        ")",
-        f'if exist "{extract_dir}" rmdir /s /q "{extract_dir}"',
-        f'mkdir "{extract_dir}"',
-        f'powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath ''{zip_path}'' -DestinationPath ''{extract_dir}'' -Force"',
-        f'robocopy "{extract_dir}" "{app_dir}" /E /R:2 /W:1 /XD "{extract_dir}\\image\\players"',
-        "if %ERRORLEVEL% GEQ 8 exit /b %ERRORLEVEL%",
-        f'rmdir /s /q "{extract_dir}"',
-        f'start "" "{exe_path}"',
-        "endlocal",
-        'del "%~f0"',
-    ]
-    with open(script_path, "w", encoding="mbcs", errors="ignore") as f:
-        f.write("\r\n".join(lines) + "\r\n")
-    return script_path
+
+
 
 
 def main():
@@ -21465,4 +22594,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

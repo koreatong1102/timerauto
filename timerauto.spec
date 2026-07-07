@@ -3,6 +3,7 @@
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
 from pathlib import Path
+import os
 
 
 def _try_collect(name):
@@ -24,10 +25,15 @@ def _try_collect_libs(name):
         return []
 
 
+INCLUDE_OCR = os.environ.get('TIMERAUTO_BUILD_NO_OCR', '').lower() not in ('1', 'true', 'yes', 'on')
+INCLUDE_USER_CONFIG = os.environ.get('TIMERAUTO_INCLUDE_USER_CONFIG', '').lower() in ('1', 'true', 'yes', 'on')
+INCLUDE_PLAYER_IMAGES = os.environ.get('TIMERAUTO_INCLUDE_PLAYER_IMAGES', '').lower() in ('1', 'true', 'yes', 'on')
+
 hiddenimports = []
-hiddenimports += _try_collect('easyocr')
-hiddenimports += _try_collect('torch')
-hiddenimports += _try_collect('torchvision')
+if INCLUDE_OCR:
+    hiddenimports += _try_collect('easyocr')
+    hiddenimports += _try_collect('torch')
+    hiddenimports += _try_collect('torchvision')
 hiddenimports += _try_collect('rapidfuzz')
 hiddenimports += _try_collect('pyautogui')
 hiddenimports += _try_collect('pyscreeze')
@@ -37,9 +43,10 @@ hiddenimports += _try_collect('edge_tts')
 hiddenimports += _try_collect('aiohttp')
 
 datas_extra = []
-datas_extra += _try_collect_data('easyocr')
-datas_extra += _try_collect_data('torch')
-datas_extra += _try_collect_data('torchvision')
+if INCLUDE_OCR:
+    datas_extra += _try_collect_data('easyocr')
+    datas_extra += _try_collect_data('torch')
+    datas_extra += _try_collect_data('torchvision')
 datas_extra += _try_collect_data('rapidfuzz')
 datas_extra += _try_collect_data('pyautogui')
 datas_extra += _try_collect_data('pyscreeze')
@@ -50,19 +57,23 @@ datas_extra += _try_collect_data('aiohttp')
 datas_extra += _try_collect_data('certifi')
 
 binaries_extra = []
-binaries_extra += _try_collect_libs('torch')
-binaries_extra += _try_collect_libs('torchvision')
+if INCLUDE_OCR:
+    binaries_extra += _try_collect_libs('torch')
+    binaries_extra += _try_collect_libs('torchvision')
 
 datas_base = [
     ('HELP.md', '.'),
     ('timer_ui.qml', '.'),
     ('cinematic_overlay.qml', '.'),
     ('timer_controls.qml', '.'),
-    ('image', 'image'),
 ]
-for optional_file in ('config.json', 'profile.json'):
-    if Path(optional_file).exists():
-        datas_base.append((optional_file, '.'))
+if INCLUDE_USER_CONFIG:
+    for optional_file in ('config.json', 'profile.json'):
+        if Path(optional_file).exists():
+            datas_base.append((optional_file, '.'))
+
+if INCLUDE_PLAYER_IMAGES and Path('image/players').exists():
+    datas_base.append(('image/players', 'image/players'))
 
 a = Analysis(
     ['timerauto.py'],

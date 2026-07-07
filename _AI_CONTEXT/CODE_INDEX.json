@@ -1,0 +1,1803 @@
+{
+  "root": ".",
+  "files": {
+    "actions.py": {
+      "role": "이벤트 액션/사운드/후킹 실행 로직",
+      "lines": 914,
+      "classes": [
+        {
+          "name": "ActionRunner",
+          "line": 28,
+          "methods": [
+            "__init__",
+            "run",
+            "_has_timer_start",
+            "_should_skip_duplicate_timer_start",
+            "_start_run",
+            "_next",
+            "_execute",
+            "drop_pending_timer_start",
+            "_run_input_action",
+            "_run_tts",
+            "_run_matchup_tts",
+            "_schedule_matchup_tts_wait",
+            "_compose_matchup_tts_text",
+            "_matchup_signature",
+            "_edge_voice_for_mode",
+            "_edge_rate",
+            "_edge_volume",
+            "_edge_pitch",
+            "_edge_save_cli",
+            "_play_media_file_blocking",
+            "_play_media_file_mci",
+            "_speak_edge_tts",
+            "_ensure_tts_ready",
+            "_enqueue_tts",
+            "speak_text",
+            "_tts_worker_loop",
+            "_start_tts_worker",
+            "_safe_status",
+            "_log_text",
+            "_has_hangul",
+            "_replace_numbers_for_korean_tts",
+            "_int_to_korean"
+          ],
+          "method_count": 32
+        }
+      ],
+      "functions": [
+        {
+          "name": "ensure_int",
+          "line": 894
+        },
+        {
+          "name": "_to_screen_xy",
+          "line": 902
+        }
+      ],
+      "function_count": 2,
+      "imports_sample": [
+        "__future__",
+        "time",
+        "threading",
+        "logging",
+        "re",
+        "ctypes",
+        "subprocess",
+        "sys",
+        "os",
+        "tempfile",
+        "asyncio",
+        "queue",
+        "collections",
+        "typing",
+        "PyQt6.QtCore"
+      ]
+    },
+    "ai_project_snapshot.py": {
+      "role": "새 채팅/AI 인수인계용 프로젝트 전체 스냅샷 생성",
+      "lines": 515,
+      "classes": [],
+      "functions": [
+        {
+          "name": "_read_text",
+          "line": 77
+        },
+        {
+          "name": "_tail_text",
+          "line": 88
+        },
+        {
+          "name": "_detect_spectator_format",
+          "line": 106
+        },
+        {
+          "name": "build_code_index",
+          "line": 126
+        },
+        {
+          "name": "build_file_manifest",
+          "line": 169
+        },
+        {
+          "name": "extract_config_schema",
+          "line": 192
+        },
+        {
+          "name": "collect_patch_note_heads",
+          "line": 218
+        },
+        {
+          "name": "make_project_docs",
+          "line": 238
+        },
+        {
+          "name": "export_project_snapshot",
+          "line": 444
+        }
+      ],
+      "function_count": 9,
+      "imports_sample": [
+        "__future__",
+        "ast",
+        "hashlib",
+        "json",
+        "os",
+        "platform",
+        "time",
+        "zipfile",
+        "datetime",
+        "typing"
+      ]
+    },
+    "app_paths.py": {
+      "role": "",
+      "lines": 133,
+      "classes": [],
+      "functions": [
+        {
+          "name": "get_app_base_dir",
+          "line": 16
+        },
+        {
+          "name": "app_path",
+          "line": 29
+        },
+        {
+          "name": "normalize_app_path",
+          "line": 32
+        },
+        {
+          "name": "to_app_rel",
+          "line": 40
+        },
+        {
+          "name": "_candidate_documents_dirs",
+          "line": 54
+        },
+        {
+          "name": "resolve_spectatorlog_path",
+          "line": 73
+        },
+        {
+          "name": "resolve_player_image_path",
+          "line": 102
+        }
+      ],
+      "function_count": 7,
+      "imports_sample": [
+        "__future__",
+        "os",
+        "sys"
+      ]
+    },
+    "browser_overlay.py": {
+      "error": "unterminated triple-quoted string literal (detected at line 1811) (<unknown>, line 406)",
+      "role": "OBS/PRISM 브라우저 오버레이 서버와 HTML/CSS/JS"
+    },
+    "browser_overlay_sync.py": {
+      "role": "Qt 앱 상태를 브라우저 오버레이 상태로 동기화",
+      "lines": 156,
+      "classes": [
+        {
+          "name": "BrowserOverlaySync",
+          "line": 18,
+          "methods": [
+            "__init__",
+            "_set_asset_path_if_changed",
+            "mark_dirty",
+            "publish"
+          ],
+          "method_count": 4
+        }
+      ],
+      "functions": [],
+      "function_count": 0,
+      "imports_sample": [
+        "__future__",
+        "logging",
+        "time",
+        "typing",
+        "config_model"
+      ]
+    },
+    "config_model.py": {
+      "role": "AppConfig 설정 모델, JSON 저장/로드",
+      "lines": 1393,
+      "classes": [
+        {
+          "name": "Rect",
+          "line": 123,
+          "methods": [
+            "valid"
+          ],
+          "method_count": 1
+        },
+        {
+          "name": "TriggerConfig",
+          "line": 134,
+          "methods": [],
+          "method_count": 0
+        },
+        {
+          "name": "OCRConfig",
+          "line": 145,
+          "methods": [],
+          "method_count": 0
+        },
+        {
+          "name": "PaletteConfig",
+          "line": 154,
+          "methods": [],
+          "method_count": 0
+        },
+        {
+          "name": "AppConfig",
+          "line": 628,
+          "methods": [
+            "from_json",
+            "to_json"
+          ],
+          "method_count": 2
+        }
+      ],
+      "functions": [
+        {
+          "name": "migrate_action_keys",
+          "line": 19
+        },
+        {
+          "name": "sync_action_keys",
+          "line": 36
+        },
+        {
+          "name": "prune_actions",
+          "line": 57
+        },
+        {
+          "name": "_normalize_win_effects_paths",
+          "line": 86
+        },
+        {
+          "name": "_normalize_config_paths",
+          "line": 104
+        },
+        {
+          "name": "_normalize_player_country",
+          "line": 115
+        },
+        {
+          "name": "default_win_effects",
+          "line": 163
+        },
+        {
+          "name": "_migrate_win_effects_legacy",
+          "line": 338
+        },
+        {
+          "name": "_player_image_path_for_gid",
+          "line": 363
+        },
+        {
+          "name": "_player_flag_path_for_gid",
+          "line": 384
+        },
+        {
+          "name": "_player_country_for_gid",
+          "line": 409
+        },
+        {
+          "name": "_default_player_flag_path",
+          "line": 427
+        },
+        {
+          "name": "_merge_dict",
+          "line": 436
+        },
+        {
+          "name": "_normalize_hex_color",
+          "line": 446
+        },
+        {
+          "name": "_normalize_player_mask",
+          "line": 454
+        },
+        {
+          "name": "_normalize_mouse_actions",
+          "line": 463
+        },
+        {
+          "name": "_default_overlay_style_round",
+          "line": 484
+        },
+        {
+          "name": "_default_overlay_style_time",
+          "line": 500
+        },
+        {
+          "name": "_default_overlay_style_blue_name",
+          "line": 518
+        },
+        {
+          "name": "_default_overlay_style_red_name",
+          "line": 539
+        },
+        {
+          "name": "_default_overlay_style_arena",
+          "line": 560
+        },
+        {
+          "name": "_default_browser_text_styles",
+          "line": 576
+        },
+        {
+          "name": "_normalize_overlay_style",
+          "line": 599
+        },
+        {
+          "name": "_normalize_browser_text_styles",
+          "line": 621
+        }
+      ],
+      "function_count": 24,
+      "imports_sample": [
+        "__future__",
+        "copy",
+        "json",
+        "os",
+        "dataclasses",
+        "typing",
+        "app_paths"
+      ]
+    },
+    "diagnostics.py": {
+      "role": "앱 흐름 기록, 진단 ZIP 생성",
+      "lines": 319,
+      "classes": [
+        {
+          "name": "DiagnosticRecorder",
+          "line": 101,
+          "methods": [
+            "__init__",
+            "set_options",
+            "record",
+            "error",
+            "mark_incident",
+            "snapshot",
+            "current_state_text",
+            "export_zip",
+            "_readme",
+            "_raw_sample_files",
+            "_app_log_candidates",
+            "_detect_spectator_format"
+          ],
+          "method_count": 12
+        }
+      ],
+      "functions": [
+        {
+          "name": "_tail_text",
+          "line": 31
+        },
+        {
+          "name": "_mask_string",
+          "line": 50
+        },
+        {
+          "name": "_safe_json",
+          "line": 57
+        }
+      ],
+      "function_count": 3,
+      "imports_sample": [
+        "__future__",
+        "json",
+        "os",
+        "platform",
+        "re",
+        "threading",
+        "time",
+        "traceback",
+        "zipfile",
+        "collections",
+        "dataclasses",
+        "datetime",
+        "typing"
+      ]
+    },
+    "hotkey_engine.py": {
+      "error": "invalid non-printable character U+FEFF (<unknown>, line 1)",
+      "role": "전역 단축키 감지"
+    },
+    "player_utils.py": {
+      "role": "선수 프로필/이미지/국가 유틸",
+      "lines": 60,
+      "classes": [],
+      "functions": [
+        {
+          "name": "player_gid_key_for_match",
+          "line": 14
+        },
+        {
+          "name": "player_similarity_for_match",
+          "line": 18
+        },
+        {
+          "name": "canonical_player_gid_for_cfg",
+          "line": 32
+        }
+      ],
+      "function_count": 3,
+      "imports_sample": [
+        "__future__",
+        "re",
+        "typing"
+      ]
+    },
+    "runtime_support.py": {
+      "role": "",
+      "lines": 175,
+      "classes": [],
+      "functions": [
+        {
+          "name": "_is_dir_writable",
+          "line": 18
+        },
+        {
+          "name": "_user_config_dir",
+          "line": 33
+        },
+        {
+          "name": "resolve_config_path",
+          "line": 38
+        },
+        {
+          "name": "_prune_runtime_logs",
+          "line": 82
+        },
+        {
+          "name": "_setup_logging",
+          "line": 106
+        }
+      ],
+      "function_count": 5,
+      "imports_sample": [
+        "__future__",
+        "fnmatch",
+        "logging",
+        "os",
+        "sys",
+        "threading",
+        "traceback",
+        "datetime",
+        "typing",
+        "app_paths"
+      ]
+    },
+    "screen_capture.py": {
+      "role": "",
+      "lines": 150,
+      "classes": [],
+      "functions": [
+        {
+          "name": "clamp",
+          "line": 10
+        },
+        {
+          "name": "capture_monitor_np",
+          "line": 14
+        },
+        {
+          "name": "_capture_monitor_np_impl",
+          "line": 21
+        },
+        {
+          "name": "capture_roi_np",
+          "line": 31
+        },
+        {
+          "name": "_capture_roi_np_impl",
+          "line": 41
+        },
+        {
+          "name": "capture_roi_np_global",
+          "line": 57
+        },
+        {
+          "name": "_capture_roi_np_global_impl",
+          "line": 66
+        },
+        {
+          "name": "capture_pixel_bgr",
+          "line": 77
+        },
+        {
+          "name": "_capture_pixel_bgr_impl",
+          "line": 84
+        },
+        {
+          "name": "capture_pixel_bgr_monitor",
+          "line": 98
+        },
+        {
+          "name": "_monitor_offset",
+          "line": 118
+        },
+        {
+          "name": "rect_local_to_global",
+          "line": 130
+        },
+        {
+          "name": "xy_local_to_global",
+          "line": 136
+        },
+        {
+          "name": "crop",
+          "line": 141
+        }
+      ],
+      "function_count": 14,
+      "imports_sample": [
+        "__future__",
+        "typing",
+        "cv2",
+        "mss",
+        "numpy"
+      ]
+    },
+    "screen_watcher.py": {
+      "role": "",
+      "lines": 346,
+      "classes": [
+        {
+          "name": "_CaptureRect",
+          "line": 18,
+          "methods": [
+            "valid"
+          ],
+          "method_count": 1
+        },
+        {
+          "name": "ScreenWatcher",
+          "line": 32,
+          "methods": [
+            "__init__",
+            "get_debug",
+            "_event_edge_enabled",
+            "get_pixel_state",
+            "_rule_has_koth_action",
+            "start",
+            "stop",
+            "is_running",
+            "set_detection_modes",
+            "trigger_detection_enabled",
+            "pixel_detection_enabled",
+            "_run",
+            "_check_pixel_rules",
+            "_build_pixel_capture_cache",
+            "_sample_cached_pixel"
+          ],
+          "method_count": 15
+        }
+      ],
+      "functions": [
+        {
+          "name": "bgr_distance",
+          "line": 28
+        }
+      ],
+      "function_count": 1,
+      "imports_sample": [
+        "__future__",
+        "logging",
+        "threading",
+        "time",
+        "dataclasses",
+        "typing",
+        "cv2",
+        "mss",
+        "numpy",
+        "PyQt6.QtCore",
+        "screen_capture"
+      ]
+    },
+    "spectator_log_watcher.py": {
+      "role": "TOTF2 SpectatorLog 파일 감시 및 파싱",
+      "lines": 4320,
+      "classes": [
+        {
+          "name": "SpectatorLogWatcher",
+          "line": 69,
+          "methods": [
+            "__init__",
+            "start",
+            "stop",
+            "force_refresh",
+            "is_running",
+            "_run",
+            "_ensure_change_notifier",
+            "_stop_change_notifier",
+            "_watch_log_directory_changes",
+            "_read_text",
+            "_read_image_if_changed",
+            "_reset_portrait_locks",
+            "_unlock_portrait_if_player_changed",
+            "_is_match_intro_state",
+            "_match_pair_key",
+            "_name_payload",
+            "_read_update",
+            "_reset_damage_session",
+            "_parse_damage_event_parts",
+            "_scan_damage_file_for_session_reset",
+            "_read_punches_thrown_file",
+            "_read_official_scores",
+            "_read_winner_result",
+            "_normalize_round_state",
+            "_set_rest_state_for_log",
+            "_file_sig",
+            "_damage_effect_kind",
+            "_side_raw_name",
+            "_registered_player_nick",
+            "_short_spoken_id",
+            "_commentary_name",
+            "_caster_name",
+            "_build_vs_caster_text",
+            "_round_caster_text",
+            "_set_caster_event_once",
+            "_weak_point_ko",
+            "_punch_ko",
+            "_punch_report_group",
+            "_display_name_for_report",
+            "_round_report_top_items",
+            "_build_round_report_payload",
+            "_korean_final_consonant_index",
+            "_josa",
+            "_ko_subject",
+            "_format_recent_hit_text",
+            "_build_commentary_text",
+            "_damage_event_key",
+            "_read_punishment_values",
+            "_clamp_percent",
+            "_punishment_snapshot",
+            "_remember_punishment_snapshot",
+            "_punishment_delta",
+            "_gauge_risk_score",
+            "_health_pressure_line",
+            "_round_gauge_context_line",
+            "_commentary_category_from_key",
+            "_commentary_meaning_from_category",
+            "_commentary_cooldown_for_category",
+            "_commentary_pick",
+            "_reset_down_state_machine",
+            "_ensure_down_round",
+            "_register_knockdown",
+            "_cancel_down_commentary",
+            "_down_restart_text",
+            "_short_down_pick",
+            "_build_knockdown_commentary_plan",
+            "_witty_duo_max_per_round",
+            "_witty_duo_chance_percent",
+            "_witty_duo_tag_from_text",
+            "_witty_duo_candidates",
+            "_witty_duo_line",
+            "_attach_witty_duo_followup",
+            "_event_names",
+            "_build_big_hit_line",
+            "_build_weak_accumulation_line",
+            "_build_idle_fight_commentary",
+            "_build_fight_summary_commentary",
+            "_estimate_commentary_tts_seconds",
+            "_round_break_summary_budget_seconds",
+            "_select_commentary_lines_for_budget",
+            "_build_round_break_summary",
+            "_new_scorecard_round",
+            "_scorecard_copy_gauge",
+            "_scorecard_remember_pair",
+            "_record_scorecard_events",
+            "_scorecard_from_fallback_events",
+            "_scorecard_round_result",
+            "_scorecard_compute",
+            "_scorecard_rounds_line",
+            "_scorecard_top_round_line",
+            "_scorecard_gauge_final_line",
+            "_scorecard_weak_final_line",
+            "_build_match_final_summary",
+            "_read_damage_update",
+            "_build_combo_update",
+            "_fmt_float_text",
+            "_punishment_percent",
+            "_read_pose_file",
+            "_read_glove_pose",
+            "_pick_attacking_glove_pose"
+          ],
+          "method_count": 103
+        }
+      ],
+      "functions": [
+        {
+          "name": "default_spectatorlog_path_resolver",
+          "line": 24
+        },
+        {
+          "name": "default_game_id_normalizer",
+          "line": 44
+        },
+        {
+          "name": "default_player_gid_canonicalizer",
+          "line": 49
+        },
+        {
+          "name": "_safe_cv2_imread",
+          "line": 53
+        }
+      ],
+      "function_count": 4,
+      "imports_sample": [
+        "__future__",
+        "logging",
+        "os",
+        "re",
+        "threading",
+        "time",
+        "ctypes",
+        "ctypes",
+        "collections",
+        "typing",
+        "cv2",
+        "numpy",
+        "PyQt6.QtCore",
+        "diagnostics"
+      ]
+    },
+    "timerauto.py": {
+      "role": "메인 Qt 앱/설정창/타이머/HUD 연결/자동해설/진단 UI",
+      "lines": 22496,
+      "classes": [
+        {
+          "name": "RoiPickerDialog",
+          "line": 1273,
+          "methods": [
+            "__init__",
+            "_update_pixmap",
+            "_map_to_image_coords",
+            "_mouse_press",
+            "_mouse_move",
+            "_mouse_release",
+            "keyPressEvent"
+          ],
+          "method_count": 7
+        },
+        {
+          "name": "HotkeyPickDialog",
+          "line": 1373,
+          "methods": [
+            "__init__",
+            "keyPressEvent"
+          ],
+          "method_count": 2
+        },
+        {
+          "name": "ClickCaptureOverlay",
+          "line": 1398,
+          "methods": [
+            "__init__",
+            "keyPressEvent",
+            "mousePressEvent"
+          ],
+          "method_count": 3
+        },
+        {
+          "name": "ImeAwareLineEdit",
+          "line": 1442,
+          "methods": [
+            "__init__",
+            "_emit_query_text",
+            "inputMethodEvent",
+            "focusOutEvent"
+          ],
+          "method_count": 4
+        },
+        {
+          "name": "PixelPickOverlay",
+          "line": 1469,
+          "methods": [
+            "__init__",
+            "_tick",
+            "_place_message",
+            "_update_at",
+            "current_sample",
+            "keyPressEvent",
+            "_safe_close",
+            "showEvent",
+            "resizeEvent",
+            "closeEvent",
+            "mousePressEvent"
+          ],
+          "method_count": 11
+        },
+        {
+          "name": "ActionMiniDialog",
+          "line": 1644,
+          "methods": [
+            "__init__",
+            "_apply_action_dialog_style",
+            "_pick_mouse",
+            "_pick_click",
+            "_on_type_changed",
+            "_load_action",
+            "action_result"
+          ],
+          "method_count": 7
+        },
+        {
+          "name": "PixelActionsDialog",
+          "line": 1992,
+          "methods": [
+            "__init__",
+            "_reload_actions",
+            "_save_actions",
+            "_add_action",
+            "_edit_action",
+            "_del_action",
+            "_move_action_up",
+            "_move_action_down",
+            "closeEvent"
+          ],
+          "method_count": 9
+        },
+        {
+          "name": "PixelActionDialog",
+          "line": 2120,
+          "methods": [
+            "__init__",
+            "_reload_rules",
+            "_apply_to_rule",
+            "_add_rule",
+            "_on_rule_clicked",
+            "_open_actions_for_rule",
+            "keyPressEvent"
+          ],
+          "method_count": 7
+        },
+        {
+          "name": "POINT",
+          "line": 2257,
+          "methods": [],
+          "method_count": 0
+        },
+        {
+          "name": "MSLLHOOKSTRUCT",
+          "line": 2264,
+          "methods": [],
+          "method_count": 0
+        },
+        {
+          "name": "MSG",
+          "line": 2274,
+          "methods": [],
+          "method_count": 0
+        },
+        {
+          "name": "_MouseHotkeyEmitter",
+          "line": 2288,
+          "methods": [],
+          "method_count": 0
+        },
+        {
+          "name": "GlobalMouseHook",
+          "line": 2293,
+          "methods": [
+            "__init__",
+            "start",
+            "stop",
+            "_run"
+          ],
+          "method_count": 4
+        },
+        {
+          "name": "QuickRoiOverlay",
+          "line": 2349,
+          "methods": [
+            "__init__",
+            "paintEvent",
+            "begin_at_global",
+            "keyPressEvent",
+            "showEvent",
+            "closeEvent",
+            "eventFilter",
+            "_grab_inputs",
+            "_poll_esc",
+            "mousePressEvent",
+            "mouseMoveEvent",
+            "mouseReleaseEvent",
+            "_safe_close",
+            "close_all"
+          ],
+          "method_count": 14
+        },
+        {
+          "name": "Controller",
+          "line": 2571,
+          "methods": [
+            "__init__",
+            "warmup_ocr_async",
+            "_ocr_with_cache",
+            "on_screen_trigger_for_names",
+            "read_palette_test_once",
+            "run_koth_winner_ocr",
+            "_read_koth_winner",
+            "_read_names",
+            "_load_player_image",
+            "_read_player_palettes"
+          ],
+          "method_count": 10
+        },
+        {
+          "name": "ColorBox",
+          "line": 3058,
+          "methods": [
+            "__init__",
+            "set_bgr"
+          ],
+          "method_count": 2
+        },
+        {
+          "name": "PaletteRow",
+          "line": 3069,
+          "methods": [
+            "__init__",
+            "set_palette"
+          ],
+          "method_count": 2
+        },
+        {
+          "name": "PlayerImageProvider",
+          "line": 3092,
+          "methods": [
+            "__init__",
+            "set_mask_shape",
+            "set_image",
+            "image",
+            "_apply_mask",
+            "requestImage"
+          ],
+          "method_count": 6
+        },
+        {
+          "name": "TimerBackend",
+          "line": 3127,
+          "methods": [
+            "__init__",
+            "timeText",
+            "roundText",
+            "statusText",
+            "restMode",
+            "blueName",
+            "redName",
+            "arenaName",
+            "startLabel",
+            "overlayBgColor",
+            "overlayBgOpacity",
+            "overlayUiBgOpacity",
+            "overlayWindowOpacity",
+            "overlayUiScale",
+            "overlayPreset",
+            "overlayPlayerMask",
+            "winChangeReason",
+            "winChangeSide",
+            "_set_win_change",
+            "overlayShowRound",
+            "overlayShowTime",
+            "overlayShowBlueImg",
+            "overlayShowBlueName",
+            "overlayShowRedImg",
+            "overlayShowRedName",
+            "overlayShowArenaName",
+            "overlayShowFlags",
+            "overlayShowCinematic",
+            "overlayVsBackgroundSource",
+            "overlayVsBackgroundOpacity",
+            "overlayVsHoldMs",
+            "vsIntroBackspaceEnabled",
+            "overlayStyle",
+            "broadcastSyncActive",
+            "screenDetectRunning",
+            "ocrDetectRunning",
+            "pixelDetectRunning",
+            "logDetectRunning",
+            "hudDemoRunning",
+            "blueImageRev",
+            "redImageRev",
+            "blueWinStreak",
+            "redWinStreak",
+            "blueDamageText",
+            "redDamageText",
+            "blueTotalDamageText",
+            "redTotalDamageText",
+            "spectatorMatchText",
+            "spectatorRecentHitText",
+            "blueRecentHitText",
+            "redRecentHitText",
+            "blueComboHitText",
+            "redComboHitText",
+            "blueComboDamageText",
+            "redComboDamageText",
+            "spectatorRecentTextSize",
+            "set_spectator_recent_text_size",
+            "clear_combo_display",
+            "bluePunishmentText",
+            "redPunishmentText",
+            "bluePunishmentMid",
+            "redPunishmentMid",
+            "bluePunishmentLong",
+            "redPunishmentLong",
+            "blueSpRatio",
+            "redSpRatio",
+            "blueRoundKnockdowns",
+            "redRoundKnockdowns",
+            "blueLogMetaText",
+            "redLogMetaText",
+            "cameraText",
+            "bluePlayerId",
+            "redPlayerId",
+            "bluePlayerRegistered",
+            "redPlayerRegistered",
+            "bluePlayerValid",
+            "redPlayerValid",
+            "blueFlagSource",
+            "redFlagSource",
+            "effectSettings",
+            "qmlPreviewEnabled",
+            "set_qml_preview_enabled",
+            "qmlEffectsEnabled",
+            "set_qml_effects_enabled",
+            "set_status",
+            "set_broadcast_sync_active",
+            "setBroadcastSyncActive",
+            "set_overlay_ui_scale",
+            "setOverlayUiScale",
+            "set_palettes",
+            "set_names",
+            "set_arena_name",
+            "set_round_time",
+            "set_log_rest_mode",
+            "apply_timer_settings",
+            "bump_blue_image",
+            "bump_red_image",
+            "set_win_streaks",
+            "_set_sp_ratio",
+            "_sp_apply_damage_delta"
+          ],
+          "method_count": 182
+        },
+        {
+          "name": "LayoutBackend",
+          "line": 4800,
+          "methods": [
+            "__init__",
+            "loadLayout",
+            "saveLayout"
+          ],
+          "method_count": 3
+        },
+        {
+          "name": "_WinMsg",
+          "line": 4821,
+          "methods": [],
+          "method_count": 0
+        },
+        {
+          "name": "OverlayHitTestFilter",
+          "line": 4832,
+          "methods": [
+            "__init__",
+            "_signed_word",
+            "nativeEventFilter"
+          ],
+          "method_count": 3
+        },
+        {
+          "name": "QmlTimerWindow",
+          "line": 4871,
+          "methods": [
+            "__init__",
+            "_main_overlay_capture_mode",
+            "_main_overlay_interactive_height",
+            "_set_main_overlay_input_transparent",
+            "_sync_main_overlay_input_transparency",
+            "_sync_main_overlay_geometry",
+            "_raise_cinematic_overlay",
+            "_sync_cinematic_geometry",
+            "set_status",
+            "set_broadcast_sync_active",
+            "set_overlay_on_top",
+            "set_names",
+            "set_arena_name",
+            "set_palettes",
+            "set_player_images",
+            "set_player_mask_shape",
+            "set_overlay_visibility",
+            "set_overlay_style",
+            "set_overlay_preset",
+            "set_overlay_ui_scale",
+            "set_overlay_layout",
+            "_on_overlay_reset",
+            "set_round_time",
+            "request_round_intro",
+            "set_log_rest_mode",
+            "set_timer_settings",
+            "add_win",
+            "set_win_streaks",
+            "set_spectator_damage",
+            "set_spectator_total_damage",
+            "trigger_stun_flash",
+            "trigger_spectator_effect",
+            "trigger_hit_impact",
+            "set_spectator_log_info",
+            "set_spectator_recent_text_size",
+            "set_player_info",
+            "set_player_flags",
+            "set_effect_settings",
+            "set_overlay_bg_color",
+            "set_overlay_bg_opacity",
+            "set_overlay_ui_bg_opacity",
+            "set_overlay_window_opacity",
+            "set_qml_preview_enabled",
+            "set_qml_effects_enabled",
+            "is_running",
+            "is_in_rest",
+            "timer_start",
+            "timer_stop",
+            "timer_reset",
+            "timer_force_reset",
+            "show"
+          ],
+          "method_count": 51
+        },
+        {
+          "name": "TimerWindow",
+          "line": 5518,
+          "methods": [
+            "__init__",
+            "set_status",
+            "set_names",
+            "set_arena_name",
+            "set_palettes",
+            "set_player_images",
+            "set_round_time",
+            "_set_img",
+            "_refresh_time",
+            "toggle_timer",
+            "reset_timer",
+            "is_running",
+            "is_in_rest",
+            "_tick"
+          ],
+          "method_count": 14
+        },
+        {
+          "name": "WheelFocusFilter",
+          "line": 5732,
+          "methods": [
+            "eventFilter"
+          ],
+          "method_count": 1
+        },
+        {
+          "name": "_NoopTimerWindow",
+          "line": 5745,
+          "methods": [
+            "timer_start",
+            "timer_stop",
+            "timer_reset",
+            "set_round_time"
+          ],
+          "method_count": 4
+        },
+        {
+          "name": "PlayerCard",
+          "line": 5907,
+          "methods": [
+            "__init__",
+            "_set_image"
+          ],
+          "method_count": 2
+        },
+        {
+          "name": "PlayerImageDialog",
+          "line": 6002,
+          "methods": [
+            "__init__",
+            "set_gid",
+            "_reload",
+            "_current_gid",
+            "select_gid",
+            "_edit_image",
+            "_paste_image",
+            "_delete_image"
+          ],
+          "method_count": 8
+        },
+        {
+          "name": "AvatarButton",
+          "line": 6148,
+          "methods": [
+            "__init__",
+            "set_image",
+            "mousePressEvent",
+            "paintEvent"
+          ],
+          "method_count": 4
+        },
+        {
+          "name": "EditPlayerDialog",
+          "line": 6192,
+          "methods": [
+            "__init__",
+            "_pick_flag",
+            "_clear_flag",
+            "values"
+          ],
+          "method_count": 4
+        },
+        {
+          "name": "ProfileEditDialog",
+          "line": 6279,
+          "methods": [
+            "__init__",
+            "_edit_profile",
+            "_edit_image",
+            "keyPressEvent"
+          ],
+          "method_count": 4
+        },
+        {
+          "name": "OverlayProfileDialog",
+          "line": 6365,
+          "methods": [
+            "__init__",
+            "_normalize_gid",
+            "_current_gid",
+            "_copy_text",
+            "_copy_gid",
+            "_copy_name",
+            "_pick_image",
+            "_paste_image",
+            "_url_image",
+            "_clear_image",
+            "_pick_flag",
+            "_clear_flag",
+            "_on_existing_name_changed",
+            "_save",
+            "_delete_id"
+          ],
+          "method_count": 15
+        },
+        {
+          "name": "SettingsDialog",
+          "line": 6614,
+          "methods": [
+            "__init__",
+            "_sync_watcher_labels",
+            "_log_running",
+            "_screen_running",
+            "eventFilter",
+            "_update_detect_button",
+            "_toggle_detection",
+            "_toggle_screen_detection",
+            "_open_help",
+            "_roi_quick_items",
+            "_apply_quick_roi",
+            "_roi_text",
+            "_trigger_pixel_text",
+            "_trigger_pixel_copy_text",
+            "_copy_trigger_pixel_value",
+            "_update_quick_labels",
+            "_start_quick_trigger_pixel_pick",
+            "_show_trigger_settings",
+            "_set_trigger_group_visible",
+            "_emit_win_streaks",
+            "_test_blue_win",
+            "_test_red_win",
+            "_test_reset_win",
+            "_finish_quick_trigger_pixel_pick",
+            "_apply_trigger_pixel_from_sample",
+            "_start_quick_roi_pick",
+            "pick_roi",
+            "_monitor_from_pos",
+            "_vk_from_key_name",
+            "_parse_hotkey",
+            "_hotkey_info",
+            "_start_quick_pixel_pick",
+            "_finish_quick_pixel_pick",
+            "_cancel_quick_pixel_pick",
+            "_sample_pixel_at_global",
+            "_on_quick_pixel_clicked",
+            "_apply_pixel_pick_to_rule",
+            "_show_pixel_pick_menu",
+            "_apply_settings_style",
+            "_normalize_settings_layout",
+            "_install_auto_apply",
+            "_install_wheel_focus",
+            "_apply_wheel_filter",
+            "_schedule_apply",
+            "_apply_silent",
+            "_copy_browser_overlay_url",
+            "_open_browser_overlay_url",
+            "_apply_browser_overlay_settings",
+            "_build_diagnostics",
+            "_diagnostics_apply_options",
+            "_diagnostics_mark_incident_clicked",
+            "_diagnostics_export_clicked",
+            "_diagnostics_copy_clicked",
+            "_diagnostics_project_snapshot_clicked",
+            "_diagnostics_open_clicked",
+            "_build_quick",
+            "_refresh_chapter_status_label",
+            "_export_chapter_txt_from_settings",
+            "_open_chapter_txt_from_settings",
+            "_browse_spectatorlog_path",
+            "_refresh_spectatorlog_state",
+            "_set_hit_fx_color_button",
+            "_pick_spectator_hit_fx_color",
+            "_pick_spectator_sfx",
+            "_spectator_sfx_path",
+            "_test_spectator_sfx",
+            "_ensure_spectator_sfx_player",
+            "_ensure_tts_test_player",
+            "_play_spectator_sfx",
+            "_spectator_timer_target",
+            "_push_browser_overlay_event",
+            "_emit_spectator_test_update",
+            "_test_set_spectator_info",
+            "_test_spectator_stun",
+            "_test_spectator_effect",
+            "_load_spectatorlog_players_for_test",
+            "_test_spectator_vs_intro",
+            "_test_spectator_damage",
+            "_test_spectator_hit_fx_sprite",
+            "_test_spectator_hp_gauge",
+            "_test_spectator_combo",
+            "_test_spectator_counter",
+            "_test_spectator_lives",
+            "_test_spectator_timer_state",
+            "_test_spectator_round_report",
+            "_test_spectator_full_demo",
+            "_stop_spectator_hud_demo",
+            "_stop_spectator_commentary_test_script",
+            "_start_spectator_commentary_script",
+            "_schedule_tts_test_followup",
+            "_run_next_spectator_commentary_script_step",
+            "_test_spectator_commentary_full_suite",
+            "_test_spectator_commentary_duo_suite",
+            "_test_spectator_commentary_down_suite",
+            "_test_spectator_commentary_summary_suite",
+            "_test_spectator_commentary_tts",
+            "_fill_edge_voice_combo",
+            "_commentary_tts_voice",
+            "_commentary_tts_rate",
+            "_commentary_tts_volume"
+          ],
+          "method_count": 315
+        },
+        {
+          "name": "MainApp",
+          "line": 17545,
+          "methods": [
+            "__init__",
+            "_play_burst_sfx",
+            "_spectator_sfx_path",
+            "_play_spectator_sfx",
+            "_split_commentary_tts_sentences",
+            "_estimate_commentary_sentence_ms",
+            "_schedule_commentary_round_summary_tts",
+            "_schedule_commentary_followup_tts",
+            "_speak_commentary_tts",
+            "_commentary_tts_cache_path",
+            "_prewarm_commentary_tts_cache",
+            "_play_commentary_tts_file",
+            "_on_commentary_media_status",
+            "_stop_commentary_tts_role",
+            "_clear_commentary_tts_busy",
+            "_chapter_anchor_epoch",
+            "_chapter_anchor_status",
+            "_chapter_log_dir",
+            "_reset_chapter_session",
+            "_sync_chapter_anchor_now",
+            "_clear_chapter_anchor",
+            "_on_chapter_export_requested",
+            "_open_chapter_txt",
+            "_chapter_autosave_tick",
+            "_ensure_chapter_paths",
+            "_format_chapter_elapsed",
+            "_chapter_competitor_text",
+            "_sync_current_players_to_config",
+            "_sync_current_player_flags_to_overlay",
+            "_apply_saved_player_state",
+            "_sync_koth_streak_to_overlay",
+            "_apply_koth_streak_with_existing_win_route",
+            "_trigger_koth_break_effect",
+            "_koth_display_side",
+            "_refresh_current_ids_for_koth",
+            "_finish_koth_winner_ui",
+            "_apply_koth_winner",
+            "_append_chapter_event",
+            "_export_chapter_txt",
+            "_overlay_side_id",
+            "_overlay_side_valid",
+            "_sync_overlay_side_from_spectatorlog",
+            "_open_overlay_profile_register",
+            "_open_overlay_profile_edit",
+            "_open_overlay_profile_dialog",
+            "_pixel_id_for_name",
+            "_pixel_name_for_id",
+            "_action_cooldown_for_event",
+            "_run_actions_with_cooldown",
+            "_enqueue_action_run",
+            "_drain_action_queue",
+            "_on_timer_reset_cleanup",
+            "on_trigger",
+            "_test_trigger_once",
+            "_save_trigger_snapshot",
+            "_flush_deferred_on_trigger_actions",
+            "_start_ocr_async",
+            "_update_backend_detect_flags",
+            "_detection_running",
+            "_screen_detection_running",
+            "_ocr_detection_running",
+            "_pixel_detection_running",
+            "_log_detection_running",
+            "_set_spectatorlog_enabled_runtime",
+            "_start_spectator_watcher_if_enabled",
+            "_start_screen_detector",
+            "_stop_screen_detector",
+            "_start_ocr_detector",
+            "_stop_ocr_detector",
+            "_start_pixel_detector",
+            "_stop_pixel_detector",
+            "_start_log_detector",
+            "_finish_log_detector_stop",
+            "_stop_log_detector",
+            "_start_detectors",
+            "_stop_detectors",
+            "_toggle_screen_detector",
+            "_toggle_ocr_detector",
+            "_toggle_pixel_detector",
+            "_toggle_log_detector",
+            "_on_overlay_visibility_request",
+            "_toggle_detectors",
+            "_select_player_from_overlay",
+            "on_pixel_rule",
+            "_on_timer_running",
+            "_on_rest_thirty_seconds",
+            "_diagnostic_folder",
+            "_diagnostic_spectator_root",
+            "_diagnostic_app_state",
+            "_diagnostic_mark_incident",
+            "_diagnostic_export_zip",
+            "_project_snapshot_export_zip",
+            "_diagnostic_open_folder",
+            "_diagnostic_copy_state",
+            "open_settings",
+            "on_settings_closed",
+            "_stop_spectator_hud_demo",
+            "_spectator_test_dialog",
+            "_push_browser_overlay_event",
+            "_push_initial_browser_overlay_settings"
+          ],
+          "method_count": 154
+        }
+      ],
+      "functions": [
+        {
+          "name": "_set_dpi_awareness",
+          "line": 38
+        },
+        {
+          "name": "_suppress_qt_window_warnings",
+          "line": 212
+        },
+        {
+          "name": "_ensure_std_streams",
+          "line": 224
+        },
+        {
+          "name": "_play_win_effect_sfx",
+          "line": 237
+        },
+        {
+          "name": "_play_media_sfx",
+          "line": 261
+        },
+        {
+          "name": "_store_player_image",
+          "line": 294
+        },
+        {
+          "name": "_store_player_flag",
+          "line": 311
+        },
+        {
+          "name": "_make_spectator_log_watcher",
+          "line": 354
+        },
+        {
+          "name": "clamp",
+          "line": 394
+        },
+        {
+          "name": "normalize_game_id",
+          "line": 398
+        },
+        {
+          "name": "snap_round_seconds",
+          "line": 404
+        },
+        {
+          "name": "snap_arena_name",
+          "line": 415
+        },
+        {
+          "name": "bgr_distance",
+          "line": 438
+        },
+        {
+          "name": "_find_window_by_title_contains",
+          "line": 442
+        },
+        {
+          "name": "_window_title",
+          "line": 474
+        },
+        {
+          "name": "_window_fullscreenish",
+          "line": 489
+        },
+        {
+          "name": "_press_vk_sendinput_held",
+          "line": 543
+        },
+        {
+          "name": "press_vk_for_window_title",
+          "line": 626
+        },
+        {
+          "name": "_get_easyocr_reader",
+          "line": 696
+        },
+        {
+          "name": "_preprocess_ocr",
+          "line": 730
+        },
+        {
+          "name": "_ocr_read_best",
+          "line": 755
+        },
+        {
+          "name": "_clean_ocr_digits",
+          "line": 775
+        },
+        {
+          "name": "ocr_one_line_digits",
+          "line": 787
+        },
+        {
+          "name": "_round_template_candidates",
+          "line": 807
+        },
+        {
+          "name": "_time_template_candidates",
+          "line": 815
+        },
+        {
+          "name": "_roi_to_binary",
+          "line": 819
+        },
+        {
+          "name": "_trim_right_for_time_roi",
+          "line": 832
+        },
+        {
+          "name": "_render_text_template",
+          "line": 842
+        },
+        {
+          "name": "_binary_match_score",
+          "line": 871
+        },
+        {
+          "name": "template_match_text",
+          "line": 882
+        },
+        {
+          "name": "ocr_one_line_english",
+          "line": 903
+        },
+        {
+          "name": "ocr_one_line_time",
+          "line": 915
+        },
+        {
+          "name": "ocr_one_line_any",
+          "line": 927
+        },
+        {
+          "name": "best_match_id",
+          "line": 949
+        },
+        {
+          "name": "save_roi_debug_images",
+          "line": 989
+        },
+        {
+          "name": "save_ocr_debug_report",
+          "line": 1016
+        },
+        {
+          "name": "_get_mediapipe_selfie",
+          "line": 1069
+        },
+        {
+          "name": "extract_palette_bgr",
+          "line": 1093
+        },
+        {
+          "name": "extract_player_cutout_bgra",
+          "line": 1169
+        },
+        {
+          "name": "cartoonize_bgr",
+          "line": 1198
+        },
+        {
+          "name": "bgr_to_qimage",
+          "line": 1216
+        },
+        {
+          "name": "qimage_to_bgr",
+          "line": 1233
+        },
+        {
+          "name": "safe_cv2_imread",
+          "line": 1249
+        },
+        {
+          "name": "_key_pressed",
+          "line": 2249
+        },
+        {
+          "name": "parse_round_setting",
+          "line": 2949
+        },
+        {
+          "name": "parse_round_seconds",
+          "line": 2971
+        },
+        {
+          "name": "parse_time_text_to_seconds",
+          "line": 2994
+        },
+        {
+          "name": "parse_round_text_to_pair",
+          "line": 3028
+        },
+        {
+          "name": "show_non_empty",
+          "line": 3040
+        },
+        {
+          "name": "observe_unique",
+          "line": 3044
+        },
+        {
+          "name": "_square_pixmap",
+          "line": 5762
+        },
+        {
+          "name": "_circle_pixmap",
+          "line": 5786
+        },
+        {
+          "name": "_paste_clipboard_image",
+          "line": 5813
+        },
+        {
+          "name": "_download_image_url",
+          "line": 5831
+        },
+        {
+          "name": "_ask_image_url",
+          "line": 5882
+        },
+        {
+          "name": "main",
+          "line": 22475
+        }
+      ],
+      "function_count": 56,
+      "imports_sample": [
+        "__future__",
+        "copy",
+        "ctypes",
+        "ctypes",
+        "json",
+        "shutil",
+        "os",
+        "sys",
+        "time",
+        "math",
+        "hashlib",
+        "threading",
+        "uuid",
+        "logging",
+        "traceback",
+        "re",
+        "tempfile",
+        "fnmatch",
+        "urllib.parse",
+        "urllib.request",
+        "datetime",
+        "dataclasses",
+        "functools",
+        "typing",
+        "collections",
+        "numpy",
+        "PyQt6.QtCore",
+        "PyQt6.QtGui",
+        "PyQt6.QtQml",
+        "PyQt6.QtQuick",
+        "PyQt6.QtWidgets",
+        "mss",
+        "cv2",
+        "actions",
+        "browser_overlay",
+        "browser_overlay_sync",
+        "hotkey_engine",
+        "screen_capture",
+        "screen_watcher",
+        "spectator_log_watcher",
+        "player_utils",
+        "app_paths",
+        "config_model",
+        "runtime_support",
+        "update_manager",
+        "diagnostics",
+        "ai_project_snapshot"
+      ]
+    },
+    "update_manager.py": {
+      "role": "",
+      "lines": 64,
+      "classes": [],
+      "functions": [
+        {
+          "name": "_parse_version",
+          "line": 15
+        },
+        {
+          "name": "_download_file",
+          "line": 20
+        },
+        {
+          "name": "_file_sha256",
+          "line": 26
+        },
+        {
+          "name": "_write_update_script",
+          "line": 34
+        }
+      ],
+      "function_count": 4,
+      "imports_sample": [
+        "__future__",
+        "hashlib",
+        "os",
+        "re",
+        "shutil",
+        "tempfile",
+        "typing",
+        "urllib.request"
+      ]
+    }
+  }
+}

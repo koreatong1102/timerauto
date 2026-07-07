@@ -1,0 +1,11 @@
+# Stage35 Fast HitFX + Color Picker
+- Continued from the normal1/stage34 stable branch.
+- Added watcher-side fast emit for `spectator_hit_effect_events` before commentary/report/stat processing finishes.
+- Added hit FX duplicate suppression in timerauto so the final full update does not replay the same impact.
+- Added latency logging:
+  - `HITFX_FAST_EMIT` in watcher
+  - `HITFX_LATENCY_PUSH` in timerauto
+  - `[HITFX_BROWSER_SHOW]` in browser console
+- Kept existing hit effect threshold setting and clarified it as the activation damage threshold.
+- Added GUI color picker buttons for Low/Mid/High/Weak/Stun colors; text hex fields are hidden.
+- Added settings checkboxes: Fast Path and Hit FX latency log.

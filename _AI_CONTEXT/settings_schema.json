@@ -1,0 +1,756 @@
+{
+  "source": "config_model.py",
+  "fields": [
+    {
+      "name": "monitor_index",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "trigger_monitor_index",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "roi_monitors",
+      "type": "Dict[str, int]",
+      "default": "field(default_factory=dict)"
+    },
+    {
+      "name": "coords_global",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "roi_hotkey",
+      "type": "str",
+      "default": "F9"
+    },
+    {
+      "name": "pixel_hotkey",
+      "type": "str",
+      "default": "F10"
+    },
+    {
+      "name": "detect_hotkey",
+      "type": "str",
+      "default": "F11"
+    },
+    {
+      "name": "trigger_pixel_hotkey",
+      "type": "str",
+      "default": "F8"
+    },
+    {
+      "name": "action_pick_hotkey",
+      "type": "str",
+      "default": "F7"
+    },
+    {
+      "name": "action_test_hotkey",
+      "type": "str",
+      "default": "F6"
+    },
+    {
+      "name": "chapter_anchor_epoch",
+      "type": "float",
+      "default": 0.0
+    },
+    {
+      "name": "chapter_offset_sec",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "chapter_dedupe_sec",
+      "type": "int",
+      "default": 20
+    },
+    {
+      "name": "chapter_output_dir",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "chapter_nickname_only",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "chapter_hide_time",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "spectatorlog_enabled",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectatorlog_path",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "spectatorlog_poll_ms",
+      "type": "int",
+      "default": 250
+    },
+    {
+      "name": "spectatorlog_file_watch_enabled",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectatorlog_debounce_ms",
+      "type": "int",
+      "default": 35
+    },
+    {
+      "name": "spectatorlog_backup_poll_ms",
+      "type": "int",
+      "default": 1500
+    },
+    {
+      "name": "spectatorlog_sync_timer",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectatorlog_sync_players",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectatorlog_intro_backspace",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectatorlog_intro_backspace_target_title",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "spectatorlog_intro_backspace_activate",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectatorlog_intro_backspace_restore",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectator_commentary_enabled",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectator_commentary_mode",
+      "type": "str",
+      "default": "standard"
+    },
+    {
+      "name": "spectator_commentary_min_damage",
+      "type": "float",
+      "default": 25.0
+    },
+    {
+      "name": "spectator_hit_effect_damage",
+      "type": "float",
+      "default": 45.0
+    },
+    {
+      "name": "spectator_hit_effect_color_preset",
+      "type": "str",
+      "default": "classic"
+    },
+    {
+      "name": "spectator_hit_effect_color_low",
+      "type": "str",
+      "default": "#38bdf8"
+    },
+    {
+      "name": "spectator_hit_effect_color_mid",
+      "type": "str",
+      "default": "#fb923c"
+    },
+    {
+      "name": "spectator_hit_effect_color_high",
+      "type": "str",
+      "default": "#f87171"
+    },
+    {
+      "name": "spectator_hit_effect_color_weak",
+      "type": "str",
+      "default": "#facc15"
+    },
+    {
+      "name": "spectator_hit_effect_color_stun",
+      "type": "str",
+      "default": "#ef4444"
+    },
+    {
+      "name": "spectator_hit_effect_duration_ms",
+      "type": "int",
+      "default": 170
+    },
+    {
+      "name": "spectator_hit_effect_pop_ms",
+      "type": "int",
+      "default": 58
+    },
+    {
+      "name": "spectator_hit_effect_base_size",
+      "type": "int",
+      "default": 86
+    },
+    {
+      "name": "spectator_hit_effect_damage_scale",
+      "type": "float",
+      "default": 0.42
+    },
+    {
+      "name": "spectator_hit_effect_ring_width",
+      "type": "int",
+      "default": 4
+    },
+    {
+      "name": "spectator_hit_effect_opacity",
+      "type": "float",
+      "default": 1.0
+    },
+    {
+      "name": "spectator_hit_effect_glow",
+      "type": "float",
+      "default": 1.0
+    },
+    {
+      "name": "spectator_hit_effect_fill_opacity",
+      "type": "float",
+      "default": 1.0
+    },
+    {
+      "name": "spectator_hit_effect_show_text",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectator_hit_effect_text_scale",
+      "type": "float",
+      "default": 1.0
+    },
+    {
+      "name": "spectator_hit_effect_latency_log",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectator_hit_effect_fast_emit",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectator_hit_effect_sprite_enabled",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "spectator_hit_effect_ring_enabled",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "spectator_commentary_cooldown_sec",
+      "type": "float",
+      "default": 6.0
+    },
+    {
+      "name": "spectator_commentary_voice",
+      "type": "str",
+      "default": "ko-KR-SunHiNeural"
+    },
+    {
+      "name": "spectator_caster_voice",
+      "type": "str",
+      "default": "ko-KR-InJoonNeural"
+    },
+    {
+      "name": "spectator_commentary_rate",
+      "type": "int",
+      "default": 200
+    },
+    {
+      "name": "spectator_commentary_volume",
+      "type": "float",
+      "default": 100.0
+    },
+    {
+      "name": "spectator_commentary_pitch",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "spectator_replay_speed",
+      "type": "float",
+      "default": 1.0
+    },
+    {
+      "name": "spectator_replay_real_time",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "spectator_recent_text_size",
+      "type": "int",
+      "default": 23
+    },
+    {
+      "name": "spectator_stun_sfx_path",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "spectator_knockdown_sfx_path",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "spectator_tko_sfx_path",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "spectator_sfx_playback_rate",
+      "type": "float",
+      "default": 1.0
+    },
+    {
+      "name": "diagnostics_enabled",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "diagnostics_trace_minutes",
+      "type": "int",
+      "default": 10
+    },
+    {
+      "name": "diagnostics_raw_sample_lines",
+      "type": "int",
+      "default": 120
+    },
+    {
+      "name": "diagnostics_mask_sensitive",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "portrait_source_priority",
+      "type": "str",
+      "default": "log"
+    },
+    {
+      "name": "roi_trigger",
+      "type": "Rect",
+      "default": "field(default_factory=Rect)"
+    },
+    {
+      "name": "roi_blue_name",
+      "type": "Rect",
+      "default": "field(default_factory=Rect)"
+    },
+    {
+      "name": "roi_red_name",
+      "type": "Rect",
+      "default": "field(default_factory=Rect)"
+    },
+    {
+      "name": "roi_arena_name",
+      "type": "Rect",
+      "default": "field(default_factory=Rect)"
+    },
+    {
+      "name": "roi_round_info",
+      "type": "Rect",
+      "default": "field(default_factory=Rect)"
+    },
+    {
+      "name": "roi_round_time",
+      "type": "Rect",
+      "default": "field(default_factory=Rect)"
+    },
+    {
+      "name": "roi_left_player",
+      "type": "Rect",
+      "default": "field(default_factory=Rect)"
+    },
+    {
+      "name": "roi_right_player",
+      "type": "Rect",
+      "default": "field(default_factory=Rect)"
+    },
+    {
+      "name": "roi_koth_winner_blue",
+      "type": "Rect",
+      "default": "field(default_factory=Rect)"
+    },
+    {
+      "name": "roi_koth_winner_red",
+      "type": "Rect",
+      "default": "field(default_factory=Rect)"
+    },
+    {
+      "name": "trigger",
+      "type": "TriggerConfig",
+      "default": "field(default_factory=TriggerConfig)"
+    },
+    {
+      "name": "ocr",
+      "type": "OCRConfig",
+      "default": "field(default_factory=OCRConfig)"
+    },
+    {
+      "name": "palette",
+      "type": "PaletteConfig",
+      "default": "field(default_factory=PaletteConfig)"
+    },
+    {
+      "name": "timer_total_rounds",
+      "type": "int",
+      "default": 3
+    },
+    {
+      "name": "timer_round_sec",
+      "type": "int",
+      "default": 180
+    },
+    {
+      "name": "timer_rest_sec",
+      "type": "int",
+      "default": 60
+    },
+    {
+      "name": "timer_rest_30s_tts_enabled",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "timer_rest_30s_tts_rate",
+      "type": "int",
+      "default": 200
+    },
+    {
+      "name": "timer_current_round",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "timer_seconds_left",
+      "type": "int",
+      "default": 180
+    },
+    {
+      "name": "overlay_bg_color",
+      "type": "str",
+      "default": "transparent"
+    },
+    {
+      "name": "overlay_bg_opacity",
+      "type": "float",
+      "default": 0.0
+    },
+    {
+      "name": "overlay_ui_bg_opacity",
+      "type": "float",
+      "default": 0.75
+    },
+    {
+      "name": "overlay_window_opacity",
+      "type": "float",
+      "default": 1.0
+    },
+    {
+      "name": "overlay_ui_scale",
+      "type": "float",
+      "default": 1.0
+    },
+    {
+      "name": "overlay_timer_font_size",
+      "type": "int",
+      "default": 54
+    },
+    {
+      "name": "overlay_timer_x",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "overlay_timer_y",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "overlay_round_font_size",
+      "type": "int",
+      "default": 11
+    },
+    {
+      "name": "overlay_round_x",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "overlay_round_y",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "overlay_preset",
+      "type": "str",
+      "default": "classic"
+    },
+    {
+      "name": "overlay_player_mask",
+      "type": "str",
+      "default": "square"
+    },
+    {
+      "name": "overlay_show_round",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "overlay_show_time",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "overlay_show_blue_img",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "overlay_show_blue_name",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "overlay_show_red_img",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "overlay_show_red_name",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "overlay_show_arena_name",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "overlay_show_flags",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "overlay_show_cinematic",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "overlay_vs_bg_path",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "overlay_vs_bg_opacity",
+      "type": "float",
+      "default": 1.0
+    },
+    {
+      "name": "overlay_vs_bg_by_arena",
+      "type": "Dict[str, str]",
+      "default": "field(default_factory=dict)"
+    },
+    {
+      "name": "overlay_vs_hold_sec",
+      "type": "float",
+      "default": 2.85
+    },
+    {
+      "name": "browser_overlay_scale",
+      "type": "float",
+      "default": 1.0
+    },
+    {
+      "name": "browser_overlay_poll_ms",
+      "type": "int",
+      "default": 50
+    },
+    {
+      "name": "browser_overlay_output_only",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "browser_fullscreen_fx_intensity",
+      "type": "float",
+      "default": 1.6
+    },
+    {
+      "name": "qml_preview_enabled",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "qml_effects_enabled",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "overlay_style_round",
+      "type": "Dict[str, object]",
+      "default": "field(default_factory=_default_overlay_style_round)"
+    },
+    {
+      "name": "overlay_style_time",
+      "type": "Dict[str, object]",
+      "default": "field(default_factory=_default_overlay_style_time)"
+    },
+    {
+      "name": "overlay_style_blue_name",
+      "type": "Dict[str, object]",
+      "default": "field(default_factory=_default_overlay_style_blue_name)"
+    },
+    {
+      "name": "overlay_style_red_name",
+      "type": "Dict[str, object]",
+      "default": "field(default_factory=_default_overlay_style_red_name)"
+    },
+    {
+      "name": "overlay_style_arena",
+      "type": "Dict[str, object]",
+      "default": "field(default_factory=_default_overlay_style_arena)"
+    },
+    {
+      "name": "browser_text_styles",
+      "type": "Dict[str, Dict[str, object]]",
+      "default": "field(default_factory=_default_browser_text_styles)"
+    },
+    {
+      "name": "action_cooldown_sec",
+      "type": "float",
+      "default": 5.0
+    },
+    {
+      "name": "action_cooldowns",
+      "type": "Dict[str, float]",
+      "default": "field(default_factory=dict)"
+    },
+    {
+      "name": "action_edge_triggers",
+      "type": "Dict[str, bool]",
+      "default": "field(default_factory=dict)"
+    },
+    {
+      "name": "capture_player_images",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "players",
+      "type": "Dict[str, str]",
+      "default": "field(default_factory=dict)"
+    },
+    {
+      "name": "players_images",
+      "type": "Dict[str, str]",
+      "default": "field(default_factory=dict)"
+    },
+    {
+      "name": "players_countries",
+      "type": "Dict[str, str]",
+      "default": "field(default_factory=dict)"
+    },
+    {
+      "name": "players_flags",
+      "type": "Dict[str, str]",
+      "default": "field(default_factory=dict)"
+    },
+    {
+      "name": "current_blue_id",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "current_red_id",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "current_blue_registered",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "current_red_registered",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "current_blue_valid",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "current_red_valid",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "koth_enabled",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "koth_champion_id",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "koth_streak",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "koth_min_score",
+      "type": "int",
+      "default": 75
+    },
+    {
+      "name": "layout",
+      "type": "Dict[str, Dict[str, int]]",
+      "default": "field(default_factory=dict)"
+    },
+    {
+      "name": "actions",
+      "type": "Dict[str, List[dict]]",
+      "default": "field(default_factory=dict)"
+    },
+    {
+      "name": "pixel_rules",
+      "type": "List[dict]",
+      "default": "field(default_factory=list)"
+    },
+    {
+      "name": "win_effects",
+      "type": "Dict[str, object]",
+      "default": "field(default_factory=default_win_effects)"
+    }
+  ],
+  "count": 150
+}

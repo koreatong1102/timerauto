@@ -1,0 +1,177 @@
+{
+  "version": 1,
+  "overlay_bg_color": "#000000",
+  "overlay_bg_opacity": 0.0,
+  "overlay_player_mask": "hex",
+  "overlay_show_round": true,
+  "overlay_show_time": true,
+  "overlay_show_blue_img": true,
+  "overlay_show_blue_name": true,
+  "overlay_show_red_img": true,
+  "overlay_show_red_name": true,
+  "overlay_show_arena_name": true,
+  "overlay_style": {
+    "round": {
+      "bg_color": "#000000",
+      "bg_opacity": 0.89,
+      "border_color": "#5b4631",
+      "border_opacity": 0.0,
+      "border_width": 2,
+      "text_color": "#ffffff",
+      "text_opacity": 1.0,
+      "font_family": "Bahnschrift",
+      "font_size": 0,
+      "font_bold": true,
+      "font_weight": 700
+    },
+    "time": {
+      "bg_color": "#000000",
+      "bg_opacity": 0.89,
+      "border_color": "#1a1a1a",
+      "border_opacity": 0.0,
+      "border_width": 2,
+      "text_color": "#ffffff",
+      "text_opacity": 1.0,
+      "font_family": "Bahnschrift",
+      "font_size": 0,
+      "font_bold": true,
+      "font_weight": 700,
+      "rest_text_color": "#ff0000",
+      "rest_text_opacity": 1.0
+    },
+    "blue_name": {
+      "bg_color": "#000000",
+      "bg_opacity": 0.61,
+      "border_color": "#1b3f8a",
+      "border_opacity": 0.0,
+      "border_width": 2,
+      "text_color": "#ffffff",
+      "text_opacity": 1.0,
+      "font_family": "Noto Sans KR",
+      "font_size": 0,
+      "font_bold": true,
+      "font_weight": 900
+    },
+    "red_name": {
+      "bg_color": "#000000",
+      "bg_opacity": 0.62,
+      "border_color": "#ff0000",
+      "border_opacity": 0.0,
+      "border_width": 2,
+      "text_color": "#ffffff",
+      "text_opacity": 1.0,
+      "font_family": "Noto Sans KR",
+      "font_size": 0,
+      "font_bold": true,
+      "font_weight": 900
+    },
+    "arena": {
+      "bg_color": "#222222",
+      "bg_opacity": 0.61,
+      "border_color": "#555555",
+      "border_opacity": 1.0,
+      "border_width": 1,
+      "text_color": "#ffffff",
+      "text_opacity": 1.0,
+      "font_family": "Malgun Gothic",
+      "font_size": 0,
+      "font_bold": true,
+      "font_weight": 700
+    }
+  },
+  "overlay_layout": {
+    "arena_name": {
+      "h": 25.0,
+      "w": 175.0,
+      "x": 375.0,
+      "y": 120.0
+    },
+    "blue_img": {
+      "h": 110.0,
+      "w": 115.0,
+      "x": 2.0,
+      "y": 34.0
+    },
+    "blue_name": {
+      "h": 40.0,
+      "w": 195.0,
+      "x": 130.0,
+      "y": 70.0
+    },
+    "custom_elements": [
+      {
+        "bg_color": "#000000",
+        "bg_opacity": 0.73,
+        "border_color": "#111827",
+        "border_opacity": 1.0,
+        "border_width": 0.0,
+        "font_bold": true,
+        "font_family": "Headline R",
+        "font_size": 0.0,
+        "font_weight": 700.0,
+        "h": 25.0,
+        "id": "custom_mkyangrn_btut",
+        "text": "RANK MATCH",
+        "text_color": "#ffffff",
+        "text_opacity": 1.0,
+        "visible": true,
+        "w": 165.0,
+        "x": 380.0,
+        "y": 34.0
+      },
+      {
+        "bg_color": "#000000",
+        "bg_opacity": 0.73,
+        "border_color": "#111827",
+        "border_opacity": 1.0,
+        "border_width": 0.0,
+        "font_bold": true,
+        "font_family": "Impact",
+        "font_size": 22.0,
+        "font_weight": 900.0,
+        "h": 40.0,
+        "id": "custom_bfa31770",
+        "text": "RFC",
+        "text_color": "#ffffff",
+        "text_opacity": 0.97,
+        "visible": true,
+        "w": 80.0,
+        "x": 330.0,
+        "y": 70.0
+      }
+    ],
+    "red_img": {
+      "h": 110.0,
+      "w": 115.0,
+      "x": 800.0,
+      "y": 34.0
+    },
+    "red_name": {
+      "h": 40.0,
+      "w": 195.0,
+      "x": 595.0,
+      "y": 70.0
+    },
+    "round": {
+      "h": 40.0,
+      "w": 75.0,
+      "x": 510.0,
+      "y": 70.0
+    },
+    "time": {
+      "h": 40.0,
+      "w": 100.0,
+      "x": 410.0,
+      "y": 70.0
+    },
+    "visibility": {
+      "arena_name": true,
+      "blue_img": true,
+      "blue_name": true,
+      "red_img": true,
+      "red_name": true,
+      "round": true,
+      "time": true
+    }
+  }
+}

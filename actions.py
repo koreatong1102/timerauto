@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import time
 import threading
@@ -16,19 +16,13 @@ from typing import List, Optional, Deque, Tuple
 
 from PyQt6.QtCore import QObject, QTimer
 
-try:
-    import pyautogui
-    HAS_PYAUTOGUI = True
-except Exception:
-    HAS_PYAUTOGUI = False
-    pyautogui = None
-
-try:
-    import edge_tts
-    HAS_EDGE_TTS = True
-except Exception:
-    HAS_EDGE_TTS = False
-    edge_tts = None
+# Heavy optional runtime dependencies are imported lazily. This keeps the main
+# window responsive on first launch and avoids loading input/TTS stacks unless
+# the user actually runs those actions.
+pyautogui = None
+HAS_PYAUTOGUI = False
+edge_tts = None
+HAS_EDGE_TTS = False
 
 
 class ActionRunner(QObject):
@@ -182,7 +176,7 @@ class ActionRunner(QObject):
                         pyautogui = _pyautogui
                         HAS_PYAUTOGUI = True
                     except Exception as e:
-                        self._status_cb("pyautogui ?꾩슂: pip install pyautogui")
+                        self._status_cb("pyautogui 필요: pip install pyautogui")
                         try:
                             logging.warning("Action blocked: pyautogui missing (type=%s) err=%s", atype, e)
                         except Exception:
@@ -224,7 +218,7 @@ class ActionRunner(QObject):
             except Exception:
                 pass
             try:
-                self._status_cb(f"?≪뀡 ?ㅻ쪟({atype}): {e}")
+                self._status_cb(f"액션 오류({atype}): {e}")
             except Exception:
                 pass
         return int(action.get("post_delay_ms", 0))
@@ -725,7 +719,7 @@ class ActionRunner(QObject):
                 logging.warning("TTS_EDGE_FAIL runner=%s err=%s", self._runner_tag, e)
             except Exception:
                 pass
-            self._safe_status(f"Edge TTS ?ㅻ쪟: {e}")
+            self._safe_status(f"Edge TTS 오류: {e}")
             return False
         finally:
             try:
@@ -772,7 +766,7 @@ class ActionRunner(QObject):
             except Exception:
                 pass
         except Exception as e:
-            self._safe_status(f"TTS ???ㅻ쪟: {e}")
+            self._safe_status(f"TTS 큐 오류: {e}")
 
     def speak_text(
         self,
@@ -829,7 +823,7 @@ class ActionRunner(QObject):
                             break
                         time.sleep(min(0.4, 0.1 * attempt))
                     if not ok:
-                        self._safe_status("Edge TTS ?ъ깮 ?ㅽ뙣")
+                        self._safe_status("Edge TTS 재생 실패")
                         break
                     if i < repeat - 1 and gap_ms > 0:
                         time.sleep(gap_ms / 1000.0)
@@ -838,7 +832,7 @@ class ActionRunner(QObject):
                 logging.exception("TTS worker crashed: %s", e)
             except Exception:
                 pass
-            self._safe_status(f"TTS ?뚯빱 ?ㅻ쪟: {e}")
+            self._safe_status(f"TTS 워커 오류: {e}")
         finally:
             if coinited:
                 try:

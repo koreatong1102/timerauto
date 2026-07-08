@@ -37,13 +37,29 @@ jobs:
           $version = "1.0.${{ github.run_number }}"
           $sourceZip = "release\TimerAuto_v${version}_portable.zip"
           $latestZip = "release\TimerAuto_latest_portable.zip"
+          $legacyZip = "release\TimerAuto_latest_legacy_update.zip"
+          $legacyDir = "release\legacy_update"
           Copy-Item -LiteralPath $sourceZip -Destination $latestZip -Force
 
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $latestZip).Hash.ToLowerInvariant()
+          if (Test-Path $legacyDir) {
+            Remove-Item -LiteralPath $legacyDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $legacyDir | Out-Null
+          Get-ChildItem -LiteralPath "dist\timerauto" -Force |
+            Where-Object { $_.Name -ne "_internal" } |
+            ForEach-Object {
+              Copy-Item -LiteralPath $_.FullName -Destination $legacyDir -Recurse -Force
+            }
+          if (Test-Path $legacyZip) {
+            Remove-Item -LiteralPath $legacyZip -Force
+          }
+          Compress-Archive -Path (Join-Path $legacyDir "*") -DestinationPath $legacyZip -Force
+
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $legacyZip).Hash.ToLowerInvariant()
           $repo = "${{ github.repository }}"
           $metadata = [ordered]@{
             version = $version
-            url = "https://github.com/$repo/releases/download/latest/TimerAuto_latest_portable.zip"
+            url = "https://github.com/$repo/releases/download/latest/TimerAuto_latest_legacy_update.zip"
             notes = "TimerAuto $version"
             sha256 = $hash
           }
@@ -62,6 +78,7 @@ jobs:
 
           gh release upload latest `
             "release\TimerAuto_latest_portable.zip" `
+            "release\TimerAuto_latest_legacy_update.zip" `
             "release\latest.json" `
             --clobber
 
@@ -73,6 +90,7 @@ jobs:
           } else {
             gh release create latest `
               "release\TimerAuto_latest_portable.zip" `
+              "release\TimerAuto_latest_legacy_update.zip" `
               "release\latest.json" `
               --title "TimerAuto latest" `
               --notes "Automatic latest build from ${{ github.sha }}" `

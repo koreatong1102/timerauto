@@ -60,11 +60,12 @@ jobs:
           git tag -f latest
           git push origin latest --force
 
-          if (gh release view latest *> $null) {
-            gh release upload latest `
-              "release\TimerAuto_latest_portable.zip" `
-              "release\latest.json" `
-              --clobber
+          gh release upload latest `
+            "release\TimerAuto_latest_portable.zip" `
+            "release\latest.json" `
+            --clobber
+
+          if ($LASTEXITCODE -eq 0) {
             gh release edit latest `
               --title "TimerAuto latest" `
               --notes "Automatic latest build from ${{ github.sha }}" `

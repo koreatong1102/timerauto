@@ -57,14 +57,23 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          gh release delete latest --yes --cleanup-tag 2>$null
-
           git tag -f latest
           git push origin latest --force
 
-          gh release create latest `
-            "release\TimerAuto_latest_portable.zip" `
-            "release\latest.json" `
-            --title "TimerAuto latest" `
-            --notes "Automatic latest build from ${{ github.sha }}" `
-            --latest
+          if (gh release view latest *> $null) {
+            gh release upload latest `
+              "release\TimerAuto_latest_portable.zip" `
+              "release\latest.json" `
+              --clobber
+            gh release edit latest `
+              --title "TimerAuto latest" `
+              --notes "Automatic latest build from ${{ github.sha }}" `
+              --latest
+          } else {
+            gh release create latest `
+              "release\TimerAuto_latest_portable.zip" `
+              "release\latest.json" `
+              --title "TimerAuto latest" `
+              --notes "Automatic latest build from ${{ github.sha }}" `
+              --latest
+          }

@@ -55,11 +55,14 @@ jobs:
           }
           Compress-Archive -Path (Join-Path $legacyDir "*") -DestinationPath $legacyZip -Force
 
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $legacyZip).Hash.ToLowerInvariant()
+          # Existing 1.0.0 installs can have an older Python runtime in
+          # _internal.  Always advertise the full portable package so updates
+          # replace runtime DLLs as well as app files.
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $latestZip).Hash.ToLowerInvariant()
           $repo = "${{ github.repository }}"
           $metadata = [ordered]@{
             version = $version
-            url = "https://github.com/$repo/releases/download/latest/TimerAuto_latest_legacy_update.zip"
+            url = "https://github.com/$repo/releases/download/latest/TimerAuto_latest_portable.zip"
             notes = "TimerAuto $version"
             sha256 = $hash
           }

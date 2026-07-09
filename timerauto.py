@@ -114,15 +114,6 @@ try:
 except Exception:
     HAS_RAPIDFUZZ = False
 
-# --- OCR: EasyOCR ---
-_EASYOCR_IMPORT_ERROR = None
-_EASYOCR_READER_ERROR = None
-easyocr = None
-HAS_EASYOCR = True
-
-if TYPE_CHECKING:
-    from easyocr import Reader as EasyOCRReader
-
 # --- Player segmentation: MediaPipe ---
 mp = None
 HAS_MEDIAPIPE = True
@@ -166,7 +157,6 @@ from app_paths import (
 from config_model import (
     Rect,
     TriggerConfig,
-    OCRConfig,
     PaletteConfig,
     AppConfig,
     default_win_effects,
@@ -195,13 +185,11 @@ from update_manager import _parse_version, _download_file, _file_sha256, _write_
 from diagnostics import diagnostics as DIAG
 from ai_project_snapshot import export_project_snapshot
 
-_EASYOCR_READERS: Dict[Tuple[str, ...], "EasyOCRReader"] = {}
-_EASYOCR_LOCK = threading.Lock()
-_TEMPLATE_CACHE: Dict[Tuple[str, int, int], np.ndarray] = {}
-
 _MP_SELFIE = None
 _MP_LOCK = threading.Lock()
 _NO_UPDATE = object()
+PLAYER_ID_ALLOW_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
+UNKNOWN_PLAYER_LABEL = "UNKNOWN"
 
 
 
@@ -623,6 +611,59 @@ def _press_vk_sendinput_held(vk: int, hold_sec: float = 0.08) -> Tuple[bool, str
         return False, str(e)
 
 
+def _activate_window_reliably(hwnd: int, *, restore: bool = False) -> Tuple[bool, str]:
+    """Activate a window while cooperating with Windows foreground-lock rules."""
+    if os.name != "nt" or not hwnd:
+        return False, "invalid window"
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.BringWindowToTop.argtypes = [wintypes.HWND]
+    user32.BringWindowToTop.restype = wintypes.BOOL
+    user32.SetActiveWindow.argtypes = [wintypes.HWND]
+    user32.SetActiveWindow.restype = wintypes.HWND
+    current_tid = int(kernel32.GetCurrentThreadId() or 0)
+    foreground_hwnd = int(user32.GetForegroundWindow() or 0)
+    foreground_pid = wintypes.DWORD()
+    target_pid = wintypes.DWORD()
+    foreground_tid = int(
+        user32.GetWindowThreadProcessId(wintypes.HWND(foreground_hwnd), ctypes.byref(foreground_pid)) or 0
+    )
+    target_tid = int(
+        user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(target_pid)) or 0
+    )
+    attached = []
+    try:
+        for thread_id in (foreground_tid, target_tid):
+            if thread_id and current_tid and thread_id != current_tid and thread_id not in attached:
+                if user32.AttachThreadInput(current_tid, thread_id, True):
+                    attached.append(thread_id)
+        if not restore:
+            user32.ShowWindow(wintypes.HWND(hwnd), 9)  # SW_RESTORE
+        user32.BringWindowToTop(wintypes.HWND(hwnd))
+        user32.SetActiveWindow(wintypes.HWND(hwnd))
+        user32.SetForegroundWindow(wintypes.HWND(hwnd))
+        time.sleep(0.08)
+        active = int(user32.GetForegroundWindow() or 0)
+        return active == int(hwnd), (
+            f"requested={int(hwnd)} active={active} "
+            f"target='{_window_title(hwnd)}' active_title='{_window_title(active)}'"
+        )
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        for thread_id in reversed(attached):
+            try:
+                user32.AttachThreadInput(current_tid, thread_id, False)
+            except Exception:
+                pass
+
+
 def press_vk_for_window_title(
     vk: int,
     title_part: str,
@@ -657,14 +698,7 @@ def press_vk_for_window_title(
     target_title = _window_title(hwnd)
     try:
         if activate:
-            try:
-                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            except Exception:
-                pass
-            try:
-                user32.SetForegroundWindow(hwnd)
-            except Exception:
-                pass
+            _activate_window_reliably(hwnd)
             time.sleep(0.28)
         active = 0
         try:
@@ -680,10 +714,7 @@ def press_vk_for_window_title(
             method = "fallback_press_vk_once"
         time.sleep(0.16)
         if restore_previous and prev and prev != hwnd:
-            try:
-                user32.SetForegroundWindow(prev)
-            except Exception:
-                pass
+            _activate_window_reliably(prev, restore=True)
         active_title = _window_title(active)
         return bool(ok), (
             f"{err or ''} method={method} hwnd={hwnd} target='{target_title}' "
@@ -693,378 +724,127 @@ def press_vk_for_window_title(
         return False, str(e)
 
 
-def _get_easyocr_reader(langs: Tuple[str, ...]):
-    global easyocr, HAS_EASYOCR, _EASYOCR_IMPORT_ERROR, _EASYOCR_READER_ERROR
-    if not HAS_EASYOCR:
-        return None
-    with _EASYOCR_LOCK:
-        if easyocr is None:
-            try:
-                import easyocr as _easyocr
-                easyocr = _easyocr
-                HAS_EASYOCR = True
-                _EASYOCR_IMPORT_ERROR = None
-            except Exception as e:
-                HAS_EASYOCR = False
-                _EASYOCR_IMPORT_ERROR = str(e)
-                _EASYOCR_READER_ERROR = str(e)
-                return None
-        reader = _EASYOCR_READERS.get(langs)
-        if reader is None:
-            try:
-                reader = easyocr.Reader(list(langs), gpu=False, verbose=False)
-            except Exception as e:
-                try:
-                    logging.exception("EasyOCR reader init failed")
-                    logging.error("EasyOCR reader error: %s", str(e))
-                except Exception:
-                    pass
-                HAS_EASYOCR = False
-                _EASYOCR_IMPORT_ERROR = str(e)
-                _EASYOCR_READER_ERROR = str(e)
-                return None
-            _EASYOCR_READERS[langs] = reader
-    return reader
+def window_client_point_from_cursor(title_part: str) -> Tuple[bool, int, int, str]:
+    """Return the current cursor position in the target window's client coordinates."""
+    if os.name != "nt":
+        return False, 0, 0, "Windows only"
+    title_part = str(title_part or "").strip()
+    if not title_part:
+        return False, 0, 0, "관전툴 창 제목이 비어 있습니다."
+    hwnd = _find_window_by_title_contains(title_part)
+    if not hwnd:
+        return False, 0, 0, f"관전툴 창을 찾지 못했습니다: {title_part}"
+    user32 = ctypes.windll.user32
+    point = wintypes.POINT()
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        return False, 0, 0, "GetCursorPos failed"
+    screen_x, screen_y = int(point.x), int(point.y)
+    if not user32.ScreenToClient(hwnd, ctypes.byref(point)):
+        return False, 0, 0, "ScreenToClient failed"
+    client_x, client_y = int(point.x), int(point.y)
+    if client_x < 0 or client_y < 0:
+        return False, client_x, client_y, "마우스가 관전툴 창 내부에 있지 않습니다."
+    return True, client_x, client_y, (
+        f"hwnd={hwnd} target='{_window_title(hwnd)}' "
+        f"screen=({screen_x},{screen_y}) client=({client_x},{client_y})"
+    )
 
 
-def _preprocess_ocr(bgr_roi: np.ndarray, *, scale: float = 2.0, force_invert: Optional[bool] = None) -> List[np.ndarray]:
-    if bgr_roi.size == 0:
-        return []
-    gray = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2GRAY)
-    if scale and scale != 1.0:
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    # Boost contrast for small UI text
+def _current_cursor_screen_position() -> Tuple[int, int]:
+    if os.name != "nt":
+        pos = QCursor.pos()
+        return int(pos.x()), int(pos.y())
+    point = wintypes.POINT()
+    if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+        return 0, 0
+    return int(point.x), int(point.y)
+
+
+def click_window_client_point(
+    title_part: str,
+    client_x: int,
+    client_y: int,
+    *,
+    activate: bool = True,
+    restore_focus: bool = True,
+    restore_cursor: bool = True,
+    minimize_target: bool = False,
+    previous_hwnd_override: int = 0,
+    previous_cursor_override: Optional[Tuple[int, int]] = None,
+) -> Tuple[bool, str]:
+    """Perform one real left click at a client-relative point in a target window."""
+    if os.name != "nt":
+        return False, "Windows only"
+    title_part = str(title_part or "").strip()
+    if not title_part:
+        return False, "관전툴 창 제목이 비어 있습니다."
+    hwnd = _find_window_by_title_contains(title_part)
+    if not hwnd:
+        return False, f"관전툴 창을 찾지 못했습니다: {title_part}"
     try:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
+        client_x = max(0, int(client_x))
+        client_y = max(0, int(client_y))
     except Exception:
-        pass
-    # Otsu threshold for crisp text
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    imgs = [gray, th]
-    if force_invert is None:
-        # If background is dark, invert for OCR
-        mean_val = float(np.mean(th)) if th.size else 0.0
-        if mean_val < 127:
-            imgs.append(255 - th)
-    elif force_invert:
-        imgs.append(255 - th)
-    return imgs
+        return False, "시작 버튼 좌표가 올바르지 않습니다."
 
+    user32 = ctypes.windll.user32
+    target = wintypes.POINT(client_x, client_y)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(target)):
+        return False, "ClientToScreen failed"
+    target_x, target_y = int(target.x), int(target.y)
+    previous_hwnd = int(previous_hwnd_override or user32.GetForegroundWindow() or 0)
+    previous_cursor = wintypes.POINT()
+    have_previous_cursor = bool(user32.GetCursorPos(ctypes.byref(previous_cursor)))
+    if previous_cursor_override is not None:
+        previous_cursor.x = int(previous_cursor_override[0])
+        previous_cursor.y = int(previous_cursor_override[1])
+        have_previous_cursor = True
 
-def _ocr_read_best(reader, images: List[np.ndarray], allowlist: Optional[str] = None) -> str:
-    best = ""
-    for img in images:
-        try:
-            results = reader.readtext(
-                img,
-                detail=0,
-                paragraph=False,
-                allowlist=allowlist
+    click_ok = False
+    detail = ""
+    try:
+        if activate:
+            activated, activate_detail = _activate_window_reliably(hwnd)
+            if not activated:
+                logging.warning("LOBBY_AUTO_START_ACTIVATE_FAIL %s", activate_detail)
+            time.sleep(0.12)
+        if not user32.SetCursorPos(target_x, target_y):
+            detail = "SetCursorPos failed"
+        else:
+            time.sleep(0.035)
+            mouse_left_down = 0x0002
+            mouse_left_up = 0x0004
+            user32.mouse_event(mouse_left_down, 0, 0, 0, 0)
+            time.sleep(0.045)
+            user32.mouse_event(mouse_left_up, 0, 0, 0, 0)
+            time.sleep(0.08)
+            click_ok = True
+            detail = (
+                f"hwnd={hwnd} target='{_window_title(hwnd)}' "
+                f"client=({client_x},{client_y}) screen=({target_x},{target_y})"
             )
-        except Exception:
-            continue
-        if not results:
-            continue
-        text = max((str(r).strip() for r in results if str(r).strip()), key=len, default="")
-        if len(text) > len(best):
-            best = text
-    return best.strip()
-
-
-def _clean_ocr_digits(text: str) -> str:
-    if not text:
-        return ""
-    repl = {
-        "O": "0", "o": "0",
-        "I": "1", "l": "1", "|": "1",
-        "S": "5", "s": "5",
-        "B": "8",
-    }
-    return "".join(repl.get(ch, ch) for ch in text)
-
-
-def ocr_one_line_digits(bgr_roi: np.ndarray, allowlist: str, *, scale: float = 2.0) -> str:
-    reader = _get_easyocr_reader(("en",))
-    if reader is None:
-        return ""
-    if bgr_roi.size == 0:
-        return ""
-    imgs = _preprocess_ocr(bgr_roi, scale=scale)
-    if not imgs:
-        return ""
-    # Try binarized first for speed/clarity, then grayscale fallback
-    ordered: List[np.ndarray] = []
-    if len(imgs) >= 2:
-        ordered.append(imgs[1])
-    ordered.append(imgs[0])
-    text = _ocr_read_best(reader, ordered[:1], allowlist=allowlist)
-    if not text and len(ordered) > 1:
-        text = _ocr_read_best(reader, [ordered[1]], allowlist=allowlist)
-    return text.strip()
-
-
-def _round_template_candidates() -> List[str]:
-    out = []
-    for total in range(1, 13):
-        for cur in range(1, total + 1):
-            out.append(f"{cur}/{total}")
-    return out
-
-
-def _time_template_candidates() -> List[str]:
-    return ["60", "120", "180"]
-
-
-def _roi_to_binary(bgr_roi: np.ndarray) -> np.ndarray:
-    if bgr_roi.size == 0:
-        return np.zeros((0, 0), dtype=np.uint8)
-    gray = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2GRAY)
-    # Mild blur to reduce noise
-    try:
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    except Exception:
-        pass
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return th
-
-
-def _trim_right_for_time_roi(bgr_roi: np.ndarray, ratio: float = 0.18) -> np.ndarray:
-    if bgr_roi.size == 0:
-        return bgr_roi
-    h, w = bgr_roi.shape[:2]
-    cut = int(w * float(ratio))
-    if cut <= 0 or w - cut <= 1:
-        return bgr_roi
-    return bgr_roi[:, :w - cut]
-
-
-def _render_text_template(text: str, h: int, w: int) -> np.ndarray:
-    key = (text, int(h), int(w))
-    cached = _TEMPLATE_CACHE.get(key)
-    if cached is not None:
-        return cached
-    img = np.zeros((int(h), int(w)), dtype=np.uint8)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    best_scale = 0.5
-    best_size = None
-    for scale in np.linspace(0.5, 3.0, 26):
-        size, base = cv2.getTextSize(text, font, float(scale), 2)
-        tw, th = size
-        if tw <= w * 0.95 and th <= h * 0.9:
-            best_scale = float(scale)
-            best_size = (tw, th, base)
-    if best_size is None:
-        best_size, base = cv2.getTextSize(text, font, best_scale, 2)
-        tw, th = best_size
-        base = base
-    else:
-        tw, th, base = best_size
-    x = max(0, int((w - tw) * 0.5))
-    y = max(th + 1, int((h + th) * 0.5))
-    cv2.putText(img, text, (x, y), font, best_scale, 255, 2, cv2.LINE_AA)
-    _, img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY)
-    _TEMPLATE_CACHE[key] = img
-    return img
-
-
-def _binary_match_score(roi_bin: np.ndarray, tpl_bin: np.ndarray) -> float:
-    if roi_bin.size == 0 or tpl_bin.size == 0:
-        return 0.0
-    if roi_bin.shape != tpl_bin.shape:
-        try:
-            tpl_bin = cv2.resize(tpl_bin, (roi_bin.shape[1], roi_bin.shape[0]), interpolation=cv2.INTER_NEAREST)
-        except Exception:
-            return 0.0
-    return float(np.mean(roi_bin == tpl_bin))
-
-
-def template_match_text(bgr_roi: np.ndarray, candidates: List[str]) -> Tuple[str, float]:
-    if bgr_roi.size == 0 or not candidates:
-        return "", 0.0
-    roi_bin = _roi_to_binary(bgr_roi)
-    if roi_bin.size == 0:
-        return "", 0.0
-    roi_inv = 255 - roi_bin
-    h, w = roi_bin.shape[:2]
-    best_text = ""
-    best_score = -1.0
-    for text in candidates:
-        tpl = _render_text_template(text, h, w)
-        score = max(
-            _binary_match_score(roi_bin, tpl),
-            _binary_match_score(roi_inv, tpl)
-        )
-        if score > best_score:
-            best_score = score
-            best_text = text
-    return best_text, float(best_score)
-
-def ocr_one_line_english(bgr_roi: np.ndarray, allowlist: str) -> str:
-    reader = _get_easyocr_reader(("en",))
-    if reader is None:
-        return ""
-    if bgr_roi.size == 0:
-        return ""
-    images = [bgr_roi]
-    images.extend(_preprocess_ocr(bgr_roi))
-    text = _ocr_read_best(reader, images, allowlist=allowlist)
-    return text.strip()
-
-
-def ocr_one_line_time(bgr_roi: np.ndarray, allowlist: str) -> str:
-    reader = _get_easyocr_reader(("en",))
-    if reader is None:
-        return ""
-    if bgr_roi.size == 0:
-        return ""
-    images = [bgr_roi]
-    images.extend(_preprocess_ocr(bgr_roi))
-    text = _ocr_read_best(reader, images, allowlist=allowlist)
-    return text.strip()
-
-
-def ocr_one_line_any(bgr_roi: np.ndarray) -> str:
-    reader = _get_easyocr_reader(("ko", "en"))
-    if reader is None:
-        return ""
-    if bgr_roi.size == 0:
-        return ""
-
-    try:
-        results = reader.readtext(
-            bgr_roi,
-            detail=0,
-            paragraph=False
-        )
-    except Exception:
-        return ""
-
-    if not results:
-        return ""
-    text = max((str(r).strip() for r in results if str(r).strip()), key=len, default="")
-    return text.strip()
-
-
-def best_match_id(ocr_text: str, id_map: Dict[str, str], cfg: OCRConfig) -> Tuple[str, int]:
-    cleaned = normalize_game_id(ocr_text, cfg.allow_chars)
-    if not cleaned:
-        return cfg.unknown_label, 0
-
-    ids = list(id_map.keys())
-    if not ids:
-        return cleaned, 100
-
-    if cleaned in id_map:
-        return cleaned, 100
-
-    if HAS_RAPIDFUZZ:
-        results = rf_process.extract(cleaned, ids, scorer=rf_fuzz.ratio, limit=2)
-        if not results:
-            return cfg.unknown_label, 0
-        top1_id, top1_score, _ = results[0]
-        top2_score = results[1][1] if len(results) > 1 else 0
-
-        if int(top1_score) < cfg.sim_threshold:
-            return cfg.unknown_label, int(top1_score)
-        if int(top1_score) - int(top2_score) < cfg.require_gap:
-            return cfg.unknown_label, int(top1_score)
-        return str(top1_id), int(top1_score)
-
-    # fallback
-    def simple_ratio(a: str, b: str) -> int:
-        common = sum(1 for ch in a if ch in b)
-        return int(100 * common / max(1, max(len(a), len(b))))
-
-    best_id, best_sc = cfg.unknown_label, 0
-    for gid in ids:
-        sc = simple_ratio(cleaned, gid)
-        if sc > best_sc:
-            best_id, best_sc = gid, sc
-    if best_sc >= cfg.sim_threshold:
-        return best_id, best_sc
-    return cfg.unknown_label, best_sc
-
-
-def save_roi_debug_images(cfg: AppConfig, out_dir: str) -> List[str]:
-    os.makedirs(out_dir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    saved: List[str] = []
-
-    items = [
-        ("blue_name", cfg.roi_blue_name),
-        ("red_name", cfg.roi_red_name),
-        ("arena_name", cfg.roi_arena_name),
-        ("round_info", cfg.roi_round_info),
-        ("round_time", cfg.roi_round_time),
-    ]
-    for name, rect in items:
-        if not isinstance(rect, Rect) or not rect.valid():
-            continue
-        img = capture_roi_np_global(rect)
-        if img.size == 0:
-            continue
-        path = os.path.join(out_dir, f"ocr_{name}_{stamp}.png")
-        try:
-            cv2.imwrite(path, img)
-            saved.append(path)
-        except Exception:
-            pass
-    return saved
-
-
-def save_ocr_debug_report(cfg: AppConfig, out_dir: str) -> Tuple[List[str], str]:
-    os.makedirs(out_dir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    img_paths = save_roi_debug_images(cfg, out_dir)
-
-    report_lines: List[str] = []
-    report_lines.append(f"timestamp={stamp}")
-    report_lines.append(f"roi_round_info={asdict(cfg.roi_round_info)}")
-    report_lines.append(f"roi_round_time={asdict(cfg.roi_round_time)}")
-    report_lines.append(f"roi_blue_name={asdict(cfg.roi_blue_name)}")
-    report_lines.append(f"roi_red_name={asdict(cfg.roi_red_name)}")
-    report_lines.append(f"roi_arena_name={asdict(cfg.roi_arena_name)}")
-
-    def _try_read(label: str, rect: Rect, mode: str) -> str:
-        if not rect.valid():
-            return ""
-        roi = capture_roi_np_global(rect)
-        if roi.size == 0:
-            return ""
-        if mode == "round":
-            cand = _round_template_candidates()
-            ttxt, score = template_match_text(roi, cand)
-            ocr = ocr_one_line_digits(roi, "0123456789/") or ""
-            return f"{label} | template={ttxt} score={score:.3f} ocr={ocr}"
-        if mode == "time":
-            cand = _time_template_candidates()
-            ttxt, score = template_match_text(roi, cand)
-            ocr = ocr_one_line_digits(roi, "0123456789") or ""
-            return f"{label} | template={ttxt} score={score:.3f} ocr={ocr}"
-        if mode == "name":
-            ocr = ocr_one_line_english(roi, cfg.ocr.allow_chars)
-            clean = normalize_game_id(ocr, cfg.ocr.allow_chars)
-            return f"{label} | ocr={ocr} clean={clean}"
-        if mode == "arena":
-            ocr = ocr_one_line_any(roi)
-            return f"{label} | ocr={ocr}"
-        return ""
-
-    report_lines.append(_try_read("round_info", cfg.roi_round_info, "round"))
-    report_lines.append(_try_read("round_time", cfg.roi_round_time, "time"))
-    report_lines.append(_try_read("blue_name", cfg.roi_blue_name, "name"))
-    report_lines.append(_try_read("red_name", cfg.roi_red_name, "name"))
-    report_lines.append(_try_read("arena_name", cfg.roi_arena_name, "arena"))
-
-    report_path = os.path.join(out_dir, f"ocr_report_{stamp}.txt")
-    try:
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(line for line in report_lines if line))
-    except Exception:
-        report_path = ""
-    return img_paths, report_path
-
+    except Exception as e:
+        detail = str(e)
+    finally:
+        if restore_cursor and have_previous_cursor:
+            try:
+                user32.SetCursorPos(int(previous_cursor.x), int(previous_cursor.y))
+            except Exception:
+                pass
+        if minimize_target:
+            try:
+                user32.ShowWindow(wintypes.HWND(hwnd), 6)  # SW_MINIMIZE
+                logging.info("LOBBY_AUTO_START_TARGET_MINIMIZED hwnd=%s", hwnd)
+            except Exception:
+                logging.exception("LOBBY_AUTO_START_TARGET_MINIMIZE_FAIL")
+        if restore_focus and previous_hwnd and previous_hwnd != hwnd:
+            restored, restore_detail = _activate_window_reliably(previous_hwnd, restore=True)
+            if restored:
+                logging.info("LOBBY_AUTO_START_FOCUS_RESTORE_OK %s", restore_detail)
+            else:
+                logging.warning("LOBBY_AUTO_START_FOCUS_RESTORE_FAIL %s", restore_detail)
+            detail = f"{detail} focus_restored={restored} {restore_detail}".strip()
+    return click_ok, detail
 
 def _get_mediapipe_selfie():
     global mp, HAS_MEDIAPIPE, _MEDIAPIPE_IMPORT_ERROR, _MP_SELFIE
@@ -1675,8 +1455,6 @@ class ActionMiniDialog(QDialog):
         self.cmb_type.addItem("\uD0C0\uC774\uBA38 \uAC12 \uC124\uC815", "timer_set")
         self.cmb_type.addItem("TTS(\uC601\uC5B4)", "tts_en")
         self.cmb_type.addItem("\uB9E4\uCE58\uC5C5 \uC548\uB0B4 TTS(\uC601\uC5B4)", "matchup_tts_en")
-        self.cmb_type.addItem("OCR \uAC31\uC2E0", "ocr_refresh")
-        self.cmb_type.addItem("\uD0B9\uC624\uBE0C\uB354\uD790 \uC2B9\uC790 OCR", "koth_winner_ocr")
         self.cmb_type.addItem("\uD314\uB808\uD2B8 \uCEA1\uCC98", "palette_capture")
         type_row.addWidget(self.cmb_type, 1)
         lay.addLayout(type_row)
@@ -2580,44 +2358,6 @@ class Controller(QObject):
         self._time_seen = False
         self._last_blue_id: Optional[str] = None
         self._last_red_id: Optional[str] = None
-        self._ocr_cache: Dict[str, Tuple[str, str]] = {}
-        self._ocr_warm_started = False
-
-    def warmup_ocr_async(self):
-        if self._ocr_warm_started or not HAS_EASYOCR:
-            return
-        self._ocr_warm_started = True
-
-        def _worker():
-            try:
-                _get_easyocr_reader(("en",))
-                dummy = np.zeros((24, 96, 3), dtype=np.uint8)
-                ocr_one_line_english(dummy, self.cfg.ocr.allow_chars)
-                logging.info("OCR_WARMUP_DONE")
-            except Exception as e:
-                logging.info("OCR_WARMUP_SKIP err=%s", e)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _ocr_with_cache(self, key: str, roi: np.ndarray, ocr_func, *args, **kwargs) -> str:
-        if roi.size == 0:
-            return ""
-        img_hash = hashlib.md5(roi.tobytes()).hexdigest()
-        cached = self._ocr_cache.get(key)
-        if cached and cached[0] == img_hash:
-            return cached[1]
-
-        res = ocr_func(roi, *args, **kwargs)
-        self._ocr_cache[key] = (img_hash, res)
-        return res
-
-    # OCR name/round/time data from screen ROIs.
-    def on_screen_trigger_for_names(self, roi_images: Optional[Dict[str, np.ndarray]] = None):
-        self.status_update.emit("\uC774\uB984 OCR \uC2DC\uC791...")
-        result = self._read_names(roi_images=roi_images)
-        if result:
-            self.ui_update.emit(result)
-        self.status_update.emit("\uC774\uB984 OCR \uC644\uB8CC")
 
     def read_palette_test_once(self):
         # Read player palette colors from configured ROIs.
@@ -2628,226 +2368,6 @@ class Controller(QObject):
         if result:
             self.ui_update.emit(result)
         self.status_update.emit("팔레트 업데이트 완료")
-
-    def run_koth_winner_ocr(self):
-        if not bool(getattr(self.cfg, "koth_enabled", False)):
-            self.status_update.emit("\uD0B9\uC624\uBE0C\uB354\uD790 \uAE30\uB2A5 OFF")
-            try:
-                logging.info("KOTH_SKIP reason=disabled")
-            except Exception:
-                pass
-            return
-        self.status_update.emit("\uD0B9\uC624\uBE0C\uB354\uD790 \uC2B9\uC790 OCR \uC2DC\uC791...")
-        try:
-            result = self._read_koth_winner()
-        except Exception as e:
-            try:
-                logging.exception("KOTH_OCR_FAIL err=%s", e)
-            except Exception:
-                pass
-            self.status_update.emit(f"킹오브더힐 OCR 오류: {e}")
-            return
-        if result:
-            self.ui_update.emit(result)
-        else:
-            self.status_update.emit("\uD0B9\uC624\uBE0C\uB354\uD790 \uC2B9\uC790 OCR \uACB0\uACFC \uC5C6\uC74C: \uB85C\uADF8\uC758 raw/score/KOTH \uC124\uC815\uC744 \uD655\uC778")
-
-    def _read_koth_winner(self) -> dict:
-        candidates = []
-        with mss.mss() as sct:
-            for side, rect in (
-                ("blue", getattr(self.cfg, "roi_koth_winner_blue", Rect())),
-                ("red", getattr(self.cfg, "roi_koth_winner_red", Rect())),
-            ):
-                if not rect.valid():
-                    continue
-                roi = capture_roi_np_global(rect, sct=sct)
-                raw = self._ocr_with_cache(f"koth_winner_{side}", roi, ocr_one_line_english, self.cfg.ocr.allow_chars)
-                match_id, score = best_match_id(raw, self.cfg.players, self.cfg.ocr)
-                clean = normalize_game_id(raw, self.cfg.ocr.allow_chars)
-                if match_id == self.cfg.ocr.unknown_label and clean:
-                    match_id = clean
-                candidates.append((side, raw, clean, match_id, int(score)))
-
-        if not candidates:
-            try:
-                logging.warning("KOTH_OCR_SKIP reason=no_roi")
-            except Exception:
-                pass
-            return {}
-
-        known = [c for c in candidates if c[3] and c[3] != self.cfg.ocr.unknown_label]
-        best = max(known or candidates, key=lambda c: c[4])
-        side, raw, clean, winner_id, score = best
-        min_score = int(getattr(self.cfg, "koth_min_score", 75) or 75)
-        try:
-            logging.info(
-                "KOTH_OCR candidates=%s selected_side=%s raw=%s clean=%s winner=%s score=%s min=%s",
-                [(c[0], c[1], c[3], c[4]) for c in candidates],
-                side, raw, clean, winner_id, score, min_score,
-            )
-        except Exception:
-            pass
-        if not winner_id or winner_id == self.cfg.ocr.unknown_label or score < min_score:
-            return {}
-        return {
-            "koth_winner_id": str(winner_id).upper().strip(),
-            "koth_winner_side": side,
-            "koth_winner_raw": raw,
-            "koth_winner_score": int(score),
-        }
-
-    def _read_names(self, roi_images: Optional[Dict[str, np.ndarray]] = None) -> dict:
-        blue_txt = ""
-        red_txt = ""
-        arena_txt = ""
-        round_txt = ""
-        time_txt = ""
-        time_forced = False
-        round_locked = False
-        time_locked = False
-
-        with mss.mss() as sct:
-            def _roi(name: str, rect: Rect) -> np.ndarray:
-                if roi_images is not None and name in roi_images:
-                    return roi_images.get(name)
-                return capture_roi_np_global(rect, sct=sct)
-
-            time_candidates = _time_template_candidates()
-            for _ in range(max(1, self.cfg.ocr.samples)):
-                if self.cfg.roi_blue_name.valid():
-                    roi = _roi("blue_name", self.cfg.roi_blue_name)
-                    blue_txt = self._ocr_with_cache("blue_name", roi, ocr_one_line_english, self.cfg.ocr.allow_chars) or blue_txt
-                if self.cfg.roi_red_name.valid():
-                    roi = _roi("red_name", self.cfg.roi_red_name)
-                    red_txt = self._ocr_with_cache("red_name", roi, ocr_one_line_english, self.cfg.ocr.allow_chars) or red_txt
-                if self.cfg.roi_arena_name.valid():
-                    roi = _roi("arena_name", self.cfg.roi_arena_name)
-                    arena_txt = self._ocr_with_cache("arena_name", roi, ocr_one_line_any) or arena_txt
-                if self.cfg.roi_round_info.valid():
-                    if not round_locked:
-                        roi = _roi("round_info", self.cfg.roi_round_info)
-                        cand = self._ocr_with_cache("round_info_30", roi, ocr_one_line_digits, "0123456789", scale=3.0) or ""
-                        if not cand:
-                            cand = self._ocr_with_cache("round_info_20", roi, ocr_one_line_digits, "0123456789", scale=2.0) or ""
-                        if cand:
-                            round_txt = cand
-                            round_locked = True
-                if self.cfg.roi_round_time.valid():
-                    if not time_locked:
-                        roi = _roi("round_time", self.cfg.roi_round_time)
-                        ttxt, score = template_match_text(roi, time_candidates)
-                        cand = self._ocr_with_cache("round_time", roi, ocr_one_line_digits, "0123456789") or ""
-                        cand_digits = "".join(ch for ch in _clean_ocr_digits(cand) if ch.isdigit())
-                        if cand_digits.startswith("100") or cand_digits.startswith("10"):
-                            time_txt = "180"
-                            time_forced = True
-                            time_locked = True
-                        elif cand_digits.startswith("18"):
-                            time_txt = "180"
-                            time_forced = True
-                            time_locked = True
-                        elif cand_digits.startswith("12"):
-                            time_txt = "120"
-                            time_forced = True
-                            time_locked = True
-                        elif cand_digits.startswith("6"):
-                            time_txt = "60"
-                            time_forced = True
-                            time_locked = True
-                        else:
-                            # Combine OCR and template by numeric closeness to reduce bad picks.
-                            ocr_sec = parse_time_text_to_seconds(cand)
-                            tpl_sec = parse_time_text_to_seconds(ttxt)
-                            if ocr_sec is not None and tpl_sec is not None:
-                                # If OCR and template disagree too much, trust OCR near 60/120/180.
-                                ocr_snap = snap_round_seconds(ocr_sec)
-                                tpl_snap = snap_round_seconds(tpl_sec)
-                                if ocr_snap is not None and tpl_snap is not None:
-                                    time_txt = str(ocr_snap if abs(ocr_sec - ocr_snap) <= 15 else tpl_snap)
-                                    time_locked = True
-                            elif ocr_sec is not None:
-                                time_txt = str(snap_round_seconds(ocr_sec) or "")
-                                time_locked = True
-                            elif ttxt and score >= 0.66 and tpl_sec is not None:
-                                time_txt = str(snap_round_seconds(tpl_sec) or "")
-                                time_locked = True
-                if blue_txt and red_txt and round_txt and time_txt and (arena_txt or not self.cfg.roi_arena_name.valid()):
-                    break
-                if _ < max(1, self.cfg.ocr.samples) - 1:
-                    time.sleep(0.02)
-
-        blue_clean = normalize_game_id(blue_txt, self.cfg.ocr.allow_chars)
-        red_clean = normalize_game_id(red_txt, self.cfg.ocr.allow_chars)
-
-        blue_id, _ = best_match_id(blue_txt, self.cfg.players, self.cfg.ocr)
-        red_id, _ = best_match_id(red_txt, self.cfg.players, self.cfg.ocr)
-        blue_changed = blue_id != self._last_blue_id
-        red_changed = red_id != self._last_red_id
-        self._last_blue_id = blue_id
-        self._last_red_id = red_id
-
-        # Use cleaned OCR text when no known player id matches.
-        if blue_id == self.cfg.ocr.unknown_label:
-            blue_id = blue_clean or self.cfg.ocr.unknown_label
-        if red_id == self.cfg.ocr.unknown_label:
-            red_id = red_clean or self.cfg.ocr.unknown_label
-
-        blue_disp = self.cfg.players.get(blue_id, blue_id)
-        red_disp = self.cfg.players.get(red_id, red_id)
-
-        # Include ids and validity flags for overlay/profile sync.
-        out = {}
-        out["blue_player_id"] = blue_id
-        out["red_player_id"] = red_id
-        out["blue_player_registered"] = bool(blue_id in self.cfg.players)
-        out["red_player_registered"] = bool(red_id in self.cfg.players)
-        out["blue_player_valid"] = bool(blue_id and blue_id != self.cfg.ocr.unknown_label)
-        out["red_player_valid"] = bool(red_id and red_id != self.cfg.ocr.unknown_label)
-        if blue_disp and blue_disp != self.cfg.ocr.unknown_label:
-            out["blue_name"] = blue_disp
-        if red_disp and red_disp != self.cfg.ocr.unknown_label:
-            out["red_name"] = red_disp
-        if arena_txt:
-            out["arena_name"] = snap_arena_name(arena_txt.strip())
-
-        if round_txt and round_txt.isdigit():
-            digits = [d for d in str(round_txt).strip() if d.isdigit()]
-            first_digit = int(digits[0]) if digits else 0
-            if first_digit == 0:
-                return out
-            out["round_total"] = max(1, min(3, first_digit))
-            out["round_current"] = 1
-            self._round_seen = True
-        if time_forced:
-            try:
-                sec = int(time_txt)
-            except Exception:
-                sec = None
-        else:
-            sec = parse_round_seconds(time_txt)
-        if sec:
-            out["seconds_left"] = sec
-            self._time_seen = True
-
-        blue_img = self._load_player_image(_player_image_path_for_gid(self.cfg, blue_id))
-        if blue_img is not None:
-            out["blue_player_img"] = blue_img
-        elif blue_changed:
-            out["blue_player_img"] = None
-        red_img = self._load_player_image(_player_image_path_for_gid(self.cfg, red_id))
-        if red_img is not None:
-            out["red_player_img"] = red_img
-        elif red_changed:
-            out["red_player_img"] = None
-        try:
-            logging.info(
-                "OCR_RESULT round_txt=%s time_txt=%s time_forced=%s out_round_total=%s out_seconds=%s",
-                round_txt, time_txt, bool(time_forced), out.get("round_total", None), out.get("seconds_left", None)
-            )
-        except Exception:
-            pass
-        return out
 
     def _load_player_image(self, path: str) -> Optional[np.ndarray]:
         path = (path or "").strip()
@@ -2946,97 +2466,6 @@ class Controller(QObject):
         return out
 
 
-def parse_round_setting(text: str) -> Tuple[Optional[int], Optional[int]]:
-    if not text:
-        return None, None
-    import re
-    cleaned = _clean_ocr_digits(text)
-    m = re.search(r"(\d+)\s*/\s*(\d+)", cleaned)
-    if not m:
-        m = re.search(r"(\d+)\s*of\s*(\d+)", cleaned.lower())
-    if not m:
-        return None, None
-    current = int(m.group(1))
-    total = int(m.group(2))
-    if total <= 0:
-        return None, None
-    total = max(1, min(12, total))
-    if current <= 0:
-        current = 1
-    if current > total:
-        current = total
-    return current, total
-
-
-def parse_round_seconds(text: str) -> Optional[int]:
-    if not text:
-        return None
-    import re
-    cleaned = _clean_ocr_digits(text.strip())
-    # Prefer mm:ss style
-    m = re.search(r"(\d{1,2})\s*[:.]\s*(\d{1,2})", cleaned)
-    if m:
-        mins = int(m.group(1))
-        secs = int(m.group(2))
-        secs = min(59, max(0, secs))
-        total = mins * 60 + secs
-        return snap_round_seconds(total)
-    # Fallback: seconds with optional 's'
-    m = re.search(r"(\d+)\s*s?", cleaned.lower())
-    if not m:
-        return None
-    sec = int(m.group(1))
-    if sec <= 0:
-        return None
-    return snap_round_seconds(sec)
-
-
-def parse_time_text_to_seconds(text: str) -> Optional[int]:
-    if not text:
-        return None
-    cleaned = _clean_ocr_digits(text.strip())
-    import re
-    digits = "".join(ch for ch in cleaned if ch.isdigit())
-    if digits:
-        if digits.startswith("6"):
-            return 60
-        if digits.startswith("12"):
-            return 120
-        if digits.startswith("18"):
-            return 180
-        if digits.startswith("100") or digits.startswith("10"):
-            return 180
-    m = re.search(r"(\d{1,2})\s*[:.]\s*(\d{1,2})", cleaned)
-    if m:
-        mins = int(m.group(1))
-        secs = int(m.group(2))
-        secs = min(59, max(0, secs))
-        total = mins * 60 + secs
-        return total if total > 0 else None
-    m = re.search(r"(\d+)\s*s?", cleaned.lower())
-    if not m:
-        return None
-    sec = int(m.group(1))
-    if sec <= 0:
-        return None
-    # Handle truncated OCR like "6"->60, "12"->120, "18"->180
-    if sec in (6, 12, 18):
-        return sec * 10
-    return sec
-
-
-def parse_round_text_to_pair(text: str) -> Tuple[Optional[int], Optional[int]]:
-    if not text:
-        return None, None
-    cleaned = _clean_ocr_digits(text.strip())
-    import re
-    nums = re.findall(r"\d+", cleaned)
-    if not nums:
-        return None, None
-    total = int(nums[-1])
-    return None, total
-
-
 def show_non_empty(s: str) -> str:
     return (s or "").strip()
 
@@ -3129,7 +2558,6 @@ class TimerBackend(QObject):
     check_updates_requested = pyqtSignal()
     start_detection_requested = pyqtSignal()
     start_screen_detection_requested = pyqtSignal()
-    toggle_ocr_detection_requested = pyqtSignal()
     toggle_pixel_detection_requested = pyqtSignal()
     toggle_log_detection_requested = pyqtSignal()
     select_player_requested = pyqtSignal(str)
@@ -3220,13 +2648,11 @@ class TimerBackend(QObject):
     overlayShowCinematicChanged = pyqtSignal()
     overlayVsBackgroundChanged = pyqtSignal()
     overlayVsHoldMsChanged = pyqtSignal()
-    vsIntroBackspaceEnabledChanged = pyqtSignal()
     overlayStyleChanged = pyqtSignal()
     qmlPreviewEnabledChanged = pyqtSignal()
     qmlEffectsEnabledChanged = pyqtSignal()
     broadcastSyncActiveChanged = pyqtSignal()
     screenDetectRunningChanged = pyqtSignal()
-    ocrDetectRunningChanged = pyqtSignal()
     pixelDetectRunningChanged = pyqtSignal()
     logDetectRunningChanged = pyqtSignal()
     hudDemoRunningChanged = pyqtSignal()
@@ -3306,13 +2732,6 @@ class TimerBackend(QObject):
         self._overlay_vs_bg_opacity = 1.0
         self._overlay_vs_bg_by_arena: Dict[str, str] = {}
         self._overlay_vs_hold_sec = 2.85
-        self._vs_intro_backspace_enabled = True
-        self._vs_intro_backspace_target_title = ""
-        self._vs_intro_backspace_activate = True
-        self._vs_intro_backspace_restore = True
-        self._vs_intro_backspace_last_ts = 0.0
-        self._vs_intro_backspace_last_key = ""
-        self._vs_intro_backspace_cooldown_sec = 15.0
         self._overlay_style = {
             "round": _default_overlay_style_round(),
             "time": _default_overlay_style_time(),
@@ -3324,7 +2743,6 @@ class TimerBackend(QObject):
         self._qml_effects_enabled = False
         self._broadcast_sync_active = False
         self._screen_detect_running = False
-        self._ocr_detect_running = False
         self._pixel_detect_running = False
         self._log_detect_running = False
         self._hud_demo_running = False
@@ -3480,10 +2898,6 @@ class TimerBackend(QObject):
             sec = 2.85
         return int(sec * 1000)
 
-    @pyqtProperty(bool, notify=vsIntroBackspaceEnabledChanged)
-    def vsIntroBackspaceEnabled(self) -> bool:
-        return bool(self._vs_intro_backspace_enabled)
-
     @pyqtProperty("QVariantMap", notify=overlayStyleChanged)
     def overlayStyle(self) -> dict:
         return dict(self._overlay_style or {})
@@ -3495,10 +2909,6 @@ class TimerBackend(QObject):
     @pyqtProperty(bool, notify=screenDetectRunningChanged)
     def screenDetectRunning(self) -> bool:
         return bool(self._screen_detect_running)
-
-    @pyqtProperty(bool, notify=ocrDetectRunningChanged)
-    def ocrDetectRunning(self) -> bool:
-        return bool(self._ocr_detect_running)
 
     @pyqtProperty(bool, notify=pixelDetectRunningChanged)
     def pixelDetectRunning(self) -> bool:
@@ -4281,70 +3691,6 @@ class TimerBackend(QObject):
             self._overlay_vs_hold_sec = val
             self.overlayVsHoldMsChanged.emit()
 
-    def set_vs_intro_backspace_enabled(
-        self,
-        enabled: bool,
-        target_title: Optional[str] = None,
-        activate: Optional[bool] = None,
-        restore: Optional[bool] = None,
-    ):
-        v = bool(enabled)
-        if v != self._vs_intro_backspace_enabled:
-            self._vs_intro_backspace_enabled = v
-            self.vsIntroBackspaceEnabledChanged.emit()
-        if target_title is not None:
-            self._vs_intro_backspace_target_title = str(target_title or "").strip()
-        if activate is not None:
-            self._vs_intro_backspace_activate = bool(activate)
-        if restore is not None:
-            self._vs_intro_backspace_restore = bool(restore)
-
-    @pyqtSlot()
-    def press_vs_intro_backspace(self):
-        if not self._vs_intro_backspace_enabled:
-            return
-        try:
-            now = time.monotonic()
-            key = "|".join((
-                normalize_game_id(str(self._blue_name or ""), "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
-                normalize_game_id(str(self._red_name or ""), "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
-                str(self._arena_name or "").strip().lower(),
-            ))
-            elapsed = now - float(self._vs_intro_backspace_last_ts or 0.0)
-            if key and key == self._vs_intro_backspace_last_key and elapsed < 120.0:
-                logging.info("VS_INTRO_BACKSPACE_SKIP reason=same_match key=%s elapsed=%.3f", key, elapsed)
-                return
-            if elapsed < float(self._vs_intro_backspace_cooldown_sec or 15.0):
-                logging.info(
-                    "VS_INTRO_BACKSPACE_SKIP reason=cooldown key=%s elapsed=%.3f cooldown=%.3f last_key=%s",
-                    key,
-                    elapsed,
-                    float(self._vs_intro_backspace_cooldown_sec or 15.0),
-                    self._vs_intro_backspace_last_key,
-                )
-                return
-            ok, err = press_vk_for_window_title(
-                0x08,
-                self._vs_intro_backspace_target_title,
-                activate=self._vs_intro_backspace_activate,
-                restore_previous=self._vs_intro_backspace_restore,
-                skip_if_fullscreen=True,
-            )
-            if ok:
-                self._vs_intro_backspace_last_ts = now
-                self._vs_intro_backspace_last_key = key
-            logging.info(
-                "VS_INTRO_BACKSPACE ok=%s err=%s target=%s activate=%s restore=%s key=%s",
-                ok,
-                err,
-                self._vs_intro_backspace_target_title,
-                self._vs_intro_backspace_activate,
-                self._vs_intro_backspace_restore,
-                key,
-            )
-        except Exception as e:
-            logging.warning("VS_INTRO_BACKSPACE failed: %s", e)
-
     @pyqtSlot()
     def test_vs_intro(self):
         changed = False
@@ -4371,12 +3717,6 @@ class TimerBackend(QObject):
         if v != self._screen_detect_running:
             self._screen_detect_running = v
             self.screenDetectRunningChanged.emit()
-
-    def set_ocr_detect_running(self, running: bool):
-        v = bool(running)
-        if v != self._ocr_detect_running:
-            self._ocr_detect_running = v
-            self.ocrDetectRunningChanged.emit()
 
     def set_pixel_detect_running(self, running: bool):
         v = bool(running)
@@ -4666,10 +4006,6 @@ class TimerBackend(QObject):
         self.start_screen_detection_requested.emit()
 
     @pyqtSlot()
-    def toggle_ocr_detection(self):
-        self.toggle_ocr_detection_requested.emit()
-
-    @pyqtSlot()
     def toggle_pixel_detection(self):
         self.toggle_pixel_detection_requested.emit()
 
@@ -4924,12 +4260,6 @@ class QmlTimerWindow(QObject):
             getattr(cfg, "overlay_vs_bg_opacity", 1.0),
         )
         self._backend.set_overlay_vs_hold_sec(getattr(cfg, "overlay_vs_hold_sec", 2.85))
-        self._backend.set_vs_intro_backspace_enabled(
-            getattr(cfg, "spectatorlog_intro_backspace", True),
-            getattr(cfg, "spectatorlog_intro_backspace_target_title", ""),
-            getattr(cfg, "spectatorlog_intro_backspace_activate", True),
-            getattr(cfg, "spectatorlog_intro_backspace_restore", True),
-        )
         self._backend.set_overlay_ui_scale(getattr(cfg, "overlay_ui_scale", 1.0))
         if HAS_QQUICKSTYLE and QQuickStyle is not None:
             try:
@@ -6734,15 +6064,16 @@ class SettingsDialog(QDialog):
         self.tabs.setElideMode(Qt.TextElideMode.ElideRight)
         self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        self.tab_quick = QWidget()
         self.tab_players = QWidget()
         self.tab_timer = QWidget()
         self.tab_overlay = QWidget()
+        self.tab_hit_effects = QWidget()
         self.tab_logs = QWidget()
+        self.tab_log_records = QWidget()
+        self.tab_auto_start = QWidget()
         self.tab_sound = QWidget()
         self.tab_tests = QWidget()
         self.tab_legacy = QWidget()
-        self.tab_ocr = QWidget()
         self.tab_palette = QWidget()
         self.tab_actions = QWidget()
         self.tab_pixels = QWidget()
@@ -6750,13 +6081,15 @@ class SettingsDialog(QDialog):
         self.tab_effects = QWidget()
         self.tab_diagnostics = QWidget()
 
-        self.tabs.addTab(self.tab_quick, "주요설정")
         self.tabs.addTab(self.tab_players, "플레이어")
         self.tabs.addTab(self.tab_overlay, "오버레이")
-        self.tabs.addTab(self.tab_logs, "로그")
+        self.tabs.addTab(self.tab_hit_effects, "피격 효과")
+        self.tabs.addTab(self.tab_logs, "로그 감지")
+        self.tabs.addTab(self.tab_log_records, "기록")
+        self.tabs.addTab(self.tab_auto_start, "자동 시작")
         self.tabs.addTab(self.tab_sound, "사운드")
         self.tabs.addTab(self.tab_tests, "테스트")
-        self.tabs.addTab(self.tab_legacy, "레거시 OCR")
+        self.tabs.addTab(self.tab_legacy, "화면감지 / 액션")
         self.tabs.addTab(self.tab_effects, "연승 이펙트")
         self.tabs.addTab(self.tab_diagnostics, "진단")
 
@@ -6800,7 +6133,6 @@ class SettingsDialog(QDialog):
         self._build_quick()
         self._build_players()
         self._build_timer()
-        self._build_ocr()
         self._build_effects()
         self._build_diagnostics()
         self._build_actions()
@@ -6810,7 +6142,6 @@ class SettingsDialog(QDialog):
         self._normalize_settings_layout()
         self.setWindowTitle("설정")
 
-        self._refresh_trigger_color_ui()
         self._refresh_action_pick_labels()
 
         self.btn_apply.setVisible(False)
@@ -6937,17 +6268,9 @@ class SettingsDialog(QDialog):
 
     def _roi_quick_items(self) -> List[Tuple[str, str]]:
         return [
-            ("블루 닉네임 인식 범위", "roi_blue_name"),
-            ("레드 닉네임 인식 범위", "roi_red_name"),
-            ("경기장 이름 인식 범위", "roi_arena_name"),
-            ("라운드 표시 인식 범위", "roi_round_info"),
-            ("라운드 시간 인식 범위", "roi_round_time"),
-            ("왼쪽 선수 인식 범위(=BLUE)", "roi_left_player"),
-            ("오른쪽 선수 인식 범위(=RED)", "roi_right_player"),
-            ("KOTH 블루 승리 ID 범위", "roi_koth_winner_blue"),
-            ("KOTH 레드 승리 ID 범위", "roi_koth_winner_red"),
+            ("왼쪽 선수 이미지 범위 (= BLUE)", "roi_left_player"),
+            ("오른쪽 선수 이미지 범위 (= RED)", "roi_right_player"),
         ]
-
     def _apply_quick_roi(self, attr_name: str, rect: Rect):
         if self._quick_roi_monitor is not None:
             rect = rect_local_to_global(int(self._quick_roi_monitor), rect)
@@ -6956,24 +6279,10 @@ class SettingsDialog(QDialog):
             rect = Rect(x=int(rect.x + dx), y=int(rect.y + dy), w=int(rect.w), h=int(rect.h))
         setattr(self.cfg, attr_name, rect)
         self._update_quick_labels()
-        if hasattr(self, "lbl_bname"):
-            self.lbl_bname.setText(self._roi_text(self.cfg.roi_blue_name))
-        if hasattr(self, "lbl_rname"):
-            self.lbl_rname.setText(self._roi_text(self.cfg.roi_red_name))
-        if hasattr(self, "lbl_arena"):
-            self.lbl_arena.setText(self._roi_text(self.cfg.roi_arena_name))
-        if hasattr(self, "lbl_round_info"):
-            self.lbl_round_info.setText(self._roi_text(self.cfg.roi_round_info))
-        if hasattr(self, "lbl_round_time"):
-            self.lbl_round_time.setText(self._roi_text(self.cfg.roi_round_time))
         if hasattr(self, "lbl_lplayer"):
             self.lbl_lplayer.setText(self._roi_text(self.cfg.roi_left_player))
         if hasattr(self, "lbl_rplayer"):
             self.lbl_rplayer.setText(self._roi_text(self.cfg.roi_right_player))
-        if hasattr(self, "lbl_koth_blue"):
-            self.lbl_koth_blue.setText(self._roi_text(self.cfg.roi_koth_winner_blue))
-        if hasattr(self, "lbl_koth_red"):
-            self.lbl_koth_red.setText(self._roi_text(self.cfg.roi_koth_winner_red))
         if hasattr(self, "_refresh_koth_setup_state"):
             self._refresh_koth_setup_state()
         self._schedule_apply()
@@ -7668,184 +6977,16 @@ class SettingsDialog(QDialog):
             self.lbl_diag_status.setText(f"진단 폴더 열기 실패: {e}")
 
     def _build_quick(self):
-        lay = QVBoxLayout()
         log_lay = QVBoxLayout()
+        record_lay = QVBoxLayout()
+        auto_start_outer = QVBoxLayout()
+        hit_effects_outer = QVBoxLayout()
         sound_lay_outer = QVBoxLayout()
         test_lay_outer = QVBoxLayout()
 
         self.cmb_monitor = QComboBox()
         self._refresh_monitors()
         self.cmb_monitor.setVisible(False)
-
-        self.btn_preview = QPushButton("미리보기(캡처)")
-        self.btn_preview.clicked.connect(self.preview_capture)
-        self.btn_preview.setVisible(False)
-        lay.addWidget(self.btn_preview)
-        hk_group = QGroupBox("단축키")
-        hk_lay = QGridLayout(hk_group)
-        hk_lay.setHorizontalSpacing(10)
-        hk_lay.setVerticalSpacing(8)
-        hk_lay.addWidget(QLabel("트리거 픽셀"), 0, 0)
-        self.edit_trigger_pixel_hotkey = QKeySequenceEdit()
-        self.edit_trigger_pixel_hotkey.setMaximumSequenceLength(1)
-        self.edit_trigger_pixel_hotkey.setKeySequence(QKeySequence(self.cfg.trigger_pixel_hotkey))
-        self.edit_trigger_pixel_hotkey.setMaximumWidth(160)
-        hk_lay.addWidget(self.edit_trigger_pixel_hotkey, 0, 1)
-        hk_lay.addWidget(QLabel("OCR 범위"), 0, 2)
-        self.edit_roi_hotkey = QKeySequenceEdit()
-        self.edit_roi_hotkey.setMaximumSequenceLength(1)
-        self.edit_roi_hotkey.setKeySequence(QKeySequence(self.cfg.roi_hotkey))
-        self.edit_roi_hotkey.setMaximumWidth(160)
-        hk_lay.addWidget(self.edit_roi_hotkey, 0, 3)
-        hk_lay.addWidget(QLabel("픽셀 선택"), 1, 0)
-        self.edit_pixel_hotkey = QKeySequenceEdit()
-        self.edit_pixel_hotkey.setMaximumSequenceLength(1)
-        self.edit_pixel_hotkey.setKeySequence(QKeySequence(self.cfg.pixel_hotkey))
-        self.edit_pixel_hotkey.setMaximumWidth(160)
-        hk_lay.addWidget(self.edit_pixel_hotkey, 1, 1)
-        self.edit_action_pick_hotkey = QKeySequenceEdit()
-        self.edit_action_pick_hotkey.setMaximumSequenceLength(1)
-        self.edit_action_pick_hotkey.setKeySequence(QKeySequence(self.cfg.action_pick_hotkey))
-        self.edit_action_pick_hotkey.setVisible(False)
-        hk_lay.addWidget(QLabel(""), 1, 2)
-        self.edit_action_test_hotkey = QKeySequenceEdit()
-        self.edit_action_test_hotkey.setMaximumSequenceLength(1)
-        self.edit_action_test_hotkey.setKeySequence(QKeySequence(self.cfg.action_test_hotkey))
-        self.edit_action_test_hotkey.setMaximumWidth(160)
-        hk_lay.addWidget(self.edit_action_test_hotkey, 1, 3)
-        hk_lay.addWidget(QLabel("감지 토글"), 2, 0)
-        self.edit_detect_hotkey = QKeySequenceEdit()
-        self.edit_detect_hotkey.setMaximumSequenceLength(1)
-        self.edit_detect_hotkey.setKeySequence(QKeySequence(self.cfg.detect_hotkey))
-        self.edit_detect_hotkey.setMaximumWidth(160)
-        hk_lay.addWidget(self.edit_detect_hotkey, 2, 1)
-        hk_lay.setColumnStretch(4, 1)
-        lay.addWidget(hk_group)
-
-        roi_grid = QGridLayout()
-        self.btn_set_trigger_pixel = QPushButton("트리거 픽셀 지정")
-        self.btn_copy_trigger_pixel = QPushButton("값 복사")
-        self.btn_copy_trigger_pixel.clicked.connect(self._copy_trigger_pixel_value)
-        self.btn_set_left_player = QPushButton("왼쪽 선수 인식 범위 지정(=BLUE)")
-        self.btn_set_right_player = QPushButton("오른쪽 선수 인식 범위 지정(=RED)")
-
-        self.lbl_trigger_pixel = QLabel(self._trigger_pixel_text())
-        self.lbl_lplayer = QLabel(self._roi_text(self.cfg.roi_left_player))
-        self.lbl_rplayer = QLabel(self._roi_text(self.cfg.roi_right_player))
-
-        self.btn_set_left_player.clicked.connect(lambda: self.pick_roi("왼쪽 선수 인식 범위", "roi_left_player"))
-        self.btn_set_right_player.clicked.connect(lambda: self.pick_roi("오른쪽 선수 인식 범위", "roi_right_player"))
-
-        self.btn_set_trigger_pixel.clicked.connect(self._start_quick_trigger_pixel_pick)
-
-        roi_grid.addWidget(self.btn_set_trigger_pixel, 0, 0)
-        roi_grid.addWidget(self.lbl_trigger_pixel, 0, 1)
-        roi_grid.addWidget(self.btn_copy_trigger_pixel, 0, 2)
-
-        lay.addLayout(roi_grid)
-
-        self.trigger_group = QGroupBox("트리거 설정")
-        trigger_lay = QVBoxLayout(self.trigger_group)
-
-        row_pick = QHBoxLayout()
-        self.btn_trigger_pick = QPushButton("픽셀 지정")
-        self.btn_trigger_pick.clicked.connect(self._start_quick_trigger_pixel_pick)
-        row_pick.addWidget(self.btn_trigger_pick)
-        row_pick.addStretch(1)
-        trigger_lay.addLayout(row_pick)
-        row_act = QHBoxLayout()
-        self.btn_trigger_actions = QPushButton("액션 설정")
-        self.btn_trigger_actions.clicked.connect(lambda: self._show_actions_for_event("on_trigger"))
-        row_act.addWidget(self.btn_trigger_actions)
-        row_act.addStretch(1)
-        trigger_lay.addLayout(row_act)
-        self.lbl_trigger_action = QLabel("액션: " + self._event_action_summary("on_trigger"))
-        self.lbl_trigger_action.setStyleSheet("color:#666;")
-        trigger_lay.addWidget(self.lbl_trigger_action)
-        if not hasattr(self, "_action_summary_labels"):
-            self._action_summary_labels = {}
-        self._action_summary_labels["on_trigger"] = self.lbl_trigger_action
-
-        chk = QCheckBox("트리거 감지 기능 사용")
-        chk.setChecked(self.cfg.trigger.enabled)
-        chk.stateChanged.connect(lambda s: setattr(self.cfg.trigger, "enabled", bool(s)))
-        trigger_lay.addWidget(chk)
-
-        color_row = QHBoxLayout()
-        color_row.addWidget(QLabel("목표 트리거색:"))
-
-        self.lbl_trigger_color_preview = QLabel(" ")
-        self.lbl_trigger_color_preview.setFixedSize(70, 24)
-        self.lbl_trigger_color_preview.setStyleSheet("border:1px solid #333; background:#444;")
-        color_row.addWidget(self.lbl_trigger_color_preview)
-
-        self.lbl_trigger_color_text = QLabel("")
-        self.lbl_trigger_color_text.setStyleSheet("color:#666;")
-        color_row.addWidget(self.lbl_trigger_color_text, 1)
-
-        trigger_lay.addLayout(color_row)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("BGR 값 조정:"))
-        self.sp_b = QSpinBox(); self.sp_b.setRange(0, 255); self.sp_b.setValue(int(self.cfg.trigger.target_bgr[0]))
-        self.sp_g = QSpinBox(); self.sp_g.setRange(0, 255); self.sp_g.setValue(int(self.cfg.trigger.target_bgr[1]))
-        self.sp_r = QSpinBox(); self.sp_r.setRange(0, 255); self.sp_r.setValue(int(self.cfg.trigger.target_bgr[2]))
-        self.sp_b.valueChanged.connect(self.on_bgr_spin_changed)
-        self.sp_g.valueChanged.connect(self.on_bgr_spin_changed)
-        self.sp_r.valueChanged.connect(self.on_bgr_spin_changed)
-        row.addWidget(QLabel("B")); row.addWidget(self.sp_b)
-        row.addWidget(QLabel("G")); row.addWidget(self.sp_g)
-        row.addWidget(QLabel("R")); row.addWidget(self.sp_r)
-        row.addStretch(1)
-        trigger_lay.addLayout(row)
-
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("허용오차:"))
-        self.sp_tol = QSpinBox(); self.sp_tol.setRange(0, 200); self.sp_tol.setValue(self.cfg.trigger.tolerance)
-        row2.addWidget(self.sp_tol)
-        self.lbl_cd = QLabel("쿄다운(초):")
-        self.sp_cd = QSpinBox(); self.sp_cd.setRange(0, 30); self.sp_cd.setValue(int(self.cfg.trigger.cooldown_sec))
-        self.lbl_cd.setVisible(False)
-        self.sp_cd.setVisible(False)
-        row2.addSpacing(12)
-        row2.addWidget(QLabel("연속 판정(창/필요):"))
-        self.sp_win = QSpinBox(); self.sp_win.setRange(1, 30); self.sp_win.setValue(self.cfg.trigger.window_frames)
-        self.sp_need = QSpinBox(); self.sp_need.setRange(1, 30); self.sp_need.setValue(self.cfg.trigger.consecutive_needed)
-        row2.addWidget(self.sp_win); row2.addWidget(QLabel("/")); row2.addWidget(self.sp_need)
-        row2.addStretch(1)
-        trigger_lay.addLayout(row2)
-
-        self.chk_live_trigger = QCheckBox("트리거 상태 실시간 표시")
-        self.chk_live_trigger.setChecked(True)
-        trigger_lay.addWidget(self.chk_live_trigger)
-
-        self.lbl_trg_live = QLabel("TRIGGER: (대기)")
-        self.lbl_trg_live.setStyleSheet("color:#aaa; font-family: Consolas;")
-        trigger_lay.addWidget(self.lbl_trg_live)
-
-        self._trg_timer = QTimer(self)
-        self._trg_timer.timeout.connect(self._update_trigger_live)
-        self._trg_timer.start(120)
-
-        self._refresh_trigger_color_ui()
-        self.trigger_group.setVisible(True)
-        lay.addWidget(self.trigger_group)
-        self.pal_group = QGroupBox("선수 팔레트")
-        pal_lay = QHBoxLayout(self.pal_group)
-        self.chk_capture_players = QCheckBox("왼쪽/오른쪽 선수 캡처 사용")
-        self.chk_capture_players.setChecked(bool(getattr(self.cfg, "capture_player_images", True)))
-        self.chk_capture_players.stateChanged.connect(self._schedule_apply)
-        pal_lay.addWidget(self.chk_capture_players)
-        pal_lay.addWidget(QLabel("팔레트 추출 프레임 수:"))
-        self.sp_pal_frames = QSpinBox(); self.sp_pal_frames.setRange(1, 30); self.sp_pal_frames.setValue(self.cfg.palette.frames)
-        pal_lay.addWidget(self.sp_pal_frames)
-        pal_lay.addWidget(QLabel("색 갯수:"))
-        self.sp_pal_k = QSpinBox(); self.sp_pal_k.setRange(1, 12); self.sp_pal_k.setValue(self.cfg.palette.k_colors)
-        pal_lay.addWidget(self.sp_pal_k)
-        pal_lay.addWidget(QLabel("마스크 임계(%)"))
-        self.sp_mask = QSpinBox(); self.sp_mask.setRange(0, 100); self.sp_mask.setValue(int(self.cfg.palette.mask_thresh * 100))
-        pal_lay.addWidget(self.sp_mask)
-        pal_lay.addStretch(1)
 
         chapter_group = QGroupBox("방송 챕터 로그")
         chapter_lay = QGridLayout(chapter_group)
@@ -7887,7 +7028,7 @@ class SettingsDialog(QDialog):
         btn_export.clicked.connect(self._export_chapter_txt_from_settings)
         btn_open_chapter.clicked.connect(self._open_chapter_txt_from_settings)
         self._refresh_chapter_status_label()
-        log_lay.addWidget(chapter_group)
+        record_lay.addWidget(chapter_group)
 
         blackbox_group = QGroupBox("관전툴 로그 전체 기록 / 블랙박스")
         blackbox_lay = QGridLayout(blackbox_group)
@@ -7920,7 +7061,7 @@ class SettingsDialog(QDialog):
         self.lbl_spectatorlog_blackbox_hint.setStyleSheet("color:#9ca3af;")
         blackbox_lay.addWidget(self.lbl_spectatorlog_blackbox_hint, 2, 0, 1, 5)
         blackbox_lay.setColumnStretch(1, 1)
-        log_lay.addWidget(blackbox_group)
+        record_lay.addWidget(blackbox_group)
 
         spectator_group = QGroupBox("ThrillOfTheFight2 SpectatorLog 연동 / 리플레이 / 피격 이펙트")
         spectator_lay = QGridLayout(spectator_group)
@@ -7933,24 +7074,6 @@ class SettingsDialog(QDialog):
         self.chk_spectatorlog_sync_timer = QCheckBox("Sync log timer")
         self.chk_spectatorlog_sync_timer.setChecked(bool(getattr(self.cfg, "spectatorlog_sync_timer", False)))
         spectator_lay.addWidget(self.chk_spectatorlog_sync_timer, 2, 0, 1, 4)
-        self.chk_spectatorlog_intro_backspace = QCheckBox("VS 오버레이 때 Backspace 자동 입력")
-        self.chk_spectatorlog_intro_backspace.setChecked(bool(getattr(self.cfg, "spectatorlog_intro_backspace", True)))
-        self.chk_spectatorlog_intro_backspace.setToolTip("철권8 VS 오버레이가 실제로 뜰 때 한 번만 Backspace를 눌러 관전툴 전체화면 전환을 돕습니다.")
-        spectator_lay.addWidget(self.chk_spectatorlog_intro_backspace, 3, 0, 1, 2)
-        spectator_lay.addWidget(QLabel("관전툴 창 제목"), 4, 0)
-        self.le_spectatorlog_backspace_title = QLineEdit(str(getattr(self.cfg, "spectatorlog_intro_backspace_target_title", "") or ""))
-        self.le_spectatorlog_backspace_title.setPlaceholderText("예: Thrill of the Fight, Spectator")
-        self.le_spectatorlog_backspace_title.setMaximumWidth(520)
-        self.le_spectatorlog_backspace_title.setToolTip("일부만 입력해도 일치하는 창을 찾아 VS 때 Backspace를 보냅니다. 비워두면 현재 활성 창에 보냅니다.")
-        spectator_lay.addWidget(self.le_spectatorlog_backspace_title, 4, 1, 1, 2)
-        self.chk_spectatorlog_backspace_activate = QCheckBox("Activate target before input")
-        self.chk_spectatorlog_backspace_activate.setChecked(bool(getattr(self.cfg, "spectatorlog_intro_backspace_activate", True)))
-        self.chk_spectatorlog_backspace_activate.setToolTip("관전툴이 비활성 창이어도 Backspace가 먹히도록 잠깐 포커스를 가져옵니다.")
-        spectator_lay.addWidget(self.chk_spectatorlog_backspace_activate, 5, 0)
-        self.chk_spectatorlog_backspace_restore = QCheckBox("입력 후 이전 창 복귀")
-        self.chk_spectatorlog_backspace_restore.setChecked(bool(getattr(self.cfg, "spectatorlog_intro_backspace_restore", True)))
-        self.chk_spectatorlog_backspace_restore.setToolTip("Backspace 입력 후 이전에 사용하던 창으로 포커스를 되돌립니다.")
-        spectator_lay.addWidget(self.chk_spectatorlog_backspace_restore, 5, 1, 1, 2)
         self.le_spectatorlog_path = QLineEdit(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
         self.le_spectatorlog_path.setPlaceholderText(r"예: ThrillOfTheFight2\SpectatorLog")
         self.le_spectatorlog_path.setMaximumWidth(520)
@@ -8002,6 +7125,7 @@ class SettingsDialog(QDialog):
         self.btn_spectatorlog_test_vs_intro= QPushButton("VS 오버레이 테스트")
         self.btn_spectatorlog_test_full_demo = QPushButton("전체 HUD 데모")
         self.btn_spectatorlog_test_round_report = QPushButton("라운드 리포트 테스트")
+        self.btn_spectatorlog_test_final_report = QPushButton("경기 종료 리포트 테스트")
         self.btn_spectatorlog_replay_last = QPushButton("과거 로그 리플레이")
         self.btn_spectatorlog_replay_stop = QPushButton("리플레이 중지")
         self.btn_spectatorlog_clear_damage = QPushButton("데미지 초기화")
@@ -8016,34 +7140,60 @@ class SettingsDialog(QDialog):
         self.btn_spectator_commentary_down_test_tab = QPushButton("다운 멘트 테스트")
         self.btn_spectator_commentary_summary_test_tab = QPushButton("요약 멘트 테스트")
         self.btn_spectator_commentary_stop_test_tab = QPushButton("해설 테스트 중지")
-        spectator_test_group = QGroupBox("SpectatorLog / HUD 테스트")
-        spectator_test_lay = QGridLayout(spectator_test_group)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_blue_stun, 0, 0)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_red_stun, 0, 1)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_blue_kd, 0, 2)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_red_kd, 0, 3)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_blue_combo, 1, 0)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_red_combo, 1, 1)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_counter, 1, 2)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_blue_tko, 1, 3)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_red_tko, 2, 0)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_damage, 2, 1)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_hit_fx_sprite, 2, 2)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_hp, 2, 3)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_replay_last, 7, 0, 1, 2)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_lives, 3, 0)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_timer_state, 3, 1)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_replay_stop, 3, 2)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_clear_damage, 3, 3)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_vs_intro, 4, 0)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_full_demo, 4, 1)
-        spectator_test_lay.addWidget(self.btn_spectatorlog_test_round_report, 4, 2, 1, 2)
-        spectator_test_lay.addWidget(self.btn_spectator_commentary_full_test_tab, 5, 0, 1, 2)
-        spectator_test_lay.addWidget(self.btn_spectator_commentary_duo_test_tab, 5, 2)
-        spectator_test_lay.addWidget(self.btn_spectator_commentary_down_test_tab, 5, 3)
-        spectator_test_lay.addWidget(self.btn_spectator_commentary_summary_test_tab, 6, 0, 1, 2)
-        spectator_test_lay.addWidget(self.btn_spectator_commentary_stop_test_tab, 6, 2, 1, 2)
-        test_lay_outer.addWidget(spectator_test_group)
+        test_tabs = QTabWidget()
+        test_tabs.setDocumentMode(True)
+
+        def _test_page(title: str, rows: List[List[QWidget]]) -> None:
+            page = QWidget()
+            page_lay = QGridLayout(page)
+            page_lay.setContentsMargins(18, 18, 18, 18)
+            page_lay.setHorizontalSpacing(12)
+            page_lay.setVerticalSpacing(12)
+            for row_index, widgets in enumerate(rows):
+                for column_index, widget in enumerate(widgets):
+                    page_lay.addWidget(widget, row_index, column_index)
+                page_lay.setRowStretch(row_index + 1, 0)
+            page_lay.setRowStretch(len(rows), 1)
+            test_tabs.addTab(page, title)
+
+        _test_page(
+            "전투 효과",
+            [
+                [self.btn_spectatorlog_test_blue_stun, self.btn_spectatorlog_test_red_stun],
+                [self.btn_spectatorlog_test_blue_kd, self.btn_spectatorlog_test_red_kd],
+                [self.btn_spectatorlog_test_blue_tko, self.btn_spectatorlog_test_red_tko],
+                [self.btn_spectatorlog_test_blue_combo, self.btn_spectatorlog_test_red_combo],
+                [self.btn_spectatorlog_test_counter],
+            ],
+        )
+        _test_page(
+            "HUD",
+            [
+                [self.btn_spectatorlog_test_damage, self.btn_spectatorlog_test_hp],
+                [self.btn_spectatorlog_test_lives, self.btn_spectatorlog_test_timer_state],
+                [self.btn_spectatorlog_clear_damage, self.btn_spectatorlog_test_full_demo],
+            ],
+        )
+        _test_page(
+            "오버레이 / 리포트",
+            [
+                [self.btn_spectatorlog_test_vs_intro],
+                [self.btn_spectatorlog_test_round_report, self.btn_spectatorlog_test_final_report],
+            ],
+        )
+        _test_page(
+            "리플레이",
+            [[self.btn_spectatorlog_replay_last, self.btn_spectatorlog_replay_stop]],
+        )
+        _test_page(
+            "해설",
+            [
+                [self.btn_spectator_commentary_full_test_tab, self.btn_spectator_commentary_duo_test_tab],
+                [self.btn_spectator_commentary_down_test_tab, self.btn_spectator_commentary_summary_test_tab],
+                [self.btn_spectator_commentary_stop_test_tab],
+            ],
+        )
+        test_lay_outer.addWidget(test_tabs)
         sound_group = QGroupBox("자동해설 TTS / Spectator 효과음")
         sound_lay = QGridLayout(sound_group)
         self.chk_spectator_commentary = QCheckBox("자동해설 사용")
@@ -8078,7 +7228,12 @@ class SettingsDialog(QDialog):
         self.sp_spectator_commentary_cooldown = QDoubleSpinBox()
         self.sp_spectator_commentary_cooldown.setRange(0.0, 60.0)
         self.sp_spectator_commentary_cooldown.setSingleStep(0.5)
-        self.sp_spectator_commentary_cooldown.setValue(float(getattr(self.cfg, "spectator_commentary_cooldown_sec", 6.0) or 6.0))
+        self.sp_spectator_commentary_cooldown.setValue(
+            max(0.0, float(getattr(self.cfg, "spectator_commentary_cooldown_sec", 6.0)))
+        )
+        self.sp_spectator_commentary_cooldown.setToolTip(
+            "일반 자동해설이 다시 생성될 때까지 기다리는 최소 시간입니다. 0초면 제한하지 않습니다."
+        )
         sound_lay.addWidget(QLabel("해설 쿨타임(초)"), 8, 4)
         sound_lay.addWidget(self.sp_spectator_commentary_cooldown, 8, 5)
         self.sp_spectator_commentary_rate = QSpinBox()
@@ -8346,10 +7501,6 @@ class SettingsDialog(QDialog):
         self.chk_spectatorlog_enabled.stateChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_spectatorlog_state()))
         self.chk_spectatorlog_sync_players.stateChanged.connect(self._schedule_apply)
         self.chk_spectatorlog_sync_timer.stateChanged.connect(self._schedule_apply)
-        self.chk_spectatorlog_intro_backspace.stateChanged.connect(self._schedule_apply)
-        self.le_spectatorlog_backspace_title.textChanged.connect(self._schedule_apply)
-        self.chk_spectatorlog_backspace_activate.stateChanged.connect(self._schedule_apply)
-        self.chk_spectatorlog_backspace_restore.stateChanged.connect(self._schedule_apply)
         self.le_spectatorlog_path.textChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_spectatorlog_state()))
         self.sp_spectatorlog_poll.valueChanged.connect(self._schedule_apply)
         self.chk_spectatorlog_file_watch.stateChanged.connect(self._schedule_apply)
@@ -8376,6 +7527,9 @@ class SettingsDialog(QDialog):
         self.btn_spectatorlog_test_vs_intro.clicked.connect(self._test_spectator_vs_intro)
         self.btn_spectatorlog_test_full_demo.clicked.connect(self._test_spectator_full_demo)
         self.btn_spectatorlog_test_round_report.clicked.connect(self._test_spectator_round_report)
+        self.btn_spectatorlog_test_final_report.clicked.connect(
+            lambda _checked=False: self._test_spectator_round_report(final=True)
+        )
         self.btn_spectatorlog_replay_last.clicked.connect(self._test_spectator_last_log)
         self.btn_spectatorlog_replay_stop.clicked.connect(self._stop_spectator_hud_demo)
         self.btn_spectatorlog_clear_damage.clicked.connect(self._clear_spectator_damage)
@@ -8439,7 +7593,189 @@ class SettingsDialog(QDialog):
         self.le_spectator_kd_sfx.textChanged.connect(self._schedule_apply)
         self.le_spectator_tko_sfx.textChanged.connect(self._schedule_apply)
         self._refresh_spectatorlog_state()
+
+        # Keep log ingestion focused on files/replay; visual hit tuning lives in
+        # its own tab so users can find and test it without scanning the log grid.
+        for row in range(10, 18):
+            for column in range(spectator_lay.columnCount()):
+                item = spectator_lay.itemAtPosition(row, column)
+                if item is not None and item.widget() is not None:
+                    item.widget().setVisible(False)
+
+        hit_group = QGroupBox("브라우저 피격 이펙트")
+        hit_lay = QGridLayout(hit_group)
+        hit_lay.setHorizontalSpacing(12)
+        hit_lay.setVerticalSpacing(10)
+        hit_lay.addWidget(QLabel("표시 최소 데미지"), 0, 0)
+        hit_lay.addWidget(self.sp_spectator_hit_effect_damage, 0, 1)
+        hit_lay.addWidget(QLabel("색상 프리셋"), 0, 2)
+        hit_lay.addWidget(self.cb_spectator_hit_fx_color_preset, 0, 3)
+        hit_lay.addWidget(self.btn_spectatorlog_test_hit_fx_sprite, 0, 4)
+
+        for row, (label, button) in enumerate(
+            (
+                ("낮은 데미지", self.btn_spectator_hit_fx_color_low),
+                ("중간 데미지", self.btn_spectator_hit_fx_color_mid),
+                ("높은 데미지", self.btn_spectator_hit_fx_color_high),
+                ("약점 타격", self.btn_spectator_hit_fx_color_weak),
+                ("스턴 / 다운", self.btn_spectator_hit_fx_color_stun),
+            ),
+            start=1,
+        ):
+            hit_lay.addWidget(QLabel(label), row, 0)
+            hit_lay.addWidget(button, row, 1)
+
+        hit_lay.addWidget(QLabel("전체 지속시간"), 1, 2)
+        hit_lay.addWidget(self.sp_spectator_hit_fx_duration, 1, 3)
+        hit_lay.addWidget(QLabel("초기 폭발시간"), 1, 4)
+        hit_lay.addWidget(self.sp_spectator_hit_fx_pop, 1, 5)
+        hit_lay.addWidget(QLabel("기본 크기"), 2, 2)
+        hit_lay.addWidget(self.sp_spectator_hit_fx_base_size, 2, 3)
+        hit_lay.addWidget(QLabel("데미지 크기 배율"), 2, 4)
+        hit_lay.addWidget(self.sp_spectator_hit_fx_damage_scale, 2, 5)
+        hit_lay.addWidget(QLabel("링 두께"), 3, 2)
+        hit_lay.addWidget(self.sp_spectator_hit_fx_ring_width, 3, 3)
+        hit_lay.addWidget(QLabel("전체 투명도"), 3, 4)
+        hit_lay.addWidget(self.sp_spectator_hit_fx_opacity, 3, 5)
+        hit_lay.addWidget(QLabel("발광 강도"), 4, 2)
+        hit_lay.addWidget(self.sp_spectator_hit_fx_glow, 4, 3)
+        hit_lay.addWidget(QLabel("내부 채움"), 4, 4)
+        hit_lay.addWidget(self.sp_spectator_hit_fx_fill_opacity, 4, 5)
+        hit_lay.addWidget(self.chk_spectator_hit_fx_show_text, 5, 2)
+        hit_lay.addWidget(self.sp_spectator_hit_fx_text_scale, 5, 3)
+        hit_lay.addWidget(self.chk_spectator_hit_fx_sprite_enabled, 5, 4)
+        hit_lay.addWidget(self.chk_spectator_hit_fx_ring_enabled, 5, 5)
+        hit_lay.addWidget(self.chk_spectator_hit_fx_fast_emit, 6, 2, 1, 2)
+        hit_lay.addWidget(self.chk_spectator_hit_fx_latency_log, 6, 4, 1, 2)
+        for widget in (
+            self.sp_spectator_hit_effect_damage,
+            self.cb_spectator_hit_fx_color_preset,
+            self.btn_spectatorlog_test_hit_fx_sprite,
+            self.btn_spectator_hit_fx_color_low,
+            self.btn_spectator_hit_fx_color_mid,
+            self.btn_spectator_hit_fx_color_high,
+            self.btn_spectator_hit_fx_color_weak,
+            self.btn_spectator_hit_fx_color_stun,
+            self.sp_spectator_hit_fx_duration,
+            self.sp_spectator_hit_fx_pop,
+            self.sp_spectator_hit_fx_base_size,
+            self.sp_spectator_hit_fx_damage_scale,
+            self.sp_spectator_hit_fx_ring_width,
+            self.sp_spectator_hit_fx_opacity,
+            self.sp_spectator_hit_fx_glow,
+            self.sp_spectator_hit_fx_fill_opacity,
+            self.chk_spectator_hit_fx_show_text,
+            self.sp_spectator_hit_fx_text_scale,
+            self.chk_spectator_hit_fx_sprite_enabled,
+            self.chk_spectator_hit_fx_ring_enabled,
+            self.chk_spectator_hit_fx_fast_emit,
+            self.chk_spectator_hit_fx_latency_log,
+        ):
+            widget.setVisible(True)
+        hit_lay.setColumnStretch(3, 1)
+        hit_lay.setColumnStretch(5, 1)
+        hit_effects_outer.addWidget(hit_group)
+        hit_effects_outer.addStretch(1)
+
         log_lay.addWidget(spectator_group)
+
+        auto_start_group = QGroupBox("매치 로비 자동 시작")
+        auto_start_lay = QGridLayout(auto_start_group)
+        self.chk_spectator_lobby_auto_start = QCheckBox("양쪽 선수가 레디하면 시작 버튼 자동 클릭")
+        self.chk_spectator_lobby_auto_start.setChecked(bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)))
+        self.chk_spectator_lobby_auto_start.setToolTip("lobby.txt의 ready_to_start가 OFF에서 ON으로 바뀌는 순간 한 번만 클릭합니다.")
+        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start, 0, 0, 1, 5)
+
+        auto_start_lay.addWidget(QLabel("관전툴 창 제목"), 1, 0)
+        self.le_spectator_lobby_auto_start_title = QLineEdit(
+            str(
+                getattr(
+                    self.cfg,
+                    "spectator_lobby_auto_start_target_title",
+                    "The Thrill of the Fight 2",
+                )
+                or "The Thrill of the Fight 2"
+            )
+        )
+        self.le_spectator_lobby_auto_start_title.setPlaceholderText("The Thrill of the Fight 2")
+        self.le_spectator_lobby_auto_start_title.setToolTip("창 제목 일부만 입력해도 됩니다. 오작동 방지를 위해 비워두면 자동 클릭하지 않습니다.")
+        auto_start_lay.addWidget(self.le_spectator_lobby_auto_start_title, 1, 1, 1, 4)
+
+        auto_start_lay.addWidget(QLabel("시작 버튼 위치"), 2, 0)
+        self.sp_spectator_lobby_auto_start_x = QSpinBox()
+        self.sp_spectator_lobby_auto_start_x.setRange(0, 20000)
+        self.sp_spectator_lobby_auto_start_x.setValue(int(getattr(self.cfg, "spectator_lobby_auto_start_client_x", 0) or 0))
+        self.sp_spectator_lobby_auto_start_y = QSpinBox()
+        self.sp_spectator_lobby_auto_start_y.setRange(0, 20000)
+        self.sp_spectator_lobby_auto_start_y.setValue(int(getattr(self.cfg, "spectator_lobby_auto_start_client_y", 0) or 0))
+        self.btn_spectator_lobby_auto_start_capture = QPushButton("2초 후 현재 마우스 위치 찍기")
+        self.btn_spectator_lobby_auto_start_test = QPushButton("자동 클릭 테스트")
+        auto_start_lay.addWidget(QLabel("X"), 2, 1)
+        auto_start_lay.addWidget(self.sp_spectator_lobby_auto_start_x, 2, 2)
+        auto_start_lay.addWidget(QLabel("Y"), 2, 3)
+        auto_start_lay.addWidget(self.sp_spectator_lobby_auto_start_y, 2, 4)
+        auto_start_lay.addWidget(self.btn_spectator_lobby_auto_start_capture, 3, 1, 1, 2)
+        auto_start_lay.addWidget(self.btn_spectator_lobby_auto_start_test, 3, 3, 1, 2)
+
+        auto_start_lay.addWidget(QLabel("클릭 전 대기"), 4, 0)
+        self.sp_spectator_lobby_auto_start_delay = QSpinBox()
+        self.sp_spectator_lobby_auto_start_delay.setRange(0, 5000)
+        self.sp_spectator_lobby_auto_start_delay.setSingleStep(50)
+        self.sp_spectator_lobby_auto_start_delay.setSuffix(" ms")
+        self.sp_spectator_lobby_auto_start_delay.setValue(
+            int(getattr(self.cfg, "spectator_lobby_auto_start_delay_ms", 300) or 300)
+        )
+        auto_start_lay.addWidget(self.sp_spectator_lobby_auto_start_delay, 4, 1)
+        auto_start_lay.addWidget(QLabel("클릭 횟수"), 4, 2)
+        self.sp_spectator_lobby_auto_start_click_count = QSpinBox()
+        self.sp_spectator_lobby_auto_start_click_count.setRange(1, 10)
+        self.sp_spectator_lobby_auto_start_click_count.setSuffix(" 회")
+        self.sp_spectator_lobby_auto_start_click_count.setValue(
+            int(getattr(self.cfg, "spectator_lobby_auto_start_click_count", 1) or 1)
+        )
+        auto_start_lay.addWidget(self.sp_spectator_lobby_auto_start_click_count, 4, 3)
+        self.chk_spectator_lobby_auto_start_activate = QCheckBox("클릭 전 관전툴 활성화")
+        self.chk_spectator_lobby_auto_start_activate.setChecked(
+            bool(getattr(self.cfg, "spectator_lobby_auto_start_activate", True))
+        )
+        self.chk_spectator_lobby_auto_start_restore_focus = QCheckBox("클릭 후 이전 창 복원")
+        self.chk_spectator_lobby_auto_start_restore_focus.setChecked(
+            bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_focus", True))
+        )
+        self.chk_spectator_lobby_auto_start_restore_cursor = QCheckBox("클릭 후 마우스 원위치")
+        self.chk_spectator_lobby_auto_start_restore_cursor.setChecked(
+            bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_cursor", True))
+        )
+        self.chk_spectator_lobby_auto_start_minimize_target = QCheckBox("클릭 후 관전툴 최소화")
+        self.chk_spectator_lobby_auto_start_minimize_target.setChecked(
+            bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False))
+        )
+        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_activate, 5, 1)
+        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_restore_focus, 5, 2, 1, 2)
+        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_restore_cursor, 5, 4)
+        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_minimize_target, 6, 1, 1, 2)
+        self.lbl_spectator_lobby_auto_start_state = QLabel("대기")
+        self.lbl_spectator_lobby_auto_start_state.setStyleSheet("color:#94a3b8;")
+        auto_start_lay.addWidget(self.lbl_spectator_lobby_auto_start_state, 7, 0, 1, 5)
+        auto_start_lay.setColumnStretch(1, 1)
+
+        self.btn_spectator_lobby_auto_start_capture.clicked.connect(self._capture_spectator_lobby_auto_start_point)
+        self.btn_spectator_lobby_auto_start_test.clicked.connect(self._test_spectator_lobby_auto_start_click)
+        for widget, signal_name in (
+            (self.chk_spectator_lobby_auto_start, "stateChanged"),
+            (self.le_spectator_lobby_auto_start_title, "textChanged"),
+            (self.sp_spectator_lobby_auto_start_x, "valueChanged"),
+            (self.sp_spectator_lobby_auto_start_y, "valueChanged"),
+            (self.sp_spectator_lobby_auto_start_delay, "valueChanged"),
+            (self.sp_spectator_lobby_auto_start_click_count, "valueChanged"),
+            (self.chk_spectator_lobby_auto_start_activate, "stateChanged"),
+            (self.chk_spectator_lobby_auto_start_restore_focus, "stateChanged"),
+            (self.chk_spectator_lobby_auto_start_restore_cursor, "stateChanged"),
+            (self.chk_spectator_lobby_auto_start_minimize_target, "stateChanged"),
+        ):
+            getattr(widget, signal_name).connect(self._schedule_apply)
+        auto_start_outer.addWidget(auto_start_group)
+        auto_start_outer.addStretch(1)
         log_lay.addStretch(1)
         log_container = QWidget()
         log_container.setLayout(log_lay)
@@ -8449,6 +7785,34 @@ class SettingsDialog(QDialog):
         log_outer = QVBoxLayout()
         log_outer.addWidget(self.log_scroll)
         self.tab_logs.setLayout(log_outer)
+
+        hit_effects_container = QWidget()
+        hit_effects_container.setLayout(hit_effects_outer)
+        self.hit_effects_scroll = QScrollArea()
+        self.hit_effects_scroll.setWidgetResizable(True)
+        self.hit_effects_scroll.setWidget(hit_effects_container)
+        hit_effects_tab_lay = QVBoxLayout()
+        hit_effects_tab_lay.addWidget(self.hit_effects_scroll)
+        self.tab_hit_effects.setLayout(hit_effects_tab_lay)
+
+        record_lay.addStretch(1)
+        record_container = QWidget()
+        record_container.setLayout(record_lay)
+        self.record_scroll = QScrollArea()
+        self.record_scroll.setWidgetResizable(True)
+        self.record_scroll.setWidget(record_container)
+        record_outer = QVBoxLayout()
+        record_outer.addWidget(self.record_scroll)
+        self.tab_log_records.setLayout(record_outer)
+
+        auto_start_container = QWidget()
+        auto_start_container.setLayout(auto_start_outer)
+        self.auto_start_scroll = QScrollArea()
+        self.auto_start_scroll.setWidgetResizable(True)
+        self.auto_start_scroll.setWidget(auto_start_container)
+        auto_start_tab_lay = QVBoxLayout()
+        auto_start_tab_lay.addWidget(self.auto_start_scroll)
+        self.tab_auto_start.setLayout(auto_start_tab_lay)
 
         sound_lay_outer.addWidget(sound_group)
         sound_lay_outer.addStretch(1)
@@ -8471,15 +7835,6 @@ class SettingsDialog(QDialog):
         test_outer = QVBoxLayout()
         test_outer.addWidget(self.test_scroll)
         self.tab_tests.setLayout(test_outer)
-
-        quick_container = QWidget()
-        quick_container.setLayout(lay)
-        self.quick_scroll = QScrollArea()
-        self.quick_scroll.setWidgetResizable(True)
-        self.quick_scroll.setWidget(quick_container)
-        outer = QVBoxLayout()
-        outer.addWidget(self.quick_scroll)
-        self.tab_quick.setLayout(outer)
 
     def _refresh_chapter_status_label(self):
         if not hasattr(self, "lbl_chapter_status"):
@@ -8562,6 +7917,74 @@ class SettingsDialog(QDialog):
             self.lbl_spectatorlog_state.setText(f"{state} | {bb_state} | 인식 폴더: {root}")
         else:
             self.lbl_spectatorlog_state.setText(f"{state} | {bb_state} | 폴더/필수 파일 확인 필요: {root}")
+
+    def _capture_spectator_lobby_auto_start_point(self):
+        title = str(self.le_spectator_lobby_auto_start_title.text() or "").strip()
+        if not title:
+            QMessageBox.warning(self, "자동 시작", "먼저 관전툴 창 제목을 입력하세요.")
+            return
+        self.btn_spectator_lobby_auto_start_capture.setEnabled(False)
+        self.btn_spectator_lobby_auto_start_capture.setText("2초 안에 시작 버튼에 마우스를 올리세요")
+        self.lbl_spectator_lobby_auto_start_state.setText("시작 버튼 위에 마우스를 올려두세요.")
+
+        def _capture():
+            ok, x, y, detail = window_client_point_from_cursor(title)
+            self.btn_spectator_lobby_auto_start_capture.setEnabled(True)
+            self.btn_spectator_lobby_auto_start_capture.setText("2초 후 현재 마우스 위치 찍기")
+            if not ok:
+                self.lbl_spectator_lobby_auto_start_state.setText(f"위치 저장 실패: {detail}")
+                QMessageBox.warning(self, "자동 시작 위치 저장 실패", detail)
+                return
+            self.sp_spectator_lobby_auto_start_x.setValue(x)
+            self.sp_spectator_lobby_auto_start_y.setValue(y)
+            self.lbl_spectator_lobby_auto_start_state.setText(f"저장 완료: 창 내부 X={x}, Y={y}")
+            logging.info("LOBBY_AUTO_START_CAPTURE %s", detail)
+            self._schedule_apply()
+
+        QTimer.singleShot(2000, _capture)
+
+    def _test_spectator_lobby_auto_start_click(self):
+        title = str(self.le_spectator_lobby_auto_start_title.text() or "").strip()
+        x = int(self.sp_spectator_lobby_auto_start_x.value())
+        y = int(self.sp_spectator_lobby_auto_start_y.value())
+        if not title:
+            QMessageBox.warning(self, "자동 시작 테스트", "관전툴 창 제목을 입력하세요.")
+            return
+        click_count = int(self.sp_spectator_lobby_auto_start_click_count.value())
+        original_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0) if os.name == "nt" else 0
+        original_cursor = _current_cursor_screen_position()
+        ok, detail = True, ""
+        for index in range(click_count):
+            ok, detail = click_window_client_point(
+                title,
+                x,
+                y,
+                activate=bool(self.chk_spectator_lobby_auto_start_activate.isChecked()) and index == 0,
+                restore_focus=(
+                    bool(self.chk_spectator_lobby_auto_start_restore_focus.isChecked())
+                    and index == click_count - 1
+                ),
+                restore_cursor=(
+                    bool(self.chk_spectator_lobby_auto_start_restore_cursor.isChecked())
+                    and index == click_count - 1
+                ),
+                minimize_target=(
+                    bool(self.chk_spectator_lobby_auto_start_minimize_target.isChecked())
+                    and index == click_count - 1
+                ),
+                previous_hwnd_override=original_hwnd,
+                previous_cursor_override=original_cursor,
+            )
+            if not ok:
+                break
+            if index < click_count - 1:
+                time.sleep(0.12)
+        logging.info("LOBBY_AUTO_START_TEST ok=%s %s", ok, detail)
+        self.lbl_spectator_lobby_auto_start_state.setText(
+            ("테스트 성공: " if ok else "테스트 실패: ") + detail
+        )
+        if not ok:
+            QMessageBox.warning(self, "자동 시작 테스트 실패", detail)
 
     def _open_spectatorlog_blackbox_dir(self):
         raw = ""
@@ -9200,7 +8623,7 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
 
-    def _test_spectator_round_report(self):
+    def _test_spectator_round_report(self, final: bool = False):
         """Show the Round Report v2 card without requiring SpectatorLog files.
 
         This is intentionally synthetic: it lets the user tune the browser overlay
@@ -9358,9 +8781,20 @@ class SettingsDialog(QDialog):
                     ],
                 },
             }
+            if bool(final):
+                payload.update({
+                    "isFinal": True,
+                    "winner": "blue",
+                    "winnerName": blue_name,
+                    "leader": "blue",
+                    "leaderName": blue_name,
+                    "roundTag": "MATCH RESULT",
+                    "summaryLine": f"{blue_name} 선수가 경기 승리를 가져갑니다.",
+                    "displayMs": 20000,
+                })
 
             info = {
-                "match_text": "ROUND REPORT TEST",
+                "match_text": "MATCH REPORT TEST" if bool(final) else "ROUND REPORT TEST",
                 "recent_hit_text": "",
                 "blue_recent_hit_text": "Straight 82\n턱",
                 "red_recent_hit_text": "Hook 36\n명치",
@@ -9392,10 +8826,14 @@ class SettingsDialog(QDialog):
             emitted = self._emit_spectator_test_update(update)
             if not emitted:
                 self._push_browser_overlay_event("round_report", **payload)
-            self._noop_status("라운드 리포트 테스트 표시")
+            self._noop_status("경기 종료 리포트 테스트 표시" if bool(final) else "라운드 리포트 테스트 표시")
         except Exception as e:
             logging.exception("SPECTATOR_ROUND_REPORT_TEST_FAIL")
-            QMessageBox.warning(self, "경고", "라운드 리포트 테스트에 실패했습니다.")
+            QMessageBox.warning(
+                self,
+                "경고",
+                "경기 종료 리포트 테스트에 실패했습니다." if bool(final) else "라운드 리포트 테스트에 실패했습니다.",
+            )
 
     def _test_spectator_full_demo(self):
         tw = self._spectator_timer_target()
@@ -10041,8 +9479,26 @@ class SettingsDialog(QDialog):
         root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
         path = os.path.join(root, "match", "damage_events.txt")
         if not os.path.exists(path):
-            QMessageBox.information(self, "안내", "처리가 완료되었습니다.")
-            return
+            candidates = []
+            for base in (
+                os.path.join(os.path.expanduser("~"), "Documents", "ThrillOfTheFight2", "SpectatorLog", "match", "damage_events.txt"),
+                os.path.join(os.path.expanduser("~"), "Downloads", "ThrillOfTheFight2", "SpectatorLog", "match", "damage_events.txt"),
+            ):
+                try:
+                    if os.path.exists(base):
+                        candidates.append(base)
+                except Exception:
+                    pass
+            if candidates:
+                path = max(candidates, key=lambda p: os.path.getmtime(p))
+                root = os.path.dirname(os.path.dirname(path))
+                logging.info("SPECTATOR_REPLAY_FALLBACK_PATH path=%s", path)
+            else:
+                msg = f"과거 로그 리플레이 실패: damage_events.txt를 찾지 못했습니다.\n확인 경로: {path}"
+                logging.warning("SPECTATOR_REPLAY_NO_DAMAGE_FILE path=%s", path)
+                QMessageBox.information(self, "과거 로그 리플레이", msg)
+                self._noop_status("과거 로그 리플레이 실패: 로그 파일 없음")
+                return
         try:
             with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
                 lines = f.readlines()
@@ -10083,8 +9539,11 @@ class SettingsDialog(QDialog):
                 "weak_point": str(parts[10] or "").strip() if len(parts) > 10 else "",
             })
         if not events:
-            QMessageBox.information(self, "안내", "처리가 완료되었습니다.")
+            logging.warning("SPECTATOR_REPLAY_NO_EVENTS path=%s line_count=%s", path, len(lines))
+            QMessageBox.information(self, "과거 로그 리플레이", f"damage_events.txt는 찾았지만 재생 가능한 타격 이벤트가 없습니다.\n경로: {path}")
+            self._noop_status("과거 로그 리플레이 실패: 이벤트 없음")
             return
+        browser_output_only = bool(getattr(self.cfg, "browser_overlay_output_only", True))
         helper = _make_spectator_log_watcher(self.cfg)
         try:
             replay_round_no = int(float(helper._read_text(os.path.join(root, "match", "round_number.txt")) or "1"))
@@ -10333,14 +9792,15 @@ class SettingsDialog(QDialog):
                     replay_payload["spectator_effect_events"] = [{"side": receiver_side, "kind": kind}]
                 emitted = self._test_set_spectator_info(log_info, replay_payload)
                 if kind:
-                    tw.trigger_spectator_effect(receiver_side, kind)
+                    if not browser_output_only:
+                        tw.trigger_spectator_effect(receiver_side, kind)
                     if not emitted:
                         self._play_spectator_sfx(kind, show_warning=False)
                 try:
                     hit_threshold = max(0.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0))
                 except Exception:
                     hit_threshold = 45.0
-                if hit_threshold > 0 and receiver_side in ("blue", "red") and damage >= hit_threshold and kind != "stun":
+                if (not browser_output_only) and hit_threshold > 0 and receiver_side in ("blue", "red") and damage >= hit_threshold and kind != "stun":
                     tw.trigger_hit_impact(receiver_side, damage)
                 if counter_hit:
                     self._push_browser_overlay_event("counter", side=attacker_side, damage=damage)
@@ -10427,7 +9887,10 @@ class SettingsDialog(QDialog):
             except Exception:
                 pass
 
-        row = QHBoxLayout()
+        profile_group = QGroupBox("새 선수 프로필 등록")
+        profile_lay = QGridLayout(profile_group)
+        profile_lay.setHorizontalSpacing(12)
+        profile_lay.setVerticalSpacing(10)
         self.txt_new_id = QLineEdit()
         self.txt_new_id.setPlaceholderText("GAME_ID1,ID2 (쉼표로 여러 개)")
         _tt(self.txt_new_id, "등록할 선수의 GAME_ID를 입력합니다. 여러 개면 쉼표로 구분합니다.")
@@ -10473,56 +9936,70 @@ class SettingsDialog(QDialog):
         _tt(btn_clear_flag, "선택한 국기 이미지를 제거합니다.")
         _tt(btn_add, "입력한 정보로 선수를 추가합니다.")
 
-        row.addWidget(self.lbl_new_avatar)
-        row.addWidget(self.txt_new_id)
-        row.addWidget(self.txt_new_name)
-        row.addWidget(QLabel("국적:"))
-        row.addWidget(self.cmb_new_country)
-        row.addWidget(btn_add)
-        lay.addLayout(row)
-        row_img = QHBoxLayout()
-        row_img.addWidget(self.lbl_new_avatar_path, 1)
-        row_img.addWidget(btn_pick_img)
-        row_img.addWidget(btn_paste_img)
-        row_img.addWidget(btn_url_img)
-        row_img.addWidget(btn_clear_img)
-        lay.addLayout(row_img)
-        row_flag = QHBoxLayout()
-        row_flag.addWidget(QLabel("국기:"))
-        row_flag.addWidget(self.lbl_new_flag_path, 1)
-        row_flag.addWidget(btn_pick_flag)
-        row_flag.addWidget(btn_clear_flag)
-        lay.addLayout(row_flag)
+        profile_lay.addWidget(self.lbl_new_avatar, 0, 0, 2, 1)
+        profile_lay.addWidget(QLabel("GAME ID"), 0, 1)
+        profile_lay.addWidget(self.txt_new_id, 0, 2, 1, 3)
+        profile_lay.addWidget(QLabel("닉네임"), 1, 1)
+        profile_lay.addWidget(self.txt_new_name, 1, 2)
+        profile_lay.addWidget(QLabel("국적"), 1, 3)
+        profile_lay.addWidget(self.cmb_new_country, 1, 4)
+        profile_lay.addWidget(btn_add, 0, 5, 2, 1)
+        profile_lay.addWidget(QLabel("초상화"), 2, 0)
+        profile_lay.addWidget(self.lbl_new_avatar_path, 2, 1, 1, 2)
+        profile_lay.addWidget(btn_pick_img, 2, 3)
+        profile_lay.addWidget(btn_paste_img, 2, 4)
+        profile_lay.addWidget(btn_url_img, 2, 5)
+        profile_lay.addWidget(btn_clear_img, 2, 6)
+        profile_lay.addWidget(QLabel("국기 이미지"), 3, 0)
+        profile_lay.addWidget(self.lbl_new_flag_path, 3, 1, 1, 2)
+        profile_lay.addWidget(btn_pick_flag, 3, 3)
+        profile_lay.addWidget(btn_clear_flag, 3, 4)
+        profile_lay.setColumnStretch(2, 1)
+        self._player_profile_editor_group = profile_group
+        profile_group.setVisible(False)
 
-        view_row = QHBoxLayout()
-        view_row.addWidget(QLabel("보기 방식:"))
+        player_actions = QHBoxLayout()
+        self.btn_open_new_player_profile = QPushButton("새 선수 프로필 등록")
+        self.btn_open_new_player_profile.clicked.connect(self._open_new_player_profile_dialog)
+        self.btn_open_player_roster_tools = QPushButton("명단 내보내기 / 불러오기")
+        self.btn_open_player_roster_tools.clicked.connect(self._open_player_roster_tools_dialog)
+        self.btn_open_new_player_profile.setMinimumHeight(38)
+        self.btn_open_player_roster_tools.setMinimumHeight(38)
+        player_actions.addWidget(self.btn_open_new_player_profile)
+        player_actions.addWidget(self.btn_open_player_roster_tools)
+        player_actions.addStretch(1)
+        lay.addLayout(player_actions)
+
+        list_group = QGroupBox("선수 목록")
+        view_row = QGridLayout(list_group)
+        view_row.addWidget(QLabel("보기 방식"), 0, 0)
         self.cmb_players_view = QComboBox()
         self.cmb_players_view.addItems(["그리드", "리스트"])
         self.cmb_players_view.currentIndexChanged.connect(self._reload_players_cards)
         _tt(self.cmb_players_view, "선수 목록 표시 방식을 선택합니다.")
-        view_row.addWidget(self.cmb_players_view)
+        view_row.addWidget(self.cmb_players_view, 0, 1)
 
-        view_row.addWidget(QLabel("초상화 모양:"))
+        view_row.addWidget(QLabel("초상화 모양"), 0, 2)
         self.cmb_players_avatar = QComboBox()
         self.cmb_players_avatar.addItems(["원형", "사각형"])
         self.cmb_players_avatar.currentIndexChanged.connect(self._reload_players_cards)
         _tt(self.cmb_players_avatar, "선수 카드의 초상화 모양을 선택합니다.")
-        view_row.addWidget(self.cmb_players_avatar)
-        view_row.addWidget(QLabel("초상화 우선:"))
+        view_row.addWidget(self.cmb_players_avatar, 0, 3)
+        view_row.addWidget(QLabel("초상화 우선"), 0, 4)
         self.cmb_portrait_priority = QComboBox()
         self.cmb_portrait_priority.addItem("로그", "log")
         self.cmb_portrait_priority.addItem("프로필", "profile")
         self.cmb_portrait_priority.currentIndexChanged.connect(self._schedule_apply)
         _tt(self.cmb_portrait_priority, "자동 로그 동기화 시 초상화 선택 기준입니다. 기본은 로그 초상화입니다.")
-        view_row.addWidget(self.cmb_portrait_priority)
-        view_row.addWidget(QLabel("정렬:"))
+        view_row.addWidget(self.cmb_portrait_priority, 0, 5)
+        view_row.addWidget(QLabel("정렬"), 0, 6)
         self.cmb_players_sort = QComboBox()
         self.cmb_players_sort.addItems(["ID", "닉네임"])
         self.cmb_players_sort.currentIndexChanged.connect(self._reload_players_cards)
         self.cmb_players_sort.setCurrentText("닉네임")
         _tt(self.cmb_players_sort, "선수 목록 정렬 기준을 선택합니다.")
-        view_row.addWidget(self.cmb_players_sort)
-        view_row.addWidget(QLabel("닉네임 검색:"))
+        view_row.addWidget(self.cmb_players_sort, 0, 7)
+        view_row.addWidget(QLabel("닉네임 검색"), 1, 0)
         self._players_search_query = ""
         self.txt_players_search = ImeAwareLineEdit()
         self.txt_players_search.setPlaceholderText("닉네임 입력")
@@ -10531,25 +10008,22 @@ class SettingsDialog(QDialog):
             lambda: self._on_players_search_query_changed(self.txt_players_search.text())
         )
         _tt(self.txt_players_search, "입력한 닉네임이 포함된 선수만 표시합니다.")
-        view_row.addWidget(self.txt_players_search)
+        view_row.addWidget(self.txt_players_search, 1, 1, 1, 3)
         self.chk_players_missing_img = QCheckBox("사진 미등록만")
         self.chk_players_missing_img.stateChanged.connect(self._reload_players_cards)
         _tt(self.chk_players_missing_img, "초상화가 등록되지 않은 선수만 표시합니다.")
-        view_row.addWidget(self.chk_players_missing_img)
+        view_row.addWidget(self.chk_players_missing_img, 1, 4)
         self.btn_export_players_txt = QPushButton("명단 TXT 내보내기")
         self.btn_export_players_txt.clicked.connect(self._export_players_txt)
         _tt(self.btn_export_players_txt, "등록된 선수 명단을 '닉네임 아이디' 형식의 TXT로 저장합니다.")
-        view_row.addWidget(self.btn_export_players_txt)
         self.btn_import_players_txt = QPushButton("명단 TXT 불러오기")
         self.btn_import_players_txt.clicked.connect(self._import_players_txt)
         _tt(self.btn_import_players_txt, "TXT에서 '닉네임 GAME_ID1,ID2 [이미지URL]' 형식의 여러 줄을 한 번에 불러옵니다.")
-        view_row.addWidget(self.btn_import_players_txt)
         self.btn_import_players_paste = QPushButton("명단 텍스트 붙여넣기")
         self.btn_import_players_paste.clicked.connect(self._import_players_paste)
         _tt(self.btn_import_players_paste, "텍스트를 직접 붙여넣어 '닉네임 GAME_ID1,ID2 [이미지URL]' 여러 줄을 한 번에 불러옵니다.")
-        view_row.addWidget(self.btn_import_players_paste)
-        view_row.addStretch(1)
-        lay.addLayout(view_row)
+        view_row.setColumnStretch(3, 1)
+        lay.addWidget(list_group)
         manage_group = QGroupBox("닉네임별 GAME_ID 관리")
         manage_lay = QGridLayout(manage_group)
         manage_lay.addWidget(QLabel(""), 0, 0)
@@ -10594,554 +10068,60 @@ class SettingsDialog(QDialog):
         self._refresh_player_manage_ui()
         self.tab_players.setLayout(lay)
 
-    # ---- OCR tab ----
-    def _build_ocr(self):
-        lay = QVBoxLayout()
-        tip = QLabel("\n".join(["OCR은 화면 글자를 읽어 이름/라운드/시간을 맞추는 기능입니다.", "먼저 글자인식 범위를 지정한 다음 보정값을 조절하세요."]))
-        tip.setStyleSheet("color:#888;")
-        tip.setWordWrap(True)
-        lay.addWidget(tip)
+    def _open_new_player_profile_dialog(self):
+        group = getattr(self, "_player_profile_editor_group", None)
+        if group is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("새 선수 프로필 등록")
+        dialog.setModal(True)
+        dialog.resize(920, 300)
+        layout = QVBoxLayout(dialog)
+        group.setParent(dialog)
+        group.setVisible(True)
+        layout.addWidget(group)
+        close_button = QPushButton("닫기")
+        close_button.clicked.connect(dialog.accept)
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+        try:
+            dialog.exec()
+        finally:
+            layout.removeWidget(group)
+            group.setParent(self)
+            group.setVisible(False)
 
-        roi_group = QGroupBox("이름/시간 글자인식 범위")
-        roi_lay = QGridLayout(roi_group)
-        self.btn_set_blue_name = QPushButton("BLUE 닉네임 범위")
-        self.btn_set_red_name = QPushButton("RED 닉네임 범위")
-        self.btn_set_arena_name = QPushButton("경기장 이름 범위")
-        self.btn_set_round_info = QPushButton("라운드 표시 범위")
-        self.btn_set_round_time = QPushButton("라운드 시간 범위")
-        self.btn_set_koth_blue = QPushButton("KOTH 블루 승리 ID 범위")
-        self.btn_set_koth_red = QPushButton("KOTH 레드 승리 ID 범위")
-        self.lbl_bname = QLabel(self._roi_text(self.cfg.roi_blue_name))
-        self.lbl_rname = QLabel(self._roi_text(self.cfg.roi_red_name))
-        self.lbl_arena = QLabel(self._roi_text(self.cfg.roi_arena_name))
-        self.lbl_round_info = QLabel(self._roi_text(self.cfg.roi_round_info))
-        self.lbl_round_time = QLabel(self._roi_text(self.cfg.roi_round_time))
-        self.lbl_koth_blue = QLabel(self._roi_text(self.cfg.roi_koth_winner_blue))
-        self.lbl_koth_red = QLabel(self._roi_text(self.cfg.roi_koth_winner_red))
-        self.btn_set_blue_name.clicked.connect(lambda: self.pick_roi("블루 닉네임 인식 범위", "roi_blue_name"))
-        self.btn_set_red_name.clicked.connect(lambda: self.pick_roi("레드 닉네임 인식 범위", "roi_red_name"))
-        self.btn_set_arena_name.clicked.connect(lambda: self.pick_roi("경기장 이름 인식 범위", "roi_arena_name"))
-        self.btn_set_round_info.clicked.connect(lambda: self.pick_roi("라운드 표시 인식 범위", "roi_round_info"))
-        self.btn_set_round_time.clicked.connect(lambda: self.pick_roi("라운드 시간 인식 범위", "roi_round_time"))
-        self.btn_set_koth_blue.clicked.connect(lambda: self.pick_roi("KOTH 블루 승리 ID 범위", "roi_koth_winner_blue"))
-        self.btn_set_koth_red.clicked.connect(lambda: self.pick_roi("KOTH 레드 승리 ID 범위", "roi_koth_winner_red"))
-        roi_lay.addWidget(self.btn_set_blue_name, 0, 0); roi_lay.addWidget(self.lbl_bname, 0, 1)
-        roi_lay.addWidget(self.btn_set_red_name, 1, 0); roi_lay.addWidget(self.lbl_rname, 1, 1)
-        roi_lay.addWidget(self.btn_set_arena_name, 2, 0); roi_lay.addWidget(self.lbl_arena, 2, 1)
-        roi_lay.addWidget(self.btn_set_round_info, 3, 0); roi_lay.addWidget(self.lbl_round_info, 3, 1)
-        roi_lay.addWidget(self.btn_set_round_time, 4, 0); roi_lay.addWidget(self.lbl_round_time, 4, 1)
-
-        koth_group = QGroupBox("킹오브더힐 간편 설정")
-        koth_lay = QVBoxLayout(koth_group)
-        koth_tip = QLabel(
-            "승리 화면 감지 조건과 승자 OCR 액션을 자동으로 연결합니다.\n"
-            "블루/레드 승리 화면이 다르면 각각 감지 조건을 따로 찍으세요."
+    def _open_player_roster_tools_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("선수 명단 내보내기 / 불러오기")
+        dialog.setModal(True)
+        dialog.resize(620, 220)
+        layout = QVBoxLayout(dialog)
+        info = QLabel(
+            "등록된 선수 명단을 TXT로 저장하거나, TXT 파일 또는 붙여넣은 텍스트로 여러 선수를 한 번에 등록합니다."
         )
-        koth_tip.setWordWrap(True)
-        koth_tip.setStyleSheet("color:#667085;")
-        koth_lay.addWidget(koth_tip)
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        export_button = QPushButton("명단 TXT 내보내기")
+        import_button = QPushButton("명단 TXT 불러오기")
+        paste_button = QPushButton("명단 텍스트 붙여넣기")
+        export_button.clicked.connect(self._export_players_txt)
+        import_button.clicked.connect(self._import_players_txt)
+        paste_button.clicked.connect(self._import_players_paste)
+        for button in (export_button, import_button, paste_button):
+            button.setMinimumHeight(40)
+            layout.addWidget(button)
+        close_button = QPushButton("닫기")
+        close_button.clicked.connect(dialog.accept)
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_row.addWidget(close_button)
+        layout.addLayout(close_row)
+        dialog.exec()
 
-        koth_detect_grid = QGridLayout()
-        self.chk_koth_enabled = QCheckBox("킹오브더힐 모드 사용")
-        self.chk_koth_enabled.setChecked(bool(getattr(self.cfg, "koth_enabled", False)))
-        self.chk_koth_enabled.stateChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_koth_setup_state()))
-        koth_detect_grid.addWidget(self.chk_koth_enabled, 0, 0, 1, 2)
-        self.btn_koth_setup_blue_rule = QPushButton("블루 승리 화면 감지 조건 설정")
-        self.btn_koth_setup_red_rule = QPushButton("레드 승리 화면 감지 조건 설정")
-        self.btn_koth_setup_blue_rule.clicked.connect(lambda: self._setup_koth_pixel_rule("blue"))
-        self.btn_koth_setup_red_rule.clicked.connect(lambda: self._setup_koth_pixel_rule("red"))
-        koth_detect_grid.addWidget(self.btn_koth_setup_blue_rule, 1, 0)
-        koth_detect_grid.addWidget(self.btn_koth_setup_red_rule, 1, 1)
-        koth_detect_grid.addWidget(self.btn_set_koth_blue, 2, 0)
-        koth_detect_grid.addWidget(self.lbl_koth_blue, 2, 1)
-        koth_detect_grid.addWidget(self.btn_set_koth_red, 3, 0)
-        koth_detect_grid.addWidget(self.lbl_koth_red, 3, 1)
-
-        self.sp_koth_blue_tol = QSpinBox()
-        self.sp_koth_blue_tol.setRange(0, 200)
-        self.sp_koth_blue_tol.setValue(self._koth_rule_tolerance("blue"))
-        self.sp_koth_red_tol = QSpinBox()
-        self.sp_koth_red_tol.setRange(0, 200)
-        self.sp_koth_red_tol.setValue(self._koth_rule_tolerance("red"))
-        self.sp_koth_blue_cd = QDoubleSpinBox()
-        self.sp_koth_blue_cd.setRange(0.0, 60.0)
-        self.sp_koth_blue_cd.setSingleStep(0.5)
-        self.sp_koth_blue_cd.setDecimals(1)
-        self.sp_koth_blue_cd.setValue(self._koth_rule_cooldown("blue"))
-        self.sp_koth_red_cd = QDoubleSpinBox()
-        self.sp_koth_red_cd.setRange(0.0, 60.0)
-        self.sp_koth_red_cd.setSingleStep(0.5)
-        self.sp_koth_red_cd.setDecimals(1)
-        self.sp_koth_red_cd.setValue(self._koth_rule_cooldown("red"))
-        self._apply_wheel_filter(self.sp_koth_blue_tol)
-        self._apply_wheel_filter(self.sp_koth_red_tol)
-        self._apply_wheel_filter(self.sp_koth_blue_cd)
-        self._apply_wheel_filter(self.sp_koth_red_cd)
-        self.sp_koth_blue_tol.valueChanged.connect(lambda v: self._set_koth_rule_tolerance("blue", int(v)))
-        self.sp_koth_red_tol.valueChanged.connect(lambda v: self._set_koth_rule_tolerance("red", int(v)))
-        self.sp_koth_blue_cd.valueChanged.connect(lambda v: self._set_koth_rule_cooldown("blue", float(v)))
-        self.sp_koth_red_cd.valueChanged.connect(lambda v: self._set_koth_rule_cooldown("red", float(v)))
-        koth_detect_grid.addWidget(QLabel("블루 감지 민감도(허용오차)"), 4, 0)
-        koth_detect_grid.addWidget(self.sp_koth_blue_tol, 4, 1)
-        koth_detect_grid.addWidget(QLabel("레드 감지 민감도(허용오차)"), 5, 0)
-        koth_detect_grid.addWidget(self.sp_koth_red_tol, 5, 1)
-        koth_detect_grid.addWidget(QLabel("블루 감지 쿨타임(초)"), 6, 0)
-        koth_detect_grid.addWidget(self.sp_koth_blue_cd, 6, 1)
-        koth_detect_grid.addWidget(QLabel("레드 감지 쿨타임(초)"), 7, 0)
-        koth_detect_grid.addWidget(self.sp_koth_red_cd, 7, 1)
-        koth_lay.addLayout(koth_detect_grid)
-
-        koth_row = QHBoxLayout()
-        self.btn_koth_test = QPushButton("테스트")
-        self.btn_koth_test.clicked.connect(self._test_koth_ocr)
-        koth_row.addWidget(self.btn_koth_test)
-        self.btn_koth_reset = QPushButton("초기화")
-        self.btn_koth_reset.clicked.connect(self._reset_koth_streak)
-        koth_row.addWidget(self.btn_koth_reset)
-        koth_row.addStretch(1)
-        koth_lay.addLayout(koth_row)
-        self.lbl_koth_setup_state = QLabel("")
-        self.lbl_koth_setup_state.setWordWrap(True)
-        self.lbl_koth_setup_state.setStyleSheet("color:#475467;")
-        koth_lay.addWidget(self.lbl_koth_setup_state)
-
-        ocr_group = QGroupBox("OCR 보정")
-        ocr_lay = QGridLayout(ocr_group)
-        ocr_lay.setHorizontalSpacing(10)
-        ocr_lay.setVerticalSpacing(8)
-        ocr_lay.addWidget(QLabel(""), 0, 0)
-        self.sp_samples = QSpinBox(); self.sp_samples.setRange(1, 5); self.sp_samples.setValue(self.cfg.ocr.samples)
-        ocr_lay.addWidget(self.sp_samples, 0, 1)
-        ocr_lay.addWidget(QLabel("유사도 기준"), 0, 2)
-        self.sp_sim = QSpinBox(); self.sp_sim.setRange(0, 100); self.sp_sim.setValue(self.cfg.ocr.sim_threshold)
-        ocr_lay.addWidget(self.sp_sim, 0, 3)
-        ocr_lay.addWidget(QLabel("KOTH 기준"), 1, 0)
-        self.sp_koth_min = QSpinBox(); self.sp_koth_min.setRange(0, 100); self.sp_koth_min.setValue(int(getattr(self.cfg, "koth_min_score", 75) or 75))
-        self.sp_koth_min.valueChanged.connect(self._schedule_apply)
-        ocr_lay.addWidget(self.sp_koth_min, 1, 1)
-        ocr_lay.addWidget(QLabel("1~2 간격"), 1, 2)
-        self.sp_gap = QSpinBox(); self.sp_gap.setRange(0, 50); self.sp_gap.setValue(self.cfg.ocr.require_gap)
-        ocr_lay.addWidget(self.sp_gap, 1, 3)
-        ocr_lay.setColumnStretch(4, 1)
-        roi_lay.addWidget(ocr_group, 7, 0, 1, 2)
-        roi_lay.addWidget(koth_group, 8, 0, 1, 2)
-        self._refresh_koth_setup_state()
-        lay.addWidget(roi_group)
-
-        test_row = QHBoxLayout()
-        self.btn_test_ocr = QPushButton("OCR 테스트")
-        self.btn_test_ocr.clicked.connect(self.test_ocr)
-        test_row.addWidget(self.btn_test_ocr)
-        self.btn_save_ocr_capture = QPushButton("OCR 캡처 저장")
-        self.btn_save_ocr_capture.clicked.connect(self._save_ocr_captures)
-        test_row.addWidget(self.btn_save_ocr_capture)
-        test_row.addStretch(1)
-        lay.addLayout(test_row)
-
-        target = getattr(self, "_quick_layout", None)
-        if target is not None:
-            target.addSpacing(12)
-            target.addWidget(roi_group)
-            target.addLayout(test_row)
-            player_group = QGroupBox("선수 인식 범위")
-            player_lay = QVBoxLayout(player_group)
-            player_grid = QGridLayout()
-            player_grid.addWidget(self.btn_set_left_player, 0, 0)
-            player_grid.addWidget(self.lbl_lplayer, 0, 1)
-            player_grid.addWidget(self.btn_set_right_player, 1, 0)
-            player_grid.addWidget(self.lbl_rplayer, 1, 1)
-            player_lay.addLayout(player_grid)
-            if hasattr(self, "pal_group"):
-                player_lay.addWidget(self.pal_group)
-            target.addWidget(player_group)
-        else:
-            player_group = QGroupBox("선수 인식 범위")
-            player_lay = QVBoxLayout(player_group)
-            player_tip = QLabel("로그 기반 사용 시 일반적으로 건드릴 필요 없습니다. 로그에서 제공되지 않는 항목을 OCR/픽셀로 보조할 때만 사용하세요.")
-            player_tip.setWordWrap(True)
-            player_tip.setStyleSheet("color:#667085;")
-            player_lay.addWidget(player_tip)
-            player_grid = QGridLayout()
-            player_grid.addWidget(self.btn_set_left_player, 0, 0)
-            player_grid.addWidget(self.lbl_lplayer, 0, 1)
-            player_grid.addWidget(self.btn_set_right_player, 1, 0)
-            player_grid.addWidget(self.lbl_rplayer, 1, 1)
-            player_lay.addLayout(player_grid)
-            if hasattr(self, "pal_group"):
-                player_lay.addWidget(self.pal_group)
-            lay.addWidget(player_group)
-            ocr_content = QWidget()
-            ocr_content.setLayout(lay)
-            ocr_scroll = QScrollArea()
-            ocr_scroll.setWidgetResizable(True)
-            ocr_scroll.setFrameShape(QFrame.Shape.NoFrame)
-            ocr_scroll.setWidget(ocr_content)
-            ocr_outer = QVBoxLayout()
-            ocr_outer.addWidget(ocr_scroll)
-            self.tab_ocr.setLayout(ocr_outer)
-
-    # ---- Timer tab ----
-    def test_ocr(self):
-        if not HAS_EASYOCR:
-            msg = "easyocr 미설치\n(pip install easyocr)"
-            if _EASYOCR_IMPORT_ERROR:
-                msg = f"OCR 비활성: {_EASYOCR_IMPORT_ERROR}"
-            QMessageBox.warning(self, "OCR 오류", msg)
-            return
-        if not (self.cfg.roi_blue_name.valid() or self.cfg.roi_red_name.valid()):
-            QMessageBox.warning(self, "OCR 오류", "ROI가 설정되어 있지 않습니다.")
-            return
-        try:
-            b = ocr_one_line_english(capture_roi_np_global(self.cfg.roi_blue_name), self.cfg.ocr.allow_chars) if self.cfg.roi_blue_name.valid() else ""
-            r = ocr_one_line_english(capture_roi_np_global(self.cfg.roi_red_name), self.cfg.ocr.allow_chars) if self.cfg.roi_red_name.valid() else ""
-        except Exception as e:
-            QMessageBox.warning(self, "OCR 오류", f"화면 캡처 실패: {e}")
-            return
-        bid, bsc = best_match_id(b, self.cfg.players, self.cfg.ocr)
-        rid, rsc = best_match_id(r, self.cfg.players, self.cfg.ocr)
-        bclean = normalize_game_id(b, self.cfg.ocr.allow_chars)
-        rclean = normalize_game_id(r, self.cfg.ocr.allow_chars)
-        QMessageBox.information(self, "OCR 결과",
-            f"BLUE OCR: {b}\nBLUE CLEAN: {bclean}\n매칭 ID: {bid} ({bsc})\n\n"
-            f"RED OCR: {r}\nRED CLEAN: {rclean}\n매칭 ID: {rid} ({rsc})"
-        )
-
-    def _koth_rule_meta(self, side: str) -> Tuple[str, str]:
-        side = str(side or "").lower().strip()
-        if side == "red":
-            return "pixel_koth_victory_red", "KOTH_레드승리화면"
-        if side == "legacy":
-            return "pixel_koth_victory", "KOTH_승리화면"
-        return "pixel_koth_victory_blue", "KOTH_블루승리화면"
-
-    def _koth_pixel_rule_index(self, side: str = "") -> int:
-        rules = self._pixel_rules if hasattr(self, "_pixel_rules") else (self.cfg.pixel_rules or [])
-        if side:
-            rid, name = self._koth_rule_meta(side)
-            for i, rule in enumerate(rules or []):
-                if str((rule or {}).get("id") or "").strip() == rid or str((rule or {}).get("name") or "").strip() == name:
-                    return i
-            return -1
-        for i, rule in enumerate(rules or []):
-            name = str((rule or {}).get("name") or "").strip()
-            rid = str((rule or {}).get("id") or "").strip()
-            if name in ("KOTH_블루승리화면", "KOTH_레드승리화면", "KOTH_승리화면") or rid in ("pixel_koth_victory_blue", "pixel_koth_victory_red", "pixel_koth_victory"):
-                return i
-        for i, rule in enumerate(rules or []):
-            actions = self._get_actions_for_event(f"pixel:{rule.get('name', '')}") if hasattr(self, "_get_actions_for_event") else []
-            if any(str((a or {}).get("type", "")).lower() == "koth_winner_ocr" for a in actions):
-                return i
-        return -1
-
-    def _koth_rule_tolerance(self, side: str) -> int:
-        rules = self._pixel_rules if hasattr(self, "_pixel_rules") else (self.cfg.pixel_rules or [])
-        idx = self._koth_pixel_rule_index(side)
-        if idx < 0 or idx >= len(rules):
-            return 8
-        try:
-            return int((rules[idx] or {}).get("tolerance", 8))
-        except Exception:
-            return 8
-
-    def _koth_rule_cooldown(self, side: str) -> float:
-        rules = self._pixel_rules if hasattr(self, "_pixel_rules") else (self.cfg.pixel_rules or [])
-        idx = self._koth_pixel_rule_index(side)
-        if idx < 0 or idx >= len(rules):
-            return 1.0
-        try:
-            return float((rules[idx] or {}).get("cooldown_sec", 1.0))
-        except Exception:
-            return 1.0
-
-    def _set_koth_rule_tolerance(self, side: str, value: int):
-        side = "red" if str(side or "").lower().strip() == "red" else "blue"
-        if not hasattr(self, "_pixel_rules"):
-            self._pixel_rules = list(self.cfg.pixel_rules or [])
-        idx = self._koth_pixel_rule_index(side)
-        if idx < 0:
-            return
-        value = max(0, min(200, int(value)))
-        self._pixel_rules[idx]["tolerance"] = value
-        self._apply_pixel_rules()
-        if self._cfg_path:
-            try:
-                self.cfg.to_json(self._cfg_path)
-            except Exception:
-                pass
-        if hasattr(self, "_render_pixel_cards"):
-            self._render_pixel_cards()
-        self._refresh_koth_setup_state()
-
-    def _set_koth_rule_cooldown(self, side: str, value: float):
-        side = "red" if str(side or "").lower().strip() == "red" else "blue"
-        if not hasattr(self, "_pixel_rules"):
-            self._pixel_rules = list(self.cfg.pixel_rules or [])
-        idx = self._koth_pixel_rule_index(side)
-        if idx < 0:
-            return
-        value = max(0.0, min(60.0, float(value)))
-        self._pixel_rules[idx]["cooldown_sec"] = value
-        self._apply_pixel_rules()
-        event = f"pixel:{self._pixel_rules[idx].get('name', '')}"
-        try:
-            self._update_action_cooldown_for_event(event, value)
-        except Exception:
-            pass
-        if self._cfg_path:
-            try:
-                self.cfg.to_json(self._cfg_path)
-            except Exception:
-                pass
-        if hasattr(self, "_render_pixel_cards"):
-            self._render_pixel_cards()
-        self._refresh_koth_setup_state()
-
-    def _refresh_koth_tolerance_widgets(self):
-        for side, attr in (("blue", "sp_koth_blue_tol"), ("red", "sp_koth_red_tol")):
-            if not hasattr(self, attr):
-                continue
-            sp = getattr(self, attr)
-            try:
-                sp.blockSignals(True)
-                sp.setValue(self._koth_rule_tolerance(side))
-                sp.blockSignals(False)
-            except Exception:
-                pass
-        for side, attr in (("blue", "sp_koth_blue_cd"), ("red", "sp_koth_red_cd")):
-            if not hasattr(self, attr):
-                continue
-            sp = getattr(self, attr)
-            try:
-                sp.blockSignals(True)
-                sp.setValue(self._koth_rule_cooldown(side))
-                sp.blockSignals(False)
-            except Exception:
-                pass
-
-    def _refresh_koth_setup_state(self):
-        if not hasattr(self, "lbl_koth_setup_state"):
-            return
-        self._refresh_koth_tolerance_widgets()
-        rules = self._pixel_rules if hasattr(self, "_pixel_rules") else (self.cfg.pixel_rules or [])
-
-        def _rule_state(side: str) -> str:
-            idx = self._koth_pixel_rule_index(side)
-            if idx < 0:
-                return "없음"
-            rule = rules[idx]
-            action_ok = any(
-                str((a or {}).get("type", "")).lower() == "koth_winner_ocr"
-                for a in self._get_actions_for_event(f"pixel:{rule.get('name', '')}")
-            )
-            tol = int((rule or {}).get("tolerance", 8))
-            cd = float((rule or {}).get("cooldown_sec", 1.0))
-            return f"OK({rule.get('name', '')}, tol={tol}, cd={cd:.1f}s)" if action_ok else f"액션필요({rule.get('name', '')}, tol={tol}, cd={cd:.1f}s)"
-
-        legacy = ""
-        legacy_idx = self._koth_pixel_rule_index("legacy")
-        if legacy_idx >= 0:
-            legacy = f" | 기존 단일 조건: {rules[legacy_idx].get('name', '')}"
-        blue_ok = bool(getattr(self.cfg, "roi_koth_winner_blue", Rect()).valid())
-        red_ok = bool(getattr(self.cfg, "roi_koth_winner_red", Rect()).valid())
-        enabled = bool(getattr(self.cfg, "koth_enabled", False))
-        self.lbl_koth_setup_state.setText(
-            f"KOTH: {'ON' if enabled else 'OFF'} | "
-            f"블루 감지: {_rule_state('blue')} | 레드 감지: {_rule_state('red')}{legacy} | "
-            f"블루 ID 영역: {'OK' if blue_ok else '필요'} | 레드 ID 영역: {'OK' if red_ok else '필요'}"
-        )
-
-    def _setup_koth_pixel_rule(self, side: str = "blue"):
-        side = "red" if str(side or "").lower().strip() == "red" else "blue"
-        if not hasattr(self, "_pixel_rules"):
-            self._pixel_rules = list(self.cfg.pixel_rules or [])
-        self._cleanup_legacy_koth_pixel_actions(keep_side=side)
-        rid, name = self._koth_rule_meta(side)
-        idx = self._koth_pixel_rule_index(side)
-        if idx < 0:
-            idx = len(self._pixel_rules)
-            self._pixel_rules.append({
-                "id": rid,
-                "name": name,
-                "enabled": True,
-                "mode": "pixel",
-                "x": 0,
-                "y": 0,
-                "sample": 3,
-                "roi": {"x": 0, "y": 0, "w": 0, "h": 0},
-                "target_bgr": [0, 0, 0],
-                "tolerance": 8,
-                "window_frames": 2,
-                "consecutive_needed": 2,
-                "cooldown_sec": 1.0,
-            })
-        rule = self._pixel_rules[idx]
-        rule["enabled"] = True
-        self.cfg.koth_enabled = True
-        if hasattr(self, "chk_koth_enabled"):
-            self.chk_koth_enabled.blockSignals(True)
-            self.chk_koth_enabled.setChecked(True)
-            self.chk_koth_enabled.blockSignals(False)
-        self._apply_pixel_rules()
-        event = f"pixel:{rule.get('name', name)}"
-        self._set_actions_for_event(event, [{"type": "koth_winner_ocr"}], update_panel=False)
-        if not hasattr(self, "_action_cooldowns_by_event"):
-            self._action_cooldowns_by_event = dict(self.cfg.action_cooldowns or {})
-        if not hasattr(self, "_action_edge_triggers_by_event"):
-            self._action_edge_triggers_by_event = dict(getattr(self.cfg, "action_edge_triggers", {}) or {})
-        self._update_action_cooldown_for_event(event, 1.0)
-        self._update_action_edge_for_event(event, True)
-        self.cfg.actions = dict(self._actions_by_event)
-        self.cfg.action_cooldowns = dict(self._action_cooldowns_by_event)
-        self.cfg.action_edge_triggers = dict(self._action_edge_triggers_by_event)
-        self._apply_pixel_rules()
-        if self._cfg_path:
-            try:
-                self.cfg.to_json(self._cfg_path)
-            except Exception:
-                pass
-        if hasattr(self, "_render_pixel_cards"):
-            self._render_pixel_cards()
-        if hasattr(self, "_refresh_action_events"):
-            self._refresh_action_events()
-        self._refresh_koth_setup_state()
-        dummy_label = QLabel()
-        QMessageBox.information(
-            self,
-            "KOTH 감지 조건",
-            f"{'블루' if side == 'blue' else '레드'} 승리 화면에서 항상 같은 색으로 보이는 위치를 찍으세요.\n"
-            "이 조건이 HIT 되면 KOTH 승자 OCR이 자동 실행됩니다."
-        )
-        self._open_screen_condition_dialog(idx, dummy_label)
-
-    def _cleanup_legacy_koth_pixel_actions(self, keep_side: str = ""):
-        keep_side = "red" if str(keep_side or "").lower().strip() == "red" else "blue"
-        keep_ids = {
-            self._koth_rule_meta("blue")[0],
-            self._koth_rule_meta("red")[0],
-        }
-        keep_names = {
-            self._koth_rule_meta("blue")[1],
-            self._koth_rule_meta("red")[1],
-        }
-        if not hasattr(self, "_actions_by_event"):
-            self._actions_by_event = dict(self.cfg.actions or {})
-        if not hasattr(self, "_action_edge_triggers_by_event"):
-            self._action_edge_triggers_by_event = dict(getattr(self.cfg, "action_edge_triggers", {}) or {})
-        for rule in list(self._pixel_rules or []):
-            rid = str((rule or {}).get("id") or "").strip()
-            name = str((rule or {}).get("name") or "").strip()
-            is_current_koth = rid in keep_ids or name in keep_names
-            keys = [f"pixel:{name}"] if name else []
-            if rid:
-                keys.append(f"pixel_id:{rid}")
-            has_koth = any(
-                any(str((a or {}).get("type", "")).lower() == "koth_winner_ocr" for a in (self._actions_by_event.get(k, []) or []))
-                for k in keys
-            )
-            if has_koth and not is_current_koth:
-                for k in keys:
-                    actions = [
-                        a for a in (self._actions_by_event.get(k, []) or [])
-                        if str((a or {}).get("type", "")).lower() != "koth_winner_ocr"
-                    ]
-                    if actions:
-                        self._actions_by_event[k] = actions
-                    else:
-                        self._actions_by_event.pop(k, None)
-                    self._action_edge_triggers_by_event.pop(k, None)
-                try:
-                    logging.info("KOTH_LEGACY_ACTION_REMOVED id=%s name=%s", rid, name)
-                except Exception:
-                    pass
-        self.cfg.actions = dict(self._actions_by_event)
-        self.cfg.action_edge_triggers = dict(self._action_edge_triggers_by_event)
-
-    def _test_koth_ocr(self):
-        self.apply_only(silent=True)
-        if not HAS_EASYOCR:
-            msg = "easyocr 미설치\n(pip install easyocr)"
-            if _EASYOCR_IMPORT_ERROR:
-                msg = f"OCR 비활성: {_EASYOCR_IMPORT_ERROR}"
-            QMessageBox.warning(self, "KOTH OCR", msg)
-            return
-        if not (self.cfg.roi_koth_winner_blue.valid() or self.cfg.roi_koth_winner_red.valid()):
-            QMessageBox.warning(self, "KOTH OCR", "KOTH 블루/레드 승리 ID 영역을 먼저 지정하세요.")
-            return
-        candidates = []
-        try:
-            with mss.mss() as sct:
-                for side, rect in (
-                    ("blue", self.cfg.roi_koth_winner_blue),
-                    ("red", self.cfg.roi_koth_winner_red),
-                ):
-                    if not rect.valid():
-                        continue
-                    raw = ocr_one_line_english(capture_roi_np_global(rect, sct=sct), self.cfg.ocr.allow_chars)
-                    clean = normalize_game_id(raw, self.cfg.ocr.allow_chars)
-                    match_id, score = best_match_id(raw, self.cfg.players, self.cfg.ocr)
-                    if match_id == self.cfg.ocr.unknown_label and clean:
-                        match_id = clean
-                    candidates.append((side, raw, clean, str(match_id or "").upper().strip(), int(score)))
-        except Exception as e:
-            QMessageBox.warning(self, "KOTH OCR", f"테스트 실패: {e}")
-            return
-        if not candidates:
-            QMessageBox.warning(self, "KOTH OCR", "테스트할 KOTH OCR 영역이 없습니다.")
-            return
-        cand_lines = []
-        for side, raw, clean, mid, score in candidates:
-            cand_lines.append(f"{side}: raw={raw} / clean={clean} / id={mid} / score={score}")
-        min_score = int(getattr(self.cfg, "koth_min_score", 75) or 75)
-        known = [c for c in candidates if c[3] and c[3] != self.cfg.ocr.unknown_label]
-        best = max(known or candidates, key=lambda c: c[4])
-        side, _raw, _clean, winner, score = best
-        if not winner or winner == self.cfg.ocr.unknown_label or int(score) < min_score:
-            winner = ""
-        if winner:
-            title = "KOTH OCR \uB9E4\uCE6D"
-            head = f"선택: {winner} ({side}, score={score}, 기준={min_score})"
-        else:
-            title = "KOTH OCR 매칭 실패"
-            head = f"선택 실패: 기준={min_score}, 선수 ID/영역/기준값 확인"
-        QMessageBox.information(self, title, head + "\n\n" + "\n".join(cand_lines))
-        self._refresh_koth_setup_state()
-
-    def _save_ocr_captures(self):
-        base = app_path("logs", "ocr_captures")
-        try:
-            paths, report_path = save_ocr_debug_report(self.cfg, base)
-        except Exception as e:
-            QMessageBox.warning(self, "OCR 캡처", f"저장 실패: {e}")
-            return
-        if not paths and not report_path:
-            QMessageBox.information(self, "OCR 캡처", "저장할 ROI가 없습니다.")
-            return
-        msg = f"{len(paths)}개 저장됨\n폴더: {base}"
-        if report_path:
-            msg += f"\n리포트: {report_path}"
-        QMessageBox.information(self, "OCR 캡처", msg)
-
-    def _reset_koth_streak(self):
-        self.cfg.koth_champion_id = ""
-        self.cfg.koth_streak = 0
-        try:
-            if self._timer_win and hasattr(self._timer_win, "set_win_streaks"):
-                self._timer_win.set_win_streaks(0, 0)
-        except Exception:
-            pass
-        try:
-            parent = self.parent()
-            if parent is not None and hasattr(parent, "_sync_koth_streak_to_overlay"):
-                parent._sync_koth_streak_to_overlay()
-        except Exception:
-            pass
-        if self._cfg_path:
-            try:
-                self.cfg.to_json(self._cfg_path)
-            except Exception:
-                pass
-        QMessageBox.information(self, "KOTH", "킹오브더힐 연승을 초기화했습니다.")
-
+    # ---- Overlay controls ----
     def _apply_overlay_bg_live(self):
         if self._suspend_apply:
             return
@@ -12375,7 +11355,7 @@ class SettingsDialog(QDialog):
         self.txt_overlay_vs_bg_map.textChanged.connect(self._apply_overlay_vs_bg_live)
         _tt(self.le_overlay_vs_bg, "경기장 값이 없거나 매핑되지 않았을 때 사용할 VS 기본 배경입니다.")
         _tt(self.sp_overlay_vs_hold_sec, "VS 오버레이가 화면에 머무는 시간입니다. 등장/퇴장 애니메이션 시간은 별도로 유지됩니다.")
-        _tt(self.txt_overlay_vs_bg_map, "한 줄에 경기장명=이미지파일경로 형식으로 입력합니다. 로그/ OCR 경기장명과 일치하면 해당 이미지가 뜹니다.")
+        _tt(self.txt_overlay_vs_bg_map, "한 줄에 경기장명=이미지파일경로 형식으로 입력합니다. 로그 경기장명과 일치하면 해당 이미지가 뜹니다.")
         overlay_lay.addWidget(vs_bg_group)
 
         browser_group = QGroupBox("OBS 브라우저 출력")
@@ -14747,12 +13727,6 @@ class SettingsDialog(QDialog):
             return self.cfg.players_images.get(gid, "")
         return ""
 
-    # ---- Trigger/OCR tab ----
-    def _build_trigger(self):
-        lay = QVBoxLayout()
-        lay.addWidget(QLabel("OCR 보정은 빠른 시작 탭에서 설정합니다."))
-        self.tab_trigger.setLayout(lay)
-
     def _update_trigger_live(self):
         if not self.chk_live_trigger.isChecked():
             return
@@ -14862,12 +13836,12 @@ class SettingsDialog(QDialog):
         else:
             self._pixel_live_rules = {}
         self._clear_layout(self.px_cards_layout)
-        cols = 1
+        cols = 2
         for idx, rule in enumerate(self._pixel_rules):
             card = QGroupBox(f"화면 감지 {idx + 1}")
             card_lay = QVBoxLayout(card)
             card.setMinimumWidth(300)
-            card.setMaximumWidth(720)
+            card.setMaximumWidth(16777215)
 
             row = QHBoxLayout()
             txt_name = QLineEdit(str(rule.get("name", f"rule{idx+1}")))
@@ -15803,21 +14777,11 @@ class SettingsDialog(QDialog):
 
     def _build_legacy_tab(self):
         lay = QVBoxLayout()
-        tip = QLabel(
-            "현재 기본 흐름은 SpectatorLog 기반입니다. 이 탭은 로그에서 아직 제공되지 않는 자동시작, 승자 감지, "
-            "구버전 OCR/픽셀 보조 기능을 위한 레거시 설정입니다."
-        )
+        tip = QLabel("SpectatorLog에 없는 화면 조건을 감지하고 필요한 액션을 연결합니다.")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#667085;")
         lay.addWidget(tip)
-
-        legacy_tabs = QTabWidget()
-        legacy_tabs.setUsesScrollButtons(True)
-        legacy_tabs.setElideMode(Qt.TextElideMode.ElideRight)
-        legacy_tabs.addTab(self.tab_ocr, "OCR / KOTH")
-        legacy_tabs.addTab(self.tab_timer, "수동 타이머")
-        legacy_tabs.addTab(self.tab_automation, "화면감지 / 액션")
-        lay.addWidget(legacy_tabs, 1)
+        lay.addWidget(self.tab_automation, 1)
         self.tab_legacy.setLayout(lay)
 
     def _apply_pixel_rules(self):
@@ -15919,8 +14883,6 @@ class SettingsDialog(QDialog):
         self.cmb_action_type.addItem("레드 연승 +1", "red_win_plus")
         self.cmb_action_type.addItem("TTS(영어)", "tts_en")
         self.cmb_action_type.addItem("매치업 안내 TTS(영어)", "matchup_tts_en")
-        self.cmb_action_type.addItem("OCR 갱신", "ocr_refresh")
-        self.cmb_action_type.addItem("킹오브더힐 승자 OCR", "koth_winner_ocr")
         self.cmb_action_type.addItem("팔레트 캡처", "palette_capture")
         self.cmb_action_type.currentIndexChanged.connect(self._on_action_type_changed)
         _tt(self.cmb_action_type, "추가/편집할 액션 종류를 선택합니다.")
@@ -16169,10 +15131,6 @@ class SettingsDialog(QDialog):
             return "블루 연승 +1"
         if t == "red_win_plus":
             return "레드 연승 +1"
-        if t == "ocr_refresh":
-            return "OCR 갱신"
-        if t == "koth_winner_ocr":
-            return "킹오브더힐 승자 OCR"
         if t == "palette_capture":
             return "팔레트 캡처"
         return t
@@ -16856,25 +15814,29 @@ class SettingsDialog(QDialog):
             self.cfg.spectatorlog_sync_players = bool(self.chk_spectatorlog_sync_players.isChecked())
         if hasattr(self, "chk_spectatorlog_sync_timer"):
             self.cfg.spectatorlog_sync_timer = bool(self.chk_spectatorlog_sync_timer.isChecked())
-        if hasattr(self, "chk_spectatorlog_intro_backspace"):
-            self.cfg.spectatorlog_intro_backspace = bool(self.chk_spectatorlog_intro_backspace.isChecked())
-        if hasattr(self, "le_spectatorlog_backspace_title"):
-            self.cfg.spectatorlog_intro_backspace_target_title = str(self.le_spectatorlog_backspace_title.text() or "").strip()
-        if hasattr(self, "chk_spectatorlog_backspace_activate"):
-            self.cfg.spectatorlog_intro_backspace_activate = bool(self.chk_spectatorlog_backspace_activate.isChecked())
-        if hasattr(self, "chk_spectatorlog_backspace_restore"):
-            self.cfg.spectatorlog_intro_backspace_restore = bool(self.chk_spectatorlog_backspace_restore.isChecked())
-        if hasattr(self, "chk_spectatorlog_intro_backspace"):
-            try:
-                if self.controller and getattr(self.controller, "timer_win", None):
-                    self.controller.timer_win._backend.set_vs_intro_backspace_enabled(
-                        self.cfg.spectatorlog_intro_backspace,
-                        self.cfg.spectatorlog_intro_backspace_target_title,
-                        self.cfg.spectatorlog_intro_backspace_activate,
-                        self.cfg.spectatorlog_intro_backspace_restore,
-                    )
-            except Exception:
-                pass
+        if hasattr(self, "chk_spectator_lobby_auto_start"):
+            self.cfg.spectator_lobby_auto_start_enabled = bool(self.chk_spectator_lobby_auto_start.isChecked())
+            self.cfg.spectator_lobby_auto_start_target_title = str(
+                self.le_spectator_lobby_auto_start_title.text() or ""
+            ).strip()
+            self.cfg.spectator_lobby_auto_start_client_x = int(self.sp_spectator_lobby_auto_start_x.value())
+            self.cfg.spectator_lobby_auto_start_client_y = int(self.sp_spectator_lobby_auto_start_y.value())
+            self.cfg.spectator_lobby_auto_start_click_count = int(
+                self.sp_spectator_lobby_auto_start_click_count.value()
+            )
+            self.cfg.spectator_lobby_auto_start_delay_ms = int(self.sp_spectator_lobby_auto_start_delay.value())
+            self.cfg.spectator_lobby_auto_start_activate = bool(
+                self.chk_spectator_lobby_auto_start_activate.isChecked()
+            )
+            self.cfg.spectator_lobby_auto_start_restore_focus = bool(
+                self.chk_spectator_lobby_auto_start_restore_focus.isChecked()
+            )
+            self.cfg.spectator_lobby_auto_start_restore_cursor = bool(
+                self.chk_spectator_lobby_auto_start_restore_cursor.isChecked()
+            )
+            self.cfg.spectator_lobby_auto_start_minimize_target = bool(
+                self.chk_spectator_lobby_auto_start_minimize_target.isChecked()
+            )
         if hasattr(self, "le_spectatorlog_path"):
             self.cfg.spectatorlog_path = str(self.le_spectatorlog_path.text() or "").strip()
         if hasattr(self, "sp_spectatorlog_poll"):
@@ -16982,26 +15944,26 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
-        # trigger
-        self.cfg.trigger.target_bgr = (int(self.sp_b.value()), int(self.sp_g.value()), int(self.sp_r.value()))
-        self.cfg.trigger.tolerance = int(self.sp_tol.value())
-        self.cfg.trigger.window_frames = int(self.sp_win.value())
-        self.cfg.trigger.consecutive_needed = min(int(self.sp_need.value()), self.cfg.trigger.window_frames)
-        self.cfg.trigger.cooldown_sec = float(self.sp_cd.value())
+        if hasattr(self, "sp_b"):
+            self.cfg.trigger.target_bgr = (int(self.sp_b.value()), int(self.sp_g.value()), int(self.sp_r.value()))
+            self.cfg.trigger.tolerance = int(self.sp_tol.value())
+            self.cfg.trigger.window_frames = int(self.sp_win.value())
+            self.cfg.trigger.consecutive_needed = min(int(self.sp_need.value()), self.cfg.trigger.window_frames)
+            self.cfg.trigger.cooldown_sec = float(self.sp_cd.value())
 
-        # ocr
-        self.cfg.ocr.samples = int(self.sp_samples.value())
-        self.cfg.ocr.sim_threshold = int(self.sp_sim.value())
-        self.cfg.ocr.require_gap = int(self.sp_gap.value())
         if hasattr(self, "chk_koth_enabled"):
             self.cfg.koth_enabled = bool(self.chk_koth_enabled.isChecked())
         if hasattr(self, "sp_koth_min"):
             self.cfg.koth_min_score = int(self.sp_koth_min.value())
 
-        # palette
-        self.cfg.palette.frames = int(self.sp_pal_frames.value())
-        self.cfg.palette.k_colors = int(self.sp_pal_k.value())
-        self.cfg.palette.mask_thresh = float(self.sp_mask.value()) / 100.0
+        # Palette capture remains available to legacy actions, but its former
+        # Legacy palette controls may be absent in log-only builds.
+        if hasattr(self, "sp_pal_frames"):
+            self.cfg.palette.frames = int(self.sp_pal_frames.value())
+        if hasattr(self, "sp_pal_k"):
+            self.cfg.palette.k_colors = int(self.sp_pal_k.value())
+        if hasattr(self, "sp_mask"):
+            self.cfg.palette.mask_thresh = float(self.sp_mask.value()) / 100.0
         if hasattr(self, "chk_capture_players"):
             self.cfg.capture_player_images = bool(self.chk_capture_players.isChecked())
             if hasattr(self, "cmb_portrait_priority"):
@@ -17275,20 +16237,6 @@ class SettingsDialog(QDialog):
 
         self._update_quick_labels()
         self._refresh_action_pick_labels()
-        if hasattr(self, "lbl_bname"):
-            self.lbl_bname.setText(self._roi_text(self.cfg.roi_blue_name))
-        if hasattr(self, "lbl_rname"):
-            self.lbl_rname.setText(self._roi_text(self.cfg.roi_red_name))
-        if hasattr(self, "lbl_arena"):
-            self.lbl_arena.setText(self._roi_text(self.cfg.roi_arena_name))
-        if hasattr(self, "lbl_round_info"):
-            self.lbl_round_info.setText(self._roi_text(self.cfg.roi_round_info))
-        if hasattr(self, "lbl_round_time"):
-            self.lbl_round_time.setText(self._roi_text(self.cfg.roi_round_time))
-        if hasattr(self, "lbl_koth_blue"):
-            self.lbl_koth_blue.setText(self._roi_text(self.cfg.roi_koth_winner_blue))
-        if hasattr(self, "lbl_koth_red"):
-            self.lbl_koth_red.setText(self._roi_text(self.cfg.roi_koth_winner_red))
         if hasattr(self, "lbl_left_player"):
             self.lbl_left_player.setText(self._roi_text(self.cfg.roi_left_player))
         if hasattr(self, "lbl_right_player"):
@@ -17310,12 +16258,6 @@ class SettingsDialog(QDialog):
             self.sp_cd.setValue(int(self.cfg.trigger.cooldown_sec))
             self._refresh_trigger_color_ui()
 
-        if hasattr(self, "sp_samples"):
-            self.sp_samples.setValue(int(self.cfg.ocr.samples))
-        if hasattr(self, "sp_sim"):
-            self.sp_sim.setValue(int(self.cfg.ocr.sim_threshold))
-        if hasattr(self, "sp_gap"):
-            self.sp_gap.setValue(int(self.cfg.ocr.require_gap))
         if hasattr(self, "chk_koth_enabled"):
             self.chk_koth_enabled.setChecked(bool(getattr(self.cfg, "koth_enabled", False)))
         if hasattr(self, "sp_koth_min"):
@@ -17364,14 +16306,37 @@ class SettingsDialog(QDialog):
             self.chk_spectatorlog_sync_players.setChecked(bool(getattr(self.cfg, "spectatorlog_sync_players", True)))
         if hasattr(self, "chk_spectatorlog_sync_timer"):
             self.chk_spectatorlog_sync_timer.setChecked(bool(getattr(self.cfg, "spectatorlog_sync_timer", False)))
-        if hasattr(self, "chk_spectatorlog_intro_backspace"):
-            self.chk_spectatorlog_intro_backspace.setChecked(bool(getattr(self.cfg, "spectatorlog_intro_backspace", True)))
-        if hasattr(self, "le_spectatorlog_backspace_title"):
-            self.le_spectatorlog_backspace_title.setText(str(getattr(self.cfg, "spectatorlog_intro_backspace_target_title", "") or ""))
-        if hasattr(self, "chk_spectatorlog_backspace_activate"):
-            self.chk_spectatorlog_backspace_activate.setChecked(bool(getattr(self.cfg, "spectatorlog_intro_backspace_activate", True)))
-        if hasattr(self, "chk_spectatorlog_backspace_restore"):
-            self.chk_spectatorlog_backspace_restore.setChecked(bool(getattr(self.cfg, "spectatorlog_intro_backspace_restore", True)))
+        if hasattr(self, "chk_spectator_lobby_auto_start"):
+            self.chk_spectator_lobby_auto_start.setChecked(
+                bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False))
+            )
+            self.le_spectator_lobby_auto_start_title.setText(
+                str(getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or "")
+            )
+            self.sp_spectator_lobby_auto_start_x.setValue(
+                int(getattr(self.cfg, "spectator_lobby_auto_start_client_x", 0) or 0)
+            )
+            self.sp_spectator_lobby_auto_start_y.setValue(
+                int(getattr(self.cfg, "spectator_lobby_auto_start_client_y", 0) or 0)
+            )
+            self.sp_spectator_lobby_auto_start_click_count.setValue(
+                int(getattr(self.cfg, "spectator_lobby_auto_start_click_count", 1) or 1)
+            )
+            self.sp_spectator_lobby_auto_start_delay.setValue(
+                int(getattr(self.cfg, "spectator_lobby_auto_start_delay_ms", 300) or 300)
+            )
+            self.chk_spectator_lobby_auto_start_activate.setChecked(
+                bool(getattr(self.cfg, "spectator_lobby_auto_start_activate", True))
+            )
+            self.chk_spectator_lobby_auto_start_restore_focus.setChecked(
+                bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_focus", True))
+            )
+            self.chk_spectator_lobby_auto_start_restore_cursor.setChecked(
+                bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_cursor", True))
+            )
+            self.chk_spectator_lobby_auto_start_minimize_target.setChecked(
+                bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False))
+            )
         if hasattr(self, "le_spectatorlog_path"):
             self.le_spectatorlog_path.setText(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
         if hasattr(self, "sp_spectatorlog_poll"):
@@ -17456,7 +16421,9 @@ class SettingsDialog(QDialog):
         if hasattr(self, "chk_spectator_hit_fx_ring_enabled"):
             self.chk_spectator_hit_fx_ring_enabled.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_ring_enabled", False)))
         if hasattr(self, "sp_spectator_commentary_cooldown"):
-            self.sp_spectator_commentary_cooldown.setValue(float(getattr(self.cfg, "spectator_commentary_cooldown_sec", 6.0) or 6.0))
+            self.sp_spectator_commentary_cooldown.setValue(
+                max(0.0, float(getattr(self.cfg, "spectator_commentary_cooldown_sec", 6.0)))
+            )
         if hasattr(self, "sp_spectator_commentary_rate"):
             self.sp_spectator_commentary_rate.setValue(int(getattr(self.cfg, "spectator_commentary_rate", 200) or 200))
         if hasattr(self, "sp_spectator_commentary_volume"):
@@ -17625,8 +16592,8 @@ class SettingsDialog(QDialog):
 # App Wiring
 # -----------------------------
 class MainApp(QObject):
-    _ocr_actions_ready = pyqtSignal()
     _log_stop_finished = pyqtSignal()
+    _lobby_auto_start_result = pyqtSignal(bool, str)
     _update_metadata_ready = pyqtSignal(dict, bool)
     _update_error_ready = pyqtSignal(str, bool)
     _update_download_ready = pyqtSignal(str)
@@ -17635,6 +16602,7 @@ class MainApp(QObject):
         super().__init__()
         self._update_metadata_ready.connect(self._handle_update_metadata)
         self._log_stop_finished.connect(self._finish_log_detector_stop)
+        self._lobby_auto_start_result.connect(self._handle_lobby_auto_start_result)
         self._update_error_ready.connect(self._finish_update_check_error)
         self._update_download_ready.connect(self._confirm_apply_update)
         self.cfg_path = cfg_path
@@ -17658,6 +16626,8 @@ class MainApp(QObject):
         except Exception:
             pass
         self._action_last_run: Dict[str, float] = {}
+        self._lobby_auto_start_lock = threading.Lock()
+        self._lobby_auto_start_last_at = 0.0
 
         self.timer_win = QmlTimerWindow(self.cfg, self.cfg_path)
         try:
@@ -17716,7 +16686,6 @@ class MainApp(QObject):
         self._quick_roi_monitor: Optional[int] = None
         self._quick_roi_virtual_offset: Optional[Tuple[int, int]] = None
         self._hotkey_cache: Dict[str, Optional[Tuple[int, dict]]] = {}
-        self._ocr_cooldown_until = 0.0
         self._action_queue = deque()
         self._action_busy = False
         self._action_timer = QTimer()
@@ -17728,9 +16697,6 @@ class MainApp(QObject):
         self._global_hotkeys = GlobalHotkeys()
         self._global_hotkeys_enabled = True
         self._hotkey_last_fired: Dict[str, float] = {}
-        self._ocr_lock = threading.Lock()
-        self._deferred_on_trigger_actions = deque()
-        self._deferred_actions_lock = threading.Lock()
         self._current_blue_id = ""
         self._current_red_id = ""
         self._current_blue_registered = False
@@ -17801,7 +16767,6 @@ class MainApp(QObject):
         self.watcher.pixel_fired.connect(self.on_pixel_rule)
         self.timer_win._backend.start_detection_requested.connect(self._start_log_detector)
         self.timer_win._backend.start_screen_detection_requested.connect(self._toggle_screen_detector)
-        self.timer_win._backend.toggle_ocr_detection_requested.connect(self._toggle_ocr_detector)
         self.timer_win._backend.toggle_pixel_detection_requested.connect(self._toggle_pixel_detector)
         self.timer_win._backend.toggle_log_detection_requested.connect(self._toggle_log_detector)
         self.timer_win._backend.select_player_requested.connect(self._select_player_from_overlay)
@@ -17832,7 +16797,6 @@ class MainApp(QObject):
         self.controller.status_update.connect(self.timer_win.set_status)
         self.spectator_watcher.ui_update.connect(self.apply_ui_update)
         self.spectator_watcher.status_update.connect(self.timer_win.set_status)
-        self._ocr_actions_ready.connect(self._flush_deferred_on_trigger_actions)
         self._apply_saved_player_state()
 
         self.timer_win._backend.runningChanged.connect(self._on_timer_running)
@@ -17840,17 +16804,7 @@ class MainApp(QObject):
         self._chapter_autosave_timer.start()
         self._apply_global_hotkeys()
 
-        if not HAS_EASYOCR:
-            msg = "주의: OCR용 easyocr 설치 필요 (pip install easyocr)"
-            if _EASYOCR_IMPORT_ERROR:
-                msg = f"OCR 비활성: {_EASYOCR_IMPORT_ERROR}"
-            try:
-                logging.warning("OCR disabled: %s", msg)
-            except Exception:
-                pass
-            self.timer_win.set_status(msg)
-        else:
-            self.timer_win.set_status("대기 중 (트리거 감시중)")
+        self.timer_win.set_status("대기 중")
 
     def _play_burst_sfx(self, path: str):
         raw = str(path or "").strip()
@@ -17964,8 +16918,8 @@ class MainApp(QObject):
         return int(max(1100, min(5200, 650 + n * 72)))
 
     def _schedule_commentary_round_summary_tts(self, text: str, role: str = "analyst", delay_ms: int = 0):
-        sentences = self._split_commentary_tts_sentences(text)
-        if not sentences:
+        text = re.sub(r"\s+", " ", str(text or "").strip())
+        if not text:
             return
         role = "caster" if str(role or "").lower() == "caster" else "analyst"
         try:
@@ -17975,11 +16929,11 @@ class MainApp(QObject):
                 epoch[role] = int(epoch.get(role, 0) or 0) + 1
         except Exception:
             pass
-        offset = max(0, int(delay_ms or 0))
-        for sentence in sentences:
-            self._schedule_commentary_followup_tts(sentence, role, delay_ms=offset, retries=8)
-            offset += self._estimate_commentary_sentence_ms(sentence)
-        logging.info("COMMENTARY_TTS_ROUND_SUMMARY_QUEUE role=%s sentences=%s delay_ms=%s", role, len(sentences), delay_ms)
+        # Round-break recaps should sound like one analyst paragraph, not a
+        # list of separate sentence clips.  Keep the busy/retry behavior, but
+        # pass the full recap as one TTS item.
+        self._schedule_commentary_followup_tts(text, role, delay_ms=max(0, int(delay_ms or 0)), retries=10)
+        logging.info("COMMENTARY_TTS_ROUND_SUMMARY_QUEUE role=%s mode=single delay_ms=%s chars=%s", role, delay_ms, len(text))
 
     def _schedule_commentary_followup_tts(self, text: str, role: str = "analyst", delay_ms: int = 2400, retries: int = 5):
         text = str(text or "").strip()
@@ -18001,9 +16955,8 @@ class MainApp(QObject):
                     logging.info("COMMENTARY_TTS_FOLLOWUP_CANCELLED role=%s text=%s", role, text)
                     return
                 busy = getattr(self, "_commentary_tts_busy", {}) or {}
-                # 역할별 독립 재생 정책: 캐스터와 해설자는 서로 막지 않는다.
-                # 단, 같은 역할이 이미 말하는 중이면 후속 멘트는 잠깐 재시도한다.
-                if bool(busy.get(role, False)):
+                # 캐스터와 해설자는 하나의 방송 음성 채널을 공유한다.
+                if any(bool(value) for value in busy.values()):
                     if remaining > 0:
                         QTimer.singleShot(900, lambda r=remaining - 1: _attempt(r))
                     else:
@@ -18020,10 +16973,9 @@ class MainApp(QObject):
         if not text:
             return
         role = "caster" if str(role or "").lower() == "caster" else "analyst"
-        # 역할별 독립 재생 정책: 캐스터와 해설자는 서로 다른 QMediaPlayer로 재생하므로
-        # 서로 막거나 끊지 않는다. 같은 역할끼리만 겹침을 방지한다.
-        if bool((getattr(self, "_commentary_tts_busy", {}) or {}).get(role, False)):
-            logging.info("COMMENTARY_TTS_SKIP_BUSY role=%s text=%s", role, text)
+        busy = getattr(self, "_commentary_tts_busy", {}) or {}
+        if any(bool(value) for value in busy.values()):
+            logging.info("COMMENTARY_TTS_SKIP_CHANNEL_BUSY role=%s text=%s", role, text)
             return
         if str(role or "").lower() == "caster":
             voice = str(getattr(self.cfg, "spectator_caster_voice", "ko-KR-InJoonNeural") or "ko-KR-InJoonNeural")
@@ -18416,7 +17368,10 @@ class MainApp(QObject):
                     epoch[role] = int(epoch.get(role, 0) or 0) + 1
             except Exception:
                 pass
-            keep_current_sentence = (role == "analyst" and str(reason or "").lower() == "round_start")
+            # Round-start and new-match boundaries are hard broadcast cuts.
+            # Keeping the analyst clip alive here caused rest/final recaps to
+            # overlap the next round or the next bout.
+            keep_current_sentence = False
             player = (getattr(self, "_commentary_players", {}) or {}).get(role)
             if player is not None and not keep_current_sentence:
                 try:
@@ -18598,7 +17553,7 @@ class MainApp(QObject):
         side = str(side or "").lower().strip()
         _name = str(name or "").strip()
         _pid = str(pid or "").strip()
-        unknown = str(getattr(self.cfg.ocr, "unknown_label", "UNKNOWN") or "UNKNOWN").upper()
+        unknown = UNKNOWN_PLAYER_LABEL.upper()
         if _pid.upper() == unknown:
             _pid = ""
         if bool(getattr(self.cfg, "chapter_nickname_only", False)):
@@ -18749,7 +17704,7 @@ class MainApp(QObject):
             return
         old_blue = str(self._current_blue_id or "")
         old_red = str(self._current_red_id or "")
-        unknown = str(getattr(self.cfg.ocr, "unknown_label", "UNKNOWN") or "UNKNOWN")
+        unknown = UNKNOWN_PLAYER_LABEL
         blue_id = str(d.get("blue_player_id") or "").upper().strip()
         red_id = str(d.get("red_player_id") or "").upper().strip()
         if blue_id and blue_id != unknown:
@@ -18799,7 +17754,7 @@ class MainApp(QObject):
         try:
             old_blue = str(self._current_blue_id or "").upper().strip()
             old_red = str(self._current_red_id or "").upper().strip()
-            unknown = str(getattr(self.cfg.ocr, "unknown_label", "UNKNOWN") or "UNKNOWN").upper()
+            unknown = UNKNOWN_PLAYER_LABEL.upper()
             if display_side == "blue":
                 new_blue = winner
                 new_red = old_blue if old_red == winner and old_blue and old_blue != winner else old_red
@@ -19007,8 +17962,8 @@ class MainApp(QObject):
         try:
             root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
             raw = _make_spectator_log_watcher(self.cfg)._read_text(os.path.join(root, side, "name.txt"))
-            gid = normalize_game_id(raw, self.cfg.ocr.allow_chars)
-            unknown = str(getattr(self.cfg.ocr, "unknown_label", "UNKNOWN") or "UNKNOWN").upper().strip()
+            gid = normalize_game_id(raw, PLAYER_ID_ALLOW_CHARS)
+            unknown = UNKNOWN_PLAYER_LABEL.upper().strip()
             if not gid or gid.upper().strip() == unknown:
                 return
             registered = bool(gid in (self.cfg.players or {}))
@@ -19065,7 +18020,7 @@ class MainApp(QObject):
                 gid = ""
         if not gid or (mode != "register" and not self._overlay_side_valid(side)):
             try:
-                self.timer_win.set_status("OCR 아이디가 없어 등록할 수 없습니다.")
+                self.timer_win.set_status("선수 ID가 없어 등록할 수 없습니다.")
             except Exception:
                 pass
             return
@@ -19425,29 +18380,9 @@ class MainApp(QObject):
             except Exception:
                 pass
         actions = self.cfg.actions.get("on_trigger", [])
-        deferred_to_ocr = False
-        if now >= self._ocr_cooldown_until:
-            started = self._start_ocr_async(deferred_on_trigger_actions=actions if actions else None)
-            if started:
-                deferred_to_ocr = bool(actions)
-                self._ocr_cooldown_until = now + 3.0
-                try:
-                    logging.info("TRIGGER_OCR_START cooldown_until=%.3f", self._ocr_cooldown_until)
-                except Exception:
-                    pass
-            else:
-                try:
-                    logging.info("TRIGGER_OCR_SKIP reason=busy_or_lock")
-                except Exception:
-                    pass
-        else:
-            try:
-                logging.info("TRIGGER_OCR_SKIP remain=%.3f", max(0.0, self._ocr_cooldown_until - now))
-            except Exception:
-                pass
-        if actions and (not deferred_to_ocr):
+        if actions:
             self._enqueue_action_run("on_trigger", actions)
-        elif not actions:
+        else:
             try:
                 logging.info("TRIGGER_ACTION_SKIP reason=on_trigger_empty")
             except Exception:
@@ -19495,57 +18430,9 @@ class MainApp(QObject):
         except Exception:
             logging.exception("Failed to save trigger log")
 
-    def _flush_deferred_on_trigger_actions(self):
-        while True:
-            with self._deferred_actions_lock:
-                if not self._deferred_on_trigger_actions:
-                    break
-                actions = self._deferred_on_trigger_actions.popleft()
-            if actions:
-                self._enqueue_action_run("on_trigger", actions)
-
-    def _start_ocr_async(self, deferred_on_trigger_actions: Optional[List[dict]] = None) -> bool:
-        if not self._ocr_lock.acquire(blocking=False):
-            return False
-
-        def _job():
-            try:
-                try:
-                    roi_images = {
-                        "blue_name": capture_roi_np_global(self.cfg.roi_blue_name) if self.cfg.roi_blue_name.valid() else np.zeros((0, 0, 3), dtype=np.uint8),
-                        "red_name": capture_roi_np_global(self.cfg.roi_red_name) if self.cfg.roi_red_name.valid() else np.zeros((0, 0, 3), dtype=np.uint8),
-                        "arena_name": capture_roi_np_global(self.cfg.roi_arena_name) if self.cfg.roi_arena_name.valid() else np.zeros((0, 0, 3), dtype=np.uint8),
-                        "round_info": capture_roi_np_global(self.cfg.roi_round_info) if self.cfg.roi_round_info.valid() else np.zeros((0, 0, 3), dtype=np.uint8),
-                        "round_time": capture_roi_np_global(self.cfg.roi_round_time) if self.cfg.roi_round_time.valid() else np.zeros((0, 0, 3), dtype=np.uint8),
-                    }
-                except Exception:
-                    roi_images = None
-                self.controller.on_screen_trigger_for_names(roi_images=roi_images)
-            finally:
-                try:
-                    self._ocr_lock.release()
-                except Exception:
-                    pass
-                if deferred_on_trigger_actions:
-                    try:
-                        actions_copy = [dict(a) for a in (deferred_on_trigger_actions or [])]
-                    except Exception:
-                        actions_copy = list(deferred_on_trigger_actions or [])
-                    if actions_copy:
-                        with self._deferred_actions_lock:
-                            self._deferred_on_trigger_actions.append(actions_copy)
-                        try:
-                            self._ocr_actions_ready.emit()
-                        except Exception:
-                            pass
-
-        threading.Thread(target=_job, daemon=True).start()
-        return True
-
     def _update_backend_detect_flags(self):
         try:
             self.timer_win._backend.set_screen_detect_running(bool(self._screen_detection_running()))
-            self.timer_win._backend.set_ocr_detect_running(bool(self._ocr_detection_running()))
             self.timer_win._backend.set_pixel_detect_running(bool(self._pixel_detection_running()))
             self.timer_win._backend.set_log_detect_running(bool(self._log_detection_running()))
         except Exception:
@@ -19559,13 +18446,6 @@ class MainApp(QObject):
 
     def _screen_detection_running(self) -> bool:
         return bool(self.watcher and self.watcher.is_running())
-
-    def _ocr_detection_running(self) -> bool:
-        return bool(
-            self.watcher
-            and self.watcher.is_running()
-            and getattr(self.watcher, "trigger_detection_enabled", lambda: True)()
-        )
 
     def _pixel_detection_running(self) -> bool:
         return bool(
@@ -19634,24 +18514,6 @@ class MainApp(QObject):
     def _stop_screen_detector(self):
         if self.watcher and self.watcher.is_running():
             self.watcher.stop()
-        if self.settings_dlg:
-            self.settings_dlg._sync_watcher_labels()
-        self._update_backend_detect_flags()
-
-    def _start_ocr_detector(self):
-        if self.watcher:
-            self.watcher.set_detection_modes(trigger=True)
-            if not self.watcher.is_running():
-                self.watcher.start()
-        if self.settings_dlg:
-            self.settings_dlg._sync_watcher_labels()
-        self._update_backend_detect_flags()
-
-    def _stop_ocr_detector(self):
-        if self.watcher:
-            self.watcher.set_detection_modes(trigger=False)
-            if self.watcher.is_running() and not self.watcher.pixel_detection_enabled():
-                self.watcher.stop()
         if self.settings_dlg:
             self.settings_dlg._sync_watcher_labels()
         self._update_backend_detect_flags()
@@ -19774,15 +18636,6 @@ class MainApp(QObject):
             self._stop_screen_detector()
         else:
             self._start_screen_detector()
-        if self.settings_dlg:
-            self.settings_dlg._sync_watcher_labels()
-        self._update_backend_detect_flags()
-
-    def _toggle_ocr_detector(self):
-        if self._ocr_detection_running():
-            self._stop_ocr_detector()
-        else:
-            self._start_ocr_detector()
         if self.settings_dlg:
             self.settings_dlg._sync_watcher_labels()
         self._update_backend_detect_flags()
@@ -19960,69 +18813,6 @@ class MainApp(QObject):
             if rid:
                 actions = self.cfg.actions.get(f"pixel_id:{rid}", [])
                 key = f"pixel_id:{rid}"
-        koth_on = bool(getattr(self.cfg, "koth_enabled", False))
-        has_koth_action = any(str((a or {}).get("type", "")).lower() == "koth_winner_ocr" for a in (actions or []))
-        if has_koth_action:
-            canonical_ids = {"pixel_koth_victory_blue", "pixel_koth_victory_red"}
-            canonical_names = {"KOTH_블루승리화면", "KOTH_레드승리화면"}
-            canonical_exists = any(
-                str((r or {}).get("id") or "") in canonical_ids or str((r or {}).get("name") or "") in canonical_names
-                for r in (self.cfg.pixel_rules or [])
-            )
-            is_canonical = key in {f"pixel_id:{v}" for v in canonical_ids} or key in {f"pixel:{v}" for v in canonical_names}
-            if canonical_exists and not is_canonical:
-                actions = [a for a in (actions or []) if str((a or {}).get("type", "")).lower() != "koth_winner_ocr"]
-                has_koth_action = any(str((a or {}).get("type", "")).lower() == "koth_winner_ocr" for a in (actions or []))
-                try:
-                    logging.info("KOTH_ACTION_FILTER key=%s reason=legacy_rule_ignored", key)
-                except Exception:
-                    pass
-            if has_koth_action and is_canonical:
-                rule = None
-                for r in (self.cfg.pixel_rules or []):
-                    rid = str((r or {}).get("id") or "")
-                    rname = str((r or {}).get("name") or "")
-                    if key == f"pixel_id:{rid}" or key == f"pixel:{rname}":
-                        rule = r
-                        break
-                try:
-                    tgt = list((rule or {}).get("target_bgr", []) or [])
-                    unconfigured = int((rule or {}).get("x", 0)) == 0 and int((rule or {}).get("y", 0)) == 0 and tgt[:3] == [0, 0, 0]
-                except Exception:
-                    unconfigured = False
-                if unconfigured:
-                    actions = [a for a in (actions or []) if str((a or {}).get("type", "")).lower() != "koth_winner_ocr"]
-                    has_koth_action = any(str((a or {}).get("type", "")).lower() == "koth_winner_ocr" for a in (actions or []))
-                    try:
-                        logging.info("KOTH_ACTION_FILTER key=%s reason=unconfigured_rule", key)
-                    except Exception:
-                        pass
-        if has_koth_action:
-            edge_map = getattr(self.cfg, "action_edge_triggers", {}) or {}
-            if not bool(edge_map.get(key, False)):
-                edge_map = dict(edge_map)
-                edge_map[key] = True
-                self.cfg.action_edge_triggers = edge_map
-                try:
-                    logging.info("KOTH_EDGE_ENFORCE key=%s", key)
-                except Exception:
-                    pass
-        if has_koth_action and not koth_on:
-            filtered = [a for a in (actions or []) if str((a or {}).get("type", "")).lower() != "koth_winner_ocr"]
-            try:
-                logging.info("KOTH_ACTION_FILTER key=%s reason=disabled before=%s after=%s", key, len(actions or []), len(filtered))
-            except Exception:
-                pass
-            actions = filtered
-        if koth_on:
-            now = time.time()
-            if not has_koth_action and now >= float(getattr(self, "_koth_auto_ocr_cooldown_until", 0.0) or 0.0):
-                self._koth_auto_ocr_cooldown_until = now + 1.5
-                try:
-                    logging.info("KOTH_AUTO_OCR_TRIGGER key=%s", key)
-                except Exception:
-                    pass
-                threading.Thread(target=self.controller.run_koth_winner_ocr, daemon=True).start()
         if actions:
             self._enqueue_action_run(key, actions)
 
@@ -20259,7 +19049,7 @@ class MainApp(QObject):
             pass
         try:
             if bool(getattr(self.cfg, "spectatorlog_enabled", False)):
-                # SpectatorLog detection is independent from screen/OCR detection.
+                # SpectatorLog detection is independent from pixel detection.
                 # Do not require ScreenWatcher to be running when settings are applied.
                 self._start_spectator_watcher_if_enabled()
             elif getattr(self, "spectator_watcher", None) and self.spectator_watcher.is_running():
@@ -20943,17 +19733,9 @@ class MainApp(QObject):
 
     def _roi_quick_items(self) -> List[Tuple[str, str]]:
         return [
-            ("블루 닉네임 인식 범위", "roi_blue_name"),
-            ("레드 닉네임 인식 범위", "roi_red_name"),
-            ("경기장 이름 인식 범위", "roi_arena_name"),
-            ("라운드 표시 인식 범위", "roi_round_info"),
-            ("라운드 시간 인식 범위", "roi_round_time"),
-            ("왼쪽 선수 인식 범위(=BLUE)", "roi_left_player"),
-            ("오른쪽 선수 인식 범위(=RED)", "roi_right_player"),
-            ("KOTH 블루 승리 ID 범위", "roi_koth_winner_blue"),
-            ("KOTH 레드 승리 ID 범위", "roi_koth_winner_red"),
+            ("왼쪽 선수 이미지 범위 (= BLUE)", "roi_left_player"),
+            ("오른쪽 선수 이미지 범위 (= RED)", "roi_right_player"),
         ]
-
     def _apply_global_roi(self, attr_name: str, rect: Rect):
         if self._quick_roi_monitor is not None:
             rect = rect_local_to_global(int(self._quick_roi_monitor), rect)
@@ -21397,24 +20179,6 @@ class MainApp(QObject):
             except Exception:
                 return False
 
-        if mode == "profile":
-            profile_path = self._profile_portrait_path_for_gid(gid)
-            profile_img = self._read_portrait_image_path(profile_path) if profile_path else None
-            if _valid_img(profile_img):
-                logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=profile path=%s", side, profile_path)
-                return profile_img, "profile"
-            if _valid_img(log_img):
-                logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=log payload=1", side)
-                return log_img, "log"
-            log_path = self._log_portrait_path_for_side(side)
-            log_img2 = self._read_portrait_image_path(log_path) if log_path else None
-            if _valid_img(log_img2):
-                logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=log path=%s", side, log_path)
-                return log_img2, "log"
-            logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=empty", side)
-            return None, "empty"
-
-        # default: current match log portrait only. Do not fall back to registered profile photo.
         if _valid_img(log_img):
             logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=log payload=1", side)
             return log_img, "log"
@@ -21423,6 +20187,12 @@ class MainApp(QObject):
         if _valid_img(log_img2):
             logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=log path=%s", side, log_path)
             return log_img2, "log"
+        if mode == "profile":
+            profile_path = self._profile_portrait_path_for_gid(gid)
+            profile_img = self._read_portrait_image_path(profile_path) if profile_path else None
+            if _valid_img(profile_img):
+                logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=profile path=%s", side, profile_path)
+                return profile_img, "profile"
         logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=empty", side)
         return None, "empty"
 
@@ -21462,7 +20232,7 @@ class MainApp(QObject):
                     try:
                         ids[side] = _canonical_player_gid_for_cfg(
                             self.cfg,
-                            normalize_game_id(names.get(side), self.cfg.ocr.allow_chars),
+                            normalize_game_id(names.get(side), PLAYER_ID_ALLOW_CHARS),
                             threshold=70,
                         )
                     except Exception:
@@ -21949,6 +20719,101 @@ class MainApp(QObject):
         except Exception:
             logging.exception("BROWSER_OVERLAY_DIRECT_UPDATE_FAIL")
 
+    def _schedule_lobby_auto_start_click(self, payload: Optional[dict] = None) -> None:
+        if not bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)):
+            return
+        title = str(getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or "").strip()
+        x = int(getattr(self.cfg, "spectator_lobby_auto_start_client_x", 0) or 0)
+        y = int(getattr(self.cfg, "spectator_lobby_auto_start_client_y", 0) or 0)
+        if not title:
+            logging.warning("LOBBY_AUTO_START_SKIP reason=empty_window_title")
+            return
+        if x == 0 and y == 0:
+            logging.warning("LOBBY_AUTO_START_SKIP reason=unset_client_point")
+            return
+        now = time.monotonic()
+        if now - float(getattr(self, "_lobby_auto_start_last_at", 0.0) or 0.0) < 2.0:
+            logging.info("LOBBY_AUTO_START_SKIP reason=cooldown")
+            return
+        lock = getattr(self, "_lobby_auto_start_lock", None)
+        if lock is None or not lock.acquire(blocking=False):
+            logging.info("LOBBY_AUTO_START_SKIP reason=busy")
+            return
+        self._lobby_auto_start_last_at = now
+        delay_ms = max(0, min(5000, int(getattr(self.cfg, "spectator_lobby_auto_start_delay_ms", 300) or 300)))
+        click_count = max(
+            1,
+            min(10, int(getattr(self.cfg, "spectator_lobby_auto_start_click_count", 1) or 1)),
+        )
+        activate = bool(getattr(self.cfg, "spectator_lobby_auto_start_activate", True))
+        restore_focus = bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_focus", True))
+        restore_cursor = bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_cursor", True))
+        minimize_target = bool(
+            getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False)
+        )
+        players = list((payload or {}).get("players") or [])
+        logging.info(
+            "LOBBY_AUTO_START_SCHEDULE delay_ms=%s title=%s client=(%s,%s) players=%s",
+            delay_ms,
+            title,
+            x,
+            y,
+            players,
+        )
+
+        def _worker():
+            try:
+                if delay_ms > 0:
+                    time.sleep(delay_ms / 1000.0)
+                ok, detail = True, ""
+                original_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0) if os.name == "nt" else 0
+                original_cursor = _current_cursor_screen_position()
+                for index in range(click_count):
+                    ok, detail = click_window_client_point(
+                        title,
+                        x,
+                        y,
+                        activate=activate and index == 0,
+                        restore_focus=restore_focus and index == click_count - 1,
+                        restore_cursor=restore_cursor and index == click_count - 1,
+                        minimize_target=minimize_target and index == click_count - 1,
+                        previous_hwnd_override=original_hwnd,
+                        previous_cursor_override=original_cursor,
+                    )
+                    if not ok:
+                        break
+                    if index < click_count - 1:
+                        time.sleep(0.12)
+                if ok:
+                    logging.info("LOBBY_AUTO_START_CLICK_OK %s", detail)
+                else:
+                    logging.error("LOBBY_AUTO_START_CLICK_FAIL %s", detail)
+                self._lobby_auto_start_result.emit(bool(ok), str(detail or ""))
+            except Exception:
+                logging.exception("LOBBY_AUTO_START_CLICK_ERROR")
+            finally:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True, name="LobbyAutoStartClick").start()
+
+    def _handle_lobby_auto_start_result(self, ok: bool, detail: str) -> None:
+        message = ("자동 시작 클릭 성공" if ok else "자동 시작 클릭 실패") + (f": {detail}" if detail else "")
+        try:
+            self.timer_win.set_status(message)
+        except Exception:
+            pass
+        try:
+            if self.settings_dlg and hasattr(self.settings_dlg, "lbl_spectator_lobby_auto_start_state"):
+                self.settings_dlg.lbl_spectator_lobby_auto_start_state.setText(message)
+                self.settings_dlg.lbl_spectator_lobby_auto_start_state.setStyleSheet(
+                    "color:#22c55e;" if ok else "color:#ef4444;"
+                )
+        except Exception:
+            pass
+
     def apply_ui_update(self, d: dict):
         try:
             DIAG.record(
@@ -21964,8 +20829,16 @@ class MainApp(QObject):
             )
         except Exception:
             pass
+        if "spectator_lobby_auto_start" in d:
+            try:
+                self._schedule_lobby_auto_start_click(dict(d.get("spectator_lobby_auto_start") or {}))
+            except Exception:
+                logging.exception("LOBBY_AUTO_START_APPLY_FAIL")
         browser_output_only = bool(getattr(self.cfg, "browser_overlay_output_only", True))
-        qml_visuals = not browser_output_only
+        # Keep QML HUD state in sync even when OBS browser output is the main
+        # broadcast path.  Only animation/effect calls are gated below.
+        qml_visuals = True
+        qml_effects = bool((not browser_output_only) and getattr(self.cfg, "qml_effects_enabled", False))
         if browser_output_only:
             self._apply_browser_overlay_direct_update(d)
         played_sfx = set()
@@ -22089,7 +20962,7 @@ class MainApp(QObject):
             try:
                 for side in list(d.get("stun_flash_sides") or []):
                     side = str(side or "")
-                    if qml_visuals:
+                    if qml_effects:
                         self.timer_win.trigger_stun_flash(side)
                     sfx_key = ("stun", side.lower().strip())
                     if sfx_key not in played_sfx:
@@ -22102,7 +20975,7 @@ class MainApp(QObject):
                 for ev in list(d.get("spectator_effect_events") or []):
                     kind = str((ev or {}).get("kind") or "")
                     side = str((ev or {}).get("side") or "")
-                    if qml_visuals:
+                    if qml_effects:
                         self.timer_win.trigger_spectator_effect(
                             side,
                             kind,
@@ -22120,12 +20993,12 @@ class MainApp(QObject):
                     effect_kind = str((ev or {}).get("effect_kind") or "").lower()
                     if effect_kind == "stun":
                         side = str((ev or {}).get("side") or "")
-                        if qml_visuals:
+                        if qml_effects:
                             self.timer_win.trigger_stun_flash(side)
                         continue
                     if effect_kind not in ("tko", "knockdown", "down") and float((ev or {}).get("damage", 0.0) or 0.0) < hit_threshold:
                         continue
-                    if qml_visuals:
+                    if qml_effects:
                         self.timer_win.trigger_hit_impact(
                             str((ev or {}).get("side") or ""),
                             float((ev or {}).get("damage", 0.0) or 0.0),
@@ -22140,7 +21013,7 @@ class MainApp(QObject):
                 pass
         if "round_intro_event" in d:
             try:
-                if qml_visuals:
+                if qml_effects:
                     self.timer_win._backend.request_round_intro()
                 ev = dict(d.get("round_intro_event") or {})
                 if not browser_output_only:
@@ -22149,7 +21022,7 @@ class MainApp(QObject):
                 pass
         if "vs_intro_event" in d:
             try:
-                if qml_visuals:
+                if qml_effects:
                     self.timer_win._backend.vsIntroResetRequested.emit()
             except Exception:
                 pass
@@ -22169,7 +21042,7 @@ class MainApp(QObject):
                     self._current_red_id,
                     self._current_red_registered,
                 )
-                unknown = str(getattr(self.cfg.ocr, "unknown_label", "UNKNOWN") or "UNKNOWN").upper()
+                unknown = UNKNOWN_PLAYER_LABEL.upper()
                 if blue_text and red_text and blue_text.upper() != unknown and red_text.upper() != unknown:
                     blue_key = str(self._current_blue_id or blue_name or blue_text).upper().strip()
                     red_key = str(self._current_red_id or red_name or red_text).upper().strip()
@@ -22280,7 +21153,7 @@ class MainApp(QObject):
                 backend = getattr(self.timer_win, "_backend", None)
                 logging.info(
                     "TIMER_SYNC_APPLY_BEGIN source=%s mode=%s rest=%s in_rest_before=%s round=%s/%s seconds_left=%s prev_round=%s prev_seconds=%s running=%s",
-                    "spectatorlog" if "spectator_time_mode" in d else "ocr_or_action",
+                    "spectatorlog" if "spectator_time_mode" in d else "legacy_action",
                     d.get("spectator_time_mode", ""),
                     d.get("spectator_rest_mode", None),
                     getattr(backend, "in_rest", None),
@@ -22308,7 +21181,7 @@ class MainApp(QObject):
             try:
                 logging.info(
                     "TIMER_SYNC_APPLY_DONE source=%s round_current=%s round_total=%s seconds_left=%s in_rest=%s text=%s round_text=%s",
-                    "spectatorlog" if "spectator_time_mode" in d else "ocr_or_action",
+                    "spectatorlog" if "spectator_time_mode" in d else "legacy_action",
                     d.get("round_current", None),
                     d.get("round_total", None),
                     d.get("seconds_left", None),
@@ -22318,7 +21191,7 @@ class MainApp(QObject):
                 )
             except Exception:
                 pass
-            # Prevent settings auto-apply from overwriting OCR values briefly.
+            # Prevent settings auto-apply from overwriting freshly synchronized timer values.
             try:
                 setattr(self.cfg, "_timer_lock_until", time.time() + 2.0)
             except Exception:

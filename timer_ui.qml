@@ -105,7 +105,6 @@ ApplicationWindow {
         if (key === "\u001f" || key === root._tekkenVsKey)
             return
         root._tekkenVsKey = key
-        backend.press_vs_intro_backspace()
         tekkenVsIntroAnim.restart()
     }
 
@@ -2193,20 +2192,6 @@ ApplicationWindow {
                 width: parent.width
                 height: 22
                 radius: 3
-                color: (backend && backend.ocrDetectRunning) ? "#ef4444" : "#2a2a2a"
-                Text { anchors.centerIn: parent; text: (backend && backend.ocrDetectRunning) ? "\u004F\u0043\u0052 \uAC10\uC9C0 \uCF1C\uC9D0" : "\u004F\u0043\u0052 \uAC10\uC9C0"; color: "#ffffff"; font.pixelSize: 12 }
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (backend) backend.toggle_ocr_detection()
-                        detectMenu.visible = false
-                    }
-                }
-            }
-            Rectangle {
-                width: parent.width
-                height: 22
-                radius: 3
                 color: (backend && backend.pixelDetectRunning) ? "#ef4444" : "#2a2a2a"
                 Text { anchors.centerIn: parent; text: (backend && backend.pixelDetectRunning) ? "\uD53D\uC140 \uAC10\uC9C0 \uCF1C\uC9D0" : "\uD53D\uC140 \uAC10\uC9C0"; color: "#ffffff"; font.pixelSize: 12 }
                 MouseArea {
@@ -2278,7 +2263,7 @@ ApplicationWindow {
                 color: "#2a2a2a"
                 opacity: _playerValid(profileMenuSide) ? 0.0 : 0.6
                 visible: !_playerValid(profileMenuSide)
-                Text { anchors.centerIn: parent; text: "OCR \uC544\uC774\uB514 \uC5C6\uC74C"; color: "#94a3b8"; font.pixelSize: 11 }
+                Text { anchors.centerIn: parent; text: "\uC120\uC218 ID \uC5C6\uC74C"; color: "#94a3b8"; font.pixelSize: 11 }
             }
         }
     }

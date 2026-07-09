@@ -94,14 +94,6 @@ class ScreenWatcher(QObject):
     def get_pixel_state(self, key: str) -> dict:
         return dict(self._pixel_state.get(str(key or ""), {}) or {})
 
-    def _rule_has_koth_action(self, name: str, rid: str) -> bool:
-        actions = []
-        if name:
-            actions.extend((getattr(self.cfg, "actions", {}) or {}).get(f"pixel:{name}", []) or [])
-        if rid:
-            actions.extend((getattr(self.cfg, "actions", {}) or {}).get(f"pixel_id:{rid}", []) or [])
-        return any(str((a or {}).get("type", "")).lower() == "koth_winner_ocr" for a in actions)
-
     def start(self):
         self._stop = False
         try:
@@ -268,7 +260,7 @@ class ScreenWatcher(QObject):
             hits = int(sum(win))
             level_ready = bool(len(win) >= window_frames and hits >= consecutive)
             edge_event_key = f"pixel_id:{rid}" if rid else f"pixel:{name}"
-            edge_enabled = self._event_edge_enabled(edge_event_key) or self._rule_has_koth_action(name, rid)
+            edge_enabled = self._event_edge_enabled(edge_event_key)
             if edge_enabled:
                 prev_level = bool(state.get("level_active", False))
                 should_fire = bool(level_ready and (not prev_level))

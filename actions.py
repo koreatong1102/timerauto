@@ -205,11 +205,6 @@ class ActionRunner(QObject):
                 self._run_tts(action)
             elif atype == "matchup_tts_en":
                 self._run_matchup_tts(action)
-            elif atype == "ocr_refresh":
-                self._controller.on_screen_trigger_for_names()
-            elif atype == "koth_winner_ocr":
-                if hasattr(self._controller, "run_koth_winner_ocr"):
-                    self._controller.run_koth_winner_ocr()
             elif atype == "palette_capture":
                 self._controller.read_palette_test_once()
         except Exception as e:

@@ -142,15 +142,6 @@ class TriggerConfig:
 
 
 @dataclass
-class OCRConfig:
-    samples: int = 2
-    allow_chars: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-    unknown_label: str = "UNKNOWN"
-    sim_threshold: int = 75     # OCR name matching similarity threshold
-    require_gap: int = 0        # Minimum score gap required between best and second OCR match
-
-
-@dataclass
 class PaletteConfig:
     # Player image palette extraction settings.
     frames: int = 3            # Number of sampled frames.
@@ -664,10 +655,16 @@ class AppConfig:
     spectator_realtime_gauge_min_interval_ms: int = 75
     spectatorlog_sync_timer: bool = True
     spectatorlog_sync_players: bool = True
-    spectatorlog_intro_backspace: bool = True
-    spectatorlog_intro_backspace_target_title: str = ""
-    spectatorlog_intro_backspace_activate: bool = True
-    spectatorlog_intro_backspace_restore: bool = True
+    spectator_lobby_auto_start_enabled: bool = False
+    spectator_lobby_auto_start_target_title: str = "The Thrill of the Fight 2"
+    spectator_lobby_auto_start_client_x: int = 0
+    spectator_lobby_auto_start_client_y: int = 0
+    spectator_lobby_auto_start_click_count: int = 1
+    spectator_lobby_auto_start_delay_ms: int = 300
+    spectator_lobby_auto_start_activate: bool = True
+    spectator_lobby_auto_start_restore_focus: bool = True
+    spectator_lobby_auto_start_restore_cursor: bool = True
+    spectator_lobby_auto_start_minimize_target: bool = False
     spectator_commentary_enabled: bool = True
     spectator_commentary_mode: str = "standard"
     spectator_commentary_min_damage: float = 25.0
@@ -718,20 +715,11 @@ class AppConfig:
     portrait_source_priority: str = "log"
 
     roi_trigger: Rect = field(default_factory=Rect)
-    roi_blue_name: Rect = field(default_factory=Rect)
-    roi_red_name: Rect = field(default_factory=Rect)
-    roi_arena_name: Rect = field(default_factory=Rect)
-    roi_round_info: Rect = field(default_factory=Rect)
-    roi_round_time: Rect = field(default_factory=Rect)
-
     # Browser overlay output and QML preview controls.
     roi_left_player: Rect = field(default_factory=Rect)
     roi_right_player: Rect = field(default_factory=Rect)
-    roi_koth_winner_blue: Rect = field(default_factory=Rect)
-    roi_koth_winner_red: Rect = field(default_factory=Rect)
 
     trigger: TriggerConfig = field(default_factory=TriggerConfig)
-    ocr: OCRConfig = field(default_factory=OCRConfig)
     palette: PaletteConfig = field(default_factory=PaletteConfig)
     timer_total_rounds: int = 3
     timer_round_sec: int = 180
@@ -840,10 +828,33 @@ class AppConfig:
         cfg.spectatorlog_path = str(raw.get("spectatorlog_path", "") or "")
         cfg.spectatorlog_sync_timer = bool(raw.get("spectatorlog_sync_timer", True))
         cfg.spectatorlog_sync_players = bool(raw.get("spectatorlog_sync_players", True))
-        cfg.spectatorlog_intro_backspace = bool(raw.get("spectatorlog_intro_backspace", True))
-        cfg.spectatorlog_intro_backspace_target_title = str(raw.get("spectatorlog_intro_backspace_target_title", "") or "")
-        cfg.spectatorlog_intro_backspace_activate = bool(raw.get("spectatorlog_intro_backspace_activate", True))
-        cfg.spectatorlog_intro_backspace_restore = bool(raw.get("spectatorlog_intro_backspace_restore", True))
+        cfg.spectator_lobby_auto_start_enabled = bool(raw.get("spectator_lobby_auto_start_enabled", False))
+        cfg.spectator_lobby_auto_start_target_title = str(
+            raw.get("spectator_lobby_auto_start_target_title", "The Thrill of the Fight 2")
+            or "The Thrill of the Fight 2"
+        )
+        try:
+            cfg.spectator_lobby_auto_start_client_x = max(0, int(raw.get("spectator_lobby_auto_start_client_x", 0) or 0))
+            cfg.spectator_lobby_auto_start_client_y = max(0, int(raw.get("spectator_lobby_auto_start_client_y", 0) or 0))
+        except Exception:
+            cfg.spectator_lobby_auto_start_client_x = 0
+            cfg.spectator_lobby_auto_start_client_y = 0
+        try:
+            cfg.spectator_lobby_auto_start_click_count = max(
+                1, min(10, int(raw.get("spectator_lobby_auto_start_click_count", 1) or 1))
+            )
+        except Exception:
+            cfg.spectator_lobby_auto_start_click_count = 1
+        try:
+            cfg.spectator_lobby_auto_start_delay_ms = max(0, min(5000, int(raw.get("spectator_lobby_auto_start_delay_ms", 300) or 300)))
+        except Exception:
+            cfg.spectator_lobby_auto_start_delay_ms = 300
+        cfg.spectator_lobby_auto_start_activate = bool(raw.get("spectator_lobby_auto_start_activate", True))
+        cfg.spectator_lobby_auto_start_restore_focus = bool(raw.get("spectator_lobby_auto_start_restore_focus", True))
+        cfg.spectator_lobby_auto_start_restore_cursor = bool(raw.get("spectator_lobby_auto_start_restore_cursor", True))
+        cfg.spectator_lobby_auto_start_minimize_target = bool(
+            raw.get("spectator_lobby_auto_start_minimize_target", False)
+        )
         cfg.spectator_commentary_enabled = bool(raw.get("spectator_commentary_enabled", True))
         cfg.spectator_commentary_mode = str(raw.get("spectator_commentary_mode", "standard") or "standard")
         cfg.spectator_commentary_voice = str(raw.get("spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
@@ -922,7 +933,9 @@ class AppConfig:
         cfg.spectator_hit_effect_sprite_enabled = bool(raw.get("spectator_hit_effect_sprite_enabled", True))
         cfg.spectator_hit_effect_ring_enabled = bool(raw.get("spectator_hit_effect_ring_enabled", False))
         try:
-            cfg.spectator_commentary_cooldown_sec = float(raw.get("spectator_commentary_cooldown_sec", 6.0) or 6.0)
+            cfg.spectator_commentary_cooldown_sec = max(
+                0.0, float(raw.get("spectator_commentary_cooldown_sec", 6.0))
+            )
         except Exception:
             cfg.spectator_commentary_cooldown_sec = 6.0
         try:
@@ -993,16 +1006,8 @@ class AppConfig:
         cfg.diagnostics_mask_sensitive = bool(raw.get("diagnostics_mask_sensitive", True))
 
         cfg.roi_trigger = rect_from(raw.get("roi_trigger", {}))
-        cfg.roi_blue_name = rect_from(raw.get("roi_blue_name", {}))
-        cfg.roi_red_name = rect_from(raw.get("roi_red_name", {}))
-        cfg.roi_arena_name = rect_from(raw.get("roi_arena_name", {}))
-        cfg.roi_round_info = rect_from(raw.get("roi_round_info", {}))
-        cfg.roi_round_time = rect_from(raw.get("roi_round_time", {}))
-
         cfg.roi_left_player = rect_from(raw.get("roi_left_player", {}))
         cfg.roi_right_player = rect_from(raw.get("roi_right_player", {}))
-        cfg.roi_koth_winner_blue = rect_from(raw.get("roi_koth_winner_blue", {}))
-        cfg.roi_koth_winner_red = rect_from(raw.get("roi_koth_winner_red", {}))
 
         tr = raw.get("trigger", {})
         cfg.trigger = TriggerConfig(
@@ -1013,15 +1018,6 @@ class AppConfig:
             window_frames=int(tr.get("window_frames", 8)),
             cooldown_sec=float(tr.get("cooldown_sec", 2.0)),
             action_cooldown_sec=float(tr.get("action_cooldown_sec", 5.0)),
-        )
-
-        oc = raw.get("ocr", {})
-        cfg.ocr = OCRConfig(
-            samples=int(oc.get("samples", 2)),
-            allow_chars=str(oc.get("allow_chars", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")),
-            unknown_label=str(oc.get("unknown_label", "UNKNOWN")),
-            sim_threshold=int(oc.get("sim_threshold", 75)),
-            require_gap=int(oc.get("require_gap", 0)),
         )
 
         pc = raw.get("palette", {})
@@ -1163,6 +1159,15 @@ class AppConfig:
         cfg.koth_min_score = max(0, min(100, int(raw.get("koth_min_score", 75) or 75)))
         cfg.layout = raw.get("layout", {}) or {}
         cfg.actions = raw.get("actions", {}) or {}
+        removed_action_types = {"ocr_refresh", "koth_winner_ocr"}
+        cfg.actions = {
+            str(event): [
+                dict(action)
+                for action in list(actions or [])
+                if str((action or {}).get("type", "")).lower() not in removed_action_types
+            ]
+            for event, actions in dict(cfg.actions or {}).items()
+        }
 
         if not cfg.coords_global:
             # Convert stored local coords to global coords once.
@@ -1299,10 +1304,22 @@ class AppConfig:
             "spectator_realtime_gauge_min_interval_ms": int(self.spectator_realtime_gauge_min_interval_ms or 75),
             "spectatorlog_sync_timer": bool(self.spectatorlog_sync_timer),
             "spectatorlog_sync_players": bool(self.spectatorlog_sync_players),
-            "spectatorlog_intro_backspace": bool(self.spectatorlog_intro_backspace),
-            "spectatorlog_intro_backspace_target_title": str(self.spectatorlog_intro_backspace_target_title or ""),
-            "spectatorlog_intro_backspace_activate": bool(self.spectatorlog_intro_backspace_activate),
-            "spectatorlog_intro_backspace_restore": bool(self.spectatorlog_intro_backspace_restore),
+            "spectator_lobby_auto_start_enabled": bool(self.spectator_lobby_auto_start_enabled),
+            "spectator_lobby_auto_start_target_title": str(
+                self.spectator_lobby_auto_start_target_title or "The Thrill of the Fight 2"
+            ),
+            "spectator_lobby_auto_start_client_x": int(max(0, self.spectator_lobby_auto_start_client_x)),
+            "spectator_lobby_auto_start_client_y": int(max(0, self.spectator_lobby_auto_start_client_y)),
+            "spectator_lobby_auto_start_click_count": int(
+                max(1, min(10, self.spectator_lobby_auto_start_click_count))
+            ),
+            "spectator_lobby_auto_start_delay_ms": int(max(0, min(5000, self.spectator_lobby_auto_start_delay_ms))),
+            "spectator_lobby_auto_start_activate": bool(self.spectator_lobby_auto_start_activate),
+            "spectator_lobby_auto_start_restore_focus": bool(self.spectator_lobby_auto_start_restore_focus),
+            "spectator_lobby_auto_start_restore_cursor": bool(self.spectator_lobby_auto_start_restore_cursor),
+            "spectator_lobby_auto_start_minimize_target": bool(
+                self.spectator_lobby_auto_start_minimize_target
+            ),
             "spectator_commentary_enabled": bool(self.spectator_commentary_enabled),
             "spectator_commentary_mode": str(self.spectator_commentary_mode or "standard"),
             "spectator_commentary_min_damage": float(self.spectator_commentary_min_damage or 25.0),
@@ -1326,7 +1343,9 @@ class AppConfig:
             "spectator_hit_effect_fast_emit": bool(self.spectator_hit_effect_fast_emit),
             "spectator_hit_effect_sprite_enabled": bool(self.spectator_hit_effect_sprite_enabled),
             "spectator_hit_effect_ring_enabled": bool(self.spectator_hit_effect_ring_enabled),
-            "spectator_commentary_cooldown_sec": float(self.spectator_commentary_cooldown_sec or 6.0),
+            "spectator_commentary_cooldown_sec": max(
+                0.0, float(self.spectator_commentary_cooldown_sec)
+            ),
             "spectator_commentary_voice": str(self.spectator_commentary_voice or "ko-KR-SunHiNeural"),
             "spectator_caster_voice": str(self.spectator_caster_voice or "ko-KR-InJoonNeural"),
             "spectator_commentary_rate": int(self.spectator_commentary_rate or 200),
@@ -1344,17 +1363,9 @@ class AppConfig:
             "diagnostics_raw_sample_lines": int(max(20, min(2000, int(getattr(self, "diagnostics_raw_sample_lines", 120) or 120)))),
             "diagnostics_mask_sensitive": bool(getattr(self, "diagnostics_mask_sensitive", True)),
             "roi_trigger": asdict(self.roi_trigger),
-            "roi_blue_name": asdict(self.roi_blue_name),
-            "roi_red_name": asdict(self.roi_red_name),
-            "roi_arena_name": asdict(self.roi_arena_name),
-            "roi_round_info": asdict(self.roi_round_info),
-            "roi_round_time": asdict(self.roi_round_time),
             "roi_left_player": asdict(self.roi_left_player),
             "roi_right_player": asdict(self.roi_right_player),
-            "roi_koth_winner_blue": asdict(self.roi_koth_winner_blue),
-            "roi_koth_winner_red": asdict(self.roi_koth_winner_red),
             "trigger": asdict(self.trigger),
-            "ocr": asdict(self.ocr),
             "palette": asdict(self.palette),
             "timer_total_rounds": self.timer_total_rounds,
             "timer_round_sec": self.timer_round_sec,

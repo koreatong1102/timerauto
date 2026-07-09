@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 from pathlib import Path
 import os
 
@@ -18,22 +18,10 @@ def _try_collect_data(name):
     except Exception:
         return []
 
-def _try_collect_libs(name):
-    try:
-        return collect_dynamic_libs(name)
-    except Exception:
-        return []
-
-
-INCLUDE_OCR = os.environ.get('TIMERAUTO_BUILD_NO_OCR', '').lower() not in ('1', 'true', 'yes', 'on')
 INCLUDE_USER_CONFIG = os.environ.get('TIMERAUTO_INCLUDE_USER_CONFIG', '').lower() in ('1', 'true', 'yes', 'on')
 INCLUDE_PLAYER_IMAGES = os.environ.get('TIMERAUTO_INCLUDE_PLAYER_IMAGES', '').lower() in ('1', 'true', 'yes', 'on')
 
 hiddenimports = []
-if INCLUDE_OCR:
-    hiddenimports += _try_collect('easyocr')
-    hiddenimports += _try_collect('torch')
-    hiddenimports += _try_collect('torchvision')
 hiddenimports += _try_collect('rapidfuzz')
 hiddenimports += _try_collect('pyautogui')
 hiddenimports += _try_collect('pyscreeze')
@@ -43,10 +31,6 @@ hiddenimports += _try_collect('edge_tts')
 hiddenimports += _try_collect('aiohttp')
 
 datas_extra = []
-if INCLUDE_OCR:
-    datas_extra += _try_collect_data('easyocr')
-    datas_extra += _try_collect_data('torch')
-    datas_extra += _try_collect_data('torchvision')
 datas_extra += _try_collect_data('rapidfuzz')
 datas_extra += _try_collect_data('pyautogui')
 datas_extra += _try_collect_data('pyscreeze')
@@ -55,11 +39,6 @@ datas_extra += _try_collect_data('mouseinfo')
 datas_extra += _try_collect_data('edge_tts')
 datas_extra += _try_collect_data('aiohttp')
 datas_extra += _try_collect_data('certifi')
-
-binaries_extra = []
-if INCLUDE_OCR:
-    binaries_extra += _try_collect_libs('torch')
-    binaries_extra += _try_collect_libs('torchvision')
 
 datas_base = [
     ('HELP.md', '.'),
@@ -78,7 +57,7 @@ if INCLUDE_PLAYER_IMAGES and Path('image/players').exists():
 a = Analysis(
     ['timerauto.py'],
     pathex=['.'],
-    binaries=binaries_extra,
+    binaries=[],
     datas=datas_base + datas_extra,
     hiddenimports=hiddenimports,
     hookspath=[],

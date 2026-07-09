@@ -3,7 +3,6 @@ param(
   [switch]$SkipPip,
   [switch]$BuildInstaller,
   [switch]$NoZip,
-  [switch]$NoOcr,
   [switch]$IncludeUserConfig,
   [switch]$IncludePlayerImages
 )
@@ -35,18 +34,10 @@ if (-not $SkipPip) {
     "edge-tts",
     "pywin32"
   )
-  if (-not $NoOcr) {
-    $deps += @(
-      "easyocr",
-      "torch",
-      "torchvision"
-    )
-  }
   python -m pip install --upgrade --prefer-binary $deps
 }
 
 Write-Host "Building with PyInstaller..."
-if ($NoOcr) { $env:TIMERAUTO_BUILD_NO_OCR = "1" } else { Remove-Item Env:TIMERAUTO_BUILD_NO_OCR -ErrorAction SilentlyContinue }
 if ($IncludeUserConfig) { $env:TIMERAUTO_INCLUDE_USER_CONFIG = "1" } else { Remove-Item Env:TIMERAUTO_INCLUDE_USER_CONFIG -ErrorAction SilentlyContinue }
 if ($IncludePlayerImages) { $env:TIMERAUTO_INCLUDE_PLAYER_IMAGES = "1" } else { Remove-Item Env:TIMERAUTO_INCLUDE_PLAYER_IMAGES -ErrorAction SilentlyContinue }
 $buildDir = Join-Path $root "build\timerauto"

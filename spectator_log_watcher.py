@@ -17,9 +17,10 @@ from diagnostics import diagnostics as DIAG
 from spectator_log_blackbox import SpectatorLogBlackboxRecorder
 
 
-COUNTER_PREV_DAMAGE_THRESHOLD = 25.0
-COUNTER_DEALT_DAMAGE_THRESHOLD = 40.0
-COUNTER_WINDOW_SEC = 0.8
+COUNTER_PREV_DAMAGE_THRESHOLD = 15.0
+COUNTER_DEALT_DAMAGE_THRESHOLD = 30.0
+COUNTER_WINDOW_SEC = 0.7
+PLAYER_ID_ALLOW_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
 
 
 def default_spectatorlog_path_resolver(path: str = "") -> str:
@@ -127,6 +128,7 @@ class SpectatorLogWatcher(QObject):
         self._last_round_state: str = ""
         self._last_lobby_sig: Tuple[int, int] = (0, 0)
         self._last_lobby_exists: bool = False
+        self._lobby_ready_latched: bool = False
         self._last_lobby_rounds: Optional[int] = None
         self._last_lobby_round_duration: Optional[int] = None
         self._last_lobby_break_duration: Optional[int] = None
@@ -140,6 +142,7 @@ class SpectatorLogWatcher(QObject):
         self._last_fight_round_no: Optional[int] = None
         self._last_active_match_pair: Tuple[str, str] = ("", "")
         self._last_vs_intro_pair: Tuple[str, str] = ("", "")
+        self._last_match_reset_pair: Tuple[str, str] = ("", "")
         self._last_synced_seconds_left: Optional[int] = None
         self._last_fight_seconds_left: Optional[int] = None
         self._last_rest_seconds_left: Optional[int] = None
@@ -458,15 +461,15 @@ class SpectatorLogWatcher(QObject):
 
     def _match_pair_key(self, blue_raw: str, red_raw: str) -> Tuple[str, str]:
         return (
-            self._normalize_game_id(str(blue_raw or ""), self.cfg.ocr.allow_chars),
-            self._normalize_game_id(str(red_raw or ""), self.cfg.ocr.allow_chars),
+            self._normalize_game_id(str(blue_raw or ""), PLAYER_ID_ALLOW_CHARS),
+            self._normalize_game_id(str(red_raw or ""), PLAYER_ID_ALLOW_CHARS),
         )
 
     def _name_payload(self, raw_name: str) -> Tuple[str, str, bool, bool]:
         name = str(raw_name or "").strip()
         gid = self._canonical_player_gid_for_cfg(
             self.cfg,
-            self._normalize_game_id(name, self.cfg.ocr.allow_chars),
+            self._normalize_game_id(name, PLAYER_ID_ALLOW_CHARS),
             threshold=70,
         )
         registered = bool(gid and gid in (self.cfg.players or {}))
@@ -575,14 +578,29 @@ class SpectatorLogWatcher(QObject):
         pair_key = self._match_pair_key(blue_name_raw, red_name_raw)
         pair_ready = bool(pair_key[0] and pair_key[1])
         match_intro_transition = self._is_match_intro_state(state_raw) and prev_round_state != "intro"
-        player_payload_due = bool(pair_ready and (match_intro_transition or pair_key != self._last_player_payload_pair))
+        try:
+            round_probe = int(float(round_raw)) if round_raw else None
+        except Exception:
+            round_probe = None
+        intro_pair_change = bool(
+            self._is_match_intro_state(state_raw)
+            and pair_ready
+            and pair_key != self._last_match_reset_pair
+        )
+        fight_after_terminal = bool(
+            state == "fight"
+            and round_probe == 1
+            and prev_round_state in ("results", "end", "knockout", "disqualified", "cancel")
+        )
+        new_match_boundary = bool(match_intro_transition or intro_pair_change or fight_after_terminal)
+        player_payload_due = bool(pair_ready and (new_match_boundary or pair_key != self._last_player_payload_pair))
 
         out: Dict[str, Any] = {}
         baseline_read = not bool(getattr(self, "_runtime_baseline_ready", False))
         if baseline_read:
             self._runtime_baseline_ready = True
         sync_players = bool(getattr(self.cfg, "spectatorlog_sync_players", True))
-        if match_intro_transition:
+        if new_match_boundary:
             self._reset_portrait_locks()
         if sync_players and player_payload_due:
             # Player/portrait files are stable during a bout and portrait.png is
@@ -635,7 +653,11 @@ class SpectatorLogWatcher(QObject):
         caster_round_no = round_no
         if caster_round_no is None and self._last_fight_round_no is not None:
             caster_round_no = self._last_fight_round_no
-        if match_intro_transition:
+        if new_match_boundary:
+            # A new bout owns the commentary channel. Stop any post-fight recap
+            # from the previous bout before queuing the new VS introduction.
+            out["commentary_tts_stop_roles"] = ["caster", "analyst"]
+            out["commentary_tts_stop_reason"] = "new_match"
             self._reset_damage_session(dmg_path)
             self._last_fight_round_no = None
             self._last_round_time_value = None
@@ -643,6 +665,10 @@ class SpectatorLogWatcher(QObject):
             self._last_round_time_state = ""
             self._round_time_auto_modes = {}
             self._reset_down_state_machine()
+            if pair_ready:
+                self._last_match_reset_pair = pair_key
+            self._last_active_match_pair = ("", "")
+            self._last_vs_intro_pair = ("", "")
             out["spectator_sp_reset"] = True
             out["spectator_match_stats_reset"] = True
         if self._is_match_intro_state(state_raw) and pair_ready and not baseline_read:
@@ -823,6 +849,7 @@ class SpectatorLogWatcher(QObject):
         result_sidecar_changed = False
         try:
             if lobby_info:
+                self._apply_lobby_auto_start_edge(lobby_info, out)
                 lobby_key = (lobby_sig, tuple((int((x or {}).get("slot", 0) or 0), str((x or {}).get("name") or ""), bool((x or {}).get("ready", False)), bool((x or {}).get("occupied", False))) for x in list(lobby_info.get("slots") or [])))
                 if baseline_read:
                     self._last_lobby_sig = lobby_key
@@ -838,6 +865,7 @@ class SpectatorLogWatcher(QObject):
                 out["spectator_lobby_hide"] = True
                 self._last_lobby_exists = False
                 self._last_lobby_sig = (0, 0)
+                self._lobby_ready_latched = False
         except Exception:
             logging.exception("SPECTATORLOG_LOBBY_OVERLAY_FAIL")
         try:
@@ -943,7 +971,17 @@ class SpectatorLogWatcher(QObject):
                 logging.exception("SPECTATORLOG_ROUND_SUMMARY_FAIL")
         if state == "break" and prev_round_state != "break" and not baseline_read:
             try:
-                report_payload = self._build_round_report_payload(dmg_path, caster_round_no, pair_key)
+                break_seconds_left = None
+                try:
+                    if self._last_rest_seconds_left is not None:
+                        break_seconds_left = float(self._last_rest_seconds_left)
+                    elif "seconds_left" in out:
+                        break_seconds_left = float(out.get("seconds_left") or 0)
+                    else:
+                        break_seconds_left = float(self._configured_break_duration())
+                except Exception:
+                    break_seconds_left = None
+                report_payload = self._build_round_report_payload(dmg_path, caster_round_no, pair_key, break_seconds_left=break_seconds_left)
                 if report_payload:
                     out["spectator_round_report"] = report_payload
             except Exception:
@@ -1197,6 +1235,67 @@ class SpectatorLogWatcher(QObject):
             "weak_point": str(parts[weak_idx] or "").strip() if len(parts) > weak_idx else "",
         }
 
+    def _is_counter_event(self, ev: Any) -> bool:
+        try:
+            if bool((ev or {}).get("is_counter")):
+                return True
+            return float((ev or {}).get("counter_mult", 1.0) or 1.0) > 1.0001
+        except Exception:
+            return False
+
+    def _counter_reason_against_previous(self, ev: dict, prev: Optional[dict]) -> str:
+        if not isinstance(ev, dict) or not isinstance(prev, dict):
+            return ""
+        attacker = str(ev.get("attacker_side") or "").lower()
+        receiver = str(ev.get("receiver_side") or "").lower()
+        prev_attacker = str(prev.get("attacker_side") or "").lower()
+        prev_receiver = str(prev.get("receiver_side") or "").lower()
+        if attacker not in ("blue", "red") or receiver not in ("blue", "red"):
+            return ""
+        if prev_attacker != receiver or prev_receiver != attacker:
+            return ""
+        try:
+            gap = abs(float(ev.get("time", 0.0) or 0.0) - float(prev.get("time", 0.0) or 0.0))
+        except Exception:
+            return ""
+        if gap > COUNTER_WINDOW_SEC:
+            return ""
+        try:
+            dmg = max(0.0, float(ev.get("damage", 0.0) or 0.0))
+        except Exception:
+            dmg = 0.0
+        try:
+            prev_dmg = max(0.0, float(prev.get("damage", 0.0) or 0.0))
+        except Exception:
+            prev_dmg = 0.0
+        if prev_dmg <= 0.0 and dmg > 0.0:
+            return "whiff"
+        if prev_dmg <= COUNTER_PREV_DAMAGE_THRESHOLD and dmg >= COUNTER_DEALT_DAMAGE_THRESHOLD:
+            return "light_trade"
+        return ""
+
+    def _annotate_counter_events(self, events: List[dict]) -> List[dict]:
+        """Mark inferred counters once so live HUD, reports and commentary agree."""
+        last_attack_by_side: Dict[str, dict] = {}
+        for ev in list(events or []):
+            if not isinstance(ev, dict):
+                continue
+            attacker = str(ev.get("attacker_side") or "").lower()
+            receiver = str(ev.get("receiver_side") or "").lower()
+            if attacker not in ("blue", "red") or receiver not in ("blue", "red"):
+                continue
+            reason = "log" if self._is_counter_event(ev) else self._counter_reason_against_previous(ev, last_attack_by_side.get(receiver))
+            if reason:
+                ev["is_counter"] = True
+                ev["counter_reason"] = reason
+                if reason != "log":
+                    try:
+                        ev["counter_mult"] = max(float(ev.get("counter_mult", 1.0) or 1.0), 1.01)
+                    except Exception:
+                        ev["counter_mult"] = 1.01
+            last_attack_by_side[attacker] = ev
+        return events
+
     def _scan_damage_file_for_session_reset(self, path: str) -> Tuple[List[dict], Dict[str, Dict[str, int]]]:
         events: List[dict] = []
         effect_counts = {
@@ -1219,6 +1318,7 @@ class SpectatorLogWatcher(QObject):
             kind = self._damage_effect_kind(damage_type)
             if receiver in effect_counts and kind:
                 effect_counts[receiver][kind] = int(effect_counts[receiver].get(kind, 0) or 0) + 1
+        self._annotate_counter_events(events)
         return events, effect_counts
 
     def _read_punches_thrown_file(self, path: str) -> List[dict]:
@@ -1423,6 +1523,35 @@ class SpectatorLogWatcher(QObject):
         except Exception:
             pass
         return info
+
+    def _apply_lobby_auto_start_edge(self, lobby_info: dict, out: Dict[str, Any]) -> bool:
+        occupied_slots = [
+            slot
+            for slot in list((lobby_info or {}).get("slots") or [])
+            if bool((slot or {}).get("occupied", False))
+        ]
+        slots_ready = bool(
+            len(occupied_slots) >= 2
+            and all(bool((slot or {}).get("ready", False)) for slot in occupied_slots)
+        )
+        ready_to_start = bool((lobby_info or {}).get("ready_to_start", False) and slots_ready)
+        if ready_to_start and not self._lobby_ready_latched:
+            self._lobby_ready_latched = True
+            if bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)):
+                out["spectator_lobby_auto_start"] = {
+                    "ready_to_start": True,
+                    "players": [str((slot or {}).get("name") or "") for slot in occupied_slots],
+                }
+                logging.info(
+                    "SPECTATOR_LOBBY_AUTO_START_EDGE players=%s",
+                    [str((slot or {}).get("name") or "") for slot in occupied_slots],
+                )
+                return True
+        elif not ready_to_start:
+            if self._lobby_ready_latched:
+                logging.info("SPECTATOR_LOBBY_AUTO_START_REARM")
+            self._lobby_ready_latched = False
+        return False
 
     def _remember_lobby_settings(self, lobby: dict) -> None:
         if not isinstance(lobby, dict) or not lobby:
@@ -1663,15 +1792,14 @@ class SpectatorLogWatcher(QObject):
 
     def _registered_player_nick(self, raw: str) -> str:
         try:
-            ocr_cfg = getattr(self.cfg, "ocr", None)
-            allow = str(getattr(ocr_cfg, "allow_chars", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") or "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+            allow = PLAYER_ID_ALLOW_CHARS
             norm = self._normalize_game_id(raw, allow)
             gid = self._canonical_player_gid_for_cfg(self.cfg, norm, threshold=70)
             players = getattr(self.cfg, "players", {}) or {}
             if gid and hasattr(players, "get") and str(players.get(gid) or "").strip():
                 return str(players.get(gid) or "").strip()
 
-            # SpectatorLog names can include prefixes/suffixes or OCR-like digits
+            # SpectatorLog names can include prefixes, suffixes, or noisy digits.
             # such as Ryan_Garc1a.  When an exact fuzzy match misses, allow a
             # conservative substring match against registered IDs so report cards
             # still show the user's Korean nickname.
@@ -1890,11 +2018,12 @@ class SpectatorLogWatcher(QObject):
             label = str(item.get("label") or key or "").strip()
             if not label or count <= 0:
                 continue
-            out.append({"key": str(key), "label": label, "count": count, "damage": round(damage, 1)})
+            safe_label = label if label and "?" not in str(label) else str(key or "").upper()
+            out.append({"key": str(key), "label": safe_label, "count": count, "damage": round(damage, 1)})
         out.sort(key=lambda x: (float(x.get("damage", 0.0) or 0.0), int(x.get("count", 0) or 0)), reverse=True)
         return out[:max(1, int(limit or 3))]
 
-    def _build_round_report_payload(self, damage_path: str, round_no: Optional[int], pair_key: Tuple[str, str]) -> dict:
+    def _build_round_report_payload(self, damage_path: str, round_no: Optional[int], pair_key: Tuple[str, str], break_seconds_left: Optional[float] = None) -> dict:
         """Build a compact visual break-time report from damage_events.txt.
 
         damage_events.txt rows are landed hits.  The corner column is the boxer
@@ -1903,12 +2032,18 @@ class SpectatorLogWatcher(QObject):
         events, _effect_counts = self._scan_damage_file_for_session_reset(damage_path)
         punches_path = os.path.join(os.path.dirname(damage_path), "punches_thrown.txt")
         thrown_events = self._read_punches_thrown_file(punches_path)
+        try:
+            punishment_snapshot = self._punishment_snapshot(damage_path)
+        except Exception:
+            punishment_snapshot = {"blue": {}, "red": {}}
         if not events and not thrown_events:
             return {}
         try:
             r = int(round_no or self._last_fight_round_no or 0)
         except Exception:
             r = 0
+        if r > 0 and thrown_events:
+            self._record_scorecard_thrown_snapshot(r, thrown_events)
         sig = self._file_sig(damage_path)
         punch_sig = self._file_sig(punches_path)
         score_sig = self._file_sig(os.path.join(os.path.dirname(damage_path), "scores.csv"))
@@ -1938,6 +2073,7 @@ class SpectatorLogWatcher(QObject):
                 "tkos_for": 0,
                 "stuns_for": 0,
                 "punches": {},
+                "max_punch": {},
                 "thrown": 0,
                 "thrown_punches": {},
                 "weak_received": {},
@@ -1987,7 +2123,7 @@ class SpectatorLogWatcher(QObject):
                 cm = float((ev or {}).get("counter_mult", 1.0) or 1.0)
             except Exception:
                 cm = 1.0
-            if cm > 1.0001:
+            if self._is_counter_event(ev):
                 ast["counter_hits"] = int(ast.get("counter_hits", 0) or 0) + 1
             if dmg >= 45.0:
                 ast["big_hits"] = int(ast.get("big_hits", 0) or 0) + 1
@@ -1995,6 +2131,8 @@ class SpectatorLogWatcher(QObject):
             pitem = ast["punches"].setdefault(pkey, {"label": plabel, "count": 0, "damage": 0.0})
             pitem["count"] = int(pitem.get("count", 0) or 0) + 1
             pitem["damage"] = float(pitem.get("damage", 0.0) or 0.0) + dmg
+            if dmg > float((ast.get("max_punch") or {}).get("damage", 0.0) or 0.0):
+                ast["max_punch"] = {"key": pkey, "label": plabel, "damage": dmg}
 
             kind = self._damage_effect_kind(str((ev or {}).get("damage_type") or ""))
             if kind == "tko":
@@ -2028,7 +2166,7 @@ class SpectatorLogWatcher(QObject):
                 "punch": punch_label or "유효타",
                 "effect": kind or "hit",
                 "counterMult": round(cm, 3),
-                "counter": bool(cm > 1.0001),
+                "counter": self._is_counter_event(ev),
             }
             stats[receiver]["received_hits"].append(hit_item)
 
@@ -2073,7 +2211,7 @@ class SpectatorLogWatcher(QObject):
             leader = "blue" if blue_thrown > red_thrown else "red"
         else:
             leader = "draw"
-        leader_name = "접전" if leader == "draw" else str(stats[leader].get("name") or ("BLUE" if leader == "blue" else "RED"))
+        leader_name = "DRAW" if leader == "draw" else str(stats[leader].get("name") or ("BLUE" if leader == "blue" else "RED"))
 
         def _event_report_payload(ev: Optional[dict], *, fallback_kind: str = "") -> dict:
             if not isinstance(ev, dict) or not ev:
@@ -2159,50 +2297,50 @@ class SpectatorLogWatcher(QObject):
         total_big = blue_big + red_big
         total_counter = blue_counter + red_counter
         if total_tko > 0:
-            round_tag = "TKO 라운드"
+            round_tag = "TKO ROUND"
         elif total_kd > 0:
-            round_tag = "다운 라운드"
+            round_tag = "KNOCKDOWN ROUND"
         elif total_counter >= 3:
-            round_tag = "카운터 게임"
+            round_tag = "COUNTER GAME"
         elif (blue_landed + red_landed) == 0 and (blue_thrown + red_thrown) > 0:
-            round_tag = "활동량 / 미스"
+            round_tag = "ACTIVITY / MISS"
         elif damage_gap >= 120.0:
-            round_tag = "데미지 우세"
+            round_tag = "DAMAGE LEAD"
         elif body_focus >= 3 and body_focus >= head_focus:
-            round_tag = "바디 공략"
+            round_tag = "BODY ATTACK"
         elif head_focus >= 3 and head_focus > body_focus:
-            round_tag = "헤드헌팅"
+            round_tag = "HEAD HUNTING"
         elif total_stun > 0:
-            round_tag = "스턴 라운드"
+            round_tag = "STUN ROUND"
         elif total_big >= 3:
-            round_tag = "파워샷"
+            round_tag = "POWER ROUND"
         elif leader == "draw":
-            round_tag = "접전 라운드"
+            round_tag = "CLOSE ROUND"
         else:
-            round_tag = "라운드 흐름"
+            round_tag = "ROUND FLOW"
 
         def _report_reason() -> str:
             total_landed = blue_landed + red_landed
             total_thrown = blue_thrown + red_thrown
             if total_landed == 0 and total_thrown > 0:
-                return f"정타 기록은 없지만 펀치 시도는 블루 {blue_thrown}회, 레드 {red_thrown}회로 집계됐습니다."
+                return f"적중 기록은 없지만 공격 시도는 블루 {blue_thrown}회, 레드 {red_thrown}회입니다."
             if leader == "draw":
                 return "데미지와 적중 차이가 크지 않은 접전 라운드입니다."
             st = stats.get(leader, {})
             tkos = int(st.get("tkos_for", 0) or 0)
             kds = int(st.get("knockdowns_for", 0) or 0)
             if tkos > 0:
-                return "TKO 장면이 라운드의 결정적 장면입니다."
+                return "TKO 장면이 라운드의 결정적인 흐름이었습니다."
             if kds > 0:
-                return "다운 장면이 라운드 인상을 크게 바꿨습니다."
+                return "다운 장면이 라운드의 인상을 크게 바꿨습니다."
             if damage_gap >= 120.0:
-                return "총 데미지 차이가 라운드 흐름을 갈랐습니다."
+                return "누적 데미지 차이가 라운드 흐름을 갈랐습니다."
             if landed_gap >= 8:
-                return "적중 수에서 차이를 만들었습니다."
+                return "적중 수에서 확실한 차이를 만들었습니다."
             if int(st.get("stuns_for", 0) or 0) > 0:
                 return "스턴 장면으로 위기를 만들었습니다."
             if int(st.get("counter_hits", 0) or 0) > 0:
-                return "카운터 타이밍으로 흐름을 끊었습니다."
+                return "카운터 타이밍으로 흐름을 잡았습니다."
             top = self._round_report_top_items(st.get("punches") or {}, limit=1)
             if top:
                 return f"{str(top[0].get('label') or '유효타')} 적중이 눈에 띄었습니다."
@@ -2232,7 +2370,7 @@ class SpectatorLogWatcher(QObject):
                 out.append({
                     "key": key,
                     "shortLabel": short_label,
-                    "label": label,
+                    "label": label if label and "?" not in str(label) else short_label,
                     "count": max(0, count),
                     "damage": round(max(0.0, damage), 1),
                 })
@@ -2242,7 +2380,6 @@ class SpectatorLogWatcher(QObject):
             st = stats[side]
             punches = st.get("punches") or {}
             thrown_punches = st.get("thrown_punches") or {}
-            breakdown_src = thrown_punches if thrown_punches else punches
             landed = int(st.get("landed", 0) or 0)
             thrown = int(st.get("thrown", 0) or 0)
             misses = max(0, thrown - landed)
@@ -2261,12 +2398,14 @@ class SpectatorLogWatcher(QObject):
                 "tkos": int(st.get("tkos_for", 0) or 0),
                 "stuns": int(st.get("stuns_for", 0) or 0),
                 "punchTop": self._round_report_top_items(punches, limit=3),
+                "maxPunch": dict(st.get("max_punch") or {}),
                 "punchesThrownTop": self._round_report_top_items(thrown_punches, limit=3),
                 "landedBreakdown": _round_report_punch_breakdown(punches),
-                "punchBreakdown": _round_report_punch_breakdown(breakdown_src),
+                "punchBreakdown": _round_report_punch_breakdown(thrown_punches),
                 "weakReceivedTop": self._round_report_top_items(st.get("weak_received") or {}, limit=3),
                 "weakReceivedAll": self._round_report_top_items(st.get("weak_received") or {}, limit=8),
                 "allHits": list(st.get("received_hits") or [])[-64:],
+                "punishment": dict((punishment_snapshot or {}).get(side) or {}),
             }
 
         official_scorecard: Dict[str, Any] = {}
@@ -2284,6 +2423,72 @@ class SpectatorLogWatcher(QObject):
         winner_side = str((match_result or {}).get("winner") or (official_scorecard or {}).get("winner") or "").lower().strip()
         winner_name = str((match_result or {}).get("winnerName") or (official_scorecard or {}).get("winnerName") or "").strip()
         is_final = bool(match_result) or str(getattr(self, "_last_round_state", "") or "").lower() in ("results", "end", "knockout", "disqualified")
+        if bool(is_final):
+            try:
+                scorecard_total = self._scorecard_compute(damage_path, round_no, events)
+                rounds_total = dict((scorecard_total or {}).get("rounds") or {})
+                if rounds_total:
+                    for side in sides:
+                        st = stats[side]
+                        st["landed"] = 0
+                        st["thrown"] = 0
+                        st["damage"] = 0.0
+                        st["big_hits"] = 0
+                        st["counter_hits"] = 0
+                        st["knockdowns_for"] = 0
+                        st["tkos_for"] = 0
+                        st["stuns_for"] = 0
+                        st["punches"] = {}
+                        st["max_punch"] = {}
+                        st["thrown_punches"] = {}
+                        st["weak_received"] = {}
+                    for _round_no, rst in sorted(rounds_total.items()):
+                        rst = dict(rst or {})
+                        dealt = dict(rst.get("dealt") or {})
+                        hits = dict(rst.get("hits") or {})
+                        bigs = dict(rst.get("bigs") or {})
+                        counters = dict(rst.get("counters_for") or {})
+                        kds = dict(rst.get("knockdowns_for") or {})
+                        tkos = dict(rst.get("tkos_for") or {})
+                        stuns = dict(rst.get("stuns_for") or {})
+                        punches_by_side = dict(rst.get("punches") or {})
+                        max_punch_by_side = dict(rst.get("max_punch") or {})
+                        thrown_by_side = dict(rst.get("thrown") or {})
+                        thrown_punches_by_side = dict(rst.get("thrown_punches") or {})
+                        weak_by_receiver = dict(rst.get("weak_received") or {})
+                        for side in sides:
+                            st = stats[side]
+                            landed_by_side = dict(rst.get("landed") or {})
+                            st["landed"] = int(st.get("landed", 0) or 0) + int(
+                                landed_by_side.get(side, hits.get(side, 0)) or 0
+                            )
+                            st["thrown"] = int(st.get("thrown", 0) or 0) + int(thrown_by_side.get(side, 0) or 0)
+                            st["damage"] = float(st.get("damage", 0.0) or 0.0) + float(dealt.get(side, 0.0) or 0.0)
+                            st["big_hits"] = int(st.get("big_hits", 0) or 0) + int(bigs.get(side, 0) or 0)
+                            st["counter_hits"] = int(st.get("counter_hits", 0) or 0) + int(counters.get(side, 0) or 0)
+                            st["knockdowns_for"] = int(st.get("knockdowns_for", 0) or 0) + int(kds.get(side, 0) or 0)
+                            st["tkos_for"] = int(st.get("tkos_for", 0) or 0) + int(tkos.get(side, 0) or 0)
+                            st["stuns_for"] = int(st.get("stuns_for", 0) or 0) + int(stuns.get(side, 0) or 0)
+                            for pkey, item in dict(punches_by_side.get(side) or {}).items():
+                                target = st["punches"].setdefault(pkey, {"label": (item or {}).get("label") or pkey, "count": 0, "damage": 0.0})
+                                target["count"] = int(target.get("count", 0) or 0) + int((item or {}).get("count", 0) or 0)
+                                target["damage"] = float(target.get("damage", 0.0) or 0.0) + float((item or {}).get("damage", 0.0) or 0.0)
+                            round_max = dict(max_punch_by_side.get(side) or {})
+                            if float(round_max.get("damage", 0.0) or 0.0) > float((st.get("max_punch") or {}).get("damage", 0.0) or 0.0):
+                                st["max_punch"] = round_max
+                            for pkey, item in dict(thrown_punches_by_side.get(side) or {}).items():
+                                target = st["thrown_punches"].setdefault(
+                                    pkey,
+                                    {"label": (item or {}).get("label") or pkey, "count": 0, "damage": 0.0},
+                                )
+                                target["count"] = int(target.get("count", 0) or 0) + int((item or {}).get("count", 0) or 0)
+                            for wkey, item in dict(weak_by_receiver.get(side) or {}).items():
+                                target = st["weak_received"].setdefault(wkey, {"label": (item or {}).get("label") or wkey, "count": 0, "damage": 0.0})
+                                target["count"] = int(target.get("count", 0) or 0) + int((item or {}).get("count", 0) or 0)
+                                target["damage"] = float(target.get("damage", 0.0) or 0.0) + float((item or {}).get("damage", 0.0) or 0.0)
+                    logging.info("SPECTATORLOG_FINAL_REPORT_TOTALS rounds=%s blue_dmg=%.1f red_dmg=%.1f", len(rounds_total), float(stats["blue"].get("damage", 0.0) or 0.0), float(stats["red"].get("damage", 0.0) or 0.0))
+            except Exception:
+                logging.exception("SPECTATORLOG_FINAL_REPORT_TOTALS_FAIL")
         report = {
             "round": r,
             "isFinal": bool(is_final),
@@ -2291,27 +2496,27 @@ class SpectatorLogWatcher(QObject):
             "winnerName": winner_name,
             "matchResult": match_result,
             "leader": winner_side if bool(is_final) and winner_side in ("blue", "red", "draw") else leader,
-            "leaderName": (winner_name or ("무승부" if winner_side == "draw" else "")) if bool(is_final) else leader_name,
+            "leaderName": (winner_name or ("DRAW" if winner_side == "draw" else "")) if bool(is_final) else leader_name,
             "summaryLine": _report_reason(),
-            "roundTag": ("경기 결과" if bool(is_final) else round_tag),
+            "roundTag": ("MATCH RESULT" if bool(is_final) else round_tag),
             "bestShot": best_shot,
             "decisiveMoment": decisive_moment,
             "officialScorecard": official_scorecard,
             "scorecard": official_scorecard,
-            "displayMs": 32000 if bool(is_final) else 24000,
+            "displayMs": 20000 if bool(is_final) else int(max(8000, min(90000, ((float(break_seconds_left) if break_seconds_left is not None else float(self._configured_break_duration())) * 1000.0) + 1200.0))),
             "blue": side_payload("blue"),
             "red": side_payload("red"),
         }
         if bool(is_final):
             try:
-                bn = report["blue"].get("name") or "블루"
-                rn = report["red"].get("name") or "레드"
+                bn = report["blue"].get("name") or "BLUE"
+                rn = report["red"].get("name") or "RED"
                 if winner_side == "draw":
                     report["summaryLine"] = "공식 판정은 무승부입니다. 라운드별 점수와 누적 데미지를 함께 확인합니다."
                 elif winner_side == "blue":
-                    report["summaryLine"] = f"{bn} 승리. 공식 스코어카드와 전체 타격 기록을 함께 정리합니다."
+                    report["summaryLine"] = f"{bn} 승리. 공식 스코어카드와 전체 타격 기록을 정리합니다."
                 elif winner_side == "red":
-                    report["summaryLine"] = f"{rn} 승리. 공식 스코어카드와 전체 타격 기록을 함께 정리합니다."
+                    report["summaryLine"] = f"{rn} 승리. 공식 스코어카드와 전체 타격 기록을 정리합니다."
                 else:
                     report["summaryLine"] = "경기 종료. 공식 스코어카드와 전체 타격 기록을 정리합니다."
             except Exception:
@@ -2385,7 +2590,7 @@ class SpectatorLogWatcher(QObject):
             cm = float(ev.get("counter_mult", 1.0) or 1.0)
         except Exception:
             cm = 1.0
-        prefix = "카운터 " if cm > 1.0001 else ""
+        prefix = "카운터 " if self._is_counter_event(ev) else ""
         head = f"{prefix}{punch} {damage}".strip()
         weak = self._weak_point_ko(str(ev.get("weak_point", "") or ""))
         if weak:
@@ -3444,14 +3649,16 @@ class SpectatorLogWatcher(QObject):
                 remaining = 40.0
         # The recap normally starts after the caster break line. Leave a buffer
         # for the next-round intro and timing drift.
-        safety = 7.0
-        caster_delay = 2.4
+        safety = 6.0
+        # The summary is queued 2.4 seconds after the break caster line when
+        # both are emitted in the same watcher update.
+        caster_delay = 2.8
         budget = max(8.0, remaining - safety - caster_delay)
         if str(mode or "").lower().strip() == "quiet":
-            return min(12.0, budget)
+            return min(18.0, budget)
         if str(mode or "").lower().strip() == "active":
-            return min(34.0, budget)
-        return min(31.0, budget)
+            return min(48.0, budget)
+        return min(44.0, budget)
 
     def _select_commentary_lines_for_budget(self, lines: List[str], budget_sec: float, *, min_lines: int = 2, max_lines: int = 10) -> List[str]:
         selected: List[str] = []
@@ -3916,7 +4123,7 @@ class SpectatorLogWatcher(QObject):
             order = [section_open, section_report_numbers, gauge_line, section_next]
             cleaned = [x for x in (fn() for fn in order) if x]
             budget_sec = self._round_break_summary_budget_seconds(break_seconds_left, mode)
-            selected = self._select_commentary_lines_for_budget(cleaned, budget_sec, min_lines=1, max_lines=3)
+            selected = self._select_commentary_lines_for_budget(cleaned, budget_sec, min_lines=2, max_lines=4)
             logging.info("SPECTATORLOG_ROUND_SUMMARY_BUDGET round=%s mode=%s budget=%.1f selected=%s total=%s", r, mode, budget_sec, len(selected), len(cleaned))
             return " ".join(selected).strip()
 
@@ -3935,9 +4142,15 @@ class SpectatorLogWatcher(QObject):
             order = [section_open, section_evidence, section_report_numbers, section_big_scene, section_report_detail, gauge_line, section_late, weak_line, section_next, section_corner, section_tactical, active_extra]
 
         lines = [x for x in (fn() for fn in order) if x]
-        max_lines = 11 if mode == "active" else 10
+        max_lines = 14 if mode == "active" else 12
         budget_sec = self._round_break_summary_budget_seconds(break_seconds_left, mode)
-        selected = self._select_commentary_lines_for_budget(lines, budget_sec, min_lines=4 if mode == "active" else 3, max_lines=max_lines)
+        if budget_sec < 26.0:
+            min_lines = 3
+        elif mode == "active" and budget_sec >= 40.0:
+            min_lines = 6
+        else:
+            min_lines = 5
+        selected = self._select_commentary_lines_for_budget(lines, budget_sec, min_lines=min_lines, max_lines=max_lines)
         text = " ".join(selected).strip()
         logging.info(
             "SPECTATORLOG_ROUND_SUMMARY_PATTERN round=%s pattern=%s budget=%.1f selected=%s total=%s",
@@ -3949,6 +4162,8 @@ class SpectatorLogWatcher(QObject):
         return {
             "round": int(max(1, round_no or 1)),
             "dealt": {"blue": 0.0, "red": 0.0},
+            "landed": {"blue": 0, "red": 0},
+            "thrown": {"blue": 0, "red": 0},
             "hits": {"blue": 0, "red": 0},
             "bigs": {"blue": 0, "red": 0},
             "counters_for": {"blue": 0, "red": 0},
@@ -3956,11 +4171,36 @@ class SpectatorLogWatcher(QObject):
             "knockdowns_for": {"blue": 0, "red": 0},
             "knockdowns_against": {"blue": 0, "red": 0},
             "tkos_for": {"blue": 0, "red": 0},
+            "punches": {"blue": {}, "red": {}},
+            "max_punch": {"blue": {}, "red": {}},
+            "thrown_punches": {"blue": {}, "red": {}},
+            "weak_received": {"blue": {}, "red": {}},
             "weak": {},
             "events": 0,
             "gauge_start": {},
             "gauge_end": {},
         }
+
+    def _record_scorecard_thrown_snapshot(self, round_no: int, thrown_events: List[dict]) -> None:
+        """Store the current round's thrown-punch file as an idempotent snapshot."""
+        try:
+            r = max(1, int(round_no or 1))
+        except Exception:
+            r = 1
+        counts = {"blue": 0, "red": 0}
+        breakdown: Dict[str, Dict[str, Dict[str, Any]]] = {"blue": {}, "red": {}}
+        for event in list(thrown_events or []):
+            side = str((event or {}).get("side") or "").lower()
+            if side not in counts:
+                continue
+            counts[side] += 1
+            key, label = self._punch_report_group(str((event or {}).get("punch") or ""))
+            item = breakdown[side].setdefault(key, {"label": label, "count": 0, "damage": 0.0})
+            item["count"] = int(item.get("count", 0) or 0) + 1
+        stats = self._scorecard_rounds.setdefault(r, self._new_scorecard_round(r))
+        stats["thrown"] = counts
+        stats["thrown_punches"] = breakdown
+        self._scorecard_remember_pair()
 
     def _scorecard_copy_gauge(self, snap: Optional[Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
         if not snap:
@@ -4019,15 +4259,23 @@ class SpectatorLogWatcher(QObject):
                 dmg = 0.0
             stats["events"] = int(stats.get("events", 0) or 0) + 1
             stats["dealt"][attacker] = float(stats["dealt"].get(attacker, 0.0) or 0.0) + dmg
+            stats["landed"][attacker] = int(stats["landed"].get(attacker, 0) or 0) + 1
             if dmg >= 12.0:
                 stats["hits"][attacker] = int(stats["hits"].get(attacker, 0) or 0) + 1
             if dmg >= 45.0:
                 stats["bigs"][attacker] = int(stats["bigs"].get(attacker, 0) or 0) + 1
+            pkey, plabel = self._punch_report_group(str((ev or {}).get("punch") or ""))
+            punches_for_side = stats.setdefault("punches", {}).setdefault(attacker, {})
+            pitem = punches_for_side.setdefault(pkey, {"label": plabel, "count": 0, "damage": 0.0})
+            pitem["count"] = int(pitem.get("count", 0) or 0) + 1
+            pitem["damage"] = float(pitem.get("damage", 0.0) or 0.0) + dmg
+            if dmg > float((stats["max_punch"].get(attacker) or {}).get("damage", 0.0) or 0.0):
+                stats["max_punch"][attacker] = {"key": pkey, "label": plabel, "damage": dmg}
             try:
                 cm = float((ev or {}).get("counter_mult", 1.0) or 1.0)
             except Exception:
                 cm = 1.0
-            if cm > 1.0001:
+            if self._is_counter_event(ev):
                 stats["counters_for"][attacker] = int(stats["counters_for"].get(attacker, 0) or 0) + 1
             kind = self._damage_effect_kind(str((ev or {}).get("damage_type") or ""))
             if kind == "knockdown":
@@ -4043,6 +4291,10 @@ class SpectatorLogWatcher(QObject):
                 item = stats["weak"].setdefault(weak_key, {"receiver": receiver, "weak": weak, "count": 0, "damage": 0.0})
                 item["count"] = int(item.get("count", 0) or 0) + 1
                 item["damage"] = float(item.get("damage", 0.0) or 0.0) + dmg
+                weak_for_side = stats.setdefault("weak_received", {}).setdefault(receiver, {})
+                ritem = weak_for_side.setdefault(weak, {"label": weak, "count": 0, "damage": 0.0})
+                ritem["count"] = int(ritem.get("count", 0) or 0) + 1
+                ritem["damage"] = float(ritem.get("damage", 0.0) or 0.0) + dmg
 
     def _scorecard_from_fallback_events(self, events: List[dict], round_no: Optional[int], damage_path: str) -> Dict[int, Dict[str, Any]]:
         try:
@@ -4064,15 +4316,23 @@ class SpectatorLogWatcher(QObject):
                 dmg = 0.0
             stats["events"] += 1
             stats["dealt"][attacker] += dmg
+            stats["landed"][attacker] += 1
             if dmg >= 12.0:
                 stats["hits"][attacker] += 1
             if dmg >= 45.0:
                 stats["bigs"][attacker] += 1
+            pkey, plabel = self._punch_report_group(str((ev or {}).get("punch") or ""))
+            punches_for_side = stats.setdefault("punches", {}).setdefault(attacker, {})
+            pitem = punches_for_side.setdefault(pkey, {"label": plabel, "count": 0, "damage": 0.0})
+            pitem["count"] = int(pitem.get("count", 0) or 0) + 1
+            pitem["damage"] = float(pitem.get("damage", 0.0) or 0.0) + dmg
+            if dmg > float((stats["max_punch"].get(attacker) or {}).get("damage", 0.0) or 0.0):
+                stats["max_punch"][attacker] = {"key": pkey, "label": plabel, "damage": dmg}
             try:
                 cm = float((ev or {}).get("counter_mult", 1.0) or 1.0)
             except Exception:
                 cm = 1.0
-            if cm > 1.0001:
+            if self._is_counter_event(ev):
                 stats["counters_for"][attacker] = int(stats["counters_for"].get(attacker, 0) or 0) + 1
             kind = self._damage_effect_kind(str((ev or {}).get("damage_type") or ""))
             if kind == "knockdown":
@@ -4088,6 +4348,10 @@ class SpectatorLogWatcher(QObject):
                 item = stats["weak"].setdefault(weak_key, {"receiver": receiver, "weak": weak, "count": 0, "damage": 0.0})
                 item["count"] += 1
                 item["damage"] += dmg
+                weak_for_side = stats.setdefault("weak_received", {}).setdefault(receiver, {})
+                ritem = weak_for_side.setdefault(weak, {"label": weak, "count": 0, "damage": 0.0})
+                ritem["count"] = int(ritem.get("count", 0) or 0) + 1
+                ritem["damage"] = float(ritem.get("damage", 0.0) or 0.0) + dmg
         return {r: stats}
 
     def _scorecard_round_result(self, stats: Dict[str, Any]) -> Dict[str, Any]:
@@ -4337,6 +4601,7 @@ class SpectatorLogWatcher(QObject):
         dealt_total = {"blue": 0.0, "red": 0.0}
         big_total = {"blue": 0, "red": 0}
         hit_total = {"blue": 0, "red": 0}
+        counter_total = {"blue": 0, "red": 0}
         kd_for = {"blue": 0, "red": 0}
         stun_for = {"blue": 0, "red": 0}
         for stats in rounds.values():
@@ -4344,6 +4609,7 @@ class SpectatorLogWatcher(QObject):
                 dealt_total[side] += float(((stats.get("dealt") or {}).get(side, 0.0)) or 0.0)
                 big_total[side] += int(((stats.get("bigs") or {}).get(side, 0)) or 0)
                 hit_total[side] += int(((stats.get("hits") or {}).get(side, 0)) or 0)
+                counter_total[side] += int(((stats.get("counters_for") or {}).get(side, 0)) or 0)
                 kd_for[side] += int(((stats.get("knockdowns_for") or {}).get(side, 0)) or 0)
                 stun_for[side] += int(((stats.get("stuns_for") or {}).get(side, 0)) or 0)
 
@@ -4432,6 +4698,22 @@ class SpectatorLogWatcher(QObject):
                 "유효타와 큰 타격이 서로 다른 라운드에 나뉘면서 경기 전체 흐름이 복잡하게 흘렀습니다.",
             ])
 
+        def total_record_line() -> str:
+            return (
+                f"전체 기록은 {blue_name} 유효타 {hit_total['blue']}회, 총 데미지 {int(round(dealt_total['blue']))}, "
+                f"{red_name} 유효타 {hit_total['red']}회, 총 데미지 {int(round(dealt_total['red']))}로 정리됩니다."
+            )
+
+        def impact_record_line() -> str:
+            blue_events = big_total["blue"] + stun_for["blue"] + kd_for["blue"] + counter_total["blue"]
+            red_events = big_total["red"] + stun_for["red"] + kd_for["red"] + counter_total["red"]
+            if blue_events == 0 and red_events == 0:
+                return "큰 위기 장면은 많지 않았고, 경기의 무게는 잔타와 라운드 운영 쪽에 더 실렸습니다."
+            return (
+                f"위험 장면만 보면 {blue_name} 강타 {big_total['blue']}회, 스턴 {stun_for['blue']}회, 다운 {kd_for['blue']}회, 카운터 {counter_total['blue']}회, "
+                f"{red_name} 강타 {big_total['red']}회, 스턴 {stun_for['red']}회, 다운 {kd_for['red']}회, 카운터 {counter_total['red']}회입니다."
+            )
+
         def weak_line() -> str:
             return self._scorecard_weak_final_line(scorecard)
 
@@ -4460,20 +4742,20 @@ class SpectatorLogWatcher(QObject):
         margin = abs(blue_total - red_total)
         if stoppage:
             pattern_name = "stoppage"
-            order = [result_line, decisive_line, damage_line, gauge_line, weak_line, tactical_line]
+            order = [result_line, score_line, rounds_line, total_record_line, impact_record_line, decisive_line, damage_line, gauge_line, weak_line, tactical_line]
         elif winner_side == "draw" or margin <= 1:
             pattern_name = "close"
-            order = [result_line, score_line, rounds_line, damage_line, decisive_line, gauge_line, weak_line, tactical_line]
+            order = [result_line, score_line, rounds_line, total_record_line, impact_record_line, damage_line, decisive_line, gauge_line, weak_line, tactical_line]
         elif margin >= 3:
             pattern_name = "clear"
-            order = [result_line, score_line, damage_line, rounds_line, decisive_line, gauge_line, weak_line, tactical_line]
+            order = [result_line, score_line, total_record_line, impact_record_line, damage_line, rounds_line, decisive_line, gauge_line, weak_line, tactical_line]
         else:
             pattern_name = "decision"
-            order = [result_line, score_line, rounds_line, decisive_line, damage_line, gauge_line, weak_line, tactical_line]
+            order = [result_line, score_line, rounds_line, total_record_line, impact_record_line, decisive_line, damage_line, gauge_line, weak_line, tactical_line]
 
         lines = [x for x in (fn() for fn in order) if str(x or "").strip()]
         # Long enough to feel like a real post-fight recap, but capped so it does not talk forever.
-        max_lines = 9 if pattern_name != "stoppage" else 7
+        max_lines = 12 if pattern_name != "stoppage" else 10
         text = " ".join(lines[:max_lines]).strip()
         logging.info(
             "SPECTATORLOG_SCORECARD_FINAL blue=%s red=%s winner=%s rounds=%s pattern=%s lines=%s",
@@ -4655,7 +4937,7 @@ class SpectatorLogWatcher(QObject):
                         "weak_point": str(ev.get("weak_point") or ""),
                         "effect_kind": str(ev.get("effect_kind") or ""),
                         "counter_mult": round(float(ev.get("counter_mult", 1.0) or 1.0), 3),
-                        "is_counter": bool(float(ev.get("counter_mult", 1.0) or 1.0) > 1.0001),
+                        "is_counter": self._is_counter_event(ev),
                         "screen_x": round(sx, 4),
                         "screen_y": round(sy, 4),
                         "coord_source": str(pose.get("source") or "hit"),
@@ -4759,7 +5041,7 @@ class SpectatorLogWatcher(QObject):
             commentary, role = event_commentary, event_role
             now = time.time()
             try:
-                cooldown = float(getattr(self.cfg, "spectator_commentary_cooldown_sec", 6.0) or 6.0)
+                cooldown = max(0.0, float(getattr(self.cfg, "spectator_commentary_cooldown_sec", 6.0)))
             except Exception:
                 cooldown = 6.0
             if role == "analyst" and str(getattr(self.cfg, "spectator_commentary_mode", "standard") or "standard").lower() == "active":
@@ -4779,7 +5061,7 @@ class SpectatorLogWatcher(QObject):
             if commentary:
                 now = time.time()
                 try:
-                    cooldown = float(getattr(self.cfg, "spectator_commentary_cooldown_sec", 6.0) or 6.0)
+                    cooldown = max(0.0, float(getattr(self.cfg, "spectator_commentary_cooldown_sec", 6.0)))
                 except Exception:
                     cooldown = 6.0
                 urgent = role == "caster"
@@ -4824,12 +5106,10 @@ class SpectatorLogWatcher(QObject):
             except Exception:
                 t = 0.0
 
-            # Stage56: do not infer counters from tempo/reversal heuristics.
-            # A counter exists only when the SpectatorLog damage_events row exposes
-            # counter_mult > 1.00.  Commentary, combo text and report all share this
-            # single source of truth.
+            # Counter source of truth is shared with reports/commentary:
+            # explicit log counter, whiff punish within the window, or light-hit reversal.
             try:
-                counter_hit = float(ev.get("counter_mult", 1.0) or 1.0) > 1.0001
+                counter_hit = self._is_counter_event(ev)
             except Exception:
                 counter_hit = False
 
@@ -4895,14 +5175,10 @@ class SpectatorLogWatcher(QObject):
                 info[f"{attacker}_combo_damage_text"] = f"{int(round(total))} DAMAGE"
                 if prev_count < 2:
                     info["_combo_commentary_text"] = self._commentary_pick(f"combo:{attacker}:{receiver}:{count}:{int(total)}", [
-                        "좋은 콤비네이션이었습니다.",
-                        "연타가 이어집니다.",
-                        "첫 타 이후 연결이 좋았습니다.",
-                        "수비가 따라가지 못했습니다.",
-                        "공격 흐름이 끊기지 않습니다.",
-                        "정타가 연속으로 들어갑니다.",
-                        "짧은 교전에서 연결이 깔끔했습니다.",
-                        "한 번 열리자 후속타가 이어졌습니다.",
+                        "좋은 콤보가 적중합니다.",
+                        "연타가 깔끔하게 이어집니다.",
+                        "방어가 늦었습니다. 콤보가 들어갑니다.",
+                        "공격 흐름을 끊기지 않고 이어갑니다.",
                     ])
                 changed = True
             elif changed:
@@ -4912,14 +5188,10 @@ class SpectatorLogWatcher(QObject):
                 info[f"{attacker}_combo_hit_text"] = "COUNTER"
                 info[f"{attacker}_combo_damage_text"] = f"{int(round(dmg))} DAMAGE"
                 info["_counter_commentary_text"] = self._commentary_pick(f"counter:{attacker}:{receiver}:{int(dmg)}", [
-                    "카운터가 정확하게 들어갑니다.",
-                    "받아치는 타이밍이 좋았습니다.",
-                    "반격이 정확했습니다.",
-                    "들어오는 순간 받아쳤습니다.",
-                    "상대 진입을 잘 읽었습니다.",
-                    "좋은 반응이었습니다.",
-                    "무리한 진입을 바로 받아칩니다.",
-                    "상대 움직임을 읽고 정타를 만듭니다.",
+                    "카운터가 적중됩니다.",
+                    "정확한 반격 타이밍입니다.",
+                    "들어오는 순간을 받아쳤습니다.",
+                    "좋은 카운터입니다.",
                 ])
                 changed = True
             last_counter_event = dict(ev)

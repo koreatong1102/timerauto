@@ -167,6 +167,13 @@ class SpectatorLogWatcher(QObject):
         self._scorecard_rounds: Dict[int, Dict[str, Any]] = {}
         self._scorecard_seen_event_keys: set = set()
         self._scorecard_last_pair: Tuple[str, str] = ("", "")
+        # punches_thrown.txt can be cumulative for a whole match.  Keep the
+        # starting snapshot for each round so report accuracy stays per-round.
+        self._scorecard_thrown_round_baselines: Dict[int, Dict[str, Any]] = {}
+        self._scorecard_thrown_last_cumulative: Dict[str, Any] = {
+            "counts": {"blue": 0, "red": 0},
+            "breakdown": {"blue": {}, "red": {}},
+        }
         self._change_event = threading.Event()
         self._change_thread: Optional[threading.Thread] = None
         self._change_root: str = ""
@@ -1088,6 +1095,11 @@ class SpectatorLogWatcher(QObject):
         self._scorecard_rounds = {}
         self._scorecard_seen_event_keys = set()
         self._scorecard_last_pair = ("", "")
+        self._scorecard_thrown_round_baselines = {}
+        self._scorecard_thrown_last_cumulative = {
+            "counts": {"blue": 0, "red": 0},
+            "breakdown": {"blue": {}, "red": {}},
+        }
         try:
             self._commentary_recent_lines.clear()
             self._commentary_category_last_at.clear()
@@ -2170,6 +2182,12 @@ class SpectatorLogWatcher(QObject):
             }
             stats[receiver]["received_hits"].append(hit_item)
 
+        # During a break the source files can already contain earlier rounds.
+        # The live scorecard is tagged at ingestion time, so prefer its current
+        # round slice instead of rescanning the cumulative files for the HUD.
+        if r > 0:
+            self._apply_scorecard_round_to_report_stats(stats, r)
+
         blue_damage = float(stats["blue"].get("damage", 0.0) or 0.0)
         red_damage = float(stats["red"].get("damage", 0.0) or 0.0)
         blue_landed = int(stats["blue"].get("landed", 0) or 0)
@@ -2384,6 +2402,18 @@ class SpectatorLogWatcher(QObject):
             thrown = int(st.get("thrown", 0) or 0)
             misses = max(0, thrown - landed)
             accuracy = int(round((float(landed) / float(thrown) * 100.0))) if thrown > 0 else 0
+            punch_accuracy = []
+            for key in ("jab", "cross", "hook", "upper", "over"):
+                landed_item = dict(punches.get(key) or {})
+                thrown_item = dict(thrown_punches.get(key) or {})
+                landed_count = max(0, int(landed_item.get("count", 0) or 0))
+                thrown_count = max(0, int(thrown_item.get("count", 0) or 0))
+                punch_accuracy.append({
+                    "key": key,
+                    "landed": landed_count,
+                    "thrown": thrown_count,
+                    "accuracy": int(round(float(landed_count) / float(thrown_count) * 100.0)) if thrown_count else 0,
+                })
             return {
                 "name": str(st.get("name") or ("BLUE" if side == "blue" else "RED")),
                 "landed": landed,
@@ -2402,6 +2432,7 @@ class SpectatorLogWatcher(QObject):
                 "punchesThrownTop": self._round_report_top_items(thrown_punches, limit=3),
                 "landedBreakdown": _round_report_punch_breakdown(punches),
                 "punchBreakdown": _round_report_punch_breakdown(thrown_punches),
+                "punchAccuracyBreakdown": punch_accuracy,
                 "weakReceivedTop": self._round_report_top_items(st.get("weak_received") or {}, limit=3),
                 "weakReceivedAll": self._round_report_top_items(st.get("weak_received") or {}, limit=8),
                 "allHits": list(st.get("received_hits") or [])[-64:],
@@ -4181,8 +4212,40 @@ class SpectatorLogWatcher(QObject):
             "gauge_end": {},
         }
 
+    def _apply_scorecard_round_to_report_stats(self, report_stats: Dict[str, Dict[str, Any]], round_no: int) -> bool:
+        """Replace cumulative file totals with the live scorecard's one-round data."""
+        round_stats = dict((self._scorecard_rounds or {}).get(int(round_no or 0)) or {})
+        if not round_stats or not int(round_stats.get("events", 0) or 0):
+            return False
+        for side in ("blue", "red"):
+            target = report_stats.get(side)
+            if not isinstance(target, dict):
+                continue
+            target["landed"] = int(dict(round_stats.get("landed") or {}).get(side, 0) or 0)
+            target["thrown"] = int(dict(round_stats.get("thrown") or {}).get(side, 0) or 0)
+            target["damage"] = float(dict(round_stats.get("dealt") or {}).get(side, 0.0) or 0.0)
+            target["big_hits"] = int(dict(round_stats.get("bigs") or {}).get(side, 0) or 0)
+            target["counter_hits"] = int(dict(round_stats.get("counters_for") or {}).get(side, 0) or 0)
+            target["knockdowns_for"] = int(dict(round_stats.get("knockdowns_for") or {}).get(side, 0) or 0)
+            target["tkos_for"] = int(dict(round_stats.get("tkos_for") or {}).get(side, 0) or 0)
+            target["stuns_for"] = int(dict(round_stats.get("stuns_for") or {}).get(side, 0) or 0)
+            target["punches"] = {
+                key: dict(item or {})
+                for key, item in dict(dict(round_stats.get("punches") or {}).get(side) or {}).items()
+            }
+            target["thrown_punches"] = {
+                key: dict(item or {})
+                for key, item in dict(dict(round_stats.get("thrown_punches") or {}).get(side) or {}).items()
+            }
+            target["weak_received"] = {
+                key: dict(item or {})
+                for key, item in dict(dict(round_stats.get("weak_received") or {}).get(side) or {}).items()
+            }
+            target["max_punch"] = dict(dict(round_stats.get("max_punch") or {}).get(side) or {})
+        return True
+
     def _record_scorecard_thrown_snapshot(self, round_no: int, thrown_events: List[dict]) -> None:
-        """Store the current round's thrown-punch file as an idempotent snapshot."""
+        """Store a round-local thrown-punch snapshot from a cumulative log file."""
         try:
             r = max(1, int(round_no or 1))
         except Exception:
@@ -4197,9 +4260,52 @@ class SpectatorLogWatcher(QObject):
             key, label = self._punch_report_group(str((event or {}).get("punch") or ""))
             item = breakdown[side].setdefault(key, {"label": label, "count": 0, "damage": 0.0})
             item["count"] = int(item.get("count", 0) or 0) + 1
+
+        current = {"counts": counts, "breakdown": breakdown}
+        baseline = self._scorecard_thrown_round_baselines.get(r)
+        if baseline is None:
+            baseline = {
+                "counts": dict((self._scorecard_thrown_last_cumulative or {}).get("counts") or {}),
+                "breakdown": {
+                    side: {
+                        key: dict(item or {})
+                        for key, item in dict(((self._scorecard_thrown_last_cumulative or {}).get("breakdown") or {}).get(side) or {}).items()
+                    }
+                    for side in ("blue", "red")
+                },
+            }
+            self._scorecard_thrown_round_baselines[r] = baseline
+
+        # Some spectator-log builds reset punches_thrown.txt every round.  A
+        # lower count than the baseline means this file is already per-round.
+        reset_file = any(
+            int(counts.get(side, 0) or 0) < int((baseline.get("counts") or {}).get(side, 0) or 0)
+            for side in ("blue", "red")
+        )
+        if reset_file:
+            baseline = {"counts": {"blue": 0, "red": 0}, "breakdown": {"blue": {}, "red": {}}}
+            self._scorecard_thrown_round_baselines[r] = baseline
+
+        delta_counts = {"blue": 0, "red": 0}
+        delta_breakdown: Dict[str, Dict[str, Dict[str, Any]]] = {"blue": {}, "red": {}}
+        for side in ("blue", "red"):
+            base_count = int((baseline.get("counts") or {}).get(side, 0) or 0)
+            delta_counts[side] = max(0, int(counts.get(side, 0) or 0) - base_count)
+            base_items = dict((baseline.get("breakdown") or {}).get(side) or {})
+            for key, item in breakdown[side].items():
+                base_item = dict(base_items.get(key) or {})
+                delta_count = max(0, int((item or {}).get("count", 0) or 0) - int(base_item.get("count", 0) or 0))
+                if delta_count:
+                    delta_breakdown[side][key] = {
+                        "label": (item or {}).get("label") or key,
+                        "count": delta_count,
+                        "damage": 0.0,
+                    }
+
         stats = self._scorecard_rounds.setdefault(r, self._new_scorecard_round(r))
-        stats["thrown"] = counts
-        stats["thrown_punches"] = breakdown
+        stats["thrown"] = delta_counts
+        stats["thrown_punches"] = delta_breakdown
+        self._scorecard_thrown_last_cumulative = current
         self._scorecard_remember_pair()
 
     def _scorecard_copy_gauge(self, snap: Optional[Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
@@ -4384,9 +4490,26 @@ class SpectatorLogWatcher(QObject):
         }
 
     def _scorecard_compute(self, damage_path: str, round_no: Optional[int], fallback_events: Optional[List[dict]] = None) -> Dict[str, Any]:
-        rounds = {int(k): dict(v) for k, v in dict(self._scorecard_rounds or {}).items() if dict(v).get("events")}
+        live_rounds = {int(k): dict(v) for k, v in dict(self._scorecard_rounds or {}).items()}
+        rounds = {int(k): dict(v) for k, v in live_rounds.items() if dict(v).get("events")}
         if not rounds and fallback_events:
             rounds = self._scorecard_from_fallback_events(fallback_events, round_no, damage_path)
+
+        # A report can be built after the damage-event baseline was established
+        # (for example when opening an old completed match).  Preserve the
+        # thrown-punch snapshots in that fallback path so accuracy never turns
+        # into a misleading "landed / 0" result.
+        for r, live_stats in live_rounds.items():
+            live_thrown = dict(live_stats.get("thrown") or {})
+            live_breakdown = dict(live_stats.get("thrown_punches") or {})
+            if not any(int(live_thrown.get(side, 0) or 0) for side in ("blue", "red")):
+                continue
+            target = rounds.setdefault(r, self._new_scorecard_round(r))
+            target["thrown"] = {side: int(live_thrown.get(side, 0) or 0) for side in ("blue", "red")}
+            target["thrown_punches"] = {
+                side: {key: dict(item or {}) for key, item in dict(live_breakdown.get(side) or {}).items()}
+                for side in ("blue", "red")
+            }
 
         match_dir = os.path.dirname(str(damage_path or ""))
         official_scores = self._read_official_scores(os.path.join(match_dir, "scores.csv"))

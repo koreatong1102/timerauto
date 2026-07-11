@@ -28,7 +28,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from collections import deque
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.14"
 UPDATE_FEED_URL = "https://github.com/koreatong1102/timerauto/releases/download/latest/latest.json"
 
 # Ensure a non-native Qt Quick Controls style for QML customization.
@@ -19634,7 +19634,7 @@ class MainApp(QObject):
         try:
             exe_path = os.path.abspath(sys.executable)
             app_dir = os.path.dirname(exe_path)
-            script = _write_update_script(zip_path, app_dir, exe_path)
+            script = _write_update_script(zip_path, app_dir, exe_path, os.getpid())
         except Exception as e:
             self._show_update_message("warning", "Update", f"Failed to prepare update:\n{e}")
             return
@@ -19643,7 +19643,12 @@ class MainApp(QObject):
             return
         try:
             import subprocess
-            subprocess.Popen(["cmd", "/c", script], close_fds=True)
+            creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+            subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
+                close_fds=True,
+                creationflags=creation_flags,
+            )
             QApplication.quit()
         except Exception as e:
             self._show_update_message("warning", "Update", f"Failed to launch updater:\n{e}")

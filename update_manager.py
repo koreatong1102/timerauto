@@ -31,54 +31,58 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest().lower()
 
 
-def _write_update_script(zip_path: str, app_dir: str, exe_path: str) -> str:
-    script_path = os.path.join(tempfile.gettempdir(), "timerauto_apply_update.bat")
+def _ps_quote(value: str) -> str:
+    return "'" + str(value or "").replace("'", "''") + "'"
+
+
+def _write_update_script(zip_path: str, app_dir: str, exe_path: str, process_id: int = 0) -> str:
+    """Create a detached updater that waits for this exact app process."""
+    script_path = os.path.join(tempfile.gettempdir(), "timerauto_apply_update.ps1")
     zip_path = os.path.abspath(zip_path)
     app_dir = os.path.abspath(app_dir)
     exe_path = os.path.abspath(exe_path)
-    exe_name = os.path.basename(exe_path)
-    extract_dir = os.path.join(tempfile.gettempdir(), "timerauto_update_extract")
-    log_path = os.path.join(tempfile.gettempdir(), "timerauto_update_apply.log")
+    extract_dir = os.path.join(tempfile.gettempdir(), "TimerAutoUpdate", "extract")
+    log_path = os.path.join(tempfile.gettempdir(), "TimerAutoUpdate", "apply.log")
+    pid = max(0, int(process_id or 0))
     lines = [
-        "@echo off",
-        "setlocal",
-        f'set "UPDATE_LOG={log_path}"',
-        'echo ==== TimerAuto update apply %DATE% %TIME% ==== > "%UPDATE_LOG%"',
-        f'echo zip={zip_path} >> "%UPDATE_LOG%"',
-        f'echo app_dir={app_dir} >> "%UPDATE_LOG%"',
-        f'echo exe={exe_path} >> "%UPDATE_LOG%"',
-        "timeout /t 2 /nobreak >nul",
-        ":waitloop",
-        f'tasklist /fi "imagename eq {exe_name}" | find /i "{exe_name}" >nul',
-        "if not errorlevel 1 (",
-        f'  echo waiting for {exe_name} to exit... >> "%UPDATE_LOG%"',
-        "  timeout /t 1 /nobreak >nul",
-        "  goto waitloop",
-        ")",
-        f'echo {exe_name} exited. >> "%UPDATE_LOG%"',
-        f'if exist "{extract_dir}" rmdir /s /q "{extract_dir}"',
-        f'mkdir "{extract_dir}"',
-        f'powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath ''{zip_path}'' -DestinationPath ''{extract_dir}'' -Force" >> "%UPDATE_LOG%" 2>&1',
-        "set EXPAND_CODE=%ERRORLEVEL%",
-        'echo Expand-Archive exit=%EXPAND_CODE% >> "%UPDATE_LOG%"',
-        'if not "%EXPAND_CODE%"=="0" goto fail',
-        f'robocopy "{extract_dir}" "{app_dir}" /E /R:2 /W:1 /XD "{extract_dir}\\image\\players" >> "%UPDATE_LOG%" 2>&1',
-        "set ROBO_CODE=%ERRORLEVEL%",
-        'echo robocopy exit=%ROBO_CODE% >> "%UPDATE_LOG%"',
-        "if %ROBO_CODE% GEQ 8 goto fail",
-        f'rmdir /s /q "{extract_dir}"',
-        'echo update apply completed. >> "%UPDATE_LOG%"',
-        f'start "" "{exe_path}"',
-        "endlocal",
-        'del "%~f0"',
-        "exit /b 0",
-        ":fail",
-        'echo update apply failed. >> "%UPDATE_LOG%"',
-        f'start "" "{exe_path}"',
-        "endlocal",
-        "pause",
-        "exit /b 1",
+        "$ErrorActionPreference = 'Stop'",
+        f"$zip = {_ps_quote(zip_path)}",
+        f"$appDir = {_ps_quote(app_dir)}",
+        f"$exePath = {_ps_quote(exe_path)}",
+        f"$extractDir = {_ps_quote(extract_dir)}",
+        f"$logPath = {_ps_quote(log_path)}",
+        f"$processId = {pid}",
+        "$logDir = Split-Path -Parent $logPath",
+        "New-Item -ItemType Directory -Force -Path $logDir | Out-Null",
+        "function Write-UpdateLog($text) { Add-Content -LiteralPath $logPath -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' ' + $text) }",
+        "Set-Content -LiteralPath $logPath -Value ('==== TimerAuto update apply ' + (Get-Date) + ' ====')",
+        "Write-UpdateLog ('zip=' + $zip)",
+        "Write-UpdateLog ('app_dir=' + $appDir)",
+        "Write-UpdateLog ('exe=' + $exePath)",
+        "try {",
+        "Start-Sleep -Seconds 2",
+        "if ($processId -gt 0) {",
+        "  $deadline = (Get-Date).AddSeconds(90)",
+        "  while ((Get-Date) -lt $deadline -and (Get-Process -Id $processId -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 500 }",
+        "  if (Get-Process -Id $processId -ErrorAction SilentlyContinue) { throw ('Timed out waiting for PID ' + $processId) }",
+        "}",
+        "Write-UpdateLog 'target process exited'",
+        "if (Test-Path -LiteralPath $extractDir) { Remove-Item -LiteralPath $extractDir -Recurse -Force }",
+        "New-Item -ItemType Directory -Force -Path $extractDir | Out-Null",
+        "Expand-Archive -LiteralPath $zip -DestinationPath $extractDir -Force",
+        "Write-UpdateLog 'archive extracted'",
+        "$protectedFiles = @('config.json','profile.json','profile1.json','as.json','test.json','latest.json')",
+        "$protectedDirs = @('logs','image','ThrillOfTheFight2','TheThrillOfTheFight2')",
+        "Get-ChildItem -LiteralPath $appDir -Force | Where-Object { $protectedFiles -notcontains $_.Name -and $protectedDirs -notcontains $_.Name } | Remove-Item -Recurse -Force",
+        "Get-ChildItem -LiteralPath $extractDir -Force | Where-Object { $protectedFiles -notcontains $_.Name } | Copy-Item -Destination $appDir -Recurse -Force",
+        "Write-UpdateLog 'application files replaced; user data preserved'",
+        "Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue",
+        "Start-Process -FilePath $exePath -WorkingDirectory $appDir",
+        "Write-UpdateLog 'update apply completed'",
+        "exit 0",
+        "}",
+        "catch { Write-UpdateLog ('update apply failed: ' + $_.Exception.Message); try { Start-Process -FilePath $exePath -WorkingDirectory $appDir } catch {}; exit 1 }",
     ]
-    with open(script_path, "w", encoding="mbcs", errors="ignore") as f:
+    with open(script_path, "w", encoding="utf-8") as f:
         f.write("\r\n".join(lines) + "\r\n")
     return script_path

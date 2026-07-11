@@ -14,6 +14,17 @@ function Assert-CommandSuccess([string]$Step) {
   }
 }
 
+function Push-ToMain {
+  Write-Host "Syncing with origin/main..."
+  git fetch origin main
+  Assert-CommandSuccess "Git fetch"
+  git rebase origin/main
+  Assert-CommandSuccess "Git rebase"
+  Write-Host "Pushing current branch HEAD to origin/main..."
+  git push origin HEAD:main
+  Assert-CommandSuccess "Git push"
+}
+
 $branch = (git branch --show-current).Trim()
 if (-not $branch) {
   throw "No active Git branch was found."
@@ -38,9 +49,7 @@ $staged = git diff --cached --name-only
 if (-not $staged) {
   Write-Host "No changes to commit."
   if (-not $NoPush) {
-    Write-Host "Pushing current branch HEAD to origin/main..."
-    git push origin HEAD:main
-    Assert-CommandSuccess "Git push"
+    Push-ToMain
   }
   exit 0
 }
@@ -54,7 +63,5 @@ if ($NoPush) {
   exit 0
 }
 
-Write-Host "Pushing current branch HEAD to origin/main..."
-git push origin HEAD:main
-Assert-CommandSuccess "Git push"
+Push-ToMain
 Write-Host "Push completed. GitHub Actions will build and publish the latest release automatically."

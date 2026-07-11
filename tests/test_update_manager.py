@@ -17,8 +17,10 @@ class UpdateManagerTests(unittest.TestCase):
                 )
             )
             text = script.read_text(encoding="utf-8")
+            raw = script.read_bytes()
 
         self.assertEqual(script.suffix.lower(), ".ps1")
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
         self.assertIn("Get-Process -Id $processId", text)
         self.assertIn("config.json", text)
         self.assertIn("profile.json", text)

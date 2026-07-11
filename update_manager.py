@@ -83,6 +83,8 @@ def _write_update_script(zip_path: str, app_dir: str, exe_path: str, process_id:
         "}",
         "catch { Write-UpdateLog ('update apply failed: ' + $_.Exception.Message); try { Start-Process -FilePath $exePath -WorkingDirectory $appDir } catch {}; exit 1 }",
     ]
-    with open(script_path, "w", encoding="utf-8") as f:
+    # Windows PowerShell 5.1 treats UTF-8 without a BOM as the active ANSI
+    # codepage.  A BOM is required or Korean install paths become corrupted.
+    with open(script_path, "w", encoding="utf-8-sig") as f:
         f.write("\r\n".join(lines) + "\r\n")
     return script_path

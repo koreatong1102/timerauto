@@ -69,6 +69,26 @@ class LobbyAutoStartTests(unittest.TestCase):
         )
         self.assertNotIn("spectator_lobby_auto_start", out)
 
+    def test_extra_spectator_slot_does_not_block_two_ready_players(self):
+        lobby = self.lobby(blue_ready=True, red_ready=True, ready_to_start=False)
+        lobby["slots"].append({"slot": 2, "occupied": True, "ready": False, "name": "SPECTATOR"})
+        out = {}
+        self.assertTrue(self.watcher._apply_lobby_auto_start_edge(lobby, out))
+        self.assertEqual(out["spectator_lobby_auto_start"]["players"], ["BLUE", "RED"])
+
+    def test_host_spectator_in_slot_zero_is_ignored(self):
+        lobby = {
+            "ready_to_start": False,
+            "slots": [
+                {"slot": 0, "type": "Spectator", "occupied": True, "ready": False, "name": "HOST"},
+                {"slot": 1, "type": "Player", "occupied": True, "ready": True, "name": "BLUE"},
+                {"slot": 2, "type": "Player", "occupied": True, "ready": True, "name": "RED"},
+            ],
+        }
+        out = {}
+        self.assertTrue(self.watcher._apply_lobby_auto_start_edge(lobby, out))
+        self.assertEqual(out["spectator_lobby_auto_start"]["players"], ["BLUE", "RED"])
+
     def test_disabled_option_does_not_emit(self):
         self.cfg.spectator_lobby_auto_start_enabled = False
         out = {}
@@ -88,6 +108,9 @@ class LobbyAutoStartTests(unittest.TestCase):
         self.cfg.spectator_lobby_auto_start_click_count = 3
         self.cfg.spectator_lobby_auto_start_restore_focus = False
         self.cfg.spectator_lobby_auto_start_minimize_target = True
+        self.cfg.spectator_lobby_auto_start_reference_width = 1920
+        self.cfg.spectator_lobby_auto_start_reference_height = 1080
+        self.cfg.spectator_final_report_delay_sec = 7.5
 
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "config.json")
@@ -102,6 +125,9 @@ class LobbyAutoStartTests(unittest.TestCase):
         self.assertEqual(loaded.spectator_lobby_auto_start_click_count, 3)
         self.assertFalse(loaded.spectator_lobby_auto_start_restore_focus)
         self.assertTrue(loaded.spectator_lobby_auto_start_minimize_target)
+        self.assertEqual(loaded.spectator_lobby_auto_start_reference_width, 1920)
+        self.assertEqual(loaded.spectator_lobby_auto_start_reference_height, 1080)
+        self.assertEqual(loaded.spectator_final_report_delay_sec, 7.5)
 
     def test_default_window_title_and_zero_commentary_cooldown(self):
         cfg = AppConfig()

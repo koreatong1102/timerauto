@@ -83,11 +83,12 @@ from PyQt6.QtGui import QPixmap, QImage, QAction, QColor, QCursor, QPainter, QPe
 from PyQt6.QtQml import QQmlApplicationEngine
 from PyQt6.QtQuick import QQuickImageProvider, QQuickWindow
 try:
-    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
     HAS_QTMULTIMEDIA = True
 except Exception:
     QMediaPlayer = None
     QAudioOutput = None
+    QMediaDevices = None
     HAS_QTMULTIMEDIA = False
 try:
     from PyQt6.QtQuickControls2 import QQuickStyle  # type: ignore[reportMissingImports]
@@ -273,6 +274,7 @@ def _play_media_sfx(player, audio_out, path: str, playback_rate: float = 1.0) ->
         except Exception:
             pass
         player.setSource(url)
+        _refresh_default_audio_device(player)
         player.play()
         return True
     except Exception:
@@ -312,6 +314,7 @@ def _store_player_flag(gid: str, src_path: str) -> str:
     try:
         player.stop()
         player.setSource(url)
+        _refresh_default_audio_device(player)
         player.play()
         return True
     except Exception:
@@ -428,11 +431,12 @@ def bgr_distance(c1: Tuple[int, int, int], c2: Tuple[int, int, int]) -> float:
 
 
 def _find_window_by_title_contains(title_part: str) -> int:
-    title_part = str(title_part or "").strip().lower()
+    requested = str(title_part or "").strip()
+    title_part = requested.lower()
     if not title_part or os.name != "nt":
         return 0
     user32 = ctypes.windll.user32
-    found = ctypes.c_void_p(0)
+    candidates = []
     enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
     def _enum_proc(hwnd, _lparam):
@@ -444,9 +448,10 @@ def _find_window_by_title_contains(title_part: str) -> int:
                 return True
             buf = ctypes.create_unicode_buffer(length + 1)
             user32.GetWindowTextW(hwnd, buf, length + 1)
-            if title_part in str(buf.value or "").lower():
-                found.value = int(hwnd)
-                return False
+            window_title = str(buf.value or "").strip()
+            lowered = window_title.lower()
+            if title_part in lowered:
+                candidates.append((int(hwnd), window_title))
         except Exception:
             return True
         return True
@@ -456,7 +461,21 @@ def _find_window_by_title_contains(title_part: str) -> int:
         user32.EnumWindows(cb, 0)
     except Exception:
         return 0
-    return int(found.value or 0)
+    if not candidates:
+        return 0
+    for hwnd, window_title in candidates:
+        if window_title.casefold() == requested.casefold():
+            return hwnd
+    non_browser = [
+        item for item in candidates
+        if not any(marker in item[1].lower() for marker in ("youtube", "whale", "chrome", "discord", "edge"))
+    ]
+    if len(non_browser) == 1:
+        return non_browser[0][0]
+    if non_browser:
+        return min(non_browser, key=lambda item: len(item[1]))[0]
+    logging.warning("WINDOW_FIND_REJECT_BROWSER_ONLY requested=%s candidates=%s", requested, [title for _hwnd, title in candidates])
+    return 0
 
 
 def _window_title(hwnd: int) -> str:
@@ -742,7 +761,8 @@ def window_client_point_from_cursor(title_part: str) -> Tuple[bool, int, int, st
     if not user32.ScreenToClient(hwnd, ctypes.byref(point)):
         return False, 0, 0, "ScreenToClient failed"
     client_x, client_y = int(point.x), int(point.y)
-    if client_x < 0 or client_y < 0:
+    width, height = window_client_size(title_part)
+    if client_x < 0 or client_y < 0 or client_x >= width or client_y >= height:
         return False, client_x, client_y, "마우스가 관전툴 창 내부에 있지 않습니다."
     return True, client_x, client_y, (
         f"hwnd={hwnd} target='{_window_title(hwnd)}' "
@@ -760,6 +780,30 @@ def _current_cursor_screen_position() -> Tuple[int, int]:
     return int(point.x), int(point.y)
 
 
+def _refresh_default_audio_device(player) -> None:
+    """Bind playback to the current Windows default output device."""
+    if QMediaDevices is None or player is None:
+        return
+    try:
+        audio_output = player.audioOutput()
+        if audio_output is not None:
+            audio_output.setDevice(QMediaDevices.defaultAudioOutput())
+    except Exception:
+        logging.debug("AUDIO_DEFAULT_DEVICE_REFRESH_FAIL", exc_info=True)
+
+
+def window_client_size(title_part: str) -> Tuple[int, int]:
+    if os.name != "nt":
+        return 0, 0
+    hwnd = _find_window_by_title_contains(str(title_part or "").strip())
+    if not hwnd:
+        return 0, 0
+    rect = wintypes.RECT()
+    if not ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return 0, 0
+    return max(1, int(rect.right - rect.left)), max(1, int(rect.bottom - rect.top))
+
+
 def click_window_client_point(
     title_part: str,
     client_x: int,
@@ -771,6 +815,8 @@ def click_window_client_point(
     minimize_target: bool = False,
     previous_hwnd_override: int = 0,
     previous_cursor_override: Optional[Tuple[int, int]] = None,
+    reference_width: int = 0,
+    reference_height: int = 0,
 ) -> Tuple[bool, str]:
     """Perform one real left click at a client-relative point in a target window."""
     if os.name != "nt":
@@ -788,6 +834,12 @@ def click_window_client_point(
         return False, "시작 버튼 좌표가 올바르지 않습니다."
 
     user32 = ctypes.windll.user32
+    current_width, current_height = window_client_size(title_part)
+    if reference_width > 0 and reference_height > 0 and current_width > 0 and current_height > 0:
+        client_x = int(round(client_x * current_width / max(1, int(reference_width))))
+        client_y = int(round(client_y * current_height / max(1, int(reference_height))))
+    if current_width <= 0 or current_height <= 0 or client_x >= current_width or client_y >= current_height:
+        return False, f"Click point outside target client: point=({client_x},{client_y}) size=({current_width},{current_height})"
     target = wintypes.POINT(client_x, client_y)
     if not user32.ClientToScreen(hwnd, ctypes.byref(target)):
         return False, "ClientToScreen failed"
@@ -7750,10 +7802,17 @@ class SettingsDialog(QDialog):
         self.chk_spectator_lobby_auto_start_minimize_target.setChecked(
             bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False))
         )
+        self.sp_spectator_final_report_delay = QDoubleSpinBox()
+        self.sp_spectator_final_report_delay.setRange(0.0, 30.0)
+        self.sp_spectator_final_report_delay.setSingleStep(0.5)
+        self.sp_spectator_final_report_delay.setSuffix(" sec")
+        self.sp_spectator_final_report_delay.setValue(float(getattr(self.cfg, "spectator_final_report_delay_sec", 5.0) or 0.0))
         auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_activate, 5, 1)
         auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_restore_focus, 5, 2, 1, 2)
         auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_restore_cursor, 5, 4)
         auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_minimize_target, 6, 1, 1, 2)
+        auto_start_lay.addWidget(QLabel("경기종료 리포트 지연"), 6, 3)
+        auto_start_lay.addWidget(self.sp_spectator_final_report_delay, 6, 4)
         self.lbl_spectator_lobby_auto_start_state = QLabel("대기")
         self.lbl_spectator_lobby_auto_start_state.setStyleSheet("color:#94a3b8;")
         auto_start_lay.addWidget(self.lbl_spectator_lobby_auto_start_state, 7, 0, 1, 5)
@@ -7772,6 +7831,7 @@ class SettingsDialog(QDialog):
             (self.chk_spectator_lobby_auto_start_restore_focus, "stateChanged"),
             (self.chk_spectator_lobby_auto_start_restore_cursor, "stateChanged"),
             (self.chk_spectator_lobby_auto_start_minimize_target, "stateChanged"),
+            (self.sp_spectator_final_report_delay, "valueChanged"),
         ):
             getattr(widget, signal_name).connect(self._schedule_apply)
         auto_start_outer.addWidget(auto_start_group)
@@ -7937,6 +7997,9 @@ class SettingsDialog(QDialog):
                 return
             self.sp_spectator_lobby_auto_start_x.setValue(x)
             self.sp_spectator_lobby_auto_start_y.setValue(y)
+            ref_w, ref_h = window_client_size(title)
+            self.cfg.spectator_lobby_auto_start_reference_width = ref_w
+            self.cfg.spectator_lobby_auto_start_reference_height = ref_h
             self.lbl_spectator_lobby_auto_start_state.setText(f"저장 완료: 창 내부 X={x}, Y={y}")
             logging.info("LOBBY_AUTO_START_CAPTURE %s", detail)
             self._schedule_apply()
@@ -9420,6 +9483,7 @@ class SettingsDialog(QDialog):
             self._tts_test_files.setdefault(role, []).append(path)
             player.setSource(QUrl.fromLocalFile(path))
             audio_out.setVolume(max(0.0, min(1.0, self._commentary_tts_volume() / 100.0)))
+            _refresh_default_audio_device(player)
             player.play()
             logging.info("TTS_TEST_QT_PLAY role=%s path=%s", role, path)
             self._noop_status("자동해설 TTS 테스트 재생")
@@ -15837,6 +15901,7 @@ class SettingsDialog(QDialog):
             self.cfg.spectator_lobby_auto_start_minimize_target = bool(
                 self.chk_spectator_lobby_auto_start_minimize_target.isChecked()
             )
+            self.cfg.spectator_final_report_delay_sec = float(self.sp_spectator_final_report_delay.value())
         if hasattr(self, "le_spectatorlog_path"):
             self.cfg.spectatorlog_path = str(self.le_spectatorlog_path.text() or "").strip()
         if hasattr(self, "sp_spectatorlog_poll"):
@@ -16336,6 +16401,9 @@ class SettingsDialog(QDialog):
             )
             self.chk_spectator_lobby_auto_start_minimize_target.setChecked(
                 bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False))
+            )
+            self.sp_spectator_final_report_delay.setValue(
+                float(getattr(self.cfg, "spectator_final_report_delay_sec", 5.0) or 0.0)
             )
         if hasattr(self, "le_spectatorlog_path"):
             self.le_spectatorlog_path.setText(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
@@ -17325,6 +17393,7 @@ class MainApp(QObject):
             except Exception:
                 volume = 100.0
             audio_out.setVolume(max(0.0, min(1.0, volume / 100.0)))
+            _refresh_default_audio_device(player)
             player.play()
             logging.info("COMMENTARY_TTS_QT_PLAY role=%s path=%s", role, path)
         except Exception as e:
@@ -20730,6 +20799,8 @@ class MainApp(QObject):
         title = str(getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or "").strip()
         x = int(getattr(self.cfg, "spectator_lobby_auto_start_client_x", 0) or 0)
         y = int(getattr(self.cfg, "spectator_lobby_auto_start_client_y", 0) or 0)
+        reference_width = int(getattr(self.cfg, "spectator_lobby_auto_start_reference_width", 0) or 0)
+        reference_height = int(getattr(self.cfg, "spectator_lobby_auto_start_reference_height", 0) or 0)
         if not title:
             logging.warning("LOBBY_AUTO_START_SKIP reason=empty_window_title")
             return
@@ -20784,6 +20855,8 @@ class MainApp(QObject):
                         minimize_target=minimize_target and index == click_count - 1,
                         previous_hwnd_override=original_hwnd,
                         previous_cursor_override=original_cursor,
+                        reference_width=reference_width,
+                        reference_height=reference_height,
                     )
                     if not ok:
                         break

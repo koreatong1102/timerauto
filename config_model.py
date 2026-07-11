@@ -659,12 +659,15 @@ class AppConfig:
     spectator_lobby_auto_start_target_title: str = "The Thrill of the Fight 2"
     spectator_lobby_auto_start_client_x: int = 0
     spectator_lobby_auto_start_client_y: int = 0
+    spectator_lobby_auto_start_reference_width: int = 0
+    spectator_lobby_auto_start_reference_height: int = 0
     spectator_lobby_auto_start_click_count: int = 1
     spectator_lobby_auto_start_delay_ms: int = 300
     spectator_lobby_auto_start_activate: bool = True
     spectator_lobby_auto_start_restore_focus: bool = True
     spectator_lobby_auto_start_restore_cursor: bool = True
     spectator_lobby_auto_start_minimize_target: bool = False
+    spectator_final_report_delay_sec: float = 5.0
     spectator_commentary_enabled: bool = True
     spectator_commentary_mode: str = "standard"
     spectator_commentary_min_damage: float = 25.0
@@ -840,6 +843,12 @@ class AppConfig:
             cfg.spectator_lobby_auto_start_client_x = 0
             cfg.spectator_lobby_auto_start_client_y = 0
         try:
+            cfg.spectator_lobby_auto_start_reference_width = max(0, int(raw.get("spectator_lobby_auto_start_reference_width", 0) or 0))
+            cfg.spectator_lobby_auto_start_reference_height = max(0, int(raw.get("spectator_lobby_auto_start_reference_height", 0) or 0))
+        except Exception:
+            cfg.spectator_lobby_auto_start_reference_width = 0
+            cfg.spectator_lobby_auto_start_reference_height = 0
+        try:
             cfg.spectator_lobby_auto_start_click_count = max(
                 1, min(10, int(raw.get("spectator_lobby_auto_start_click_count", 1) or 1))
             )
@@ -855,6 +864,10 @@ class AppConfig:
         cfg.spectator_lobby_auto_start_minimize_target = bool(
             raw.get("spectator_lobby_auto_start_minimize_target", False)
         )
+        try:
+            cfg.spectator_final_report_delay_sec = max(0.0, min(30.0, float(raw.get("spectator_final_report_delay_sec", 5.0) or 0.0)))
+        except Exception:
+            cfg.spectator_final_report_delay_sec = 5.0
         cfg.spectator_commentary_enabled = bool(raw.get("spectator_commentary_enabled", True))
         cfg.spectator_commentary_mode = str(raw.get("spectator_commentary_mode", "standard") or "standard")
         cfg.spectator_commentary_voice = str(raw.get("spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
@@ -1310,6 +1323,8 @@ class AppConfig:
             ),
             "spectator_lobby_auto_start_client_x": int(max(0, self.spectator_lobby_auto_start_client_x)),
             "spectator_lobby_auto_start_client_y": int(max(0, self.spectator_lobby_auto_start_client_y)),
+            "spectator_lobby_auto_start_reference_width": int(max(0, self.spectator_lobby_auto_start_reference_width)),
+            "spectator_lobby_auto_start_reference_height": int(max(0, self.spectator_lobby_auto_start_reference_height)),
             "spectator_lobby_auto_start_click_count": int(
                 max(1, min(10, self.spectator_lobby_auto_start_click_count))
             ),
@@ -1320,6 +1335,7 @@ class AppConfig:
             "spectator_lobby_auto_start_minimize_target": bool(
                 self.spectator_lobby_auto_start_minimize_target
             ),
+            "spectator_final_report_delay_sec": float(max(0.0, min(30.0, self.spectator_final_report_delay_sec))),
             "spectator_commentary_enabled": bool(self.spectator_commentary_enabled),
             "spectator_commentary_mode": str(self.spectator_commentary_mode or "standard"),
             "spectator_commentary_min_damage": float(self.spectator_commentary_min_damage or 25.0),

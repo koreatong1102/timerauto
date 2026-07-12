@@ -28,7 +28,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from collections import deque
 
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.18"
 UPDATE_FEED_URL = "https://github.com/koreatong1102/timerauto/releases/download/latest/latest.json"
 
 # Ensure a non-native Qt Quick Controls style for QML customization.
@@ -2710,8 +2710,9 @@ class TimerBackend(QObject):
     hudDemoRunningChanged = pyqtSignal()
     restThirtySecondsReached = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self, cfg: Optional[AppConfig] = None):
         super().__init__()
+        self.cfg = cfg
         self._time_text = "3:00"
         self._round_text = "RD 1 of 3"
         self._status_text = "Ready"
@@ -2746,6 +2747,7 @@ class TimerBackend(QObject):
         self._red_sp_ratio = 1.0
         self._last_blue_round_damage_for_sp = 0.0
         self._last_red_round_damage_for_sp = 0.0
+        self._last_sp_activity_spent = {"blue": 0.0, "red": 0.0}
         self._last_rest_seconds_for_sp = None
         self._last_fight_seconds_for_sp = None
         self._sp_recovery_delay = {"blue": 0.0, "red": 0.0}
@@ -3365,7 +3367,8 @@ class TimerBackend(QObject):
                 self._sp_recovery_delay[side] = delay
             if recover_elapsed <= 0:
                 continue
-            gain = 0.30 * (recover_elapsed / float(round_sec))
+            recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 15.0) or 0.0) / 100.0))
+            gain = recovery * (recover_elapsed / float(round_sec))
             current = float(self._blue_sp_ratio if side == "blue" else self._red_sp_ratio)
             self._set_sp_ratio(side, current + gain)
 
@@ -3386,7 +3389,8 @@ class TimerBackend(QObject):
         if elapsed <= 0:
             return
         rest_sec = max(1, int(self.rest_duration_sec or 60))
-        gain = 0.60 * (float(elapsed) / float(rest_sec))
+        recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 60.0) or 0.0) / 100.0))
+        gain = recovery * (float(elapsed) / float(rest_sec))
         self._set_sp_ratio("blue", float(self._blue_sp_ratio or 0.0) + gain)
         self._set_sp_ratio("red", float(self._red_sp_ratio or 0.0) + gain)
 
@@ -3396,8 +3400,27 @@ class TimerBackend(QObject):
         self._last_rest_seconds_for_sp = None
         self._last_fight_seconds_for_sp = None
         self._sp_recovery_delay = {"blue": 0.0, "red": 0.0}
+        self._last_sp_activity_spent = {"blue": 0.0, "red": 0.0}
         self._set_sp_ratio("blue", 1.0)
         self._set_sp_ratio("red", 1.0)
+
+    def apply_spectator_sp_activity(self, cumulative: dict):
+        cumulative = dict(cumulative or {})
+        for side in ("blue", "red"):
+            try:
+                value = max(0.0, float(cumulative.get(side, 0.0) or 0.0))
+            except Exception:
+                value = 0.0
+            previous = max(0.0, float(self._last_sp_activity_spent.get(side, 0.0) or 0.0))
+            if value < previous:
+                previous = 0.0
+            delta = max(0.0, value - previous)
+            self._last_sp_activity_spent[side] = value
+            if delta <= 0.0:
+                continue
+            self._sp_recovery_delay[side] = 1.5
+            current = float(self._blue_sp_ratio if side == "blue" else self._red_sp_ratio)
+            self._set_sp_ratio(side, current - delta)
 
     def set_spectator_damage(self, blue_dealt: float, red_dealt: float):
         def fmt(v: float) -> str:
@@ -3415,11 +3438,7 @@ class TimerBackend(QObject):
             red_f = max(0.0, float(red_dealt or 0.0))
         except Exception:
             red_f = 0.0
-        if blue_f >= float(self._last_blue_round_damage_for_sp or 0.0):
-            self._sp_apply_damage_delta("blue", blue_f - float(self._last_blue_round_damage_for_sp or 0.0))
         self._last_blue_round_damage_for_sp = blue_f
-        if red_f >= float(self._last_red_round_damage_for_sp or 0.0):
-            self._sp_apply_damage_delta("red", red_f - float(self._last_red_round_damage_for_sp or 0.0))
         self._last_red_round_damage_for_sp = red_f
 
         b = fmt(blue_dealt)
@@ -4271,7 +4290,7 @@ class QmlTimerWindow(QObject):
 
     def __init__(self, cfg: AppConfig, cfg_path: str):
         super().__init__()
-        self._backend = TimerBackend()
+        self._backend = TimerBackend(cfg)
         self._backend.open_settings_requested.connect(self.open_settings.emit)
         self._backend.check_updates_requested.connect(self.check_updates.emit)
         self._backend.overlayResetRequested.connect(self._on_overlay_reset)
@@ -6163,6 +6182,9 @@ class SettingsDialog(QDialog):
         self.btn_screen_detect_toggle.clicked.connect(self._toggle_screen_detection)
 
         bottom = QHBoxLayout()
+        self.lbl_app_version = QLabel(f"TimerAuto v{APP_VERSION}")
+        self.lbl_app_version.setStyleSheet("color:#94a3b8; padding-right:10px;")
+        bottom.addWidget(self.lbl_app_version)
         bottom.addStretch(1)
         bottom.addWidget(self.btn_apply)
         bottom.addWidget(self.btn_detect_toggle)
@@ -7149,7 +7171,7 @@ class SettingsDialog(QDialog):
         self.sp_spectatorlog_debounce = QSpinBox()
         self.sp_spectatorlog_debounce.setRange(0, 500)
         self.sp_spectatorlog_debounce.setSingleStep(5)
-        self.sp_spectatorlog_debounce.setValue(int(getattr(self.cfg, "spectatorlog_debounce_ms", 35) or 35))
+        self.sp_spectatorlog_debounce.setValue(int(getattr(self.cfg, "spectatorlog_debounce_ms", 8) or 8))
         self.sp_spectatorlog_debounce.setToolTip("로그 파일 쓰기가 끝날 시간을 아주 짧게 기다립니다. 너무 크면 반응이 느려집니다.")
         spectator_lay.addWidget(self.sp_spectatorlog_debounce, 8, 1)
         spectator_lay.addWidget(QLabel("백업 확인(ms)"), 8, 2)
@@ -7159,6 +7181,31 @@ class SettingsDialog(QDialog):
         self.sp_spectatorlog_backup_poll.setValue(int(getattr(self.cfg, "spectatorlog_backup_poll_ms", 1500) or 1500))
         self.sp_spectatorlog_backup_poll.setToolTip("파일 변경 이벤트를 놓쳤을 때를 대비한 느린 백업 확인 간격입니다.")
         spectator_lay.addWidget(self.sp_spectatorlog_backup_poll, 8, 3)
+
+        self.sp_spectator_sp_throw_scale = QDoubleSpinBox()
+        self.sp_spectator_sp_throw_scale.setRange(0.1, 5.0)
+        self.sp_spectator_sp_throw_scale.setSingleStep(0.1)
+        self.sp_spectator_sp_throw_scale.setValue(float(getattr(self.cfg, "spectator_sp_throw_cost_scale", 1.0) or 1.0))
+        self.sp_spectator_sp_impact_scale = QDoubleSpinBox()
+        self.sp_spectator_sp_impact_scale.setRange(0.0, 5.0)
+        self.sp_spectator_sp_impact_scale.setSingleStep(0.1)
+        self.sp_spectator_sp_impact_scale.setValue(float(getattr(self.cfg, "spectator_sp_impact_cost_scale", 1.0) or 1.0))
+        spectator_lay.addWidget(QLabel("SP 펀치 소비 배율"), 18, 0)
+        spectator_lay.addWidget(self.sp_spectator_sp_throw_scale, 18, 1)
+        spectator_lay.addWidget(QLabel("SP 타격 강도 배율"), 18, 2)
+        spectator_lay.addWidget(self.sp_spectator_sp_impact_scale, 18, 3)
+        self.sp_spectator_sp_fight_recovery = QDoubleSpinBox()
+        self.sp_spectator_sp_fight_recovery.setRange(0.0, 100.0)
+        self.sp_spectator_sp_fight_recovery.setSuffix(" %")
+        self.sp_spectator_sp_fight_recovery.setValue(float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 15.0) or 0.0))
+        self.sp_spectator_sp_break_recovery = QDoubleSpinBox()
+        self.sp_spectator_sp_break_recovery.setRange(0.0, 100.0)
+        self.sp_spectator_sp_break_recovery.setSuffix(" %")
+        self.sp_spectator_sp_break_recovery.setValue(float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 60.0) or 0.0))
+        spectator_lay.addWidget(QLabel("경기 중 SP 회복"), 19, 0)
+        spectator_lay.addWidget(self.sp_spectator_sp_fight_recovery, 19, 1)
+        spectator_lay.addWidget(QLabel("휴식 SP 회복"), 19, 2)
+        spectator_lay.addWidget(self.sp_spectator_sp_break_recovery, 19, 3)
 
         self.btn_spectatorlog_test_blue_stun= QPushButton("블루 스턴 테스트")
         self.btn_spectatorlog_test_red_stun= QPushButton("레드 스턴 테스트")
@@ -7806,7 +7853,7 @@ class SettingsDialog(QDialog):
         self.sp_spectator_final_report_delay.setRange(0.0, 30.0)
         self.sp_spectator_final_report_delay.setSingleStep(0.5)
         self.sp_spectator_final_report_delay.setSuffix(" sec")
-        self.sp_spectator_final_report_delay.setValue(float(getattr(self.cfg, "spectator_final_report_delay_sec", 5.0) or 0.0))
+        self.sp_spectator_final_report_delay.setValue(float(getattr(self.cfg, "spectator_final_report_delay_sec", 10.0) or 0.0))
         auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_activate, 5, 1)
         auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_restore_focus, 5, 2, 1, 2)
         auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_restore_cursor, 5, 4)
@@ -8844,6 +8891,50 @@ class SettingsDialog(QDialog):
                     ],
                 },
             }
+            # Synthetic report data must obey the same landed/thrown contract
+            # as real SpectatorLog reports. Keep landed and attempt breakdowns
+            # separate so the accuracy UI is meaningful during testing.
+            test_attempts = {
+                "blue": {"jab": 14, "cross": 9, "hook": 6, "upper": 3, "over": 2},
+                "red": {"jab": 9, "cross": 3, "hook": 9, "upper": 4, "over": 2},
+            }
+            test_metrics = {
+                "blue": {"officialScore": 10, "powerHits55": 1, "maxComboHits": 3, "maxComboDamage": 82},
+                "red": {"officialScore": 8, "powerHits55": 0, "maxComboHits": 2, "maxComboDamage": 46},
+            }
+            for side in ("blue", "red"):
+                side_data = payload[side]
+                landed_rows = [dict(item or {}) for item in side_data.get("punchBreakdown") or []]
+                landed_map = {
+                    str(item.get("key") or ""): int(item.get("count", 0) or 0)
+                    for item in landed_rows if str(item.get("key") or "") != "other"
+                }
+                side_data["landedBreakdown"] = landed_rows
+                side_data["punchBreakdown"] = [
+                    {
+                        "key": key,
+                        "shortLabel": key.upper(),
+                        "label": key.upper(),
+                        "count": count,
+                        "damage": 0,
+                    }
+                    for key, count in test_attempts[side].items()
+                ]
+                side_data["punchAccuracyBreakdown"] = [
+                    {
+                        "key": key,
+                        "landed": int(landed_map.get(key, 0) or 0),
+                        "thrown": count,
+                        "accuracy": int(round(float(landed_map.get(key, 0) or 0) / count * 100.0)),
+                    }
+                    for key, count in test_attempts[side].items()
+                ]
+                side_data["thrown"] = sum(test_attempts[side].values())
+                side_data["accuracyValid"] = side_data["landed"] <= side_data["thrown"]
+                side_data.update(test_metrics[side])
+                side_data["averageDamage"] = round(
+                    float(side_data.get("damage", 0) or 0) / max(1, int(side_data.get("landed", 0) or 0)), 1
+                )
             if bool(final):
                 payload.update({
                     "isFinal": True,
@@ -9569,46 +9660,34 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
             return
+        helper = _make_spectator_log_watcher(self.cfg)
         events = []
         for line in lines:
             parts = str(line or "").strip().split("\t")
-            if len(parts) < 10:
+            parsed = helper._parse_damage_event_parts(parts)
+            if not parsed:
                 continue
             try:
-                damage = float(parts[1])
+                damage = float(parsed.get("damage", 0.0) or 0.0)
             except Exception:
                 continue
-            corner = str(parts[2] or "").strip().lower()
-            if corner == "red":
-                attacker = "BLUE"
-                attacker_side = "blue"
-            elif corner == "blue":
-                attacker = "RED"
-                attacker_side = "red"
-            else:
+            attacker_side = str(parsed.get("attacker_side") or "").strip().lower()
+            receiver_side = str(parsed.get("receiver_side") or "").strip().lower()
+            if damage <= 0.0 or attacker_side not in ("blue", "red") or receiver_side not in ("blue", "red"):
                 continue
-            try:
-                t = float(parts[0])
-            except Exception:
-                t = 0.0
-            events.append({
-                "time": t,
-                "attacker": attacker,
-                "attacker_side": attacker_side,
-                "receiver": corner.upper(),
-                "receiver_side": corner,
+            event = dict(parsed)
+            event.update({
+                "attacker": attacker_side.upper(),
+                "receiver": receiver_side.upper(),
                 "damage": damage,
-                "punch": str(parts[8] or "").strip(),
-                "damage_type": str(parts[9] or "").strip(),
-                "weak_point": str(parts[10] or "").strip() if len(parts) > 10 else "",
             })
+            events.append(event)
         if not events:
             logging.warning("SPECTATOR_REPLAY_NO_EVENTS path=%s line_count=%s", path, len(lines))
             QMessageBox.information(self, "과거 로그 리플레이", f"damage_events.txt는 찾았지만 재생 가능한 타격 이벤트가 없습니다.\n경로: {path}")
             self._noop_status("과거 로그 리플레이 실패: 이벤트 없음")
             return
         browser_output_only = bool(getattr(self.cfg, "browser_overlay_output_only", True))
-        helper = _make_spectator_log_watcher(self.cfg)
         try:
             replay_round_no = int(float(helper._read_text(os.path.join(root, "match", "round_number.txt")) or "1"))
         except Exception:
@@ -15912,6 +15991,11 @@ class SettingsDialog(QDialog):
             self.cfg.spectatorlog_debounce_ms = int(self.sp_spectatorlog_debounce.value())
         if hasattr(self, "sp_spectatorlog_backup_poll"):
             self.cfg.spectatorlog_backup_poll_ms = int(self.sp_spectatorlog_backup_poll.value())
+        if hasattr(self, "sp_spectator_sp_throw_scale"):
+            self.cfg.spectator_sp_throw_cost_scale = float(self.sp_spectator_sp_throw_scale.value())
+            self.cfg.spectator_sp_impact_cost_scale = float(self.sp_spectator_sp_impact_scale.value())
+            self.cfg.spectator_sp_fight_recovery_pct = float(self.sp_spectator_sp_fight_recovery.value())
+            self.cfg.spectator_sp_break_recovery_pct = float(self.sp_spectator_sp_break_recovery.value())
         if hasattr(self, "chk_spectatorlog_blackbox_enabled"):
             self.cfg.spectatorlog_blackbox_enabled = bool(self.chk_spectatorlog_blackbox_enabled.isChecked())
         if hasattr(self, "le_spectatorlog_blackbox_dir"):
@@ -16403,7 +16487,7 @@ class SettingsDialog(QDialog):
                 bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False))
             )
             self.sp_spectator_final_report_delay.setValue(
-                float(getattr(self.cfg, "spectator_final_report_delay_sec", 5.0) or 0.0)
+                float(getattr(self.cfg, "spectator_final_report_delay_sec", 10.0) or 0.0)
             )
         if hasattr(self, "le_spectatorlog_path"):
             self.le_spectatorlog_path.setText(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
@@ -16412,7 +16496,12 @@ class SettingsDialog(QDialog):
         if hasattr(self, "chk_spectatorlog_file_watch"):
             self.chk_spectatorlog_file_watch.setChecked(bool(getattr(self.cfg, "spectatorlog_file_watch_enabled", True)))
         if hasattr(self, "sp_spectatorlog_debounce"):
-            self.sp_spectatorlog_debounce.setValue(int(getattr(self.cfg, "spectatorlog_debounce_ms", 35) or 35))
+            self.sp_spectatorlog_debounce.setValue(int(getattr(self.cfg, "spectatorlog_debounce_ms", 8) or 8))
+        if hasattr(self, "sp_spectator_sp_throw_scale"):
+            self.sp_spectator_sp_throw_scale.setValue(float(getattr(self.cfg, "spectator_sp_throw_cost_scale", 1.0) or 1.0))
+            self.sp_spectator_sp_impact_scale.setValue(float(getattr(self.cfg, "spectator_sp_impact_cost_scale", 1.0) or 1.0))
+            self.sp_spectator_sp_fight_recovery.setValue(float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 15.0) or 0.0))
+            self.sp_spectator_sp_break_recovery.setValue(float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 60.0) or 0.0))
         if hasattr(self, "sp_spectatorlog_backup_poll"):
             self.sp_spectatorlog_backup_poll.setValue(int(getattr(self.cfg, "spectatorlog_backup_poll_ms", 1500) or 1500))
         if hasattr(self, "chk_spectatorlog_blackbox_enabled"):
@@ -16714,6 +16803,7 @@ class MainApp(QObject):
         self._browser_sp_ratio = {"blue": 1.0, "red": 1.0}
         self._browser_sp_last_damage = {"blue": 0.0, "red": 0.0}
         self._browser_sp_recovery_delay = {"blue": 0.0, "red": 0.0}
+        self._browser_sp_last_activity_spent = {"blue": 0.0, "red": 0.0}
         self._browser_sp_last_fight_seconds = None
         self._browser_sp_last_rest_seconds = None
         self._browser_round_knockdowns = {"blue": 0, "red": 0}
@@ -17000,10 +17090,21 @@ class MainApp(QObject):
         # Round-break recaps should sound like one analyst paragraph, not a
         # list of separate sentence clips.  Keep the busy/retry behavior, but
         # pass the full recap as one TTS item.
-        self._schedule_commentary_followup_tts(text, role, delay_ms=max(0, int(delay_ms or 0)), retries=10)
+        # A break recap is intentionally a long TTS item.  Do not discard it
+        # merely because Edge TTS generation takes longer than live callouts.
+        self._schedule_commentary_followup_tts(
+            text, role, delay_ms=max(0, int(delay_ms or 0)), retries=10, allow_slow=True
+        )
         logging.info("COMMENTARY_TTS_ROUND_SUMMARY_QUEUE role=%s mode=single delay_ms=%s chars=%s", role, delay_ms, len(text))
 
-    def _schedule_commentary_followup_tts(self, text: str, role: str = "analyst", delay_ms: int = 2400, retries: int = 5):
+    def _schedule_commentary_followup_tts(
+        self,
+        text: str,
+        role: str = "analyst",
+        delay_ms: int = 2400,
+        retries: int = 5,
+        allow_slow: bool = False,
+    ):
         text = str(text or "").strip()
         if not text:
             return
@@ -17030,13 +17131,20 @@ class MainApp(QObject):
                     else:
                         logging.info("COMMENTARY_TTS_FOLLOWUP_SKIP_BUSY role=%s text=%s", role, text)
                     return
-                self._speak_commentary_tts(text, role)
+                self._speak_commentary_tts(text, role, allow_slow=allow_slow)
             except Exception:
                 logging.exception("COMMENTARY_TTS_FOLLOWUP_FAIL")
 
         QTimer.singleShot(max(0, min(15000, int(delay_ms or 2400))), lambda: _attempt(max(0, int(retries or 0))))
 
-    def _speak_commentary_tts(self, text: str, role: str = "analyst", rate_override: Optional[int] = None, pitch_override: Optional[int] = None):
+    def _speak_commentary_tts(
+        self,
+        text: str,
+        role: str = "analyst",
+        rate_override: Optional[int] = None,
+        pitch_override: Optional[int] = None,
+        allow_slow: bool = False,
+    ):
         text = str(text or "").strip()
         if not text:
             return
@@ -17126,7 +17234,7 @@ class MainApp(QObject):
                 try:
                     elapsed_gen = time.time() - float(request_started_at or time.time())
                     urgent = bool(re.search(r"다운|쓰러|녹아웃|TKO|케이오|시작|종료|휴식|위험", text, re.IGNORECASE))
-                    if elapsed_gen > 3.2 and not urgent:
+                    if elapsed_gen > 3.2 and not urgent and not allow_slow:
                         logging.info("COMMENTARY_TTS_DROP_STALE role=%s elapsed=%.2f text=%s", role, elapsed_gen, text)
                         QMetaObject.invokeMethod(
                             self,
@@ -19225,6 +19333,7 @@ class MainApp(QObject):
         self._browser_sp_ratio = {"blue": 1.0, "red": 1.0}
         self._browser_sp_last_damage = {"blue": 0.0, "red": 0.0}
         self._browser_sp_recovery_delay = {"blue": 0.0, "red": 0.0}
+        self._browser_sp_last_activity_spent = {"blue": 0.0, "red": 0.0}
         self._browser_sp_last_fight_seconds = None
         self._browser_sp_last_rest_seconds = None
 
@@ -19252,21 +19361,22 @@ class MainApp(QObject):
             delay = {"blue": 0.0, "red": 0.0}
             self._browser_sp_last_fight_seconds = None
             self._browser_sp_last_rest_seconds = None
+            self._browser_sp_last_activity_spent = {"blue": 0.0, "red": 0.0}
 
-        for side, key in (("blue", "blue_round_damage_dealt"), ("red", "red_round_damage_dealt")):
-            if key not in d:
-                continue
-            try:
-                dealt = max(0.0, float(d.get(key, 0.0) or 0.0))
-            except Exception:
-                dealt = 0.0
-            prev = float(last_damage.get(side, 0.0) or 0.0)
-            if dealt >= prev:
-                delta = dealt - prev
-                if delta > 0:
-                    ratios[side] = max(0.0, ratios[side] - (delta / 3000.0))
-                    delay[side] = 1.2
-            last_damage[side] = dealt
+        if isinstance(d.get("spectator_sp_activity_spent"), dict):
+            cumulative = dict(d.get("spectator_sp_activity_spent") or {})
+            previous_spent = dict(getattr(self, "_browser_sp_last_activity_spent", {}) or {})
+            for side in ("blue", "red"):
+                value = max(0.0, float(cumulative.get(side, 0.0) or 0.0))
+                previous = max(0.0, float(previous_spent.get(side, 0.0) or 0.0))
+                if value < previous:
+                    previous = 0.0
+                delta = max(0.0, value - previous)
+                previous_spent[side] = value
+                if delta > 0.0:
+                    ratios[side] = max(0.0, ratios[side] - delta)
+                    delay[side] = 1.5
+            self._browser_sp_last_activity_spent = previous_spent
 
         if "seconds_left" in d:
             try:
@@ -19283,7 +19393,8 @@ class MainApp(QObject):
                         elapsed = max(0, int(prev) - cur)
                         if elapsed > 0:
                             rest_sec = max(1, int(getattr(self.cfg, "timer_rest_sec", 60) or 60))
-                            gain = 0.60 * (float(elapsed) / float(rest_sec))
+                            recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 60.0) or 0.0) / 100.0))
+                            gain = recovery * (float(elapsed) / float(rest_sec))
                             ratios["blue"] = min(1.0, ratios["blue"] + gain)
                             ratios["red"] = min(1.0, ratios["red"] + gain)
                 else:
@@ -19301,7 +19412,8 @@ class MainApp(QObject):
                                     delay[side] -= used
                                     recover_elapsed -= used
                                 if recover_elapsed > 0:
-                                    gain = 0.30 * (recover_elapsed / float(round_sec))
+                                    recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 15.0) or 0.0) / 100.0))
+                                    gain = recovery * (recover_elapsed / float(round_sec))
                                     ratios[side] = min(1.0, ratios[side] + gain)
 
         self._browser_sp_ratio = ratios
@@ -20764,9 +20876,28 @@ class MainApp(QObject):
                     overlay.push_event("round_report_hide")
                 except Exception:
                     logging.exception("BROWSER_OVERLAY_ROUND_REPORT_HIDE_FAIL")
-            if "spectator_round_report" in d and isinstance(d.get("spectator_round_report"), dict):
-                report_payload = dict(d.get("spectator_round_report") or {})
+            report_payloads = []
+            if isinstance(d.get("spectator_round_reports"), list):
+                report_payloads.extend(
+                    dict(item or {}) for item in d.get("spectator_round_reports") or [] if isinstance(item, dict)
+                )
+            elif "spectator_round_report" in d and isinstance(d.get("spectator_round_report"), dict):
+                report_payloads.append(dict(d.get("spectator_round_report") or {}))
+            for report_payload in report_payloads:
                 try:
+                    # Freeze HUD vitals at report creation time. Browser reports
+                    # must not infer stamina from punishment or follow later resets.
+                    for side, sp_ratio in (
+                        ("blue", float(getattr(self.timer_win._backend, "blueSpRatio", 1.0))),
+                        ("red", float(getattr(self.timer_win._backend, "redSpRatio", 1.0))),
+                    ):
+                        side_payload = dict(report_payload.get(side) or {})
+                        side_payload["staminaPct"] = int(round(max(0.0, min(1.0, sp_ratio)) * 100.0))
+                        punishment = dict(side_payload.get("punishment") or {})
+                        hp_ratio = punishment.get("hp_ratio")
+                        if hp_ratio is not None:
+                            side_payload["healthPct"] = int(round(max(0.0, min(1.0, float(hp_ratio))) * 100.0))
+                        report_payload[side] = side_payload
                     overlay.push_event("round_report", **report_payload)
                 except Exception:
                     logging.exception("BROWSER_OVERLAY_ROUND_REPORT_EVENT_FAIL")
@@ -21027,6 +21158,13 @@ class MainApp(QObject):
                     )
             except Exception:
                 pass
+        if isinstance(d.get("spectator_sp_activity_spent"), dict):
+            try:
+                self.timer_win._backend.apply_spectator_sp_activity(
+                    dict(d.get("spectator_sp_activity_spent") or {})
+                )
+            except Exception:
+                logging.exception("SPECTATOR_SP_ACTIVITY_APPLY_FAIL")
         if "blue_round_damage_dealt" in d or "red_round_damage_dealt" in d:
             try:
                 if qml_visuals:

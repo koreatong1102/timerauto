@@ -641,7 +641,7 @@ class AppConfig:
     spectatorlog_path: str = ""
     spectatorlog_poll_ms: int = 250
     spectatorlog_file_watch_enabled: bool = True
-    spectatorlog_debounce_ms: int = 35
+    spectatorlog_debounce_ms: int = 8
     spectatorlog_backup_poll_ms: int = 1500
     # Stage51 SpectatorLog Blackbox Recorder. Raw snapshots are byte-exact;
     # timestamps/metadata are written separately to events.jsonl.
@@ -667,7 +667,11 @@ class AppConfig:
     spectator_lobby_auto_start_restore_focus: bool = True
     spectator_lobby_auto_start_restore_cursor: bool = True
     spectator_lobby_auto_start_minimize_target: bool = False
-    spectator_final_report_delay_sec: float = 5.0
+    spectator_final_report_delay_sec: float = 10.0
+    spectator_sp_throw_cost_scale: float = 1.0
+    spectator_sp_impact_cost_scale: float = 1.0
+    spectator_sp_fight_recovery_pct: float = 15.0
+    spectator_sp_break_recovery_pct: float = 60.0
     spectator_commentary_enabled: bool = True
     spectator_commentary_mode: str = "standard"
     spectator_commentary_min_damage: float = 25.0
@@ -865,9 +869,13 @@ class AppConfig:
             raw.get("spectator_lobby_auto_start_minimize_target", False)
         )
         try:
-            cfg.spectator_final_report_delay_sec = max(0.0, min(30.0, float(raw.get("spectator_final_report_delay_sec", 5.0) or 0.0)))
+            cfg.spectator_final_report_delay_sec = max(0.0, min(30.0, float(raw.get("spectator_final_report_delay_sec", 10.0) or 0.0)))
         except Exception:
-            cfg.spectator_final_report_delay_sec = 5.0
+            cfg.spectator_final_report_delay_sec = 10.0
+        cfg.spectator_sp_throw_cost_scale = max(0.1, min(5.0, float(raw.get("spectator_sp_throw_cost_scale", 1.0) or 1.0)))
+        cfg.spectator_sp_impact_cost_scale = max(0.0, min(5.0, float(raw.get("spectator_sp_impact_cost_scale", 1.0) or 1.0)))
+        cfg.spectator_sp_fight_recovery_pct = max(0.0, min(100.0, float(raw.get("spectator_sp_fight_recovery_pct", 15.0) or 0.0)))
+        cfg.spectator_sp_break_recovery_pct = max(0.0, min(100.0, float(raw.get("spectator_sp_break_recovery_pct", 60.0) or 0.0)))
         cfg.spectator_commentary_enabled = bool(raw.get("spectator_commentary_enabled", True))
         cfg.spectator_commentary_mode = str(raw.get("spectator_commentary_mode", "standard") or "standard")
         cfg.spectator_commentary_voice = str(raw.get("spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
@@ -978,9 +986,9 @@ class AppConfig:
             cfg.spectatorlog_poll_ms = 250
         cfg.spectatorlog_file_watch_enabled = bool(raw.get("spectatorlog_file_watch_enabled", True))
         try:
-            cfg.spectatorlog_debounce_ms = max(0, min(500, int(raw.get("spectatorlog_debounce_ms", 35) or 35)))
+            cfg.spectatorlog_debounce_ms = max(0, min(500, int(raw.get("spectatorlog_debounce_ms", 8) or 8)))
         except Exception:
-            cfg.spectatorlog_debounce_ms = 35
+            cfg.spectatorlog_debounce_ms = 8
         try:
             cfg.spectatorlog_backup_poll_ms = max(250, min(10000, int(raw.get("spectatorlog_backup_poll_ms", 1500) or 1500)))
         except Exception:
@@ -1305,7 +1313,7 @@ class AppConfig:
             "spectatorlog_path": to_app_rel(str(self.spectatorlog_path or "")),
             "spectatorlog_poll_ms": int(self.spectatorlog_poll_ms or 250),
             "spectatorlog_file_watch_enabled": bool(self.spectatorlog_file_watch_enabled),
-            "spectatorlog_debounce_ms": int(self.spectatorlog_debounce_ms or 35),
+            "spectatorlog_debounce_ms": int(self.spectatorlog_debounce_ms or 8),
             "spectatorlog_backup_poll_ms": int(self.spectatorlog_backup_poll_ms or 1500),
             "spectatorlog_blackbox_enabled": bool(self.spectatorlog_blackbox_enabled),
             "spectatorlog_blackbox_dir": to_app_rel(str(self.spectatorlog_blackbox_dir or "SpectatorLogArchive")),
@@ -1336,6 +1344,10 @@ class AppConfig:
                 self.spectator_lobby_auto_start_minimize_target
             ),
             "spectator_final_report_delay_sec": float(max(0.0, min(30.0, self.spectator_final_report_delay_sec))),
+            "spectator_sp_throw_cost_scale": float(max(0.1, min(5.0, self.spectator_sp_throw_cost_scale))),
+            "spectator_sp_impact_cost_scale": float(max(0.0, min(5.0, self.spectator_sp_impact_cost_scale))),
+            "spectator_sp_fight_recovery_pct": float(max(0.0, min(100.0, self.spectator_sp_fight_recovery_pct))),
+            "spectator_sp_break_recovery_pct": float(max(0.0, min(100.0, self.spectator_sp_break_recovery_pct))),
             "spectator_commentary_enabled": bool(self.spectator_commentary_enabled),
             "spectator_commentary_mode": str(self.spectator_commentary_mode or "standard"),
             "spectator_commentary_min_damage": float(self.spectator_commentary_min_damage or 25.0),

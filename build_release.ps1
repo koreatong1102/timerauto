@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "1.0.14",
+  [string]$Version = "",
   [switch]$SkipPip,
   [switch]$BuildInstaller,
   [switch]$NoZip,
@@ -11,6 +11,15 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
+
+if ([string]::IsNullOrWhiteSpace($Version)) {
+  $source = Get-Content -LiteralPath (Join-Path $root "timerauto.py") -Raw -Encoding UTF8
+  $match = [regex]::Match($source, 'APP_VERSION\s*=\s*["'']([^"'']+)["'']')
+  if (-not $match.Success) {
+    throw "APP_VERSION was not found in timerauto.py"
+  }
+  $Version = $match.Groups[1].Value
+}
 
 Write-Host "Preparing release build (version: $Version)"
 

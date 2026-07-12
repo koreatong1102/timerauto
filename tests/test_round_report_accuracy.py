@@ -106,6 +106,50 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertEqual(round_one["landed"]["blue"], 1)
         self.assertEqual(round_one["punches"]["blue"]["hook"]["count"], 1)
 
+    def test_report_landed_requires_ten_damage_but_keeps_total_damage(self):
+        events = [
+            {
+                "attacker_side": "blue", "receiver_side": "red",
+                "punch": "Jab", "damage": 9.99, "weak_point": "Chin",
+            },
+            {
+                "attacker_side": "blue", "receiver_side": "red",
+                "punch": "RearHook", "damage": 10.0, "weak_point": "TempleLeft",
+            },
+        ]
+
+        stats = self.watcher._scorecard_from_fallback_events(events, 1, "")[1]
+
+        self.assertEqual(stats["landed"]["blue"], 1)
+        self.assertAlmostEqual(stats["dealt"]["blue"], 19.99)
+        self.assertNotIn("jab", stats["punches"]["blue"])
+        self.assertEqual(stats["punches"]["blue"]["hook"]["count"], 1)
+        self.assertNotIn("턱", stats["weak_received"]["red"])
+
+    def test_snapshot_accuracy_excludes_sub_ten_damage_match(self):
+        thrown = [
+            {"side": "blue", "hand": "left", "punch": "Jab", "time": 100.0},
+            {"side": "blue", "hand": "right", "punch": "RearHook", "time": 99.0},
+        ]
+        landed = [
+            {
+                "attacker_side": "blue", "receiver_side": "red", "hand": "left",
+                "punch": "Jab", "time": 100.05, "damage": 8.0,
+            },
+            {
+                "attacker_side": "blue", "receiver_side": "red", "hand": "right",
+                "punch": "RearHook", "time": 99.05, "damage": 12.0,
+            },
+        ]
+
+        self.watcher._record_scorecard_thrown_snapshot(1, thrown, landed)
+        round_one = self.watcher._scorecard_rounds[1]
+
+        self.assertEqual(round_one["thrown"]["blue"], 2)
+        self.assertEqual(round_one["landed"]["blue"], 1)
+        self.assertNotIn("jab", round_one["punches"]["blue"])
+        self.assertEqual(round_one["punches"]["blue"]["hook"]["count"], 1)
+
     def test_damage_corner_is_receiver_when_matching_throw(self):
         thrown = [{"side": "red", "hand": "left", "punch": "BackHand", "time": 176.71}]
         landed = [{
@@ -131,7 +175,23 @@ class RoundReportAccuracyTests(unittest.TestCase):
             snapshot = self.watcher._punishment_snapshot(os.path.join(match, "damage_events.txt"))
         self.assertEqual(snapshot["blue"]["mid"], 40.0)
         self.assertEqual(snapshot["blue"]["long"], 25.0)
-        self.assertAlmostEqual(snapshot["blue"]["hp_ratio"], 0.45)
+        self.assertAlmostEqual(snapshot["blue"]["hp_ratio"], 0.75)
+
+    def test_report_health_keeps_last_in_fight_long_snapshot(self):
+        self.watcher._last_round_state = "fight"
+        live = {
+            "blue": {"mid": 80.0, "long": 35.0, "hp_ratio": 0.65},
+            "red": {"mid": 20.0, "long": 10.0, "hp_ratio": 0.90},
+        }
+        self.watcher._report_punishment_snapshot(3, live)
+        self.watcher._last_round_state = "results"
+        reset = {
+            "blue": {"mid": 0.0, "long": 0.0, "hp_ratio": 1.0},
+            "red": {"mid": 0.0, "long": 0.0, "hp_ratio": 1.0},
+        }
+        report = self.watcher._report_punishment_snapshot(3, reset)
+        self.assertEqual(report["blue"]["long"], 35.0)
+        self.assertEqual(report["blue"]["hp_ratio"], 0.65)
 
     def test_official_scores_replace_event_damage_and_knockdowns(self):
         with tempfile.TemporaryDirectory() as root:
@@ -149,6 +209,36 @@ class RoundReportAccuracyTests(unittest.TestCase):
         round_one = scorecard["rounds"][1]
         self.assertEqual(round_one["dealt"], {"blue": 1600.0, "red": 1200.0})
         self.assertEqual(round_one["knockdowns_for"], {"blue": 1, "red": 0})
+
+    def test_round_report_keeps_official_knockdowns_after_live_slice(self):
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\t20\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tJab\tHit\tChin\n")
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("100.0\tblue\tleft\tJab\n")
+            with open(os.path.join(root, "scores.csv"), "w", encoding="utf-8") as stream:
+                stream.write("round,blue_score,red_score,blue_total,red_total,blue_damage_taken,red_damage_taken,blue_kds,red_kds\n")
+                stream.write("1,10,7,10,7,500,800,0,2\n")
+            self.watcher._last_round_state = "break"
+            report = self.watcher._build_round_report_payload(damage_path, 1, ("BLUE", "RED"))
+        self.assertEqual(report["blue"]["knockdowns"], 2)
+        self.assertEqual(report["red"]["knockdowns"], 0)
+
+    def test_tko_round_report_keeps_official_score_row(self):
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\t20\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tJab\tHit\tChin\n")
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("100.0\tblue\tleft\tJab\n")
+            with open(os.path.join(root, "scores.csv"), "w", encoding="utf-8") as stream:
+                stream.write("round,blue_score,red_score,blue_total,red_total\n")
+                stream.write("2,10,7,20,17\n")
+            self.watcher._last_round_state = "knockout"
+            report = self.watcher._build_round_report_payload(damage_path, 2, ("BLUE", "RED"), force_final=False)
+        self.assertEqual(report["blue"]["officialScore"], 10)
+        self.assertEqual(report["red"]["officialScore"], 7)
 
     def test_live_sp_throw_reader_consumes_only_appended_rows(self):
         with tempfile.TemporaryDirectory() as root:

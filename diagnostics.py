@@ -308,6 +308,12 @@ class DiagnosticRecorder:
             "match/scores.csv",
             "match/winner.txt",
             "match/camera_input.txt",
+            "blue/punishment_mid.txt",
+            "blue/punishment_long_raw.txt",
+            "blue/punishment_long_weighted.txt",
+            "red/punishment_mid.txt",
+            "red/punishment_long_raw.txt",
+            "red/punishment_long_weighted.txt",
             "blue/name.txt",
             "red/name.txt",
             "blue/accessibility.txt",
@@ -319,6 +325,17 @@ class DiagnosticRecorder:
     def _app_log_candidates(self, base: str) -> Iterable[str]:
         for rel in ("timerauto.log", "app.log", "logs/timerauto.log", "logs/app.log", "logs/error.log"):
             yield os.path.join(base, rel)
+        logs_dir = os.path.join(base, "logs")
+        try:
+            dated = [
+                os.path.join(logs_dir, name)
+                for name in os.listdir(logs_dir)
+                if name.lower().startswith("timerauto_") and name.lower().endswith(".log")
+            ]
+            for path in sorted(dated, key=os.path.getmtime, reverse=True)[:3]:
+                yield path
+        except Exception:
+            return
 
     def _detect_spectator_format(self, root: str) -> dict:
         info: Dict[str, Any] = {"root_exists": bool(root and os.path.isdir(root)), "root": _mask_string(root or "")}

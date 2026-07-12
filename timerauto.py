@@ -813,6 +813,7 @@ def click_window_client_point(
     restore_focus: bool = True,
     restore_cursor: bool = True,
     minimize_target: bool = False,
+    restore_minimized_after: bool = True,
     previous_hwnd_override: int = 0,
     previous_cursor_override: Optional[Tuple[int, int]] = None,
     reference_width: int = 0,
@@ -834,16 +835,6 @@ def click_window_client_point(
         return False, "시작 버튼 좌표가 올바르지 않습니다."
 
     user32 = ctypes.windll.user32
-    current_width, current_height = window_client_size(title_part)
-    if reference_width > 0 and reference_height > 0 and current_width > 0 and current_height > 0:
-        client_x = int(round(client_x * current_width / max(1, int(reference_width))))
-        client_y = int(round(client_y * current_height / max(1, int(reference_height))))
-    if current_width <= 0 or current_height <= 0 or client_x >= current_width or client_y >= current_height:
-        return False, f"Click point outside target client: point=({client_x},{client_y}) size=({current_width},{current_height})"
-    target = wintypes.POINT(client_x, client_y)
-    if not user32.ClientToScreen(hwnd, ctypes.byref(target)):
-        return False, "ClientToScreen failed"
-    target_x, target_y = int(target.x), int(target.y)
     previous_hwnd = int(previous_hwnd_override or user32.GetForegroundWindow() or 0)
     previous_cursor = wintypes.POINT()
     have_previous_cursor = bool(user32.GetCursorPos(ctypes.byref(previous_cursor)))
@@ -852,13 +843,51 @@ def click_window_client_point(
         previous_cursor.y = int(previous_cursor_override[1])
         have_previous_cursor = True
 
+    # A minimized Windows window commonly reports a 1x1 client rectangle.
+    # Restore it before scaling the saved reference coordinates.
+    was_minimized = bool(user32.IsIconic(wintypes.HWND(hwnd)))
+    initial_width, initial_height = window_client_size(title_part)
+    if was_minimized or initial_width <= 2 or initial_height <= 2:
+        user32.ShowWindow(wintypes.HWND(hwnd), 9)  # SW_RESTORE
+    should_minimize_after = bool(minimize_target or (was_minimized and restore_minimized_after))
+    if activate:
+        activated, activate_detail = _activate_window_reliably(hwnd)
+        if not activated:
+            logging.warning("LOBBY_AUTO_START_ACTIVATE_FAIL %s", activate_detail)
+
+    current_width, current_height = 0, 0
+    for _attempt in range(12):
+        current_width, current_height = window_client_size(title_part)
+        if current_width > 2 and current_height > 2:
+            break
+        time.sleep(0.05)
+    logging.info(
+        "LOBBY_AUTO_START_CLIENT_READY hwnd=%s minimized=%s initial=(%s,%s) current=(%s,%s)",
+        hwnd, was_minimized, initial_width, initial_height, current_width, current_height,
+    )
+
+    def _abort_after_restore(message: str) -> Tuple[bool, str]:
+        if should_minimize_after:
+            user32.ShowWindow(wintypes.HWND(hwnd), 6)  # SW_MINIMIZE
+        if restore_focus and previous_hwnd and previous_hwnd != hwnd:
+            _activate_window_reliably(previous_hwnd, restore=True)
+        return False, message
+    if reference_width > 0 and reference_height > 0 and current_width > 0 and current_height > 0:
+        client_x = int(round(client_x * current_width / max(1, int(reference_width))))
+        client_y = int(round(client_y * current_height / max(1, int(reference_height))))
+    if current_width <= 0 or current_height <= 0 or client_x >= current_width or client_y >= current_height:
+        return _abort_after_restore(
+            f"Click point outside target client: point=({client_x},{client_y}) size=({current_width},{current_height})"
+        )
+    target = wintypes.POINT(client_x, client_y)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(target)):
+        return _abort_after_restore("ClientToScreen failed")
+    target_x, target_y = int(target.x), int(target.y)
+
     click_ok = False
     detail = ""
     try:
         if activate:
-            activated, activate_detail = _activate_window_reliably(hwnd)
-            if not activated:
-                logging.warning("LOBBY_AUTO_START_ACTIVATE_FAIL %s", activate_detail)
             time.sleep(0.12)
         if not user32.SetCursorPos(target_x, target_y):
             detail = "SetCursorPos failed"
@@ -883,7 +912,7 @@ def click_window_client_point(
                 user32.SetCursorPos(int(previous_cursor.x), int(previous_cursor.y))
             except Exception:
                 pass
-        if minimize_target:
+        if should_minimize_after:
             try:
                 user32.ShowWindow(wintypes.HWND(hwnd), 6)  # SW_MINIMIZE
                 logging.info("LOBBY_AUTO_START_TARGET_MINIMIZED hwnd=%s", hwnd)
@@ -2749,6 +2778,8 @@ class TimerBackend(QObject):
         self._last_red_round_damage_for_sp = 0.0
         self._last_sp_activity_spent = {"blue": 0.0, "red": 0.0}
         self._last_rest_seconds_for_sp = None
+        self._sp_rest_start_seconds = None
+        self._sp_rest_start_ratio = {"blue": 1.0, "red": 1.0}
         self._last_fight_seconds_for_sp = None
         self._sp_recovery_delay = {"blue": 0.0, "red": 0.0}
         self._blue_round_knockdowns = 0
@@ -3333,7 +3364,7 @@ class TimerBackend(QObject):
         if delta <= 0:
             return
         if side in self._sp_recovery_delay:
-            self._sp_recovery_delay[side] = 1.2
+            self._sp_recovery_delay[side] = max(0.0, float(getattr(self.cfg, "spectator_sp_recovery_delay_sec", 1.5) or 0.0))
         spend = delta / 3000.0
         if side == "blue":
             self._set_sp_ratio("blue", float(self._blue_sp_ratio or 0.0) - spend)
@@ -3367,7 +3398,7 @@ class TimerBackend(QObject):
                 self._sp_recovery_delay[side] = delay
             if recover_elapsed <= 0:
                 continue
-            recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 15.0) or 0.0) / 100.0))
+            recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 5.0) or 0.0) / 100.0))
             gain = recovery * (recover_elapsed / float(round_sec))
             current = float(self._blue_sp_ratio if side == "blue" else self._red_sp_ratio)
             self._set_sp_ratio(side, current + gain)
@@ -3375,6 +3406,7 @@ class TimerBackend(QObject):
     def _sp_apply_rest_recovery(self, seconds_left: Optional[int]):
         if not self.in_rest or seconds_left is None:
             self._last_rest_seconds_for_sp = None
+            self._sp_rest_start_seconds = None
             return
         try:
             cur = max(0, int(seconds_left))
@@ -3382,6 +3414,11 @@ class TimerBackend(QObject):
             return
         if self._last_rest_seconds_for_sp is None:
             self._last_rest_seconds_for_sp = cur
+            self._sp_rest_start_seconds = cur
+            self._sp_rest_start_ratio = {
+                "blue": float(self._blue_sp_ratio or 0.0),
+                "red": float(self._red_sp_ratio or 0.0),
+            }
             return
         prev = int(self._last_rest_seconds_for_sp)
         elapsed = max(0, prev - cur)
@@ -3389,15 +3426,20 @@ class TimerBackend(QObject):
         if elapsed <= 0:
             return
         rest_sec = max(1, int(self.rest_duration_sec or 60))
-        recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 60.0) or 0.0) / 100.0))
-        gain = recovery * (float(elapsed) / float(rest_sec))
-        self._set_sp_ratio("blue", float(self._blue_sp_ratio or 0.0) + gain)
-        self._set_sp_ratio("red", float(self._red_sp_ratio or 0.0) + gain)
+        recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 30.0) or 0.0) / 100.0))
+        start_seconds = int(self._sp_rest_start_seconds if self._sp_rest_start_seconds is not None else prev)
+        progressed = max(0.0, min(1.0, float(start_seconds - cur) / float(rest_sec)))
+        for side in ("blue", "red"):
+            start = max(0.0, min(1.0, float((self._sp_rest_start_ratio or {}).get(side, 1.0) or 0.0)))
+            # Recover only a fraction of the missing SP over the whole break.
+            self._set_sp_ratio(side, start + (1.0 - start) * recovery * progressed)
 
     def reset_spectator_sp(self):
         self._last_blue_round_damage_for_sp = 0.0
         self._last_red_round_damage_for_sp = 0.0
         self._last_rest_seconds_for_sp = None
+        self._sp_rest_start_seconds = None
+        self._sp_rest_start_ratio = {"blue": 1.0, "red": 1.0}
         self._last_fight_seconds_for_sp = None
         self._sp_recovery_delay = {"blue": 0.0, "red": 0.0}
         self._last_sp_activity_spent = {"blue": 0.0, "red": 0.0}
@@ -3418,7 +3460,7 @@ class TimerBackend(QObject):
             self._last_sp_activity_spent[side] = value
             if delta <= 0.0:
                 continue
-            self._sp_recovery_delay[side] = 1.5
+            self._sp_recovery_delay[side] = max(0.0, float(getattr(self.cfg, "spectator_sp_recovery_delay_sec", 1.5) or 0.0))
             current = float(self._blue_sp_ratio if side == "blue" else self._red_sp_ratio)
             self._set_sp_ratio(side, current - delta)
 
@@ -6138,6 +6180,7 @@ class SettingsDialog(QDialog):
         self.tab_players = QWidget()
         self.tab_timer = QWidget()
         self.tab_overlay = QWidget()
+        self.tab_sp = QWidget()
         self.tab_hit_effects = QWidget()
         self.tab_logs = QWidget()
         self.tab_log_records = QWidget()
@@ -6154,6 +6197,7 @@ class SettingsDialog(QDialog):
 
         self.tabs.addTab(self.tab_players, "플레이어")
         self.tabs.addTab(self.tab_overlay, "오버레이")
+        self.tabs.addTab(self.tab_sp, "SP 관리")
         self.tabs.addTab(self.tab_hit_effects, "피격 효과")
         self.tabs.addTab(self.tab_logs, "로그 감지")
         self.tabs.addTab(self.tab_log_records, "기록")
@@ -7189,23 +7233,20 @@ class SettingsDialog(QDialog):
         self.sp_spectator_sp_impact_scale = QDoubleSpinBox()
         self.sp_spectator_sp_impact_scale.setRange(0.0, 5.0)
         self.sp_spectator_sp_impact_scale.setSingleStep(0.1)
-        self.sp_spectator_sp_impact_scale.setValue(float(getattr(self.cfg, "spectator_sp_impact_cost_scale", 1.0) or 1.0))
-        spectator_lay.addWidget(QLabel("SP 펀치 소비 배율"), 18, 0)
-        spectator_lay.addWidget(self.sp_spectator_sp_throw_scale, 18, 1)
-        spectator_lay.addWidget(QLabel("SP 타격 강도 배율"), 18, 2)
-        spectator_lay.addWidget(self.sp_spectator_sp_impact_scale, 18, 3)
+        self.sp_spectator_sp_impact_scale.setValue(float(getattr(self.cfg, "spectator_sp_impact_cost_scale", 1.25)))
         self.sp_spectator_sp_fight_recovery = QDoubleSpinBox()
         self.sp_spectator_sp_fight_recovery.setRange(0.0, 100.0)
         self.sp_spectator_sp_fight_recovery.setSuffix(" %")
-        self.sp_spectator_sp_fight_recovery.setValue(float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 15.0) or 0.0))
+        self.sp_spectator_sp_fight_recovery.setValue(float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 5.0) or 0.0))
         self.sp_spectator_sp_break_recovery = QDoubleSpinBox()
         self.sp_spectator_sp_break_recovery.setRange(0.0, 100.0)
         self.sp_spectator_sp_break_recovery.setSuffix(" %")
-        self.sp_spectator_sp_break_recovery.setValue(float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 60.0) or 0.0))
-        spectator_lay.addWidget(QLabel("경기 중 SP 회복"), 19, 0)
-        spectator_lay.addWidget(self.sp_spectator_sp_fight_recovery, 19, 1)
-        spectator_lay.addWidget(QLabel("휴식 SP 회복"), 19, 2)
-        spectator_lay.addWidget(self.sp_spectator_sp_break_recovery, 19, 3)
+        self.sp_spectator_sp_break_recovery.setValue(float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 30.0) or 0.0))
+        self.sp_spectator_sp_recovery_delay = QDoubleSpinBox()
+        self.sp_spectator_sp_recovery_delay.setRange(0.0, 10.0)
+        self.sp_spectator_sp_recovery_delay.setSingleStep(0.1)
+        self.sp_spectator_sp_recovery_delay.setSuffix(" sec")
+        self.sp_spectator_sp_recovery_delay.setValue(float(getattr(self.cfg, "spectator_sp_recovery_delay_sec", 1.5) or 0.0))
 
         self.btn_spectatorlog_test_blue_stun= QPushButton("블루 스턴 테스트")
         self.btn_spectatorlog_test_red_stun= QPushButton("레드 스턴 테스트")
@@ -7608,6 +7649,11 @@ class SettingsDialog(QDialog):
         self.chk_spectatorlog_blackbox_enabled.stateChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_spectatorlog_state()))
         self.cmb_spectatorlog_blackbox_mode.currentIndexChanged.connect(self._schedule_apply)
         self.le_spectatorlog_blackbox_dir.textChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_spectatorlog_state()))
+        self.sp_spectator_sp_throw_scale.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_sp_impact_scale.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_sp_fight_recovery.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_sp_break_recovery.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_sp_recovery_delay.valueChanged.connect(self._schedule_apply)
         self.btn_spectatorlog_blackbox_open.clicked.connect(self._open_spectatorlog_blackbox_dir)
         self.btn_spectatorlog_test_blue_stun.clicked.connect(lambda: self._test_spectator_stun("blue"))
         self.btn_spectatorlog_test_red_stun.clicked.connect(lambda: self._test_spectator_stun("red"))
@@ -7920,6 +7966,29 @@ class SettingsDialog(QDialog):
         auto_start_tab_lay = QVBoxLayout()
         auto_start_tab_lay.addWidget(self.auto_start_scroll)
         self.tab_auto_start.setLayout(auto_start_tab_lay)
+
+        sp_group = QGroupBox("SP 소모 및 회복")
+        sp_lay = QGridLayout(sp_group)
+        sp_lay.setColumnStretch(1, 1)
+        sp_lay.setColumnStretch(3, 1)
+        sp_lay.addWidget(QLabel("펀치 소모 배율"), 0, 0)
+        sp_lay.addWidget(self.sp_spectator_sp_throw_scale, 0, 1)
+        sp_lay.addWidget(QLabel("적중 추가 소모 배율"), 0, 2)
+        sp_lay.addWidget(self.sp_spectator_sp_impact_scale, 0, 3)
+        sp_lay.addWidget(QLabel("경기 중 회복"), 1, 0)
+        sp_lay.addWidget(self.sp_spectator_sp_fight_recovery, 1, 1)
+        sp_lay.addWidget(QLabel("휴식 중 부족분 회복"), 1, 2)
+        sp_lay.addWidget(self.sp_spectator_sp_break_recovery, 1, 3)
+        sp_lay.addWidget(QLabel("공격 후 회복 대기"), 2, 0)
+        sp_lay.addWidget(self.sp_spectator_sp_recovery_delay, 2, 1)
+        sp_hint = QLabel("휴식 회복은 최대 SP를 더하는 방식이 아니라, 현재 부족한 SP의 지정 비율만 회복합니다.")
+        sp_hint.setWordWrap(True)
+        sp_hint.setStyleSheet("color:#94a3b8;")
+        sp_lay.addWidget(sp_hint, 3, 0, 1, 4)
+        sp_outer = QVBoxLayout()
+        sp_outer.addWidget(sp_group)
+        sp_outer.addStretch(1)
+        self.tab_sp.setLayout(sp_outer)
 
         sound_lay_outer.addWidget(sound_group)
         sound_lay_outer.addStretch(1)
@@ -15996,6 +16065,7 @@ class SettingsDialog(QDialog):
             self.cfg.spectator_sp_impact_cost_scale = float(self.sp_spectator_sp_impact_scale.value())
             self.cfg.spectator_sp_fight_recovery_pct = float(self.sp_spectator_sp_fight_recovery.value())
             self.cfg.spectator_sp_break_recovery_pct = float(self.sp_spectator_sp_break_recovery.value())
+            self.cfg.spectator_sp_recovery_delay_sec = float(self.sp_spectator_sp_recovery_delay.value())
         if hasattr(self, "chk_spectatorlog_blackbox_enabled"):
             self.cfg.spectatorlog_blackbox_enabled = bool(self.chk_spectatorlog_blackbox_enabled.isChecked())
         if hasattr(self, "le_spectatorlog_blackbox_dir"):
@@ -16499,9 +16569,10 @@ class SettingsDialog(QDialog):
             self.sp_spectatorlog_debounce.setValue(int(getattr(self.cfg, "spectatorlog_debounce_ms", 8) or 8))
         if hasattr(self, "sp_spectator_sp_throw_scale"):
             self.sp_spectator_sp_throw_scale.setValue(float(getattr(self.cfg, "spectator_sp_throw_cost_scale", 1.0) or 1.0))
-            self.sp_spectator_sp_impact_scale.setValue(float(getattr(self.cfg, "spectator_sp_impact_cost_scale", 1.0) or 1.0))
-            self.sp_spectator_sp_fight_recovery.setValue(float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 15.0) or 0.0))
-            self.sp_spectator_sp_break_recovery.setValue(float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 60.0) or 0.0))
+            self.sp_spectator_sp_impact_scale.setValue(float(getattr(self.cfg, "spectator_sp_impact_cost_scale", 1.25)))
+            self.sp_spectator_sp_fight_recovery.setValue(float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 5.0) or 0.0))
+            self.sp_spectator_sp_break_recovery.setValue(float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 30.0) or 0.0))
+            self.sp_spectator_sp_recovery_delay.setValue(float(getattr(self.cfg, "spectator_sp_recovery_delay_sec", 1.5) or 0.0))
         if hasattr(self, "sp_spectatorlog_backup_poll"):
             self.sp_spectatorlog_backup_poll.setValue(int(getattr(self.cfg, "spectatorlog_backup_poll_ms", 1500) or 1500))
         if hasattr(self, "chk_spectatorlog_blackbox_enabled"):
@@ -16806,6 +16877,8 @@ class MainApp(QObject):
         self._browser_sp_last_activity_spent = {"blue": 0.0, "red": 0.0}
         self._browser_sp_last_fight_seconds = None
         self._browser_sp_last_rest_seconds = None
+        self._browser_sp_rest_start_seconds = None
+        self._browser_sp_rest_start_ratio = {"blue": 1.0, "red": 1.0}
         self._browser_round_knockdowns = {"blue": 0, "red": 0}
         self._browser_knockdown_round_key = None
         self._browser_overlay_timer = QTimer()
@@ -19336,6 +19409,8 @@ class MainApp(QObject):
         self._browser_sp_last_activity_spent = {"blue": 0.0, "red": 0.0}
         self._browser_sp_last_fight_seconds = None
         self._browser_sp_last_rest_seconds = None
+        self._browser_sp_rest_start_seconds = None
+        self._browser_sp_rest_start_ratio = {"blue": 1.0, "red": 1.0}
 
     def _browser_overlay_sp_update(self, d: dict, state: dict) -> Dict[str, float]:
         ratios = dict(getattr(self, "_browser_sp_ratio", {}) or {})
@@ -19361,6 +19436,8 @@ class MainApp(QObject):
             delay = {"blue": 0.0, "red": 0.0}
             self._browser_sp_last_fight_seconds = None
             self._browser_sp_last_rest_seconds = None
+            self._browser_sp_rest_start_seconds = None
+            self._browser_sp_rest_start_ratio = {"blue": 1.0, "red": 1.0}
             self._browser_sp_last_activity_spent = {"blue": 0.0, "red": 0.0}
 
         if isinstance(d.get("spectator_sp_activity_spent"), dict):
@@ -19375,7 +19452,7 @@ class MainApp(QObject):
                 previous_spent[side] = value
                 if delta > 0.0:
                     ratios[side] = max(0.0, ratios[side] - delta)
-                    delay[side] = 1.5
+                    delay[side] = max(0.0, float(getattr(self.cfg, "spectator_sp_recovery_delay_sec", 1.5) or 0.0))
             self._browser_sp_last_activity_spent = previous_spent
 
         if "seconds_left" in d:
@@ -19389,16 +19466,21 @@ class MainApp(QObject):
                     self._browser_sp_last_fight_seconds = None
                     prev = self._browser_sp_last_rest_seconds
                     self._browser_sp_last_rest_seconds = cur
-                    if prev is not None:
-                        elapsed = max(0, int(prev) - cur)
-                        if elapsed > 0:
-                            rest_sec = max(1, int(getattr(self.cfg, "timer_rest_sec", 60) or 60))
-                            recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 60.0) or 0.0) / 100.0))
-                            gain = recovery * (float(elapsed) / float(rest_sec))
-                            ratios["blue"] = min(1.0, ratios["blue"] + gain)
-                            ratios["red"] = min(1.0, ratios["red"] + gain)
+                    if prev is None:
+                        self._browser_sp_rest_start_seconds = cur
+                        self._browser_sp_rest_start_ratio = {"blue": float(ratios["blue"]), "red": float(ratios["red"])}
+                    else:
+                        rest_sec = max(1, int(getattr(self.cfg, "timer_rest_sec", 60) or 60))
+                        recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 30.0) or 0.0) / 100.0))
+                        start_seconds = int(getattr(self, "_browser_sp_rest_start_seconds", prev) or prev)
+                        progressed = max(0.0, min(1.0, float(start_seconds - cur) / float(rest_sec)))
+                        starts = dict(getattr(self, "_browser_sp_rest_start_ratio", {}) or {})
+                        for side in ("blue", "red"):
+                            start = max(0.0, min(1.0, float(starts.get(side, ratios[side]) or 0.0)))
+                            ratios[side] = start + (1.0 - start) * recovery * progressed
                 else:
                     self._browser_sp_last_rest_seconds = None
+                    self._browser_sp_rest_start_seconds = None
                     prev = self._browser_sp_last_fight_seconds
                     self._browser_sp_last_fight_seconds = cur
                     if prev is not None:
@@ -19412,7 +19494,7 @@ class MainApp(QObject):
                                     delay[side] -= used
                                     recover_elapsed -= used
                                 if recover_elapsed > 0:
-                                    recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 15.0) or 0.0) / 100.0))
+                                    recovery = max(0.0, min(1.0, float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 5.0) or 0.0) / 100.0))
                                     gain = recovery * (recover_elapsed / float(round_sec))
                                     ratios[side] = min(1.0, ratios[side] + gain)
 
@@ -20706,6 +20788,8 @@ class MainApp(QObject):
                 sec = _int(d.get("seconds_left", self.cfg.timer_seconds_left), self.cfg.timer_seconds_left)
                 update["timeText"] = "%d:%02d" % (max(0, sec) // 60, max(0, sec) % 60)
                 update["roundText"] = "RD %d OF %d" % (max(1, cur), max(1, total))
+                if str(d.get("spectator_time_mode", "") or "").startswith("knockdown"):
+                    update["timeText"] = "KD"
 
             if "timer_seconds_left" in d or "timer_current_round" in d or "timer_total_rounds" in d:
                 cur = _int(d.get("timer_current_round", self.cfg.timer_current_round), self.cfg.timer_current_round)
@@ -20883,8 +20967,13 @@ class MainApp(QObject):
                 )
             elif "spectator_round_report" in d and isinstance(d.get("spectator_round_report"), dict):
                 report_payloads.append(dict(d.get("spectator_round_report") or {}))
-            for report_payload in report_payloads:
+            queued_delay_ms = 0
+            for report_index, report_payload in enumerate(report_payloads):
                 try:
+                    if report_index > 0:
+                        report_payload["showDelayMs"] = queued_delay_ms
+                    else:
+                        queued_delay_ms = max(0, int(report_payload.get("showDelayMs", 0) or 0))
                     # Freeze HUD vitals at report creation time. Browser reports
                     # must not infer stamina from punishment or follow later resets.
                     for side, sp_ratio in (
@@ -20899,6 +20988,7 @@ class MainApp(QObject):
                             side_payload["healthPct"] = int(round(max(0.0, min(1.0, float(hp_ratio))) * 100.0))
                         report_payload[side] = side_payload
                     overlay.push_event("round_report", **report_payload)
+                    queued_delay_ms += max(0, int(report_payload.get("displayMs", 0) or 0))
                 except Exception:
                     logging.exception("BROWSER_OVERLAY_ROUND_REPORT_EVENT_FAIL")
             if bool(d.get("spectator_lobby_hide")):
@@ -20984,6 +21074,7 @@ class MainApp(QObject):
                         restore_focus=restore_focus and index == click_count - 1,
                         restore_cursor=restore_cursor and index == click_count - 1,
                         minimize_target=minimize_target and index == click_count - 1,
+                        restore_minimized_after=index == click_count - 1,
                         previous_hwnd_override=original_hwnd,
                         previous_cursor_override=original_cursor,
                         reference_width=reference_width,
@@ -21394,6 +21485,11 @@ class MainApp(QObject):
                     d.get("round_total", None),
                     d.get("seconds_left", None),
                 )
+                if str(d.get("spectator_time_mode", "") or "").startswith("knockdown"):
+                    backend = getattr(self.timer_win, "_backend", None)
+                    if backend is not None and getattr(backend, "_time_text", "") != "KD":
+                        backend._time_text = "KD"
+                        backend.timeTextChanged.emit()
             try:
                 logging.info(
                     "TIMER_SYNC_APPLY_DONE source=%s round_current=%s round_total=%s seconds_left=%s in_rest=%s text=%s round_text=%s",

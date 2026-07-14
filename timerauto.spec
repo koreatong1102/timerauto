@@ -45,6 +45,7 @@ datas_base = [
     ('timer_ui.qml', '.'),
     ('cinematic_overlay.qml', '.'),
     ('timer_controls.qml', '.'),
+    ('assets', 'assets'),
 ]
 if INCLUDE_USER_CONFIG:
     for optional_file in ('config.json', 'profile.json'):

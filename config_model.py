@@ -14,7 +14,7 @@ import os
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional
 
-from app_paths import app_path, normalize_app_path, to_app_rel
+from app_paths import app_path, normalize_app_path, normalize_builtin_asset_path, to_app_rel
 
 def migrate_action_keys(actions: Dict[str, List[dict]],
                         pixel_rules: List[dict]) -> Dict[str, List[dict]]:
@@ -87,16 +87,16 @@ def _normalize_win_effects_paths(data: Optional[dict]) -> dict:
     raw = dict(data or {})
     burst = dict(raw.get("burst", {}) or {})
     if "sfx_path" in burst:
-        burst["sfx_path"] = to_app_rel(str(burst.get("sfx_path", "") or ""))
+        burst["sfx_path"] = to_app_rel(normalize_builtin_asset_path(str(burst.get("sfx_path", "") or "")))
     raw["burst"] = burst
     fail = dict(raw.get("fail", {}) or {})
     if "sfx_path" in fail:
-        fail["sfx_path"] = to_app_rel(str(fail.get("sfx_path", "") or ""))
+        fail["sfx_path"] = to_app_rel(normalize_builtin_asset_path(str(fail.get("sfx_path", "") or "")))
     raw["fail"] = fail
     nameplates = dict(raw.get("nameplates", {}) or {})
     imgs = nameplates.get("images", [])
     if isinstance(imgs, list):
-        nameplates["images"] = [to_app_rel(str(p or "")) for p in imgs]
+        nameplates["images"] = [to_app_rel(normalize_builtin_asset_path(str(p or ""))) for p in imgs]
     raw["nameplates"] = nameplates
     return raw
 
@@ -634,6 +634,44 @@ class AppConfig:
     chapter_output_dir: str = ""
     chapter_nickname_only: bool = False
     chapter_hide_time: bool = False
+    obs_integration_enabled: bool = False
+    obs_host: str = "127.0.0.1"
+    obs_port: int = 4455
+    obs_password: str = ""
+    obs_auto_chapter_enabled: bool = False
+    obs_chapter_add_start_event: bool = True
+    obs_chapter_export_on_stop: bool = False
+    obs_replay_buffer_enabled: bool = False
+    obs_replay_buffer_auto_start: bool = True
+    obs_highlight_kd: bool = True
+    obs_highlight_tko: bool = True
+    obs_highlight_stun: bool = True
+    obs_highlight_counter: bool = True
+    obs_highlight_combo: bool = True
+    obs_highlight_heavy: bool = True
+    obs_highlight_counter_damage_min: float = 30.0
+    obs_highlight_combo_min: int = 3
+    obs_highlight_damage_min: float = 55.0
+    obs_highlight_cooldown_sec: float = 8.0
+    obs_auto_replay_enabled: bool = True
+    obs_auto_replay_kd: bool = True
+    obs_auto_replay_tko: bool = True
+    # Wait briefly after every highlight trigger so the decisive moment is
+    # present in OBS Replay Buffer before it is saved.
+    obs_auto_replay_capture_delay_sec: float = 1.0
+    obs_auto_replay_delay_sec: float = 2.0
+    obs_auto_replay_muted: bool = True
+    obs_auto_replay_volume: int = 100
+    obs_auto_replay_fit: str = "cover"
+    obs_auto_replay_fade_ms: int = 140
+    obs_auto_replay_stop_on_round: bool = True
+    idle_highlight_enabled: bool = False
+    idle_highlight_path: str = ""
+    idle_highlight_random: bool = True
+    idle_highlight_muted: bool = True
+    idle_highlight_volume: int = 0
+    idle_highlight_fit: str = "cover"
+    idle_highlight_fade_ms: int = 350
     # Release first-run default: ON, because public builds do not ship SWa's
     # config.json.  If the user presses log detection, it should work immediately
     # with auto SpectatorLog path discovery instead of silently staying OFF.
@@ -675,6 +713,16 @@ class AppConfig:
     # addition to the full gauge.  Thirty percent keeps a tired fighter tired.
     spectator_sp_break_recovery_pct: float = 30.0
     spectator_sp_recovery_delay_sec: float = 1.5
+    spectator_sp_bar_x: int = 0
+    spectator_sp_bar_y: int = 0
+    spectator_sp_bar_length_pct: int = 100
+    spectator_sp_bar_thickness: int = 10
+    spectator_sp_bar_color: str = "#1876d3"
+    spectator_name_bar_x: int = 0
+    spectator_name_bar_y: int = 0
+    spectator_fight_style_enabled: bool = True
+    spectator_fight_style_min_attempts: int = 20
+    spectator_fight_style_min_landed: int = 10
     spectator_commentary_enabled: bool = True
     spectator_commentary_mode: str = "standard"
     spectator_commentary_min_damage: float = 25.0
@@ -766,6 +814,24 @@ class AppConfig:
     overlay_vs_bg_opacity: float = 1.0
     overlay_vs_bg_by_arena: Dict[str, str] = field(default_factory=dict)
     overlay_vs_hold_sec: float = 2.85
+    overlay_kd_image_path: str = "assets/images/overlays/KD.png"
+    overlay_tko_image_path: str = "assets/images/overlays/TKO.png"
+    overlay_ko_image_scale_pct: int = 100
+    overlay_ko_x: int = 0
+    overlay_ko_y: int = 0
+    overlay_ko_motion_blur_pct: int = 100
+    overlay_ko_flash_intensity_pct: int = 100
+    overlay_ko_trail_intensity_pct: int = 100
+    overlay_ko_shake_intensity_pct: int = 100
+    overlay_ko_screen_shake: bool = True
+    overlay_ko_perspective_px: int = 1400
+    overlay_ko_start_z_px: int = 760
+    overlay_ko_impact_depth_px: int = 34
+    overlay_ko_rebound_px: int = 20
+    overlay_ko_entry_ms: int = 500
+    overlay_ko_drop_y_px: int = 190
+    overlay_kd_hold_sec: float = 2.2
+    overlay_tko_hold_sec: float = 2.6
     browser_overlay_scale: float = 1.0
     browser_overlay_poll_ms: int = 50
     browser_overlay_output_only: bool = True
@@ -834,6 +900,46 @@ class AppConfig:
         cfg.chapter_output_dir = str(raw.get("chapter_output_dir", "") or "")
         cfg.chapter_nickname_only = bool(raw.get("chapter_nickname_only", False))
         cfg.chapter_hide_time = bool(raw.get("chapter_hide_time", False))
+        cfg.obs_integration_enabled = bool(raw.get("obs_integration_enabled", False))
+        cfg.obs_host = str(raw.get("obs_host", "127.0.0.1") or "127.0.0.1").strip()
+        cfg.obs_port = max(1, min(65535, int(raw.get("obs_port", 4455) or 4455)))
+        cfg.obs_password = str(raw.get("obs_password", "") or "")
+        cfg.obs_auto_chapter_enabled = bool(raw.get("obs_auto_chapter_enabled", False))
+        cfg.obs_chapter_add_start_event = bool(raw.get("obs_chapter_add_start_event", True))
+        cfg.obs_chapter_export_on_stop = bool(raw.get("obs_chapter_export_on_stop", False))
+        cfg.obs_replay_buffer_enabled = bool(raw.get("obs_replay_buffer_enabled", False))
+        cfg.obs_replay_buffer_auto_start = bool(raw.get("obs_replay_buffer_auto_start", True))
+        cfg.obs_highlight_kd = bool(raw.get("obs_highlight_kd", True))
+        cfg.obs_highlight_tko = bool(raw.get("obs_highlight_tko", True))
+        cfg.obs_highlight_stun = bool(raw.get("obs_highlight_stun", True))
+        cfg.obs_highlight_counter = bool(raw.get("obs_highlight_counter", True))
+        cfg.obs_highlight_combo = bool(raw.get("obs_highlight_combo", True))
+        cfg.obs_highlight_heavy = bool(raw.get("obs_highlight_heavy", True))
+        cfg.obs_highlight_counter_damage_min = max(0.0, min(300.0, float(raw.get("obs_highlight_counter_damage_min", 30.0) or 0.0)))
+        cfg.obs_highlight_combo_min = max(2, min(20, int(raw.get("obs_highlight_combo_min", 3) or 3)))
+        cfg.obs_highlight_damage_min = max(0.0, min(300.0, float(raw.get("obs_highlight_damage_min", 55.0) or 55.0)))
+        cfg.obs_highlight_cooldown_sec = max(0.0, min(120.0, float(raw.get("obs_highlight_cooldown_sec", 8.0) or 8.0)))
+        cfg.obs_auto_replay_enabled = bool(raw.get("obs_auto_replay_enabled", True))
+        cfg.obs_auto_replay_kd = bool(raw.get("obs_auto_replay_kd", True))
+        cfg.obs_auto_replay_tko = bool(raw.get("obs_auto_replay_tko", True))
+        cfg.obs_auto_replay_capture_delay_sec = max(0.0, min(15.0, float(raw.get("obs_auto_replay_capture_delay_sec", 1.0) or 0.0)))
+        cfg.obs_auto_replay_delay_sec = max(0.0, min(15.0, float(raw.get("obs_auto_replay_delay_sec", 2.0) or 0.0)))
+        cfg.obs_auto_replay_muted = bool(raw.get("obs_auto_replay_muted", True))
+        cfg.obs_auto_replay_volume = max(0, min(100, int(raw.get("obs_auto_replay_volume", 100) or 0)))
+        cfg.obs_auto_replay_fit = str(raw.get("obs_auto_replay_fit", "cover") or "cover").lower()
+        if cfg.obs_auto_replay_fit not in ("cover", "contain"):
+            cfg.obs_auto_replay_fit = "cover"
+        cfg.obs_auto_replay_fade_ms = max(0, min(2000, int(raw.get("obs_auto_replay_fade_ms", 140) or 0)))
+        cfg.obs_auto_replay_stop_on_round = bool(raw.get("obs_auto_replay_stop_on_round", True))
+        cfg.idle_highlight_enabled = bool(raw.get("idle_highlight_enabled", False))
+        cfg.idle_highlight_path = str(raw.get("idle_highlight_path", "") or "")
+        cfg.idle_highlight_random = bool(raw.get("idle_highlight_random", True))
+        cfg.idle_highlight_muted = bool(raw.get("idle_highlight_muted", True))
+        cfg.idle_highlight_volume = max(0, min(100, int(raw.get("idle_highlight_volume", 0) or 0)))
+        cfg.idle_highlight_fit = str(raw.get("idle_highlight_fit", "cover") or "cover").lower()
+        if cfg.idle_highlight_fit not in ("cover", "contain"):
+            cfg.idle_highlight_fit = "cover"
+        cfg.idle_highlight_fade_ms = max(0, min(3000, int(raw.get("idle_highlight_fade_ms", 350) or 350)))
         cfg.spectatorlog_enabled = bool(raw.get("spectatorlog_enabled", True))
         cfg.spectatorlog_path = str(raw.get("spectatorlog_path", "") or "")
         cfg.spectatorlog_sync_timer = bool(raw.get("spectatorlog_sync_timer", True))
@@ -880,13 +986,37 @@ class AppConfig:
         cfg.spectator_sp_fight_recovery_pct = max(0.0, min(100.0, float(raw.get("spectator_sp_fight_recovery_pct", 5.0) or 0.0)))
         cfg.spectator_sp_break_recovery_pct = max(0.0, min(100.0, float(raw.get("spectator_sp_break_recovery_pct", 30.0) or 0.0)))
         cfg.spectator_sp_recovery_delay_sec = max(0.0, min(10.0, float(raw.get("spectator_sp_recovery_delay_sec", 1.5) or 0.0)))
+        try:
+            cfg.spectator_sp_bar_x = max(-300, min(300, int(raw.get("spectator_sp_bar_x", 0) or 0)))
+            cfg.spectator_sp_bar_y = max(-100, min(100, int(raw.get("spectator_sp_bar_y", 0) or 0)))
+            cfg.spectator_sp_bar_length_pct = max(25, min(160, int(raw.get("spectator_sp_bar_length_pct", 100) or 100)))
+            cfg.spectator_sp_bar_thickness = max(2, min(40, int(raw.get("spectator_sp_bar_thickness", 10) or 10)))
+        except (TypeError, ValueError):
+            cfg.spectator_sp_bar_x = 0
+            cfg.spectator_sp_bar_y = 0
+            cfg.spectator_sp_bar_length_pct = 100
+            cfg.spectator_sp_bar_thickness = 10
+        cfg.spectator_sp_bar_color = _normalize_hex_color(str(raw.get("spectator_sp_bar_color", "#1876d3") or "#1876d3"))
+        cfg.spectator_name_bar_x = max(-300, min(300, int(raw.get("spectator_name_bar_x", 0) or 0)))
+        cfg.spectator_name_bar_y = max(-100, min(100, int(raw.get("spectator_name_bar_y", 0) or 0)))
+        cfg.spectator_fight_style_enabled = bool(raw.get("spectator_fight_style_enabled", True))
+        try:
+            cfg.spectator_fight_style_min_attempts = max(
+                1, min(500, int(raw.get("spectator_fight_style_min_attempts", 20) or 20))
+            )
+            cfg.spectator_fight_style_min_landed = max(
+                1, min(500, int(raw.get("spectator_fight_style_min_landed", 10) or 10))
+            )
+        except (TypeError, ValueError):
+            cfg.spectator_fight_style_min_attempts = 20
+            cfg.spectator_fight_style_min_landed = 10
         cfg.spectator_commentary_enabled = bool(raw.get("spectator_commentary_enabled", True))
         cfg.spectator_commentary_mode = str(raw.get("spectator_commentary_mode", "standard") or "standard")
         cfg.spectator_commentary_voice = str(raw.get("spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
         cfg.spectator_caster_voice = str(raw.get("spectator_caster_voice", "ko-KR-InJoonNeural") or "ko-KR-InJoonNeural")
-        cfg.spectator_stun_sfx_path = str(raw.get("spectator_stun_sfx_path", "") or "")
-        cfg.spectator_knockdown_sfx_path = str(raw.get("spectator_knockdown_sfx_path", "") or "")
-        cfg.spectator_tko_sfx_path = str(raw.get("spectator_tko_sfx_path", "") or "")
+        cfg.spectator_stun_sfx_path = normalize_builtin_asset_path(str(raw.get("spectator_stun_sfx_path", "") or ""))
+        cfg.spectator_knockdown_sfx_path = normalize_builtin_asset_path(str(raw.get("spectator_knockdown_sfx_path", "") or ""))
+        cfg.spectator_tko_sfx_path = normalize_builtin_asset_path(str(raw.get("spectator_tko_sfx_path", "") or ""))
         try:
             cfg.spectator_sfx_playback_rate = float(raw.get("spectator_sfx_playback_rate", 1.0) or 1.0)
         except Exception:
@@ -1133,6 +1263,43 @@ class AppConfig:
             cfg.overlay_vs_hold_sec = max(0.5, min(15.0, float(raw.get("overlay_vs_hold_sec", 2.85) or 2.85)))
         except Exception:
             cfg.overlay_vs_hold_sec = 2.85
+        cfg.overlay_kd_image_path = normalize_builtin_asset_path(str(raw.get("overlay_kd_image_path", "assets/images/overlays/KD.png") or "assets/images/overlays/KD.png"))
+        cfg.overlay_tko_image_path = normalize_builtin_asset_path(str(raw.get("overlay_tko_image_path", "assets/images/overlays/TKO.png") or "assets/images/overlays/TKO.png"))
+        try:
+            cfg.overlay_ko_image_scale_pct = max(30, min(200, int(raw.get("overlay_ko_image_scale_pct", 100) or 100)))
+            cfg.overlay_ko_x = max(-800, min(800, int(raw.get("overlay_ko_x", 0) or 0)))
+            cfg.overlay_ko_y = max(-450, min(450, int(raw.get("overlay_ko_y", 0) or 0)))
+            cfg.overlay_ko_motion_blur_pct = max(0, min(200, int(raw.get("overlay_ko_motion_blur_pct", 100) or 0)))
+            cfg.overlay_ko_flash_intensity_pct = max(0, min(200, int(raw.get("overlay_ko_flash_intensity_pct", 100) or 0)))
+            cfg.overlay_ko_trail_intensity_pct = max(0, min(200, int(raw.get("overlay_ko_trail_intensity_pct", 100) or 0)))
+            cfg.overlay_ko_shake_intensity_pct = max(0, min(200, int(raw.get("overlay_ko_shake_intensity_pct", 100) or 0)))
+            cfg.overlay_ko_perspective_px = max(700, min(3000, int(raw.get("overlay_ko_perspective_px", 1400) or 1400)))
+            cfg.overlay_ko_start_z_px = max(100, min(2400, int(raw.get("overlay_ko_start_z_px", 760) or 760)))
+            cfg.overlay_ko_impact_depth_px = max(0, min(180, int(raw.get("overlay_ko_impact_depth_px", 34) or 0)))
+            cfg.overlay_ko_rebound_px = max(0, min(120, int(raw.get("overlay_ko_rebound_px", 20) or 0)))
+            cfg.overlay_ko_entry_ms = max(250, min(1200, int(raw.get("overlay_ko_entry_ms", 500) or 500)))
+            cfg.overlay_ko_drop_y_px = max(0, min(500, int(raw.get("overlay_ko_drop_y_px", 190) or 0)))
+        except Exception:
+            cfg.overlay_ko_image_scale_pct = 100
+            cfg.overlay_ko_x = 0
+            cfg.overlay_ko_y = 0
+            cfg.overlay_ko_motion_blur_pct = 100
+            cfg.overlay_ko_flash_intensity_pct = 100
+            cfg.overlay_ko_trail_intensity_pct = 100
+            cfg.overlay_ko_shake_intensity_pct = 100
+            cfg.overlay_ko_perspective_px = 1400
+            cfg.overlay_ko_start_z_px = 760
+            cfg.overlay_ko_impact_depth_px = 34
+            cfg.overlay_ko_rebound_px = 20
+            cfg.overlay_ko_entry_ms = 500
+            cfg.overlay_ko_drop_y_px = 190
+        cfg.overlay_ko_screen_shake = bool(raw.get("overlay_ko_screen_shake", True))
+        try:
+            cfg.overlay_kd_hold_sec = max(0.8, min(10.0, float(raw.get("overlay_kd_hold_sec", 2.2) or 2.2)))
+            cfg.overlay_tko_hold_sec = max(0.8, min(10.0, float(raw.get("overlay_tko_hold_sec", 2.6) or 2.6)))
+        except Exception:
+            cfg.overlay_kd_hold_sec = 2.2
+            cfg.overlay_tko_hold_sec = 2.6
         try:
             cfg.browser_overlay_scale = max(0.25, min(4.0, float(raw.get("browser_overlay_scale", 1.0) or 1.0)))
         except Exception:
@@ -1313,6 +1480,42 @@ class AppConfig:
             "chapter_output_dir": str(self.chapter_output_dir or ""),
             "chapter_nickname_only": bool(self.chapter_nickname_only),
             "chapter_hide_time": bool(self.chapter_hide_time),
+            "obs_integration_enabled": bool(self.obs_integration_enabled),
+            "obs_host": str(self.obs_host or "127.0.0.1"),
+            "obs_port": int(max(1, min(65535, self.obs_port))),
+            "obs_password": str(self.obs_password or ""),
+            "obs_auto_chapter_enabled": bool(self.obs_auto_chapter_enabled),
+            "obs_chapter_add_start_event": bool(self.obs_chapter_add_start_event),
+            "obs_chapter_export_on_stop": bool(self.obs_chapter_export_on_stop),
+            "obs_replay_buffer_enabled": bool(self.obs_replay_buffer_enabled),
+            "obs_replay_buffer_auto_start": bool(self.obs_replay_buffer_auto_start),
+            "obs_highlight_kd": bool(self.obs_highlight_kd),
+            "obs_highlight_tko": bool(self.obs_highlight_tko),
+            "obs_highlight_stun": bool(self.obs_highlight_stun),
+            "obs_highlight_counter": bool(self.obs_highlight_counter),
+            "obs_highlight_combo": bool(self.obs_highlight_combo),
+            "obs_highlight_heavy": bool(self.obs_highlight_heavy),
+            "obs_highlight_counter_damage_min": float(max(0.0, min(300.0, self.obs_highlight_counter_damage_min))),
+            "obs_highlight_combo_min": int(max(2, min(20, self.obs_highlight_combo_min))),
+            "obs_highlight_damage_min": float(max(0.0, min(300.0, self.obs_highlight_damage_min))),
+            "obs_highlight_cooldown_sec": float(max(0.0, min(120.0, self.obs_highlight_cooldown_sec))),
+            "obs_auto_replay_enabled": bool(self.obs_auto_replay_enabled),
+            "obs_auto_replay_kd": bool(self.obs_auto_replay_kd),
+            "obs_auto_replay_tko": bool(self.obs_auto_replay_tko),
+            "obs_auto_replay_capture_delay_sec": float(max(0.0, min(15.0, self.obs_auto_replay_capture_delay_sec))),
+            "obs_auto_replay_delay_sec": float(max(0.0, min(15.0, self.obs_auto_replay_delay_sec))),
+            "obs_auto_replay_muted": bool(self.obs_auto_replay_muted),
+            "obs_auto_replay_volume": int(max(0, min(100, self.obs_auto_replay_volume))),
+            "obs_auto_replay_fit": str(self.obs_auto_replay_fit or "cover"),
+            "obs_auto_replay_fade_ms": int(max(0, min(2000, self.obs_auto_replay_fade_ms))),
+            "obs_auto_replay_stop_on_round": bool(self.obs_auto_replay_stop_on_round),
+            "idle_highlight_enabled": bool(self.idle_highlight_enabled),
+            "idle_highlight_path": to_app_rel(str(self.idle_highlight_path or "")),
+            "idle_highlight_random": bool(self.idle_highlight_random),
+            "idle_highlight_muted": bool(self.idle_highlight_muted),
+            "idle_highlight_volume": int(max(0, min(100, self.idle_highlight_volume))),
+            "idle_highlight_fit": str(self.idle_highlight_fit or "cover"),
+            "idle_highlight_fade_ms": int(max(0, min(3000, self.idle_highlight_fade_ms))),
             "spectatorlog_enabled": bool(self.spectatorlog_enabled),
             "spectatorlog_path": to_app_rel(str(self.spectatorlog_path or "")),
             "spectatorlog_poll_ms": int(self.spectatorlog_poll_ms or 250),
@@ -1353,6 +1556,20 @@ class AppConfig:
             "spectator_sp_fight_recovery_pct": float(max(0.0, min(100.0, self.spectator_sp_fight_recovery_pct))),
             "spectator_sp_break_recovery_pct": float(max(0.0, min(100.0, self.spectator_sp_break_recovery_pct))),
             "spectator_sp_recovery_delay_sec": float(max(0.0, min(10.0, self.spectator_sp_recovery_delay_sec))),
+            "spectator_sp_bar_x": int(max(-300, min(300, self.spectator_sp_bar_x))),
+            "spectator_sp_bar_y": int(max(-100, min(100, self.spectator_sp_bar_y))),
+            "spectator_sp_bar_length_pct": int(max(25, min(160, self.spectator_sp_bar_length_pct))),
+            "spectator_sp_bar_thickness": int(max(2, min(40, self.spectator_sp_bar_thickness))),
+            "spectator_sp_bar_color": _normalize_hex_color(str(self.spectator_sp_bar_color or "#1876d3")),
+            "spectator_name_bar_x": int(max(-300, min(300, self.spectator_name_bar_x))),
+            "spectator_name_bar_y": int(max(-100, min(100, self.spectator_name_bar_y))),
+            "spectator_fight_style_enabled": bool(self.spectator_fight_style_enabled),
+            "spectator_fight_style_min_attempts": int(
+                max(1, min(500, self.spectator_fight_style_min_attempts))
+            ),
+            "spectator_fight_style_min_landed": int(
+                max(1, min(500, self.spectator_fight_style_min_landed))
+            ),
             "spectator_commentary_enabled": bool(self.spectator_commentary_enabled),
             "spectator_commentary_mode": str(self.spectator_commentary_mode or "standard"),
             "spectator_commentary_min_damage": float(self.spectator_commentary_min_damage or 25.0),
@@ -1387,9 +1604,9 @@ class AppConfig:
             "spectator_replay_speed": float(self.spectator_replay_speed or 1.0),
             "spectator_replay_real_time": bool(self.spectator_replay_real_time),
             "spectator_recent_text_size": int(self.spectator_recent_text_size or 23),
-            "spectator_stun_sfx_path": to_app_rel(str(self.spectator_stun_sfx_path or "")),
-            "spectator_knockdown_sfx_path": to_app_rel(str(self.spectator_knockdown_sfx_path or "")),
-            "spectator_tko_sfx_path": to_app_rel(str(self.spectator_tko_sfx_path or "")),
+            "spectator_stun_sfx_path": to_app_rel(normalize_builtin_asset_path(str(self.spectator_stun_sfx_path or ""))),
+            "spectator_knockdown_sfx_path": to_app_rel(normalize_builtin_asset_path(str(self.spectator_knockdown_sfx_path or ""))),
+            "spectator_tko_sfx_path": to_app_rel(normalize_builtin_asset_path(str(self.spectator_tko_sfx_path or ""))),
             "spectator_sfx_playback_rate": float(self.spectator_sfx_playback_rate or 1.0),
             "diagnostics_enabled": bool(getattr(self, "diagnostics_enabled", True)),
             "diagnostics_trace_minutes": int(max(1, min(120, int(getattr(self, "diagnostics_trace_minutes", 10) or 10)))),
@@ -1434,6 +1651,24 @@ class AppConfig:
             "overlay_vs_bg_opacity": float(self.overlay_vs_bg_opacity if self.overlay_vs_bg_opacity is not None else 1.0),
             "overlay_vs_bg_by_arena": {str(k): to_app_rel(str(v)) for k, v in (self.overlay_vs_bg_by_arena or {}).items()},
             "overlay_vs_hold_sec": float(self.overlay_vs_hold_sec if self.overlay_vs_hold_sec is not None else 2.85),
+            "overlay_kd_image_path": to_app_rel(normalize_builtin_asset_path(str(self.overlay_kd_image_path or "assets/images/overlays/KD.png"))),
+            "overlay_tko_image_path": to_app_rel(normalize_builtin_asset_path(str(self.overlay_tko_image_path or "assets/images/overlays/TKO.png"))),
+            "overlay_ko_image_scale_pct": int(max(30, min(200, self.overlay_ko_image_scale_pct))),
+            "overlay_ko_x": int(max(-800, min(800, self.overlay_ko_x))),
+            "overlay_ko_y": int(max(-450, min(450, self.overlay_ko_y))),
+            "overlay_ko_motion_blur_pct": int(max(0, min(200, self.overlay_ko_motion_blur_pct))),
+            "overlay_ko_flash_intensity_pct": int(max(0, min(200, self.overlay_ko_flash_intensity_pct))),
+            "overlay_ko_trail_intensity_pct": int(max(0, min(200, self.overlay_ko_trail_intensity_pct))),
+            "overlay_ko_shake_intensity_pct": int(max(0, min(200, self.overlay_ko_shake_intensity_pct))),
+            "overlay_ko_screen_shake": bool(self.overlay_ko_screen_shake),
+            "overlay_ko_perspective_px": int(max(700, min(3000, self.overlay_ko_perspective_px))),
+            "overlay_ko_start_z_px": int(max(100, min(2400, self.overlay_ko_start_z_px))),
+            "overlay_ko_impact_depth_px": int(max(0, min(180, self.overlay_ko_impact_depth_px))),
+            "overlay_ko_rebound_px": int(max(0, min(120, self.overlay_ko_rebound_px))),
+            "overlay_ko_entry_ms": int(max(250, min(1200, self.overlay_ko_entry_ms))),
+            "overlay_ko_drop_y_px": int(max(0, min(500, self.overlay_ko_drop_y_px))),
+            "overlay_kd_hold_sec": float(max(0.8, min(10.0, self.overlay_kd_hold_sec))),
+            "overlay_tko_hold_sec": float(max(0.8, min(10.0, self.overlay_tko_hold_sec))),
             "browser_overlay_scale": float(self.browser_overlay_scale if self.browser_overlay_scale is not None else 1.0),
             "browser_overlay_poll_ms": int(self.browser_overlay_poll_ms or 50),
             "browser_overlay_output_only": bool(self.browser_overlay_output_only),

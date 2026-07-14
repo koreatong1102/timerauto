@@ -123,6 +123,9 @@ _MEDIAPIPE_IMPORT_ERROR = None
 from actions import ActionRunner
 from browser_overlay import BrowserOverlayServer
 from browser_overlay_sync import BrowserOverlaySync
+from commentary_demo import build_commentary_director_demo
+from obs_auto_replay import ObsAutoReplayController
+from obs_integration import ObsIntegration
 from hotkey_engine import build_vk_map, GlobalHotkeys, press_vk_once
 from screen_capture import (
     capture_monitor_np,
@@ -2743,6 +2746,10 @@ class TimerBackend(QObject):
         super().__init__()
         self.cfg = cfg
         self._time_text = "3:00"
+        # Spectator log can temporarily replace the round clock with a state label
+        # such as KD. Keep this as an explicit display override so the normal timer
+        # refresh path cannot race it on every log tick.
+        self._time_display_override = ""
         self._round_text = "RD 1 of 3"
         self._status_text = "Ready"
         self._blue_name = "BLUE"
@@ -3295,6 +3302,14 @@ class TimerBackend(QObject):
             else:
                 self._sp_apply_fight_recovery(self.seconds_left)
                 self._sp_apply_rest_recovery(None)
+        self._refresh_time()
+
+    def set_log_time_mode(self, mode: Optional[str]):
+        mode_key = str(mode or "").strip().lower()
+        override = "KD" if mode_key.startswith("knockdown") else ""
+        if override == self._time_display_override:
+            return
+        self._time_display_override = override
         self._refresh_time()
 
     def set_log_rest_mode(self, is_rest: bool):
@@ -4208,7 +4223,7 @@ class TimerBackend(QObject):
     def _refresh_time(self):
         m = self.seconds_left // 60
         s = self.seconds_left % 60
-        time_text = f"{m}:{s:02d}"
+        time_text = self._time_display_override or f"{m}:{s:02d}"
         round_text = f"RD {self.current_round} of {self.total_rounds}"
         if time_text != self._time_text:
             self._time_text = time_text
@@ -4799,6 +4814,9 @@ class QmlTimerWindow(QObject):
 
     def set_round_time(self, current_round: Optional[int], total_rounds: Optional[int], seconds_left: Optional[int]):
         self._backend.set_round_time(current_round, total_rounds, seconds_left)
+
+    def set_log_time_mode(self, mode: Optional[str]):
+        self._backend.set_log_time_mode(mode)
 
     def request_round_intro(self):
         self._backend.request_round_intro()
@@ -6093,6 +6111,10 @@ class SettingsDialog(QDialog):
         diagnostic_open_folder: Optional[Callable[[], str]] = None,
         diagnostic_copy_state: Optional[Callable[[], str]] = None,
         diagnostic_project_snapshot: Optional[Callable[[], str]] = None,
+        obs_reconfigure: Optional[Callable[[], None]] = None,
+        obs_test_connection: Optional[Callable[[], None]] = None,
+        obs_status_getter: Optional[Callable[[], str]] = None,
+        idle_highlight_refresh: Optional[Callable[[], None]] = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("설정")
@@ -6138,6 +6160,10 @@ class SettingsDialog(QDialog):
         self._diagnostic_open_folder = diagnostic_open_folder
         self._diagnostic_copy_state = diagnostic_copy_state
         self._diagnostic_project_snapshot = diagnostic_project_snapshot
+        self._obs_reconfigure = obs_reconfigure
+        self._obs_test_connection = obs_test_connection
+        self._obs_status_getter = obs_status_getter
+        self._idle_highlight_refresh = idle_highlight_refresh
         timer_target = self._timer_win or getattr(self.controller, "timer_win", None)
         if timer_target is None:
             timer_target = _NoopTimerWindow()
@@ -6185,6 +6211,7 @@ class SettingsDialog(QDialog):
         self.tab_logs = QWidget()
         self.tab_log_records = QWidget()
         self.tab_auto_start = QWidget()
+        self.tab_obs = QWidget()
         self.tab_sound = QWidget()
         self.tab_tests = QWidget()
         self.tab_legacy = QWidget()
@@ -6202,6 +6229,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.tab_logs, "로그 감지")
         self.tabs.addTab(self.tab_log_records, "기록")
         self.tabs.addTab(self.tab_auto_start, "자동 시작")
+        self.tabs.addTab(self.tab_obs, "OBS / 하이라이트")
         self.tabs.addTab(self.tab_sound, "사운드")
         self.tabs.addTab(self.tab_tests, "테스트")
         self.tabs.addTab(self.tab_legacy, "화면감지 / 액션")
@@ -6249,6 +6277,7 @@ class SettingsDialog(QDialog):
         self._apply_settings_style()
 
         self._build_quick()
+        self._build_obs()
         self._build_players()
         self._build_timer()
         self._build_effects()
@@ -6906,6 +6935,15 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "OBS 브라우저 소스", f"브라우저 열기 실패: {e}")
 
+    def _open_browser_overlay_studio_url(self):
+        url = "http://127.0.0.1:17872/studio"
+        try:
+            if self.controller and hasattr(self.controller, "browser_overlay"):
+                url = str(self.controller.browser_overlay.studio_url)
+            QDesktopServices.openUrl(QUrl(url))
+        except Exception as e:
+            QMessageBox.warning(self, "오버레이 스튜디오", f"편집기 열기 실패: {e}")
+
     def _apply_browser_overlay_settings(self):
         if hasattr(self, "sp_browser_overlay_poll"):
             self.cfg.browser_overlay_poll_ms = int(self.sp_browser_overlay_poll.value())
@@ -7181,6 +7219,38 @@ class SettingsDialog(QDialog):
         blackbox_lay.setColumnStretch(1, 1)
         record_lay.addWidget(blackbox_group)
 
+        report_analysis_group = QGroupBox("경기 종료 리포트 분석")
+        report_analysis_lay = QGridLayout(report_analysis_group)
+        self.chk_spectator_fight_style = QCheckBox("경기 종료 리포트에 한글 경기 스타일 표시")
+        self.chk_spectator_fight_style.setChecked(
+            bool(getattr(self.cfg, "spectator_fight_style_enabled", True))
+        )
+        report_analysis_lay.addWidget(self.chk_spectator_fight_style, 0, 0, 1, 4)
+        self.sp_spectator_fight_style_attempts = QSpinBox()
+        self.sp_spectator_fight_style_attempts.setRange(1, 500)
+        self.sp_spectator_fight_style_attempts.setValue(
+            int(getattr(self.cfg, "spectator_fight_style_min_attempts", 20) or 20)
+        )
+        self.sp_spectator_fight_style_landed = QSpinBox()
+        self.sp_spectator_fight_style_landed.setRange(1, 500)
+        self.sp_spectator_fight_style_landed.setValue(
+            int(getattr(self.cfg, "spectator_fight_style_min_landed", 10) or 10)
+        )
+        report_analysis_lay.addWidget(QLabel("최소 공격 시도"), 1, 0)
+        report_analysis_lay.addWidget(self.sp_spectator_fight_style_attempts, 1, 1)
+        report_analysis_lay.addWidget(QLabel("최소 유효타"), 1, 2)
+        report_analysis_lay.addWidget(self.sp_spectator_fight_style_landed, 1, 3)
+        report_analysis_hint = QLabel(
+            "표본이 둘 중 하나의 기준에 도달하면 슬러거, 카운터 마스터, 정밀 타격가 등으로 분석합니다. "
+            "방송에 표시되는 명칭과 설명은 모두 한글입니다."
+        )
+        report_analysis_hint.setWordWrap(True)
+        report_analysis_hint.setStyleSheet("color:#9ca3af;")
+        report_analysis_lay.addWidget(report_analysis_hint, 2, 0, 1, 4)
+        report_analysis_lay.setColumnStretch(1, 1)
+        report_analysis_lay.setColumnStretch(3, 1)
+        record_lay.addWidget(report_analysis_group)
+
         spectator_group = QGroupBox("ThrillOfTheFight2 SpectatorLog 연동 / 리플레이 / 피격 이펙트")
         spectator_lay = QGridLayout(spectator_group)
         self.chk_spectatorlog_enabled = QCheckBox("SpectatorLog 사용")
@@ -7247,6 +7317,34 @@ class SettingsDialog(QDialog):
         self.sp_spectator_sp_recovery_delay.setSingleStep(0.1)
         self.sp_spectator_sp_recovery_delay.setSuffix(" sec")
         self.sp_spectator_sp_recovery_delay.setValue(float(getattr(self.cfg, "spectator_sp_recovery_delay_sec", 1.5) or 0.0))
+        self.sp_spectator_sp_bar_x = QSpinBox()
+        self.sp_spectator_sp_bar_x.setRange(-300, 300)
+        self.sp_spectator_sp_bar_x.setSuffix(" px")
+        self.sp_spectator_sp_bar_x.setValue(int(getattr(self.cfg, "spectator_sp_bar_x", 0) or 0))
+        self.sp_spectator_sp_bar_y = QSpinBox()
+        self.sp_spectator_sp_bar_y.setRange(-100, 100)
+        self.sp_spectator_sp_bar_y.setSuffix(" px")
+        self.sp_spectator_sp_bar_y.setValue(int(getattr(self.cfg, "spectator_sp_bar_y", 0) or 0))
+        self.sp_spectator_sp_bar_length = QSpinBox()
+        self.sp_spectator_sp_bar_length.setRange(25, 160)
+        self.sp_spectator_sp_bar_length.setSuffix(" %")
+        self.sp_spectator_sp_bar_length.setValue(int(getattr(self.cfg, "spectator_sp_bar_length_pct", 100) or 100))
+        self.sp_spectator_sp_bar_thickness = QSpinBox()
+        self.sp_spectator_sp_bar_thickness.setRange(2, 40)
+        self.sp_spectator_sp_bar_thickness.setSuffix(" px")
+        self.sp_spectator_sp_bar_thickness.setValue(int(getattr(self.cfg, "spectator_sp_bar_thickness", 10) or 10))
+        self.le_spectator_sp_bar_color = QLineEdit(str(getattr(self.cfg, "spectator_sp_bar_color", "#1876d3") or "#1876d3"))
+        self.le_spectator_sp_bar_color.setMaxLength(7)
+        self.btn_spectator_sp_bar_color = QPushButton("색상 선택")
+        self._attach_color_button(self.le_spectator_sp_bar_color, self.btn_spectator_sp_bar_color)
+        self.sp_spectator_name_bar_x = QSpinBox()
+        self.sp_spectator_name_bar_x.setRange(-300, 300)
+        self.sp_spectator_name_bar_x.setSuffix(" px")
+        self.sp_spectator_name_bar_x.setValue(int(getattr(self.cfg, "spectator_name_bar_x", 0) or 0))
+        self.sp_spectator_name_bar_y = QSpinBox()
+        self.sp_spectator_name_bar_y.setRange(-100, 100)
+        self.sp_spectator_name_bar_y.setSuffix(" px")
+        self.sp_spectator_name_bar_y.setValue(int(getattr(self.cfg, "spectator_name_bar_y", 0) or 0))
 
         self.btn_spectatorlog_test_blue_stun= QPushButton("블루 스턴 테스트")
         self.btn_spectatorlog_test_red_stun= QPushButton("레드 스턴 테스트")
@@ -7255,7 +7353,7 @@ class SettingsDialog(QDialog):
         self.btn_spectatorlog_test_blue_tko= QPushButton("블루 TKO 테스트")
         self.btn_spectatorlog_test_red_tko= QPushButton("레드 TKO 테스트")
         self.btn_spectatorlog_test_damage= QPushButton("데미지 표시 테스트")
-        self.btn_spectatorlog_test_hit_fx_sprite = QPushButton("폭발 피격 테스트")
+        self.btn_spectatorlog_test_hit_fx_sprite = QPushButton("브라우저 피격 테스트")
         self.btn_spectatorlog_test_hp= QPushButton("게이지 테스트")
         self.btn_spectatorlog_test_blue_combo= QPushButton("블루 콤보 테스트")
         self.btn_spectatorlog_test_red_combo= QPushButton("레드 콤보 테스트")
@@ -7274,11 +7372,19 @@ class SettingsDialog(QDialog):
         self.btn_spectator_commentary_duo_test = QPushButton("듀오 해설 테스트")
         self.btn_spectator_commentary_down_test = QPushButton("다운 멘트 테스트")
         self.btn_spectator_commentary_summary_test = QPushButton("요약 멘트 테스트")
+        self.btn_spectator_commentary_director_test = QPushButton("해설 디렉터 상황 테스트")
+        self.btn_spectator_commentary_director_test.setToolTip(
+            "실제 해설 판단기로 카운터+콤보, 긴급 상황, 반격, 흐름 전환, 라운드 적응, 경기 서사를 검사합니다."
+        )
         self.btn_spectator_commentary_stop_test = QPushButton("해설 테스트 중지")
         self.btn_spectator_commentary_full_test_tab = QPushButton("자동해설 종합 테스트")
         self.btn_spectator_commentary_duo_test_tab = QPushButton("듀오 해설 테스트")
         self.btn_spectator_commentary_down_test_tab = QPushButton("다운 멘트 테스트")
         self.btn_spectator_commentary_summary_test_tab = QPushButton("요약 멘트 테스트")
+        self.btn_spectator_commentary_director_test_tab = QPushButton("해설 디렉터 상황 테스트")
+        self.btn_spectator_commentary_director_test_tab.setToolTip(
+            "운영 경기 상태를 변경하지 않고 실제 해설 판단 시나리오를 음성으로 재생합니다."
+        )
         self.btn_spectator_commentary_stop_test_tab = QPushButton("해설 테스트 중지")
         test_tabs = QTabWidget()
         test_tabs.setDocumentMode(True)
@@ -7330,7 +7436,7 @@ class SettingsDialog(QDialog):
             [
                 [self.btn_spectator_commentary_full_test_tab, self.btn_spectator_commentary_duo_test_tab],
                 [self.btn_spectator_commentary_down_test_tab, self.btn_spectator_commentary_summary_test_tab],
-                [self.btn_spectator_commentary_stop_test_tab],
+                [self.btn_spectator_commentary_director_test_tab, self.btn_spectator_commentary_stop_test_tab],
             ],
         )
         test_lay_outer.addWidget(test_tabs)
@@ -7529,13 +7635,13 @@ class SettingsDialog(QDialog):
         self.chk_spectator_hit_fx_latency_log.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)))
         self.chk_spectator_hit_fx_latency_log.setToolTip("damage_events 감지 → overlay push → 브라우저 실행 시점을 로그/콘솔에 남깁니다.")
         spectator_lay.addWidget(self.chk_spectator_hit_fx_latency_log, 16, 2, 1, 2)
-        self.chk_spectator_hit_fx_sprite_enabled = QCheckBox("폭발 스프라이트")
+        self.chk_spectator_hit_fx_sprite_enabled = QCheckBox("방향성 파편")
         self.chk_spectator_hit_fx_sprite_enabled.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_sprite_enabled", True)))
-        self.chk_spectator_hit_fx_sprite_enabled.setToolTip("철권식 짧은 폭발 sprite atlas를 미리 로드해 피격 위치에 즉시 재생합니다.")
+        self.chk_spectator_hit_fx_sprite_enabled.setToolTip("타격 방향을 따라 뻗는 빛 조각과 파편을 표시합니다.")
         spectator_lay.addWidget(self.chk_spectator_hit_fx_sprite_enabled, 16, 4)
-        self.chk_spectator_hit_fx_ring_enabled = QCheckBox("기존 링 같이 표시")
+        self.chk_spectator_hit_fx_ring_enabled = QCheckBox("충격선 표시")
         self.chk_spectator_hit_fx_ring_enabled.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_ring_enabled", False)))
-        self.chk_spectator_hit_fx_ring_enabled.setToolTip("폭발 sprite 위에 기존 원형 링/글로우도 같이 표시합니다. 끄면 sprite만 남습니다.")
+        self.chk_spectator_hit_fx_ring_enabled.setToolTip("원형 링 대신 타격점 주변의 각진 충격선을 표시합니다.")
         spectator_lay.addWidget(self.chk_spectator_hit_fx_ring_enabled, 16, 5)
         sound_lay.addWidget(self.btn_spectator_commentary_tts_test, 10, 5)
         sound_lay.addWidget(self.btn_spectator_commentary_full_test, 11, 0, 1, 2)
@@ -7543,6 +7649,7 @@ class SettingsDialog(QDialog):
         sound_lay.addWidget(self.btn_spectator_commentary_down_test, 11, 3)
         sound_lay.addWidget(self.btn_spectator_commentary_summary_test, 11, 4)
         sound_lay.addWidget(self.btn_spectator_commentary_stop_test, 11, 5)
+        sound_lay.addWidget(self.btn_spectator_commentary_director_test, 12, 0, 1, 2)
         self.sp_spectator_recent_text_size = QSpinBox()
         self.sp_spectator_recent_text_size.setRange(10, 80)
         self.sp_spectator_recent_text_size.setSuffix(" px")
@@ -7609,7 +7716,7 @@ class SettingsDialog(QDialog):
             self.sp_spectator_hit_fx_pop: "첫 프레임이 얼마나 빠르게 팍 터질지 정합니다. 짧을수록 더 순간 폭발 느낌입니다.",
             self.sp_spectator_hit_fx_base_size: "피격 이펙트 기본 크기입니다.",
             self.sp_spectator_hit_fx_damage_scale: "데미지가 클수록 이펙트가 얼마나 더 커질지 정합니다.",
-            self.sp_spectator_hit_fx_ring_width: "원형 링을 같이 쓸 때 링 두께입니다.",
+            self.sp_spectator_hit_fx_ring_width: "타격점 주변에 퍼지는 각진 충격선 두께입니다.",
             self.sp_spectator_hit_fx_opacity: "피격 이펙트 전체 강도/투명도입니다.",
             self.sp_spectator_hit_fx_glow: "폭발 외곽 불빛 강도입니다.",
             self.sp_spectator_hit_fx_fill_opacity: "폭발 중심부 채움 강도입니다.",
@@ -7617,8 +7724,8 @@ class SettingsDialog(QDialog):
             self.sp_spectator_hit_fx_text_scale: "데미지 숫자 크기 배수입니다.",
             self.chk_spectator_hit_fx_fast_emit: "로그를 읽자마자 피격 이펙트만 먼저 보내 반응 속도를 높입니다.",
             self.chk_spectator_hit_fx_latency_log: "피격 이펙트가 얼마나 빨리 나가는지 콘솔/로그에 기록합니다.",
-            self.chk_spectator_hit_fx_sprite_enabled: "화염 폭발 느낌의 스프라이트 이펙트를 켭니다.",
-            self.chk_spectator_hit_fx_ring_enabled: "폭발 위에 원형 링도 같이 표시합니다."
+            self.chk_spectator_hit_fx_sprite_enabled: "타격 방향을 따라 뻗는 빛 조각과 파편을 표시합니다.",
+            self.chk_spectator_hit_fx_ring_enabled: "원형 링 대신 타격점 주변의 각진 충격선을 표시합니다."
         }
         for _w, _tip in _spectator_tips.items():
             try:
@@ -7649,11 +7756,22 @@ class SettingsDialog(QDialog):
         self.chk_spectatorlog_blackbox_enabled.stateChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_spectatorlog_state()))
         self.cmb_spectatorlog_blackbox_mode.currentIndexChanged.connect(self._schedule_apply)
         self.le_spectatorlog_blackbox_dir.textChanged.connect(lambda _v: (self._schedule_apply(), self._refresh_spectatorlog_state()))
+        self.chk_spectator_fight_style.stateChanged.connect(self._schedule_apply)
+        self.sp_spectator_fight_style_attempts.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_fight_style_landed.valueChanged.connect(self._schedule_apply)
         self.sp_spectator_sp_throw_scale.valueChanged.connect(self._schedule_apply)
         self.sp_spectator_sp_impact_scale.valueChanged.connect(self._schedule_apply)
         self.sp_spectator_sp_fight_recovery.valueChanged.connect(self._schedule_apply)
         self.sp_spectator_sp_break_recovery.valueChanged.connect(self._schedule_apply)
         self.sp_spectator_sp_recovery_delay.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_sp_bar_x.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_sp_bar_y.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_sp_bar_length.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_sp_bar_thickness.valueChanged.connect(self._schedule_apply)
+        self.le_spectator_sp_bar_color.textChanged.connect(self._schedule_apply)
+        self.btn_spectator_sp_bar_color.clicked.connect(self._pick_spectator_sp_bar_color)
+        self.sp_spectator_name_bar_x.valueChanged.connect(self._schedule_apply)
+        self.sp_spectator_name_bar_y.valueChanged.connect(self._schedule_apply)
         self.btn_spectatorlog_blackbox_open.clicked.connect(self._open_spectatorlog_blackbox_dir)
         self.btn_spectatorlog_test_blue_stun.clicked.connect(lambda: self._test_spectator_stun("blue"))
         self.btn_spectatorlog_test_red_stun.clicked.connect(lambda: self._test_spectator_stun("red"))
@@ -7683,11 +7801,13 @@ class SettingsDialog(QDialog):
         self.btn_spectator_commentary_duo_test.clicked.connect(self._test_spectator_commentary_duo_suite)
         self.btn_spectator_commentary_down_test.clicked.connect(self._test_spectator_commentary_down_suite)
         self.btn_spectator_commentary_summary_test.clicked.connect(self._test_spectator_commentary_summary_suite)
+        self.btn_spectator_commentary_director_test.clicked.connect(self._test_spectator_commentary_director_suite)
         self.btn_spectator_commentary_stop_test.clicked.connect(self._stop_spectator_commentary_test_script)
         self.btn_spectator_commentary_full_test_tab.clicked.connect(self._test_spectator_commentary_full_suite)
         self.btn_spectator_commentary_duo_test_tab.clicked.connect(self._test_spectator_commentary_duo_suite)
         self.btn_spectator_commentary_down_test_tab.clicked.connect(self._test_spectator_commentary_down_suite)
         self.btn_spectator_commentary_summary_test_tab.clicked.connect(self._test_spectator_commentary_summary_suite)
+        self.btn_spectator_commentary_director_test_tab.clicked.connect(self._test_spectator_commentary_director_suite)
         self.btn_spectator_commentary_stop_test_tab.clicked.connect(self._stop_spectator_commentary_test_script)
         self.btn_spectator_stun_sfx_pick.clicked.connect(lambda: self._pick_spectator_sfx(self.le_spectator_stun_sfx))
         self.btn_spectator_kd_sfx_pick.clicked.connect(lambda: self._pick_spectator_sfx(self.le_spectator_kd_sfx))
@@ -7778,7 +7898,7 @@ class SettingsDialog(QDialog):
         hit_lay.addWidget(self.sp_spectator_hit_fx_base_size, 2, 3)
         hit_lay.addWidget(QLabel("데미지 크기 배율"), 2, 4)
         hit_lay.addWidget(self.sp_spectator_hit_fx_damage_scale, 2, 5)
-        hit_lay.addWidget(QLabel("링 두께"), 3, 2)
+        hit_lay.addWidget(QLabel("충격선 두께"), 3, 2)
         hit_lay.addWidget(self.sp_spectator_hit_fx_ring_width, 3, 3)
         hit_lay.addWidget(QLabel("전체 투명도"), 3, 4)
         hit_lay.addWidget(self.sp_spectator_hit_fx_opacity, 3, 5)
@@ -7985,7 +8105,27 @@ class SettingsDialog(QDialog):
         sp_hint.setWordWrap(True)
         sp_hint.setStyleSheet("color:#94a3b8;")
         sp_lay.addWidget(sp_hint, 3, 0, 1, 4)
+        sp_display_group = QGroupBox("SP 바 표시 설정")
+        sp_display_lay = QGridLayout(sp_display_group)
+        sp_display_lay.addWidget(QLabel("가로 위치 (안쪽 +)"), 0, 0)
+        sp_display_lay.addWidget(self.sp_spectator_sp_bar_x, 0, 1)
+        sp_display_lay.addWidget(QLabel("세로 위치"), 0, 2)
+        sp_display_lay.addWidget(self.sp_spectator_sp_bar_y, 0, 3)
+        sp_display_lay.addWidget(QLabel("길이"), 1, 0)
+        sp_display_lay.addWidget(self.sp_spectator_sp_bar_length, 1, 1)
+        sp_display_lay.addWidget(QLabel("두께"), 1, 2)
+        sp_display_lay.addWidget(self.sp_spectator_sp_bar_thickness, 1, 3)
+        sp_display_lay.addWidget(QLabel("색상"), 2, 0)
+        sp_display_lay.addWidget(self.le_spectator_sp_bar_color, 2, 1, 1, 2)
+        sp_display_lay.addWidget(self.btn_spectator_sp_bar_color, 2, 3)
+        sp_display_lay.addWidget(QLabel("닉네임바 가로 위치 (안쪽 +)"), 3, 0)
+        sp_display_lay.addWidget(self.sp_spectator_name_bar_x, 3, 1)
+        sp_display_lay.addWidget(QLabel("닉네임바 세로 위치"), 3, 2)
+        sp_display_lay.addWidget(self.sp_spectator_name_bar_y, 3, 3)
+        sp_display_lay.setColumnStretch(1, 1)
+        sp_display_lay.setColumnStretch(3, 1)
         sp_outer = QVBoxLayout()
+        sp_outer.addWidget(sp_display_group)
         sp_outer.addWidget(sp_group)
         sp_outer.addStretch(1)
         self.tab_sp.setLayout(sp_outer)
@@ -8011,6 +8151,328 @@ class SettingsDialog(QDialog):
         test_outer = QVBoxLayout()
         test_outer.addWidget(self.test_scroll)
         self.tab_tests.setLayout(test_outer)
+
+    def _build_obs(self):
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(10)
+
+        connection_group = QGroupBox("OBS WebSocket 연결")
+        connection = QGridLayout(connection_group)
+        connection.setHorizontalSpacing(10)
+        connection.setVerticalSpacing(8)
+        self.chk_obs_enabled = QCheckBox("OBS 연동 사용")
+        self.chk_obs_enabled.setChecked(bool(getattr(self.cfg, "obs_integration_enabled", False)))
+        self.le_obs_host = QLineEdit(str(getattr(self.cfg, "obs_host", "127.0.0.1") or "127.0.0.1"))
+        self.sp_obs_port = QSpinBox()
+        self.sp_obs_port.setRange(1, 65535)
+        self.sp_obs_port.setValue(int(getattr(self.cfg, "obs_port", 4455) or 4455))
+        self.le_obs_password = QLineEdit(str(getattr(self.cfg, "obs_password", "") or ""))
+        self.le_obs_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.le_obs_password.setPlaceholderText("OBS WebSocket 비밀번호")
+        self.btn_obs_test = QPushButton("연결 테스트")
+        self.btn_obs_test.clicked.connect(self._test_obs_connection_from_settings)
+        self.lbl_obs_status = QLabel("-")
+        self.lbl_obs_status.setWordWrap(True)
+        connection.addWidget(self.chk_obs_enabled, 0, 0, 1, 4)
+        connection.addWidget(QLabel("호스트"), 1, 0)
+        connection.addWidget(self.le_obs_host, 1, 1)
+        connection.addWidget(QLabel("포트"), 1, 2)
+        connection.addWidget(self.sp_obs_port, 1, 3)
+        connection.addWidget(QLabel("비밀번호"), 2, 0)
+        connection.addWidget(self.le_obs_password, 2, 1, 1, 3)
+        connection.addWidget(self.btn_obs_test, 3, 0)
+        connection.addWidget(self.lbl_obs_status, 3, 1, 1, 3)
+        connection.setColumnStretch(1, 1)
+        connection.setColumnStretch(3, 1)
+        outer.addWidget(connection_group)
+
+        automation_group = QGroupBox("방송 / 자동 하이라이트")
+        automation = QGridLayout(automation_group)
+        automation.setHorizontalSpacing(10)
+        automation.setVerticalSpacing(8)
+        self.chk_obs_auto_chapter = QCheckBox("OBS 방송 시작 시 챕터 기록 시작")
+        self.chk_obs_auto_chapter.setChecked(bool(getattr(self.cfg, "obs_auto_chapter_enabled", False)))
+        self.chk_obs_chapter_start_event = QCheckBox("챕터에 '방송 시작' 항목 추가")
+        self.chk_obs_chapter_start_event.setChecked(bool(getattr(self.cfg, "obs_chapter_add_start_event", True)))
+        self.chk_obs_chapter_export_stop = QCheckBox("OBS 방송 종료 시 챕터 TXT 내보내기")
+        self.chk_obs_chapter_export_stop.setChecked(bool(getattr(self.cfg, "obs_chapter_export_on_stop", False)))
+        self.chk_obs_replay_buffer = QCheckBox("OBS 리플레이 버퍼에 하이라이트 자동 저장")
+        self.chk_obs_replay_buffer.setChecked(bool(getattr(self.cfg, "obs_replay_buffer_enabled", False)))
+        self.chk_obs_replay_buffer_auto_start = QCheckBox("OBS 연결 시 리플레이 버퍼 자동 시작")
+        self.chk_obs_replay_buffer_auto_start.setChecked(bool(getattr(self.cfg, "obs_replay_buffer_auto_start", True)))
+        automation.addWidget(self.chk_obs_auto_chapter, 0, 0, 1, 2)
+        automation.addWidget(self.chk_obs_chapter_start_event, 0, 2, 1, 2)
+        automation.addWidget(self.chk_obs_chapter_export_stop, 1, 0, 1, 2)
+        automation.addWidget(self.chk_obs_replay_buffer, 1, 2, 1, 2)
+        automation.addWidget(self.chk_obs_replay_buffer_auto_start, 2, 0, 1, 4)
+
+        self.chk_obs_highlight_kd = QCheckBox("KD")
+        self.chk_obs_highlight_tko = QCheckBox("TKO")
+        self.chk_obs_highlight_stun = QCheckBox("스턴")
+        self.chk_obs_highlight_counter = QCheckBox("카운터")
+        self.chk_obs_highlight_combo = QCheckBox("콤보")
+        self.chk_obs_highlight_heavy = QCheckBox("강타")
+        for widget, attr in (
+            (self.chk_obs_highlight_kd, "obs_highlight_kd"),
+            (self.chk_obs_highlight_tko, "obs_highlight_tko"),
+            (self.chk_obs_highlight_stun, "obs_highlight_stun"),
+            (self.chk_obs_highlight_counter, "obs_highlight_counter"),
+            (self.chk_obs_highlight_combo, "obs_highlight_combo"),
+            (self.chk_obs_highlight_heavy, "obs_highlight_heavy"),
+        ):
+            widget.setChecked(bool(getattr(self.cfg, attr, True)))
+        automation.addWidget(QLabel("저장 이벤트"), 3, 0)
+        event_row = QHBoxLayout()
+        for widget in (
+            self.chk_obs_highlight_kd, self.chk_obs_highlight_tko,
+            self.chk_obs_highlight_stun, self.chk_obs_highlight_counter,
+            self.chk_obs_highlight_combo, self.chk_obs_highlight_heavy,
+        ):
+            event_row.addWidget(widget)
+        event_row.addStretch(1)
+        automation.addLayout(event_row, 3, 1, 1, 3)
+
+        self.sp_obs_combo_min = QSpinBox()
+        self.sp_obs_combo_min.setRange(2, 20)
+        self.sp_obs_combo_min.setValue(int(getattr(self.cfg, "obs_highlight_combo_min", 3) or 3))
+        self.sp_obs_damage_min = QDoubleSpinBox()
+        self.sp_obs_damage_min.setRange(0.0, 300.0)
+        self.sp_obs_damage_min.setDecimals(1)
+        self.sp_obs_damage_min.setValue(float(getattr(self.cfg, "obs_highlight_damage_min", 55.0) or 55.0))
+        self.sp_obs_counter_damage_min = QDoubleSpinBox()
+        self.sp_obs_counter_damage_min.setRange(0.0, 300.0)
+        self.sp_obs_counter_damage_min.setDecimals(1)
+        self.sp_obs_counter_damage_min.setValue(float(getattr(self.cfg, "obs_highlight_counter_damage_min", 30.0) or 0.0))
+        self.sp_obs_highlight_cooldown = QDoubleSpinBox()
+        self.sp_obs_highlight_cooldown.setRange(0.0, 120.0)
+        self.sp_obs_highlight_cooldown.setDecimals(1)
+        self.sp_obs_highlight_cooldown.setValue(float(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0) or 8.0))
+        automation.addWidget(QLabel("최소 콤보"), 4, 0)
+        automation.addWidget(self.sp_obs_combo_min, 4, 1)
+        automation.addWidget(QLabel("강타 최소 데미지"), 4, 2)
+        automation.addWidget(self.sp_obs_damage_min, 4, 3)
+        automation.addWidget(QLabel("카운터 최소 데미지"), 5, 0)
+        automation.addWidget(self.sp_obs_counter_damage_min, 5, 1)
+        automation.addWidget(QLabel("저장 쿨타임(초)"), 5, 2)
+        automation.addWidget(self.sp_obs_highlight_cooldown, 5, 3)
+        replay_hint = QLabel("OBS 출력 설정에서 리플레이 버퍼 사용을 허용해야 합니다. 자동 시작을 켜면 연결 후 버퍼를 시작하며, 브라우저 이펙트와 별도 스레드로 동작합니다.")
+        replay_hint.setWordWrap(True)
+        replay_hint.setStyleSheet("color:#94a3b8;")
+        automation.addWidget(replay_hint, 6, 0, 1, 4)
+        automation.setColumnStretch(1, 1)
+        automation.setColumnStretch(3, 1)
+        outer.addWidget(automation_group)
+
+        auto_replay_group = QGroupBox("KD / TKO 자동 리플레이")
+        auto_replay = QGridLayout(auto_replay_group)
+        auto_replay.setHorizontalSpacing(10)
+        auto_replay.setVerticalSpacing(8)
+        self.chk_obs_auto_replay = QCheckBox("저장된 리플레이를 브라우저 오버레이에서 자동 재생")
+        self.chk_obs_auto_replay.setChecked(bool(getattr(self.cfg, "obs_auto_replay_enabled", True)))
+        self.chk_obs_auto_replay_kd = QCheckBox("KD 재생")
+        self.chk_obs_auto_replay_kd.setChecked(bool(getattr(self.cfg, "obs_auto_replay_kd", True)))
+        self.chk_obs_auto_replay_tko = QCheckBox("TKO 재생")
+        self.chk_obs_auto_replay_tko.setChecked(bool(getattr(self.cfg, "obs_auto_replay_tko", True)))
+        self.sp_obs_auto_replay_capture_delay = QDoubleSpinBox()
+        self.sp_obs_auto_replay_capture_delay.setRange(0.0, 15.0)
+        self.sp_obs_auto_replay_capture_delay.setDecimals(1)
+        self.sp_obs_auto_replay_capture_delay.setSingleStep(0.1)
+        self.sp_obs_auto_replay_capture_delay.setSuffix(" 초")
+        self.sp_obs_auto_replay_capture_delay.setValue(float(getattr(self.cfg, "obs_auto_replay_capture_delay_sec", 1.0) or 0.0))
+        self.sp_obs_auto_replay_delay = QDoubleSpinBox()
+        self.sp_obs_auto_replay_delay.setRange(0.0, 15.0)
+        self.sp_obs_auto_replay_delay.setDecimals(1)
+        self.sp_obs_auto_replay_delay.setSingleStep(0.1)
+        self.sp_obs_auto_replay_delay.setSuffix(" 초")
+        self.sp_obs_auto_replay_delay.setValue(float(getattr(self.cfg, "obs_auto_replay_delay_sec", 2.0) or 0.0))
+        self.chk_obs_auto_replay_muted = QCheckBox("리플레이 음소거")
+        self.chk_obs_auto_replay_muted.setChecked(bool(getattr(self.cfg, "obs_auto_replay_muted", True)))
+        self.sp_obs_auto_replay_volume = QSpinBox()
+        self.sp_obs_auto_replay_volume.setRange(0, 100)
+        self.sp_obs_auto_replay_volume.setSuffix(" %")
+        self.sp_obs_auto_replay_volume.setValue(int(getattr(self.cfg, "obs_auto_replay_volume", 100) or 0))
+        self.cmb_obs_auto_replay_fit = QComboBox()
+        self.cmb_obs_auto_replay_fit.addItem("화면 채우기", "cover")
+        self.cmb_obs_auto_replay_fit.addItem("전체 영상 맞춤", "contain")
+        replay_fit_index = self.cmb_obs_auto_replay_fit.findData(
+            str(getattr(self.cfg, "obs_auto_replay_fit", "cover") or "cover")
+        )
+        self.cmb_obs_auto_replay_fit.setCurrentIndex(max(0, replay_fit_index))
+        self.sp_obs_auto_replay_fade = QSpinBox()
+        self.sp_obs_auto_replay_fade.setRange(0, 2000)
+        self.sp_obs_auto_replay_fade.setSuffix(" ms")
+        self.sp_obs_auto_replay_fade.setValue(int(getattr(self.cfg, "obs_auto_replay_fade_ms", 140) or 0))
+        self.chk_obs_auto_replay_stop_round = QCheckBox("다음 라운드 또는 새 경기 시작 시 즉시 종료")
+        self.chk_obs_auto_replay_stop_round.setChecked(bool(getattr(self.cfg, "obs_auto_replay_stop_on_round", True)))
+        auto_replay.addWidget(self.chk_obs_auto_replay, 0, 0, 1, 4)
+        auto_replay.addWidget(self.chk_obs_auto_replay_kd, 1, 0)
+        auto_replay.addWidget(self.chk_obs_auto_replay_tko, 1, 1)
+        auto_replay.addWidget(QLabel("이벤트 후 저장 대기"), 1, 2)
+        auto_replay.addWidget(self.sp_obs_auto_replay_capture_delay, 1, 3)
+        auto_replay.addWidget(QLabel("감지 후 재생 목표"), 2, 0)
+        auto_replay.addWidget(self.sp_obs_auto_replay_delay, 2, 1)
+        auto_replay.addWidget(self.chk_obs_auto_replay_muted, 2, 2, 1, 2)
+        auto_replay.addWidget(QLabel("볼륨"), 3, 0)
+        auto_replay.addWidget(self.sp_obs_auto_replay_volume, 3, 1)
+        auto_replay.addWidget(self.cmb_obs_auto_replay_fit, 3, 2, 1, 2)
+        auto_replay.addWidget(QLabel("전환 시간"), 4, 0)
+        auto_replay.addWidget(self.sp_obs_auto_replay_fade, 4, 1)
+        auto_replay.addWidget(self.chk_obs_auto_replay_stop_round, 4, 2, 1, 2)
+        auto_replay_hint = QLabel(
+            "저장 전 대기 동안 KO 장면까지 버퍼에 담습니다. 감지 후 재생 목표가 저장 전 대기보다 작으면 저장 완료 직후 재생됩니다."
+        )
+        auto_replay_hint.setWordWrap(True)
+        auto_replay_hint.setStyleSheet("color:#94a3b8;")
+        auto_replay.addWidget(auto_replay_hint, 5, 0, 1, 4)
+        auto_replay.setColumnStretch(1, 1)
+        auto_replay.setColumnStretch(3, 1)
+        outer.addWidget(auto_replay_group)
+
+        idle_group = QGroupBox("경기 대기 중 하이라이트 영상")
+        idle = QGridLayout(idle_group)
+        idle.setHorizontalSpacing(10)
+        idle.setVerticalSpacing(8)
+        self.chk_idle_highlight = QCheckBox("경기 중이 아닐 때 영상 재생")
+        self.chk_idle_highlight.setChecked(bool(getattr(self.cfg, "idle_highlight_enabled", False)))
+        self.le_idle_highlight_path = QLineEdit(str(getattr(self.cfg, "idle_highlight_path", "") or ""))
+        self.le_idle_highlight_path.setPlaceholderText("영상 파일 또는 영상 폴더")
+        self.btn_idle_highlight_file = QPushButton("파일")
+        self.btn_idle_highlight_folder = QPushButton("폴더")
+        self.btn_idle_highlight_file.clicked.connect(self._pick_idle_highlight_file)
+        self.btn_idle_highlight_folder.clicked.connect(self._pick_idle_highlight_folder)
+        self.chk_idle_highlight_random = QCheckBox("무작위 순서")
+        self.chk_idle_highlight_random.setChecked(bool(getattr(self.cfg, "idle_highlight_random", True)))
+        self.chk_idle_highlight_muted = QCheckBox("영상 음소거")
+        self.chk_idle_highlight_muted.setChecked(bool(getattr(self.cfg, "idle_highlight_muted", True)))
+        self.sp_idle_highlight_volume = QSpinBox()
+        self.sp_idle_highlight_volume.setRange(0, 100)
+        self.sp_idle_highlight_volume.setSuffix(" %")
+        self.sp_idle_highlight_volume.setValue(int(getattr(self.cfg, "idle_highlight_volume", 0) or 0))
+        self.cmb_idle_highlight_fit = QComboBox()
+        self.cmb_idle_highlight_fit.addItem("화면 채우기", "cover")
+        self.cmb_idle_highlight_fit.addItem("전체 영상 맞춤", "contain")
+        fit_index = self.cmb_idle_highlight_fit.findData(str(getattr(self.cfg, "idle_highlight_fit", "cover") or "cover"))
+        self.cmb_idle_highlight_fit.setCurrentIndex(max(0, fit_index))
+        self.sp_idle_highlight_fade = QSpinBox()
+        self.sp_idle_highlight_fade.setRange(0, 3000)
+        self.sp_idle_highlight_fade.setSuffix(" ms")
+        self.sp_idle_highlight_fade.setValue(int(getattr(self.cfg, "idle_highlight_fade_ms", 350) or 350))
+        idle.addWidget(self.chk_idle_highlight, 0, 0, 1, 4)
+        idle.addWidget(QLabel("영상 경로"), 1, 0)
+        idle.addWidget(self.le_idle_highlight_path, 1, 1)
+        idle.addWidget(self.btn_idle_highlight_file, 1, 2)
+        idle.addWidget(self.btn_idle_highlight_folder, 1, 3)
+        idle.addWidget(self.chk_idle_highlight_random, 2, 0)
+        idle.addWidget(self.chk_idle_highlight_muted, 2, 1)
+        idle.addWidget(QLabel("볼륨"), 2, 2)
+        idle.addWidget(self.sp_idle_highlight_volume, 2, 3)
+        idle.addWidget(QLabel("영상 맞춤"), 3, 0)
+        idle.addWidget(self.cmb_idle_highlight_fit, 3, 1)
+        idle.addWidget(QLabel("전환 시간"), 3, 2)
+        idle.addWidget(self.sp_idle_highlight_fade, 3, 3)
+        idle.setColumnStretch(1, 1)
+        idle.setColumnStretch(3, 1)
+        outer.addWidget(idle_group)
+        outer.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(container)
+        tab_layout = QVBoxLayout(self.tab_obs)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll)
+        self._refresh_obs_status_label()
+
+    def _pick_idle_highlight_file(self):
+        start = normalize_app_path(str(self.le_idle_highlight_path.text() or ""))
+        if not os.path.isdir(start):
+            start = os.path.dirname(start) if start else get_app_base_dir()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "하이라이트 영상 선택", start,
+            "Video Files (*.mp4 *.webm *.mov *.m4v);;All Files (*)",
+        )
+        if path:
+            self.le_idle_highlight_path.setText(path)
+            self._schedule_apply()
+
+    def _pick_idle_highlight_folder(self):
+        start = normalize_app_path(str(self.le_idle_highlight_path.text() or ""))
+        if not os.path.isdir(start):
+            start = os.path.dirname(start) if start else get_app_base_dir()
+        path = QFileDialog.getExistingDirectory(self, "하이라이트 영상 폴더 선택", start)
+        if path:
+            self.le_idle_highlight_path.setText(path)
+            self._schedule_apply()
+
+    def _refresh_obs_status_label(self):
+        if not hasattr(self, "lbl_obs_status"):
+            return
+        text = "비활성"
+        if callable(self._obs_status_getter):
+            try:
+                text = str(self._obs_status_getter() or text)
+            except Exception:
+                pass
+        self.lbl_obs_status.setText(text)
+
+    def _sync_obs_widgets_from_config(self):
+        if not hasattr(self, "chk_obs_enabled"):
+            return
+        self.chk_obs_enabled.setChecked(bool(getattr(self.cfg, "obs_integration_enabled", False)))
+        self.le_obs_host.setText(str(getattr(self.cfg, "obs_host", "127.0.0.1") or "127.0.0.1"))
+        self.sp_obs_port.setValue(int(getattr(self.cfg, "obs_port", 4455) or 4455))
+        self.le_obs_password.setText(str(getattr(self.cfg, "obs_password", "") or ""))
+        self.chk_obs_auto_chapter.setChecked(bool(getattr(self.cfg, "obs_auto_chapter_enabled", False)))
+        self.chk_obs_chapter_start_event.setChecked(bool(getattr(self.cfg, "obs_chapter_add_start_event", True)))
+        self.chk_obs_chapter_export_stop.setChecked(bool(getattr(self.cfg, "obs_chapter_export_on_stop", False)))
+        self.chk_obs_replay_buffer.setChecked(bool(getattr(self.cfg, "obs_replay_buffer_enabled", False)))
+        self.chk_obs_replay_buffer_auto_start.setChecked(bool(getattr(self.cfg, "obs_replay_buffer_auto_start", True)))
+        for widget, attr in (
+            (self.chk_obs_highlight_kd, "obs_highlight_kd"),
+            (self.chk_obs_highlight_tko, "obs_highlight_tko"),
+            (self.chk_obs_highlight_stun, "obs_highlight_stun"),
+            (self.chk_obs_highlight_counter, "obs_highlight_counter"),
+            (self.chk_obs_highlight_combo, "obs_highlight_combo"),
+            (self.chk_obs_highlight_heavy, "obs_highlight_heavy"),
+        ):
+            widget.setChecked(bool(getattr(self.cfg, attr, True)))
+        self.sp_obs_combo_min.setValue(int(getattr(self.cfg, "obs_highlight_combo_min", 3) or 3))
+        self.sp_obs_damage_min.setValue(float(getattr(self.cfg, "obs_highlight_damage_min", 55.0) or 55.0))
+        self.sp_obs_counter_damage_min.setValue(float(getattr(self.cfg, "obs_highlight_counter_damage_min", 30.0) or 0.0))
+        self.sp_obs_highlight_cooldown.setValue(float(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0) or 8.0))
+        self.chk_obs_auto_replay.setChecked(bool(getattr(self.cfg, "obs_auto_replay_enabled", True)))
+        self.chk_obs_auto_replay_kd.setChecked(bool(getattr(self.cfg, "obs_auto_replay_kd", True)))
+        self.chk_obs_auto_replay_tko.setChecked(bool(getattr(self.cfg, "obs_auto_replay_tko", True)))
+        self.sp_obs_auto_replay_capture_delay.setValue(float(getattr(self.cfg, "obs_auto_replay_capture_delay_sec", 1.0) or 0.0))
+        self.sp_obs_auto_replay_delay.setValue(float(getattr(self.cfg, "obs_auto_replay_delay_sec", 2.0) or 0.0))
+        self.chk_obs_auto_replay_muted.setChecked(bool(getattr(self.cfg, "obs_auto_replay_muted", True)))
+        self.sp_obs_auto_replay_volume.setValue(int(getattr(self.cfg, "obs_auto_replay_volume", 100) or 0))
+        replay_fit_index = self.cmb_obs_auto_replay_fit.findData(
+            str(getattr(self.cfg, "obs_auto_replay_fit", "cover") or "cover")
+        )
+        self.cmb_obs_auto_replay_fit.setCurrentIndex(max(0, replay_fit_index))
+        self.sp_obs_auto_replay_fade.setValue(int(getattr(self.cfg, "obs_auto_replay_fade_ms", 140) or 0))
+        self.chk_obs_auto_replay_stop_round.setChecked(bool(getattr(self.cfg, "obs_auto_replay_stop_on_round", True)))
+        self.chk_idle_highlight.setChecked(bool(getattr(self.cfg, "idle_highlight_enabled", False)))
+        self.le_idle_highlight_path.setText(str(getattr(self.cfg, "idle_highlight_path", "") or ""))
+        self.chk_idle_highlight_random.setChecked(bool(getattr(self.cfg, "idle_highlight_random", True)))
+        self.chk_idle_highlight_muted.setChecked(bool(getattr(self.cfg, "idle_highlight_muted", True)))
+        self.sp_idle_highlight_volume.setValue(int(getattr(self.cfg, "idle_highlight_volume", 0) or 0))
+        fit_index = self.cmb_idle_highlight_fit.findData(str(getattr(self.cfg, "idle_highlight_fit", "cover") or "cover"))
+        self.cmb_idle_highlight_fit.setCurrentIndex(max(0, fit_index))
+        self.sp_idle_highlight_fade.setValue(int(getattr(self.cfg, "idle_highlight_fade_ms", 350) or 350))
+        self._refresh_obs_status_label()
+
+    def _test_obs_connection_from_settings(self):
+        self.apply_only(silent=True)
+        self.lbl_obs_status.setText("연결 확인 중...")
+        if callable(self._obs_test_connection):
+            self._obs_test_connection()
+        else:
+            self.lbl_obs_status.setText("OBS 연결 기능이 연결되지 않았습니다.")
 
     def _refresh_chapter_status_label(self):
         if not hasattr(self, "lbl_chapter_status"):
@@ -8224,6 +8686,17 @@ class SettingsDialog(QDialog):
             self._schedule_apply()
         except Exception:
             logging.exception("SPECTATOR_HIT_FX_COLOR_PICK_FAIL")
+
+    def _pick_spectator_sp_bar_color(self) -> None:
+        try:
+            current = _normalize_hex_color(str(self.le_spectator_sp_bar_color.text() or "#1876d3"))
+            color = QColorDialog.getColor(QColor(current), self, "SP 바 색상 선택")
+            if not color.isValid():
+                return
+            self.le_spectator_sp_bar_color.setText(color.name(QColor.HexRgb))
+            self._schedule_apply()
+        except Exception:
+            logging.exception("SPECTATOR_SP_BAR_COLOR_PICK_FAIL")
 
     def _pick_spectator_sfx(self, line_edit: QLineEdit):
         current = str(line_edit.text() or "").strip() if line_edit is not None else ""
@@ -9005,6 +9478,18 @@ class SettingsDialog(QDialog):
                     float(side_data.get("damage", 0) or 0) / max(1, int(side_data.get("landed", 0) or 0)), 1
                 )
             if bool(final):
+                payload["blue"]["fightStyle"] = {
+                    "label": "슬러거",
+                    "signature": "한 방으로 판을 바꾸는 힘",
+                    "description": "강한 정타와 다운 위협으로 경기 흐름을 바꾸는 유형입니다.",
+                    "confidence": 88,
+                }
+                payload["red"]["fightStyle"] = {
+                    "label": "카운터 마스터",
+                    "signature": "빈틈을 읽는 반격",
+                    "description": "상대 공격 뒤 빈틈을 읽고 반격으로 흐름을 가져가는 유형입니다.",
+                    "confidence": 84,
+                }
                 payload.update({
                     "isFinal": True,
                     "winner": "blue",
@@ -9374,6 +9859,16 @@ class SettingsDialog(QDialog):
             rate_override = step.get("rate_override", None)
             pitch_override = step.get("pitch_override", None)
             action = step.get("action", None)
+            label = str(step.get("label", "") or "").strip()
+            category = str(step.get("category", "") or "").strip()
+            if label or category:
+                logging.info(
+                    "COMMENTARY_SCRIPT_SCENARIO name=%s label=%s category=%s role=%s",
+                    self._commentary_test_script_name,
+                    label,
+                    category,
+                    role,
+                )
             if callable(action):
                 try:
                     action()
@@ -9417,6 +9912,41 @@ class SettingsDialog(QDialog):
             {"role": "analyst", "text": "자동해설 종합 테스트 완료입니다.", "post_ms": 700},
         ]
         self._start_spectator_commentary_script("자동해설 종합 테스트", steps)
+
+    def _test_spectator_commentary_director_suite(self):
+        try:
+            demo_steps, checks = build_commentary_director_demo()
+            failed = [name for name, passed in checks.items() if not passed]
+            logging.info(
+                "COMMENTARY_DIRECTOR_DEMO checks=%s failed=%s steps=%s",
+                checks,
+                failed,
+                len(demo_steps),
+            )
+            if failed:
+                QMessageBox.warning(
+                    self,
+                    "해설 디렉터 테스트",
+                    "상황 판단 테스트에 실패했습니다: " + ", ".join(failed),
+                )
+                return
+            steps = [
+                {
+                    "role": "caster",
+                    "text": "해설 디렉터 상황 테스트를 시작합니다.",
+                    "post_ms": 700,
+                },
+                *demo_steps,
+                {
+                    "role": "caster",
+                    "text": "상황 판단과 중복 억제 테스트를 모두 통과했습니다.",
+                    "post_ms": 700,
+                },
+            ]
+            self._start_spectator_commentary_script("해설 디렉터 상황 테스트", steps)
+        except Exception as exc:
+            logging.exception("COMMENTARY_DIRECTOR_DEMO_FAIL")
+            QMessageBox.warning(self, "해설 디렉터 테스트", f"테스트를 시작하지 못했습니다.\n{exc}")
 
 
     def _test_spectator_commentary_duo_suite(self):
@@ -10586,6 +11116,9 @@ class SettingsDialog(QDialog):
             self.cfg.overlay_vs_bg_opacity = float(self.sl_overlay_vs_bg_opacity.value()) / 100.0
         if hasattr(self, "sp_overlay_vs_hold_sec"):
             self.cfg.overlay_vs_hold_sec = float(self.sp_overlay_vs_hold_sec.value())
+        if hasattr(self, "le_overlay_kd_image"):
+            for key, value in self._collect_overlay_ko_settings().items():
+                setattr(self.cfg, key, value)
         try:
             if self.controller:
                 self.controller.ui_update.emit({
@@ -10597,6 +11130,106 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
         self._schedule_apply()
+
+    def _browse_overlay_ko_image(self, kind: str):
+        kind = "tko" if str(kind or "").lower() == "tko" else "kd"
+        widget_name = "le_overlay_tko_image" if kind == "tko" else "le_overlay_kd_image"
+        widget = getattr(self, widget_name, None)
+        start = get_app_base_dir()
+        current = str(widget.text() or "").strip() if widget is not None else ""
+        if current:
+            try:
+                resolved = normalize_app_path(current)
+                start = os.path.dirname(resolved) if os.path.isfile(resolved) else resolved
+            except Exception:
+                pass
+        title = "TKO 연출 이미지 선택" if kind == "tko" else "다운 연출 이미지 선택"
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            start,
+            "이미지 파일 (*.png *.webp *.jpg *.jpeg *.bmp);;모든 파일 (*.*)",
+        )
+        if path and widget is not None:
+            widget.setText(to_app_rel(path))
+            self._apply_overlay_ko_live()
+
+    def _collect_overlay_ko_settings(self) -> Dict[str, object]:
+        def _text(name: str, default: str) -> str:
+            widget = getattr(self, name, None)
+            return str(widget.text() or default).strip() if widget is not None else default
+
+        def _value(name: str, default):
+            widget = getattr(self, name, None)
+            return widget.value() if widget is not None else default
+
+        shake_widget = getattr(self, "chk_overlay_ko_screen_shake", None)
+        return {
+            "overlay_kd_image_path": _text(
+                "le_overlay_kd_image", str(getattr(self.cfg, "overlay_kd_image_path", "assets/images/overlays/KD.png") or "assets/images/overlays/KD.png")
+            ),
+            "overlay_tko_image_path": _text(
+                "le_overlay_tko_image", str(getattr(self.cfg, "overlay_tko_image_path", "assets/images/overlays/TKO.png") or "assets/images/overlays/TKO.png")
+            ),
+            "overlay_ko_image_scale_pct": max(30, min(200, int(_value("sp_overlay_ko_scale", getattr(self.cfg, "overlay_ko_image_scale_pct", 100))))),
+            "overlay_ko_x": max(-800, min(800, int(_value("sp_overlay_ko_x", getattr(self.cfg, "overlay_ko_x", 0))))),
+            "overlay_ko_y": max(-450, min(450, int(_value("sp_overlay_ko_y", getattr(self.cfg, "overlay_ko_y", 0))))),
+            "overlay_ko_motion_blur_pct": max(0, min(200, int(_value("sp_overlay_ko_blur", getattr(self.cfg, "overlay_ko_motion_blur_pct", 100))))),
+            "overlay_ko_flash_intensity_pct": max(0, min(200, int(_value("sp_overlay_ko_flash", getattr(self.cfg, "overlay_ko_flash_intensity_pct", 100))))),
+            "overlay_ko_trail_intensity_pct": max(0, min(200, int(_value("sp_overlay_ko_trail", getattr(self.cfg, "overlay_ko_trail_intensity_pct", 100))))),
+            "overlay_ko_shake_intensity_pct": max(0, min(200, int(_value("sp_overlay_ko_shake", getattr(self.cfg, "overlay_ko_shake_intensity_pct", 100))))),
+            "overlay_ko_perspective_px": max(700, min(3000, int(_value("sp_overlay_ko_perspective", getattr(self.cfg, "overlay_ko_perspective_px", 1400))))),
+            "overlay_ko_start_z_px": max(100, min(2400, int(_value("sp_overlay_ko_start_z", getattr(self.cfg, "overlay_ko_start_z_px", 760))))),
+            "overlay_ko_impact_depth_px": max(0, min(180, int(_value("sp_overlay_ko_impact_depth", getattr(self.cfg, "overlay_ko_impact_depth_px", 34))))),
+            "overlay_ko_rebound_px": max(0, min(120, int(_value("sp_overlay_ko_rebound", getattr(self.cfg, "overlay_ko_rebound_px", 20))))),
+            "overlay_ko_entry_ms": max(250, min(1200, int(_value("sp_overlay_ko_entry_ms", getattr(self.cfg, "overlay_ko_entry_ms", 500))))),
+            "overlay_ko_drop_y_px": max(0, min(500, int(_value("sp_overlay_ko_drop_y", getattr(self.cfg, "overlay_ko_drop_y_px", 190))))),
+            "overlay_ko_screen_shake": bool(
+                shake_widget.isChecked() if shake_widget is not None else getattr(self.cfg, "overlay_ko_screen_shake", True)
+            ),
+            "overlay_kd_hold_sec": max(0.8, min(10.0, float(_value("sp_overlay_kd_hold", getattr(self.cfg, "overlay_kd_hold_sec", 2.2))))),
+            "overlay_tko_hold_sec": max(0.8, min(10.0, float(_value("sp_overlay_tko_hold", getattr(self.cfg, "overlay_tko_hold_sec", 2.6))))),
+        }
+
+    def _apply_overlay_ko_live(self):
+        if self._suspend_apply:
+            return
+        values = self._collect_overlay_ko_settings()
+        for key, value in values.items():
+            setattr(self.cfg, key, value)
+        try:
+            if self.controller:
+                self.controller.ui_update.emit(dict(values))
+        except Exception:
+            logging.exception("OVERLAY_KO_SETTINGS_APPLY_FAIL")
+        self._schedule_apply()
+
+    def _reset_overlay_ko_effect_defaults(self):
+        defaults = {
+            "sp_overlay_ko_blur": 100,
+            "sp_overlay_ko_flash": 100,
+            "sp_overlay_ko_trail": 100,
+            "sp_overlay_ko_shake": 100,
+            "sp_overlay_ko_perspective": 1400,
+            "sp_overlay_ko_start_z": 760,
+            "sp_overlay_ko_impact_depth": 34,
+            "sp_overlay_ko_rebound": 20,
+            "sp_overlay_ko_entry_ms": 500,
+            "sp_overlay_ko_drop_y": 190,
+        }
+        previous = self._suspend_apply
+        self._suspend_apply = True
+        try:
+            for name, value in defaults.items():
+                widget = getattr(self, name, None)
+                if widget is not None:
+                    widget.setValue(value)
+            shake_widget = getattr(self, "chk_overlay_ko_screen_shake", None)
+            if shake_widget is not None:
+                shake_widget.setChecked(True)
+        finally:
+            self._suspend_apply = previous
+        self._apply_overlay_ko_live()
 
     def _overlay_style_for_key(self, key: str) -> Dict[str, object]:
         defaults = {
@@ -10710,6 +11343,7 @@ class SettingsDialog(QDialog):
         vs_bg_opacity = float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0)
         vs_bg_map = dict(getattr(self.cfg, "overlay_vs_bg_by_arena", {}) or {})
         vs_hold_sec = float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85)
+        ko_settings = self._collect_overlay_ko_settings()
 
         if hasattr(self, "le_overlay_bg"):
             bg_color = _normalize_hex_color(str(self.le_overlay_bg.text() or "transparent").strip() or "transparent")
@@ -10790,6 +11424,24 @@ class SettingsDialog(QDialog):
             "overlay_vs_bg_opacity": max(0.0, min(1.0, float(vs_bg_opacity))),
             "overlay_vs_bg_by_arena": {str(k): to_app_rel(str(v)) for k, v in (vs_bg_map or {}).items()},
             "overlay_vs_hold_sec": max(0.5, min(15.0, float(vs_hold_sec))),
+            "overlay_kd_image_path": to_app_rel(str(ko_settings["overlay_kd_image_path"])),
+            "overlay_tko_image_path": to_app_rel(str(ko_settings["overlay_tko_image_path"])),
+            "overlay_ko_image_scale_pct": int(ko_settings["overlay_ko_image_scale_pct"]),
+            "overlay_ko_x": int(ko_settings["overlay_ko_x"]),
+            "overlay_ko_y": int(ko_settings["overlay_ko_y"]),
+            "overlay_ko_motion_blur_pct": int(ko_settings["overlay_ko_motion_blur_pct"]),
+            "overlay_ko_flash_intensity_pct": int(ko_settings["overlay_ko_flash_intensity_pct"]),
+            "overlay_ko_trail_intensity_pct": int(ko_settings["overlay_ko_trail_intensity_pct"]),
+            "overlay_ko_shake_intensity_pct": int(ko_settings["overlay_ko_shake_intensity_pct"]),
+            "overlay_ko_perspective_px": int(ko_settings["overlay_ko_perspective_px"]),
+            "overlay_ko_start_z_px": int(ko_settings["overlay_ko_start_z_px"]),
+            "overlay_ko_impact_depth_px": int(ko_settings["overlay_ko_impact_depth_px"]),
+            "overlay_ko_rebound_px": int(ko_settings["overlay_ko_rebound_px"]),
+            "overlay_ko_entry_ms": int(ko_settings["overlay_ko_entry_ms"]),
+            "overlay_ko_drop_y_px": int(ko_settings["overlay_ko_drop_y_px"]),
+            "overlay_ko_screen_shake": bool(ko_settings["overlay_ko_screen_shake"]),
+            "overlay_kd_hold_sec": float(ko_settings["overlay_kd_hold_sec"]),
+            "overlay_tko_hold_sec": float(ko_settings["overlay_tko_hold_sec"]),
         }
 
     def _apply_overlay_preset(self, data: dict):
@@ -10828,6 +11480,26 @@ class SettingsDialog(QDialog):
             vs_hold_sec = max(0.5, min(15.0, float(data.get("overlay_vs_hold_sec", 2.85) or 2.85)))
         except Exception:
             vs_hold_sec = 2.85
+        ko_settings = {
+            "overlay_kd_image_path": str(data.get("overlay_kd_image_path", "assets/images/overlays/KD.png") or "assets/images/overlays/KD.png"),
+            "overlay_tko_image_path": str(data.get("overlay_tko_image_path", "assets/images/overlays/TKO.png") or "assets/images/overlays/TKO.png"),
+            "overlay_ko_image_scale_pct": max(30, min(200, int(data.get("overlay_ko_image_scale_pct", 100) or 100))),
+            "overlay_ko_x": max(-800, min(800, int(data.get("overlay_ko_x", 0) or 0))),
+            "overlay_ko_y": max(-450, min(450, int(data.get("overlay_ko_y", 0) or 0))),
+            "overlay_ko_motion_blur_pct": max(0, min(200, int(data.get("overlay_ko_motion_blur_pct", 100) or 0))),
+            "overlay_ko_flash_intensity_pct": max(0, min(200, int(data.get("overlay_ko_flash_intensity_pct", 100) or 0))),
+            "overlay_ko_trail_intensity_pct": max(0, min(200, int(data.get("overlay_ko_trail_intensity_pct", 100) or 0))),
+            "overlay_ko_shake_intensity_pct": max(0, min(200, int(data.get("overlay_ko_shake_intensity_pct", 100) or 0))),
+            "overlay_ko_perspective_px": max(700, min(3000, int(data.get("overlay_ko_perspective_px", 1400) or 1400))),
+            "overlay_ko_start_z_px": max(100, min(2400, int(data.get("overlay_ko_start_z_px", 760) or 760))),
+            "overlay_ko_impact_depth_px": max(0, min(180, int(data.get("overlay_ko_impact_depth_px", 34) or 0))),
+            "overlay_ko_rebound_px": max(0, min(120, int(data.get("overlay_ko_rebound_px", 20) or 0))),
+            "overlay_ko_entry_ms": max(250, min(1200, int(data.get("overlay_ko_entry_ms", 500) or 500))),
+            "overlay_ko_drop_y_px": max(0, min(500, int(data.get("overlay_ko_drop_y_px", 190) or 0))),
+            "overlay_ko_screen_shake": bool(data.get("overlay_ko_screen_shake", True)),
+            "overlay_kd_hold_sec": max(0.8, min(10.0, float(data.get("overlay_kd_hold_sec", 2.2) or 2.2))),
+            "overlay_tko_hold_sec": max(0.8, min(10.0, float(data.get("overlay_tko_hold_sec", 2.6) or 2.6))),
+        }
         style = data.get("overlay_style", None)
         if style is None:
             style = {
@@ -10905,6 +11577,25 @@ class SettingsDialog(QDialog):
             self.txt_overlay_vs_bg_map.setPlainText(self._format_overlay_vs_bg_map(vs_bg_map))
         if hasattr(self, "sp_overlay_vs_hold_sec"):
             self.sp_overlay_vs_hold_sec.setValue(vs_hold_sec)
+        if hasattr(self, "le_overlay_kd_image"):
+            self.le_overlay_kd_image.setText(str(ko_settings["overlay_kd_image_path"]))
+            self.le_overlay_tko_image.setText(str(ko_settings["overlay_tko_image_path"]))
+            self.sp_overlay_ko_scale.setValue(int(ko_settings["overlay_ko_image_scale_pct"]))
+            self.sp_overlay_ko_x.setValue(int(ko_settings["overlay_ko_x"]))
+            self.sp_overlay_ko_y.setValue(int(ko_settings["overlay_ko_y"]))
+            self.sp_overlay_ko_blur.setValue(int(ko_settings["overlay_ko_motion_blur_pct"]))
+            self.sp_overlay_ko_flash.setValue(int(ko_settings["overlay_ko_flash_intensity_pct"]))
+            self.sp_overlay_ko_trail.setValue(int(ko_settings["overlay_ko_trail_intensity_pct"]))
+            self.sp_overlay_ko_shake.setValue(int(ko_settings["overlay_ko_shake_intensity_pct"]))
+            self.sp_overlay_ko_perspective.setValue(int(ko_settings["overlay_ko_perspective_px"]))
+            self.sp_overlay_ko_start_z.setValue(int(ko_settings["overlay_ko_start_z_px"]))
+            self.sp_overlay_ko_impact_depth.setValue(int(ko_settings["overlay_ko_impact_depth_px"]))
+            self.sp_overlay_ko_rebound.setValue(int(ko_settings["overlay_ko_rebound_px"]))
+            self.sp_overlay_ko_entry_ms.setValue(int(ko_settings["overlay_ko_entry_ms"]))
+            self.sp_overlay_ko_drop_y.setValue(int(ko_settings["overlay_ko_drop_y_px"]))
+            self.chk_overlay_ko_screen_shake.setChecked(bool(ko_settings["overlay_ko_screen_shake"]))
+            self.sp_overlay_kd_hold.setValue(float(ko_settings["overlay_kd_hold_sec"]))
+            self.sp_overlay_tko_hold.setValue(float(ko_settings["overlay_tko_hold_sec"]))
         if hasattr(self, "_overlay_style_widgets"):
             for key, style_data in (
                 ("round", style_round),
@@ -10939,11 +11630,14 @@ class SettingsDialog(QDialog):
         except Exception:
             self.cfg.browser_overlay_scale = 1.0
         self.cfg.browser_overlay_output_only = browser_output_only
+        for key, value in ko_settings.items():
+            setattr(self.cfg, key, value)
         self._apply_overlay_bg_live()
         self._apply_overlay_preset_mode_live()
         self._apply_overlay_mask_live()
         self._apply_overlay_elements_live()
         self._apply_overlay_vs_bg_live()
+        self._apply_overlay_ko_live()
         self._apply_overlay_style_live()
         if isinstance(layout, dict):
             try:
@@ -11488,7 +12182,7 @@ class SettingsDialog(QDialog):
         self.chk_overlay_arena_name = QCheckBox("Arena")
         self.chk_overlay_flags = QCheckBox("국기")
         self.chk_overlay_cinematic = QCheckBox("전체화면 연출")
-        _tt(self.chk_overlay_round, "라운드 박스 표시 여부")
+        _tt(self.chk_overlay_round, "라운드 텍스트와 ROUND/READY/FIGHT 연출 표시 여부")
         _tt(self.chk_overlay_time, "타이머 박스 표시 여부")
         _tt(self.chk_overlay_blue_img, "블루 초상화 표시 여부")
         _tt(self.chk_overlay_blue_name, "블루 닉네임 표시 여부")
@@ -11570,6 +12264,171 @@ class SettingsDialog(QDialog):
         _tt(self.txt_overlay_vs_bg_map, "한 줄에 경기장명=이미지파일경로 형식으로 입력합니다. 로그 경기장명과 일치하면 해당 이미지가 뜹니다.")
         overlay_lay.addWidget(vs_bg_group)
 
+        ko_group = QGroupBox("다운 / TKO 이미지 연출")
+        ko_lay = QGridLayout(ko_group)
+        self.le_overlay_kd_image = QLineEdit(str(getattr(self.cfg, "overlay_kd_image_path", "assets/images/overlays/KD.png") or "assets/images/overlays/KD.png"))
+        self.le_overlay_tko_image = QLineEdit(str(getattr(self.cfg, "overlay_tko_image_path", "assets/images/overlays/TKO.png") or "assets/images/overlays/TKO.png"))
+        self.btn_overlay_kd_image = QPushButton("다운 이미지 선택")
+        self.btn_overlay_tko_image = QPushButton("TKO 이미지 선택")
+        self.btn_overlay_kd_default = QPushButton("기본값")
+        self.btn_overlay_tko_default = QPushButton("기본값")
+        ko_lay.addWidget(QLabel("다운 이미지"), 0, 0)
+        ko_lay.addWidget(self.le_overlay_kd_image, 0, 1, 1, 4)
+        ko_lay.addWidget(self.btn_overlay_kd_image, 0, 5)
+        ko_lay.addWidget(self.btn_overlay_kd_default, 0, 6)
+        ko_lay.addWidget(QLabel("TKO 이미지"), 1, 0)
+        ko_lay.addWidget(self.le_overlay_tko_image, 1, 1, 1, 4)
+        ko_lay.addWidget(self.btn_overlay_tko_image, 1, 5)
+        ko_lay.addWidget(self.btn_overlay_tko_default, 1, 6)
+
+        self.sp_overlay_ko_scale = QSpinBox()
+        self.sp_overlay_ko_scale.setRange(30, 200)
+        self.sp_overlay_ko_scale.setSuffix("%")
+        self.sp_overlay_ko_scale.setValue(int(getattr(self.cfg, "overlay_ko_image_scale_pct", 100) or 100))
+        self.sp_overlay_ko_x = QSpinBox()
+        self.sp_overlay_ko_x.setRange(-800, 800)
+        self.sp_overlay_ko_x.setSuffix(" px")
+        self.sp_overlay_ko_x.setValue(int(getattr(self.cfg, "overlay_ko_x", 0) or 0))
+        self.sp_overlay_ko_y = QSpinBox()
+        self.sp_overlay_ko_y.setRange(-450, 450)
+        self.sp_overlay_ko_y.setSuffix(" px")
+        self.sp_overlay_ko_y.setValue(int(getattr(self.cfg, "overlay_ko_y", 0) or 0))
+        self.sp_overlay_ko_blur = QSpinBox()
+        self.sp_overlay_ko_blur.setRange(0, 200)
+        self.sp_overlay_ko_blur.setSuffix("%")
+        self.sp_overlay_ko_blur.setValue(int(getattr(self.cfg, "overlay_ko_motion_blur_pct", 100) or 100))
+        ko_lay.addWidget(QLabel("이미지 크기"), 2, 0)
+        ko_lay.addWidget(self.sp_overlay_ko_scale, 2, 1)
+        ko_lay.addWidget(QLabel("가로 위치"), 2, 2)
+        ko_lay.addWidget(self.sp_overlay_ko_x, 2, 3)
+        ko_lay.addWidget(QLabel("세로 위치"), 2, 4)
+        ko_lay.addWidget(self.sp_overlay_ko_y, 2, 5)
+        ko_lay.addWidget(QLabel("모션 블러"), 2, 6)
+        ko_lay.addWidget(self.sp_overlay_ko_blur, 2, 7)
+
+        self.sp_overlay_kd_hold = QDoubleSpinBox()
+        self.sp_overlay_kd_hold.setRange(0.8, 10.0)
+        self.sp_overlay_kd_hold.setDecimals(1)
+        self.sp_overlay_kd_hold.setSingleStep(0.1)
+        self.sp_overlay_kd_hold.setSuffix(" 초")
+        self.sp_overlay_kd_hold.setValue(float(getattr(self.cfg, "overlay_kd_hold_sec", 2.2) or 2.2))
+        self.sp_overlay_tko_hold = QDoubleSpinBox()
+        self.sp_overlay_tko_hold.setRange(0.8, 10.0)
+        self.sp_overlay_tko_hold.setDecimals(1)
+        self.sp_overlay_tko_hold.setSingleStep(0.1)
+        self.sp_overlay_tko_hold.setSuffix(" 초")
+        self.sp_overlay_tko_hold.setValue(float(getattr(self.cfg, "overlay_tko_hold_sec", 2.6) or 2.6))
+        self.chk_overlay_ko_screen_shake = QCheckBox("충돌 순간 HUD 전체 흔들림")
+        self.chk_overlay_ko_screen_shake.setChecked(bool(getattr(self.cfg, "overlay_ko_screen_shake", True)))
+        self.btn_overlay_kd_test = QPushButton("다운 연출 테스트")
+        self.btn_overlay_tko_test = QPushButton("TKO 연출 테스트")
+        ko_lay.addWidget(QLabel("다운 유지"), 3, 0)
+        ko_lay.addWidget(self.sp_overlay_kd_hold, 3, 1)
+        ko_lay.addWidget(QLabel("TKO 유지"), 3, 2)
+        ko_lay.addWidget(self.sp_overlay_tko_hold, 3, 3)
+        ko_lay.addWidget(self.chk_overlay_ko_screen_shake, 3, 4, 1, 2)
+        ko_lay.addWidget(self.btn_overlay_kd_test, 3, 6)
+        ko_lay.addWidget(self.btn_overlay_tko_test, 3, 7)
+
+        self.sp_overlay_ko_perspective = QSpinBox()
+        self.sp_overlay_ko_perspective.setRange(700, 3000)
+        self.sp_overlay_ko_perspective.setSuffix(" px")
+        self.sp_overlay_ko_perspective.setValue(int(getattr(self.cfg, "overlay_ko_perspective_px", 1400) or 1400))
+        self.sp_overlay_ko_start_z = QSpinBox()
+        self.sp_overlay_ko_start_z.setRange(100, 2400)
+        self.sp_overlay_ko_start_z.setSuffix(" px")
+        self.sp_overlay_ko_start_z.setValue(int(getattr(self.cfg, "overlay_ko_start_z_px", 760) or 760))
+        self.sp_overlay_ko_impact_depth = QSpinBox()
+        self.sp_overlay_ko_impact_depth.setRange(0, 180)
+        self.sp_overlay_ko_impact_depth.setSuffix(" px")
+        self.sp_overlay_ko_impact_depth.setValue(int(getattr(self.cfg, "overlay_ko_impact_depth_px", 34) or 34))
+        self.sp_overlay_ko_rebound = QSpinBox()
+        self.sp_overlay_ko_rebound.setRange(0, 120)
+        self.sp_overlay_ko_rebound.setSuffix(" px")
+        self.sp_overlay_ko_rebound.setValue(int(getattr(self.cfg, "overlay_ko_rebound_px", 20) or 20))
+        self.sp_overlay_ko_entry_ms = QSpinBox()
+        self.sp_overlay_ko_entry_ms.setRange(250, 1200)
+        self.sp_overlay_ko_entry_ms.setSingleStep(10)
+        self.sp_overlay_ko_entry_ms.setSuffix(" ms")
+        self.sp_overlay_ko_entry_ms.setValue(int(getattr(self.cfg, "overlay_ko_entry_ms", 500) or 500))
+        self.sp_overlay_ko_drop_y = QSpinBox()
+        self.sp_overlay_ko_drop_y.setRange(0, 500)
+        self.sp_overlay_ko_drop_y.setSuffix(" px")
+        self.sp_overlay_ko_drop_y.setValue(int(getattr(self.cfg, "overlay_ko_drop_y_px", 190) or 0))
+        self.sp_overlay_ko_flash = QSpinBox()
+        self.sp_overlay_ko_flash.setRange(0, 200)
+        self.sp_overlay_ko_flash.setSuffix("%")
+        self.sp_overlay_ko_flash.setValue(int(getattr(self.cfg, "overlay_ko_flash_intensity_pct", 100) or 100))
+        self.sp_overlay_ko_trail = QSpinBox()
+        self.sp_overlay_ko_trail.setRange(0, 200)
+        self.sp_overlay_ko_trail.setSuffix("%")
+        self.sp_overlay_ko_trail.setValue(int(getattr(self.cfg, "overlay_ko_trail_intensity_pct", 100) or 100))
+        self.sp_overlay_ko_shake = QSpinBox()
+        self.sp_overlay_ko_shake.setRange(0, 200)
+        self.sp_overlay_ko_shake.setSuffix("%")
+        self.sp_overlay_ko_shake.setValue(int(getattr(self.cfg, "overlay_ko_shake_intensity_pct", 100) or 100))
+        self.btn_overlay_ko_fx_default = QPushButton("연출 기본값")
+        ko_lay.addWidget(QLabel("원근 거리"), 4, 0)
+        ko_lay.addWidget(self.sp_overlay_ko_perspective, 4, 1)
+        ko_lay.addWidget(QLabel("시작 Z"), 4, 2)
+        ko_lay.addWidget(self.sp_overlay_ko_start_z, 4, 3)
+        ko_lay.addWidget(QLabel("충돌 깊이"), 4, 4)
+        ko_lay.addWidget(self.sp_overlay_ko_impact_depth, 4, 5)
+        ko_lay.addWidget(QLabel("반동"), 4, 6)
+        ko_lay.addWidget(self.sp_overlay_ko_rebound, 4, 7)
+        ko_lay.addWidget(QLabel("진입 시간"), 5, 0)
+        ko_lay.addWidget(self.sp_overlay_ko_entry_ms, 5, 1)
+        ko_lay.addWidget(QLabel("낙하 높이"), 5, 2)
+        ko_lay.addWidget(self.sp_overlay_ko_drop_y, 5, 3)
+        ko_lay.addWidget(QLabel("착지 플래시"), 5, 4)
+        ko_lay.addWidget(self.sp_overlay_ko_flash, 5, 5)
+        ko_lay.addWidget(QLabel("잔상 강도"), 5, 6)
+        ko_lay.addWidget(self.sp_overlay_ko_trail, 5, 7)
+        ko_lay.addWidget(QLabel("흔들림 강도"), 6, 0)
+        ko_lay.addWidget(self.sp_overlay_ko_shake, 6, 1)
+        ko_lay.addWidget(self.btn_overlay_ko_fx_default, 6, 6, 1, 2)
+
+        self.btn_overlay_kd_image.clicked.connect(lambda: self._browse_overlay_ko_image("kd"))
+        self.btn_overlay_tko_image.clicked.connect(lambda: self._browse_overlay_ko_image("tko"))
+        self.btn_overlay_kd_default.clicked.connect(lambda: self.le_overlay_kd_image.setText("assets/images/overlays/KD.png"))
+        self.btn_overlay_tko_default.clicked.connect(lambda: self.le_overlay_tko_image.setText("assets/images/overlays/TKO.png"))
+        self.le_overlay_kd_image.editingFinished.connect(self._apply_overlay_ko_live)
+        self.le_overlay_tko_image.editingFinished.connect(self._apply_overlay_ko_live)
+        self.btn_overlay_kd_default.clicked.connect(self._apply_overlay_ko_live)
+        self.btn_overlay_tko_default.clicked.connect(self._apply_overlay_ko_live)
+        self.sp_overlay_ko_scale.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_x.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_y.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_blur.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_perspective.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_start_z.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_impact_depth.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_rebound.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_entry_ms.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_drop_y.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_flash.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_trail.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_ko_shake.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_kd_hold.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.sp_overlay_tko_hold.valueChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.chk_overlay_ko_screen_shake.stateChanged.connect(lambda _v: self._apply_overlay_ko_live())
+        self.btn_overlay_ko_fx_default.clicked.connect(self._reset_overlay_ko_effect_defaults)
+        self.btn_overlay_kd_test.clicked.connect(lambda: self._test_spectator_effect("blue", "knockdown"))
+        self.btn_overlay_tko_test.clicked.connect(lambda: self._test_spectator_effect("red", "tko"))
+        _tt(self.sp_overlay_ko_blur, "Z축으로 돌진할 때 보이는 잔상과 모션 블러 강도입니다. 0%면 잔상이 거의 사라집니다.")
+        _tt(self.sp_overlay_ko_perspective, "3D 카메라의 원근 거리입니다. 값이 낮을수록 Z축 깊이감이 강해집니다.")
+        _tt(self.sp_overlay_ko_start_z, "이미지가 카메라 가까이에서 출발하는 거리입니다. 값이 클수록 처음에 더 크게 보입니다.")
+        _tt(self.sp_overlay_ko_impact_depth, "이미지가 화면 평면을 뚫고 들어가는 충돌 깊이입니다.")
+        _tt(self.sp_overlay_ko_rebound, "충돌 직후 이미지가 시청자 방향으로 튕겨 나오는 거리입니다.")
+        _tt(self.sp_overlay_ko_entry_ms, "카메라 가까이에서 화면까지 돌진하는 시간입니다. 값이 작을수록 더 빠르게 박힙니다.")
+        _tt(self.sp_overlay_ko_drop_y, "이미지가 화면 위쪽에서 충돌 지점으로 떨어지는 거리입니다. 0이면 수직 낙하 없이 Z축으로만 이동합니다.")
+        _tt(self.sp_overlay_ko_flash, "착지 순간 화면 전체가 번쩍이는 강도입니다. 0%면 플래시를 끕니다.")
+        _tt(self.sp_overlay_ko_trail, "착지 전 이동 중 보이는 잔상 강도입니다. 모션 블러와 별도로 조절됩니다.")
+        _tt(self.sp_overlay_ko_shake, "착지 순간 HUD가 흔들리는 강도입니다. HUD 흔들림 체크가 켜져 있을 때 적용됩니다.")
+        _tt(self.btn_overlay_ko_fx_default, "이미지·위치·크기·유지시간은 보존하고 KD/TKO 모션 연출값만 기본값으로 복원합니다.")
+        _tt(self.chk_overlay_ko_screen_shake, "이미지가 박히는 순간 HUD 전체에 짧은 감쇠 흔들림을 추가합니다.")
+        overlay_lay.addWidget(ko_group)
+
         browser_group = QGroupBox("OBS 브라우저 출력")
         browser_lay = QGridLayout(browser_group)
         browser_url = "http://127.0.0.1:17872/overlay"
@@ -11584,6 +12443,8 @@ class SettingsDialog(QDialog):
         self.btn_browser_overlay_copy.clicked.connect(self._copy_browser_overlay_url)
         self.btn_browser_overlay_open = QPushButton("열기")
         self.btn_browser_overlay_open.clicked.connect(self._open_browser_overlay_url)
+        self.btn_browser_overlay_studio = QPushButton("오버레이 스튜디오")
+        self.btn_browser_overlay_studio.clicked.connect(self._open_browser_overlay_studio_url)
         self.sp_browser_overlay_poll = QSpinBox()
         self.sp_browser_overlay_poll.setRange(16, 1000)
         self.sp_browser_overlay_poll.setSingleStep(10)
@@ -11612,6 +12473,7 @@ class SettingsDialog(QDialog):
         browser_lay.addWidget(self.le_browser_overlay_url, 0, 1, 1, 3)
         browser_lay.addWidget(self.btn_browser_overlay_open, 0, 4)
         browser_lay.addWidget(self.btn_browser_overlay_copy, 0, 5)
+        browser_lay.addWidget(self.btn_browser_overlay_studio, 0, 6)
         browser_lay.addWidget(QLabel("갱신 주기"), 1, 0)
         browser_lay.addWidget(self.sp_browser_overlay_poll, 1, 1)
         browser_lay.addWidget(QLabel("상태"), 1, 2)
@@ -11622,6 +12484,7 @@ class SettingsDialog(QDialog):
         browser_lay.addWidget(self.chk_qml_preview_enabled, 3, 0, 1, 6)
         browser_lay.addWidget(self.chk_qml_effects_enabled, 4, 0, 1, 6)
         _tt(self.le_browser_overlay_url, "OBS 브라우저 소스 주소입니다. timerauto 실행 중에 사용하세요.")
+        _tt(self.btn_browser_overlay_studio, "브라우저 오버레이를 직접 드래그하고 크기·색상·표시 여부를 편집합니다.")
         _tt(self.sp_browser_overlay_poll, "timerauto 상태를 OBS 브라우저 소스에 갱신하는 주기입니다. 짧을수록 반응은 빠르지만 CPU 사용량이 늘 수 있습니다.")
         _tt(self.sp_browser_fullscreen_fx_intensity, "다운/KO/TKO 때 브라우저 화면 전체를 덮는 플래시와 충격 효과의 강도입니다.")
         _tt(self.chk_browser_overlay_output_only, "Show fullscreen effects only in the OBS browser source, not on the local Qt overlay.")
@@ -16020,6 +16883,43 @@ class SettingsDialog(QDialog):
             self.cfg.chapter_nickname_only = bool(self.chk_chapter_nickname_only.isChecked())
         if hasattr(self, "chk_chapter_hide_time"):
             self.cfg.chapter_hide_time = bool(self.chk_chapter_hide_time.isChecked())
+        if hasattr(self, "chk_obs_enabled"):
+            self.cfg.obs_integration_enabled = bool(self.chk_obs_enabled.isChecked())
+            self.cfg.obs_host = str(self.le_obs_host.text() or "127.0.0.1").strip() or "127.0.0.1"
+            self.cfg.obs_port = int(self.sp_obs_port.value())
+            self.cfg.obs_password = str(self.le_obs_password.text() or "")
+            self.cfg.obs_auto_chapter_enabled = bool(self.chk_obs_auto_chapter.isChecked())
+            self.cfg.obs_chapter_add_start_event = bool(self.chk_obs_chapter_start_event.isChecked())
+            self.cfg.obs_chapter_export_on_stop = bool(self.chk_obs_chapter_export_stop.isChecked())
+            self.cfg.obs_replay_buffer_enabled = bool(self.chk_obs_replay_buffer.isChecked())
+            self.cfg.obs_replay_buffer_auto_start = bool(self.chk_obs_replay_buffer_auto_start.isChecked())
+            self.cfg.obs_highlight_kd = bool(self.chk_obs_highlight_kd.isChecked())
+            self.cfg.obs_highlight_tko = bool(self.chk_obs_highlight_tko.isChecked())
+            self.cfg.obs_highlight_stun = bool(self.chk_obs_highlight_stun.isChecked())
+            self.cfg.obs_highlight_counter = bool(self.chk_obs_highlight_counter.isChecked())
+            self.cfg.obs_highlight_combo = bool(self.chk_obs_highlight_combo.isChecked())
+            self.cfg.obs_highlight_heavy = bool(self.chk_obs_highlight_heavy.isChecked())
+            self.cfg.obs_highlight_combo_min = int(self.sp_obs_combo_min.value())
+            self.cfg.obs_highlight_damage_min = float(self.sp_obs_damage_min.value())
+            self.cfg.obs_highlight_counter_damage_min = float(self.sp_obs_counter_damage_min.value())
+            self.cfg.obs_highlight_cooldown_sec = float(self.sp_obs_highlight_cooldown.value())
+            self.cfg.obs_auto_replay_enabled = bool(self.chk_obs_auto_replay.isChecked())
+            self.cfg.obs_auto_replay_kd = bool(self.chk_obs_auto_replay_kd.isChecked())
+            self.cfg.obs_auto_replay_tko = bool(self.chk_obs_auto_replay_tko.isChecked())
+            self.cfg.obs_auto_replay_capture_delay_sec = float(self.sp_obs_auto_replay_capture_delay.value())
+            self.cfg.obs_auto_replay_delay_sec = float(self.sp_obs_auto_replay_delay.value())
+            self.cfg.obs_auto_replay_muted = bool(self.chk_obs_auto_replay_muted.isChecked())
+            self.cfg.obs_auto_replay_volume = int(self.sp_obs_auto_replay_volume.value())
+            self.cfg.obs_auto_replay_fit = str(self.cmb_obs_auto_replay_fit.currentData() or "cover")
+            self.cfg.obs_auto_replay_fade_ms = int(self.sp_obs_auto_replay_fade.value())
+            self.cfg.obs_auto_replay_stop_on_round = bool(self.chk_obs_auto_replay_stop_round.isChecked())
+            self.cfg.idle_highlight_enabled = bool(self.chk_idle_highlight.isChecked())
+            self.cfg.idle_highlight_path = str(self.le_idle_highlight_path.text() or "").strip()
+            self.cfg.idle_highlight_random = bool(self.chk_idle_highlight_random.isChecked())
+            self.cfg.idle_highlight_muted = bool(self.chk_idle_highlight_muted.isChecked())
+            self.cfg.idle_highlight_volume = int(self.sp_idle_highlight_volume.value())
+            self.cfg.idle_highlight_fit = str(self.cmb_idle_highlight_fit.currentData() or "cover")
+            self.cfg.idle_highlight_fade_ms = int(self.sp_idle_highlight_fade.value())
         if hasattr(self, "chk_spectatorlog_enabled"):
             self.cfg.spectatorlog_enabled = bool(self.chk_spectatorlog_enabled.isChecked())
         if hasattr(self, "chk_spectatorlog_sync_players"):
@@ -16066,12 +16966,29 @@ class SettingsDialog(QDialog):
             self.cfg.spectator_sp_fight_recovery_pct = float(self.sp_spectator_sp_fight_recovery.value())
             self.cfg.spectator_sp_break_recovery_pct = float(self.sp_spectator_sp_break_recovery.value())
             self.cfg.spectator_sp_recovery_delay_sec = float(self.sp_spectator_sp_recovery_delay.value())
+            self.cfg.spectator_sp_bar_x = int(self.sp_spectator_sp_bar_x.value())
+            self.cfg.spectator_sp_bar_y = int(self.sp_spectator_sp_bar_y.value())
+            self.cfg.spectator_sp_bar_length_pct = int(self.sp_spectator_sp_bar_length.value())
+            self.cfg.spectator_sp_bar_thickness = int(self.sp_spectator_sp_bar_thickness.value())
+            self.cfg.spectator_sp_bar_color = _normalize_hex_color(str(self.le_spectator_sp_bar_color.text() or "#1876d3"))
+            self.cfg.spectator_name_bar_x = int(self.sp_spectator_name_bar_x.value())
+            self.cfg.spectator_name_bar_y = int(self.sp_spectator_name_bar_y.value())
         if hasattr(self, "chk_spectatorlog_blackbox_enabled"):
             self.cfg.spectatorlog_blackbox_enabled = bool(self.chk_spectatorlog_blackbox_enabled.isChecked())
         if hasattr(self, "le_spectatorlog_blackbox_dir"):
             self.cfg.spectatorlog_blackbox_dir = str(self.le_spectatorlog_blackbox_dir.text() or "").strip() or "SpectatorLogArchive"
         if hasattr(self, "cmb_spectatorlog_blackbox_mode"):
             self.cfg.spectatorlog_blackbox_mode = str(self.cmb_spectatorlog_blackbox_mode.currentData() or "smart")
+        if hasattr(self, "chk_spectator_fight_style"):
+            self.cfg.spectator_fight_style_enabled = bool(self.chk_spectator_fight_style.isChecked())
+        if hasattr(self, "sp_spectator_fight_style_attempts"):
+            self.cfg.spectator_fight_style_min_attempts = int(
+                self.sp_spectator_fight_style_attempts.value()
+            )
+        if hasattr(self, "sp_spectator_fight_style_landed"):
+            self.cfg.spectator_fight_style_min_landed = int(
+                self.sp_spectator_fight_style_landed.value()
+            )
         if hasattr(self, "chk_spectator_commentary"):
             self.cfg.spectator_commentary_enabled = bool(self.chk_spectator_commentary.isChecked())
         if hasattr(self, "cmb_spectator_commentary_mode"):
@@ -16316,6 +17233,24 @@ class SettingsDialog(QDialog):
                     "overlay_show_cinematic": self.cfg.overlay_show_cinematic,
                     "browser_overlay_output_only": self.cfg.browser_overlay_output_only,
                     "browser_fullscreen_fx_intensity": self.cfg.browser_fullscreen_fx_intensity,
+                    "overlay_kd_image_path": self.cfg.overlay_kd_image_path,
+                    "overlay_tko_image_path": self.cfg.overlay_tko_image_path,
+                    "overlay_ko_image_scale_pct": self.cfg.overlay_ko_image_scale_pct,
+                    "overlay_ko_x": self.cfg.overlay_ko_x,
+                    "overlay_ko_y": self.cfg.overlay_ko_y,
+                    "overlay_ko_motion_blur_pct": self.cfg.overlay_ko_motion_blur_pct,
+                    "overlay_ko_flash_intensity_pct": self.cfg.overlay_ko_flash_intensity_pct,
+                    "overlay_ko_trail_intensity_pct": self.cfg.overlay_ko_trail_intensity_pct,
+                    "overlay_ko_shake_intensity_pct": self.cfg.overlay_ko_shake_intensity_pct,
+                    "overlay_ko_perspective_px": self.cfg.overlay_ko_perspective_px,
+                    "overlay_ko_start_z_px": self.cfg.overlay_ko_start_z_px,
+                    "overlay_ko_impact_depth_px": self.cfg.overlay_ko_impact_depth_px,
+                    "overlay_ko_rebound_px": self.cfg.overlay_ko_rebound_px,
+                    "overlay_ko_entry_ms": self.cfg.overlay_ko_entry_ms,
+                    "overlay_ko_drop_y_px": self.cfg.overlay_ko_drop_y_px,
+                    "overlay_ko_screen_shake": self.cfg.overlay_ko_screen_shake,
+                    "overlay_kd_hold_sec": self.cfg.overlay_kd_hold_sec,
+                    "overlay_tko_hold_sec": self.cfg.overlay_tko_hold_sec,
                     "qml_effects_enabled": self.cfg.qml_effects_enabled,
                     "spectator_recent_text_size": self.cfg.spectator_recent_text_size,
                     "overlay_style": {
@@ -16343,6 +17278,14 @@ class SettingsDialog(QDialog):
                 self.cfg.to_json(self._cfg_path)
             except Exception:
                 pass
+        try:
+            if callable(self._obs_reconfigure):
+                self._obs_reconfigure()
+            if callable(self._idle_highlight_refresh):
+                self._idle_highlight_refresh()
+            self._refresh_obs_status_label()
+        except Exception:
+            logging.exception("OBS_SETTINGS_APPLY_FAIL")
 
         if not silent:
             QMessageBox.information(self, "적용", "설정이 적용되었습니다.")
@@ -16383,6 +17326,10 @@ class SettingsDialog(QDialog):
             self.cfg.chapter_anchor_epoch = 0.0
             QMessageBox.information(self, "불러오기", f"불러오기 완료!\n{path}")
             self._sync_from_config()
+            if callable(self._obs_reconfigure):
+                self._obs_reconfigure()
+            if callable(self._idle_highlight_refresh):
+                self._idle_highlight_refresh()
             try:
                 if self._player_state_apply:
                     self._player_state_apply(self.cfg)
@@ -16409,6 +17356,24 @@ class SettingsDialog(QDialog):
                         "overlay_show_arena_name": bool(getattr(self.cfg, "overlay_show_arena_name", True)),
                         "overlay_show_flags": bool(getattr(self.cfg, "overlay_show_flags", True)),
                         "overlay_show_cinematic": bool(getattr(self.cfg, "overlay_show_cinematic", True)),
+                        "overlay_kd_image_path": str(getattr(self.cfg, "overlay_kd_image_path", "assets/images/overlays/KD.png") or "assets/images/overlays/KD.png"),
+                        "overlay_tko_image_path": str(getattr(self.cfg, "overlay_tko_image_path", "assets/images/overlays/TKO.png") or "assets/images/overlays/TKO.png"),
+                        "overlay_ko_image_scale_pct": int(getattr(self.cfg, "overlay_ko_image_scale_pct", 100) or 100),
+                        "overlay_ko_x": int(getattr(self.cfg, "overlay_ko_x", 0) or 0),
+                        "overlay_ko_y": int(getattr(self.cfg, "overlay_ko_y", 0) or 0),
+                        "overlay_ko_motion_blur_pct": int(getattr(self.cfg, "overlay_ko_motion_blur_pct", 100) or 100),
+                        "overlay_ko_flash_intensity_pct": int(getattr(self.cfg, "overlay_ko_flash_intensity_pct", 100) or 100),
+                        "overlay_ko_trail_intensity_pct": int(getattr(self.cfg, "overlay_ko_trail_intensity_pct", 100) or 100),
+                        "overlay_ko_shake_intensity_pct": int(getattr(self.cfg, "overlay_ko_shake_intensity_pct", 100) or 100),
+                        "overlay_ko_perspective_px": int(getattr(self.cfg, "overlay_ko_perspective_px", 1400) or 1400),
+                        "overlay_ko_start_z_px": int(getattr(self.cfg, "overlay_ko_start_z_px", 760) or 760),
+                        "overlay_ko_impact_depth_px": int(getattr(self.cfg, "overlay_ko_impact_depth_px", 34) or 34),
+                        "overlay_ko_rebound_px": int(getattr(self.cfg, "overlay_ko_rebound_px", 20) or 20),
+                        "overlay_ko_entry_ms": int(getattr(self.cfg, "overlay_ko_entry_ms", 500) or 500),
+                        "overlay_ko_drop_y_px": int(getattr(self.cfg, "overlay_ko_drop_y_px", 190) or 0),
+                        "overlay_ko_screen_shake": bool(getattr(self.cfg, "overlay_ko_screen_shake", True)),
+                        "overlay_kd_hold_sec": float(getattr(self.cfg, "overlay_kd_hold_sec", 2.2) or 2.2),
+                        "overlay_tko_hold_sec": float(getattr(self.cfg, "overlay_tko_hold_sec", 2.6) or 2.6),
                         "overlay_style": {
                             "round": getattr(self.cfg, "overlay_style_round", _default_overlay_style_round()),
                             "time": getattr(self.cfg, "overlay_style_time", _default_overlay_style_time()),
@@ -16573,6 +17538,13 @@ class SettingsDialog(QDialog):
             self.sp_spectator_sp_fight_recovery.setValue(float(getattr(self.cfg, "spectator_sp_fight_recovery_pct", 5.0) or 0.0))
             self.sp_spectator_sp_break_recovery.setValue(float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 30.0) or 0.0))
             self.sp_spectator_sp_recovery_delay.setValue(float(getattr(self.cfg, "spectator_sp_recovery_delay_sec", 1.5) or 0.0))
+            self.sp_spectator_sp_bar_x.setValue(int(getattr(self.cfg, "spectator_sp_bar_x", 0) or 0))
+            self.sp_spectator_sp_bar_y.setValue(int(getattr(self.cfg, "spectator_sp_bar_y", 0) or 0))
+            self.sp_spectator_sp_bar_length.setValue(int(getattr(self.cfg, "spectator_sp_bar_length_pct", 100) or 100))
+            self.sp_spectator_sp_bar_thickness.setValue(int(getattr(self.cfg, "spectator_sp_bar_thickness", 10) or 10))
+            self.le_spectator_sp_bar_color.setText(str(getattr(self.cfg, "spectator_sp_bar_color", "#1876d3") or "#1876d3"))
+            self.sp_spectator_name_bar_x.setValue(int(getattr(self.cfg, "spectator_name_bar_x", 0) or 0))
+            self.sp_spectator_name_bar_y.setValue(int(getattr(self.cfg, "spectator_name_bar_y", 0) or 0))
         if hasattr(self, "sp_spectatorlog_backup_poll"):
             self.sp_spectatorlog_backup_poll.setValue(int(getattr(self.cfg, "spectatorlog_backup_poll_ms", 1500) or 1500))
         if hasattr(self, "chk_spectatorlog_blackbox_enabled"):
@@ -16582,6 +17554,18 @@ class SettingsDialog(QDialog):
         if hasattr(self, "cmb_spectatorlog_blackbox_mode"):
             idx = self.cmb_spectatorlog_blackbox_mode.findData(str(getattr(self.cfg, "spectatorlog_blackbox_mode", "smart") or "smart"))
             self.cmb_spectatorlog_blackbox_mode.setCurrentIndex(idx if idx >= 0 else 1)
+        if hasattr(self, "chk_spectator_fight_style"):
+            self.chk_spectator_fight_style.setChecked(
+                bool(getattr(self.cfg, "spectator_fight_style_enabled", True))
+            )
+        if hasattr(self, "sp_spectator_fight_style_attempts"):
+            self.sp_spectator_fight_style_attempts.setValue(
+                int(getattr(self.cfg, "spectator_fight_style_min_attempts", 20) or 20)
+            )
+        if hasattr(self, "sp_spectator_fight_style_landed"):
+            self.sp_spectator_fight_style_landed.setValue(
+                int(getattr(self.cfg, "spectator_fight_style_min_landed", 10) or 10)
+            )
         if hasattr(self, "chk_spectator_commentary"):
             self.chk_spectator_commentary.setChecked(bool(getattr(self.cfg, "spectator_commentary_enabled", False)))
         if hasattr(self, "cmb_spectator_commentary_mode"):
@@ -16731,6 +17715,25 @@ class SettingsDialog(QDialog):
             self.sl_overlay_vs_bg_opacity.setValue(int(max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))) * 100))
         if hasattr(self, "sp_overlay_vs_hold_sec"):
             self.sp_overlay_vs_hold_sec.setValue(max(0.5, min(15.0, float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85))))
+        if hasattr(self, "le_overlay_kd_image"):
+            self.le_overlay_kd_image.setText(str(getattr(self.cfg, "overlay_kd_image_path", "assets/images/overlays/KD.png") or "assets/images/overlays/KD.png"))
+            self.le_overlay_tko_image.setText(str(getattr(self.cfg, "overlay_tko_image_path", "assets/images/overlays/TKO.png") or "assets/images/overlays/TKO.png"))
+            self.sp_overlay_ko_scale.setValue(int(getattr(self.cfg, "overlay_ko_image_scale_pct", 100) or 100))
+            self.sp_overlay_ko_x.setValue(int(getattr(self.cfg, "overlay_ko_x", 0) or 0))
+            self.sp_overlay_ko_y.setValue(int(getattr(self.cfg, "overlay_ko_y", 0) or 0))
+            self.sp_overlay_ko_blur.setValue(int(getattr(self.cfg, "overlay_ko_motion_blur_pct", 100) or 100))
+            self.sp_overlay_ko_flash.setValue(int(getattr(self.cfg, "overlay_ko_flash_intensity_pct", 100) or 100))
+            self.sp_overlay_ko_trail.setValue(int(getattr(self.cfg, "overlay_ko_trail_intensity_pct", 100) or 100))
+            self.sp_overlay_ko_shake.setValue(int(getattr(self.cfg, "overlay_ko_shake_intensity_pct", 100) or 100))
+            self.sp_overlay_ko_perspective.setValue(int(getattr(self.cfg, "overlay_ko_perspective_px", 1400) or 1400))
+            self.sp_overlay_ko_start_z.setValue(int(getattr(self.cfg, "overlay_ko_start_z_px", 760) or 760))
+            self.sp_overlay_ko_impact_depth.setValue(int(getattr(self.cfg, "overlay_ko_impact_depth_px", 34) or 34))
+            self.sp_overlay_ko_rebound.setValue(int(getattr(self.cfg, "overlay_ko_rebound_px", 20) or 20))
+            self.sp_overlay_ko_entry_ms.setValue(int(getattr(self.cfg, "overlay_ko_entry_ms", 500) or 500))
+            self.sp_overlay_ko_drop_y.setValue(int(getattr(self.cfg, "overlay_ko_drop_y_px", 190) or 0))
+            self.chk_overlay_ko_screen_shake.setChecked(bool(getattr(self.cfg, "overlay_ko_screen_shake", True)))
+            self.sp_overlay_kd_hold.setValue(float(getattr(self.cfg, "overlay_kd_hold_sec", 2.2) or 2.2))
+            self.sp_overlay_tko_hold.setValue(float(getattr(self.cfg, "overlay_tko_hold_sec", 2.6) or 2.6))
         if hasattr(self, "sp_browser_overlay_scale"):
             self.sp_browser_overlay_scale.setValue(int(float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0) * 100))
         if hasattr(self, "sp_browser_overlay_poll"):
@@ -16813,6 +17816,7 @@ class SettingsDialog(QDialog):
                     except Exception:
                         pass
         self._refresh_overlay_custom_list()
+        self._sync_obs_widgets_from_config()
         self._suspend_apply = False
 
 
@@ -16945,6 +17949,23 @@ class MainApp(QObject):
         self._chapter_autosave_timer = QTimer()
         self._chapter_autosave_timer.setInterval(5000)
         self._chapter_autosave_timer.timeout.connect(self._chapter_autosave_tick)
+        self._match_active = False
+        self._obs_stream_active: Optional[bool] = None
+        self._obs_last_highlight_at = 0.0
+        self._obs_highlight_event_keys = deque(maxlen=300)
+        self._obs_highlight_event_key_set = set()
+        self._obs_highlight_capture_generation = 0
+        self._obs_combo_text = {"blue": "", "red": ""}
+        self._obs_status_detail = ""
+        self.obs_integration = ObsIntegration(self.cfg)
+        self._obs_auto_replay = ObsAutoReplayController(
+            lambda: self.cfg,
+            lambda: getattr(self, "browser_overlay", None),
+            lambda delay_ms, callback: QTimer.singleShot(delay_ms, callback),
+        )
+        self._obs_poll_timer = QTimer()
+        self._obs_poll_timer.setInterval(200)
+        self._obs_poll_timer.timeout.connect(self._poll_obs_integration)
         self._burst_audio_out = QAudioOutput() if HAS_QTMULTIMEDIA and QAudioOutput else None
         self._burst_player = QMediaPlayer() if HAS_QTMULTIMEDIA and QMediaPlayer else None
         if self._burst_player is not None and self._burst_audio_out is not None:
@@ -17033,6 +18054,10 @@ class MainApp(QObject):
         self.timer_win._backend.runningChanged.connect(self._on_timer_running)
         self._hotkey_timer.start(30)
         self._chapter_autosave_timer.start()
+        self._sync_idle_highlight_playlist()
+        if bool(getattr(self.cfg, "obs_integration_enabled", False)):
+            self.obs_integration.start()
+        self._obs_poll_timer.start()
         self._apply_global_hotkeys()
 
         self.timer_win.set_status("대기 중")
@@ -17807,7 +18832,12 @@ class MainApp(QObject):
         if _pid.upper() == unknown:
             _pid = ""
         if bool(getattr(self.cfg, "chapter_nickname_only", False)):
-            return _name if _name else _pid
+            # Never fall back to the raw spectator-log ID in privacy mode.
+            # An unregistered player has no verified nickname, so use the
+            # corner label instead of exposing the log identifier.
+            if registered and _name:
+                return _name
+            return "레드 코너" if side == "red" else "블루 코너"
         if registered and _name:
             if _pid:
                 return f"{_name}({_pid})"
@@ -18980,17 +20010,12 @@ class MainApp(QObject):
                 self.settings_dlg.apply_only(silent=True)
         except Exception:
             pass
-        running = bool(self.watcher and self.watcher.is_running())
-        if running:
-            if self.watcher:
-                self.watcher.stop()
+        # F11 is the global all-detectors toggle.  Keep SpectatorLog in the
+        # same lifecycle as the legacy screen/pixel detector.
+        if self._detection_running():
+            self._stop_detectors()
         else:
-            if self.watcher:
-                self.watcher.set_detection_modes(trigger=True, pixel=True)
-                self.watcher.start()
-        if self.settings_dlg:
-            self.settings_dlg._sync_watcher_labels()
-        self._update_backend_detect_flags()
+            self._start_detectors()
 
     def _select_player_from_overlay(self, side: str):
         side = (side or "").lower().strip()
@@ -19275,6 +20300,10 @@ class MainApp(QObject):
                 diagnostic_open_folder=self._diagnostic_open_folder,
                 diagnostic_copy_state=self._diagnostic_copy_state,
                 diagnostic_project_snapshot=self._project_snapshot_export_zip,
+                obs_reconfigure=self._reconfigure_obs_integration,
+                obs_test_connection=self._test_obs_connection,
+                obs_status_getter=self._obs_status_label,
+                idle_highlight_refresh=self._sync_idle_highlight_playlist,
             )
         except Exception as e:
             logging.exception("Failed to open settings dialog")
@@ -19362,6 +20391,270 @@ class MainApp(QObject):
             logging.exception("BROWSER_OVERLAY_PUSH_FAIL kind=%s payload=%s", kind, payload)
         return False
 
+    def _idle_highlight_files(self) -> List[str]:
+        raw = str(getattr(self.cfg, "idle_highlight_path", "") or "").strip()
+        if not raw:
+            return []
+        path = normalize_app_path(raw)
+        allowed = {".mp4", ".webm", ".mov", ".m4v", ".avi"}
+        if os.path.isfile(path):
+            return [path] if os.path.splitext(path)[1].lower() in allowed else []
+        if not os.path.isdir(path):
+            return []
+        try:
+            return sorted(
+                os.path.join(path, name)
+                for name in os.listdir(path)
+                if os.path.isfile(os.path.join(path, name))
+                and os.path.splitext(name)[1].lower() in allowed
+            )
+        except OSError:
+            logging.exception("IDLE_HIGHLIGHT_SCAN_FAIL path=%s", path)
+            return []
+
+    def _sync_idle_highlight_playlist(self) -> None:
+        overlay = getattr(self, "browser_overlay", None)
+        if overlay is None:
+            return
+        files = self._idle_highlight_files()
+        overlay.set_highlight_playlist(files)
+        overlay.update(
+            idleHighlightEnabled=bool(getattr(self.cfg, "idle_highlight_enabled", False)),
+            idleHighlightRandom=bool(getattr(self.cfg, "idle_highlight_random", True)),
+            idleHighlightMuted=bool(getattr(self.cfg, "idle_highlight_muted", True)),
+            idleHighlightVolume=max(0, min(100, int(getattr(self.cfg, "idle_highlight_volume", 0) or 0))),
+            idleHighlightFit=str(getattr(self.cfg, "idle_highlight_fit", "cover") or "cover"),
+            idleHighlightFadeMs=max(0, min(3000, int(getattr(self.cfg, "idle_highlight_fade_ms", 350) or 350))),
+            matchActive=bool(getattr(self, "_match_active", False)),
+        )
+        logging.info("IDLE_HIGHLIGHT_PLAYLIST enabled=%s count=%s", bool(getattr(self.cfg, "idle_highlight_enabled", False)), len(files))
+
+    def _obs_status_label(self) -> str:
+        status = str(getattr(getattr(self, "obs_integration", None), "status", "disabled") or "disabled")
+        labels = {
+            "disabled": "비활성",
+            "starting": "연결 시작 중",
+            "connected": "OBS 연결됨",
+            "disconnected": "OBS 연결 끊김",
+            "error": "OBS 연결 오류",
+        }
+        detail = str(getattr(self, "_obs_status_detail", "") or "").strip()
+        return labels.get(status, status) + (f" - {detail}" if detail else "")
+
+    def _reconfigure_obs_integration(self) -> None:
+        integration = getattr(self, "obs_integration", None)
+        if integration is not None:
+            integration.reconfigure(self.cfg)
+        if not bool(getattr(self.cfg, "obs_auto_replay_enabled", True)):
+            self._cancel_obs_auto_replay("disabled")
+
+    def _test_obs_connection(self) -> None:
+        integration = getattr(self, "obs_integration", None)
+        if integration is None:
+            return
+        self._obs_status_detail = "연결 확인 중"
+        integration.reconfigure(self.cfg)
+        integration.test_connection()
+
+    def _poll_obs_integration(self) -> None:
+        integration = getattr(self, "obs_integration", None)
+        if integration is None:
+            return
+        events = integration.drain_events(100)
+        if not events:
+            return
+        for event in events:
+            kind = str(event.get("type") or "")
+            if kind == "status":
+                self._obs_status_detail = str(event.get("detail") or "").strip()
+                logging.info("OBS_STATUS status=%s detail=%s", event.get("status"), self._obs_status_detail)
+                if (str(event.get("status") or "") == "connected"
+                        and bool(getattr(self.cfg, "obs_replay_buffer_enabled", False))
+                        and bool(getattr(self.cfg, "obs_replay_buffer_auto_start", True))):
+                    integration.ensure_replay_buffer()
+            elif kind == "stream_state":
+                active = bool(event.get("active", False))
+                previous = self._obs_stream_active
+                self._obs_stream_active = active
+                logging.info("OBS_STREAM_STATE active=%s previous=%s", active, previous)
+                if active and previous is not True and bool(getattr(self.cfg, "obs_auto_chapter_enabled", False)):
+                    self._sync_chapter_anchor_now()
+                    if bool(getattr(self.cfg, "obs_chapter_add_start_event", True)):
+                        self._append_chapter_event(
+                            "방송 시작",
+                            {"source": "obs_websocket"},
+                            elapsed_sec=0,
+                            dedupe_key=f"obs-stream:{int(time.time())}",
+                        )
+                elif (not active) and previous is True and bool(getattr(self.cfg, "obs_chapter_export_on_stop", False)):
+                    self._export_chapter_txt()
+            elif kind == "test_result":
+                ok = bool(event.get("ok", False))
+                self._obs_status_detail = "연결 테스트 성공" if ok else (str(event.get("message") or "연결 테스트 실패"))
+                if ok:
+                    logging.info("OBS_CONNECTION_TEST_OK")
+                else:
+                    logging.warning("OBS_CONNECTION_TEST_FAIL detail=%s", self._obs_status_detail)
+            elif kind == "replay_saved":
+                ok = bool(event.get("ok", False))
+                message = str(event.get("message") or "").strip()
+                if ok:
+                    logging.info("OBS_REPLAY_SAVE_OK")
+                else:
+                    logging.warning("OBS_REPLAY_SAVE_FAIL detail=%s", message)
+                    self._obs_status_detail = message or "리플레이 버퍼가 실행 중인지 확인하세요"
+            elif kind == "replay_file_saved":
+                replay_path = str(event.get("path") or "").strip()
+                replay_reason = str(event.get("reason") or "").strip()
+                replay_context = dict(event.get("context") or {})
+                logging.info(
+                    "OBS_REPLAY_FILE_SAVED path=%s reason=%s auto_kind=%s",
+                    replay_path,
+                    replay_reason,
+                    replay_context.get("auto_replay_kind", ""),
+                )
+                self._schedule_obs_auto_replay(replay_path, replay_reason, replay_context)
+            elif kind == "replay_buffer_status":
+                if not bool(event.get("ok", False)):
+                    self._obs_status_detail = str(event.get("message") or "리플레이 버퍼 상태 확인 실패")
+                    logging.warning("OBS_REPLAY_BUFFER_STATUS_FAIL detail=%s", self._obs_status_detail)
+            elif kind == "replay_buffer_started":
+                if bool(event.get("ok", False)):
+                    logging.info("OBS_REPLAY_BUFFER_AUTO_START_OK")
+                else:
+                    self._obs_status_detail = str(event.get("message") or "리플레이 버퍼 자동 시작 실패")
+                    logging.warning("OBS_REPLAY_BUFFER_AUTO_START_FAIL detail=%s", self._obs_status_detail)
+        try:
+            if self.settings_dlg and hasattr(self.settings_dlg, "_refresh_obs_status_label"):
+                self.settings_dlg._refresh_obs_status_label()
+        except Exception:
+            pass
+
+    def _cancel_obs_auto_replay(self, reason: str = "") -> None:
+        self._obs_highlight_capture_generation = int(getattr(self, "_obs_highlight_capture_generation", 0) or 0) + 1
+        self._obs_auto_replay.cancel(reason)
+
+    def _save_obs_highlight_after_capture_delay(
+        self,
+        integration,
+        reason: str,
+        context: dict,
+        delay_sec: float,
+        *,
+        cancel_previous: bool = False,
+    ) -> None:
+        # KD/TKO are mutually exclusive terminal moments, so a later terminal
+        # event replaces a pending earlier one. Normal highlights must not
+        # cancel each other merely because they occur within the same second.
+        if cancel_previous:
+            self._obs_highlight_capture_generation = int(getattr(self, "_obs_highlight_capture_generation", 0) or 0) + 1
+        generation = self._obs_highlight_capture_generation
+        delay_ms = max(0, int(round(max(0.0, float(delay_sec or 0.0)) * 1000.0)))
+
+        def _save() -> None:
+            if generation != int(getattr(self, "_obs_highlight_capture_generation", 0) or 0):
+                logging.info("OBS_HIGHLIGHT_SAVE_CANCELLED reason=%s", reason)
+                return
+            if integration is not getattr(self, "obs_integration", None) or integration.status != "connected":
+                logging.info("OBS_HIGHLIGHT_SAVE_SKIPPED reason=%s status=%s", reason, getattr(integration, "status", ""))
+                return
+            integration.save_replay(reason, context=context)
+            logging.info("OBS_HIGHLIGHT_SAVE_REQUEST_AFTER_DELAY reason=%s delay_ms=%s", reason, delay_ms)
+
+        QTimer.singleShot(delay_ms, _save)
+
+    def _schedule_obs_auto_replay(self, path: str, reason: str, context: dict) -> bool:
+        return self._obs_auto_replay.schedule(path, reason, context)
+
+    def _remember_obs_highlight_key(self, key: str) -> bool:
+        value = str(key or "").strip()
+        if not value:
+            return True
+        if value in self._obs_highlight_event_key_set:
+            return False
+        if len(self._obs_highlight_event_keys) >= int(self._obs_highlight_event_keys.maxlen or 300):
+            old = self._obs_highlight_event_keys.popleft()
+            self._obs_highlight_event_key_set.discard(old)
+        self._obs_highlight_event_keys.append(value)
+        self._obs_highlight_event_key_set.add(value)
+        return True
+
+    def _maybe_save_obs_highlight(
+        self,
+        kind: str,
+        *,
+        event_key: str = "",
+        damage: float = 0.0,
+        combo_hits: int = 0,
+    ) -> bool:
+        integration = getattr(self, "obs_integration", None)
+        if integration is None or integration.status != "connected":
+            return False
+        if not bool(getattr(self.cfg, "obs_integration_enabled", False)) or not bool(getattr(self.cfg, "obs_replay_buffer_enabled", False)):
+            return False
+        normalized = str(kind or "").lower().strip()
+        enabled = False
+        reason = normalized or "highlight"
+        if normalized == "tko":
+            enabled = bool(getattr(self.cfg, "obs_highlight_tko", True))
+        elif normalized in ("knockdown", "down", "kd", "ko"):
+            enabled = bool(getattr(self.cfg, "obs_highlight_kd", True))
+            reason = "knockdown"
+        elif normalized == "stun":
+            enabled = bool(getattr(self.cfg, "obs_highlight_stun", True))
+        elif normalized == "counter":
+            enabled = (
+                bool(getattr(self.cfg, "obs_highlight_counter", True))
+                and float(damage or 0.0) >= float(getattr(self.cfg, "obs_highlight_counter_damage_min", 30.0) or 0.0)
+            )
+            reason = f"counter-{float(damage or 0.0):.1f}"
+        elif normalized == "combo":
+            enabled = bool(getattr(self.cfg, "obs_highlight_combo", True)) and int(combo_hits or 0) >= int(getattr(self.cfg, "obs_highlight_combo_min", 3) or 3)
+            reason = f"combo-{int(combo_hits or 0)}"
+        elif normalized in ("heavy", "hit"):
+            enabled = bool(getattr(self.cfg, "obs_highlight_heavy", True)) and float(damage or 0.0) >= float(getattr(self.cfg, "obs_highlight_damage_min", 55.0) or 55.0)
+            reason = f"heavy-{float(damage or 0.0):.1f}"
+        if not enabled or not self._remember_obs_highlight_key(event_key):
+            return False
+        now = time.monotonic()
+        cooldown = max(0.0, float(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0) or 0.0))
+        auto_replay_kind = ""
+        if normalized == "tko":
+            auto_replay_kind = "tko"
+        elif normalized in ("knockdown", "down", "kd", "ko"):
+            auto_replay_kind = "kd"
+        auto_replay_requested = bool(getattr(self.cfg, "obs_auto_replay_enabled", True)) and (
+            (auto_replay_kind == "kd" and bool(getattr(self.cfg, "obs_auto_replay_kd", True)))
+            or (auto_replay_kind == "tko" and bool(getattr(self.cfg, "obs_auto_replay_tko", True)))
+        )
+        if not auto_replay_requested and now - float(self._obs_last_highlight_at or 0.0) < cooldown:
+            return False
+        self._obs_last_highlight_at = now
+        context = {
+            "auto_replay_kind": auto_replay_kind,
+            "trigger_monotonic": now,
+            "event_key": str(event_key or ""),
+        }
+        capture_delay = max(0.0, min(15.0, float(getattr(self.cfg, "obs_auto_replay_capture_delay_sec", 1.0) or 0.0)))
+        if capture_delay > 0.0:
+            self._save_obs_highlight_after_capture_delay(
+                integration,
+                reason,
+                context,
+                capture_delay,
+                cancel_previous=auto_replay_requested,
+            )
+        else:
+            integration.save_replay(reason, context=context)
+        logging.info(
+            "OBS_HIGHLIGHT_SAVE_REQUEST kind=%s damage=%.1f combo=%s auto_replay=%s",
+            normalized,
+            float(damage or 0.0),
+            int(combo_hits or 0),
+            auto_replay_kind or "none",
+        )
+        return True
+
     def _push_initial_browser_overlay_settings(self):
         try:
             overlay = getattr(self, "browser_overlay", None)
@@ -19375,6 +20668,29 @@ class MainApp(QObject):
                 overlayUiScale=float(getattr(self.cfg, "overlay_ui_scale", 1.0) or 1.0),
                 browserOverlayScale=float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),
                 browserFullscreenFxIntensity=max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6))),
+                koImageScalePct=int(max(30, min(200, int(getattr(self.cfg, "overlay_ko_image_scale_pct", 100) or 100)))),
+                koImageX=int(max(-800, min(800, int(getattr(self.cfg, "overlay_ko_x", 0) or 0)))),
+                koImageY=int(max(-450, min(450, int(getattr(self.cfg, "overlay_ko_y", 0) or 0)))),
+                koMotionBlurPct=int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_motion_blur_pct", 100) or 0)))),
+                koFlashIntensityPct=int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_flash_intensity_pct", 100) or 0)))),
+                koTrailIntensityPct=int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_trail_intensity_pct", 100) or 0)))),
+                koShakeIntensityPct=int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_shake_intensity_pct", 100) or 0)))),
+                koPerspectivePx=int(max(700, min(3000, int(getattr(self.cfg, "overlay_ko_perspective_px", 1400) or 1400)))),
+                koStartZPx=int(max(100, min(2400, int(getattr(self.cfg, "overlay_ko_start_z_px", 760) or 760)))),
+                koImpactDepthPx=int(max(0, min(180, int(getattr(self.cfg, "overlay_ko_impact_depth_px", 34) or 0)))),
+                koReboundPx=int(max(0, min(120, int(getattr(self.cfg, "overlay_ko_rebound_px", 20) or 0)))),
+                koEntryMs=int(max(250, min(1200, int(getattr(self.cfg, "overlay_ko_entry_ms", 500) or 500)))),
+                koDropYPx=int(max(0, min(500, int(getattr(self.cfg, "overlay_ko_drop_y_px", 190) or 0)))),
+                koScreenShake=bool(getattr(self.cfg, "overlay_ko_screen_shake", True)),
+                koKdHoldMs=int(max(800, min(10000, float(getattr(self.cfg, "overlay_kd_hold_sec", 2.2) or 2.2) * 1000))),
+                koTkoHoldMs=int(max(800, min(10000, float(getattr(self.cfg, "overlay_tko_hold_sec", 2.6) or 2.6) * 1000))),
+                spBarX=int(getattr(self.cfg, "spectator_sp_bar_x", 0) or 0),
+                spBarY=int(getattr(self.cfg, "spectator_sp_bar_y", 0) or 0),
+                spBarLengthPct=int(getattr(self.cfg, "spectator_sp_bar_length_pct", 100) or 100),
+                spBarThickness=int(getattr(self.cfg, "spectator_sp_bar_thickness", 10) or 10),
+                spBarColor=str(getattr(self.cfg, "spectator_sp_bar_color", "#1876d3") or "#1876d3"),
+                nameBarX=int(getattr(self.cfg, "spectator_name_bar_x", 0) or 0),
+                nameBarY=int(getattr(self.cfg, "spectator_name_bar_y", 0) or 0),
                 overlayTimerFontSize=int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54),
                 overlayTimerX=int(getattr(self.cfg, "overlay_timer_x", 0) or 0),
                 overlayTimerY=int(getattr(self.cfg, "overlay_timer_y", 0) or 0),
@@ -19740,6 +21056,15 @@ class MainApp(QObject):
         try:
             if self._browser_overlay_timer:
                 self._browser_overlay_timer.stop()
+        except Exception:
+            pass
+        try:
+            if self._obs_poll_timer:
+                self._obs_poll_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.obs_integration.stop()
         except Exception:
             pass
         try:
@@ -20190,6 +21515,10 @@ class MainApp(QObject):
                 diagnostic_open_folder=self._diagnostic_open_folder,
                 diagnostic_copy_state=self._diagnostic_copy_state,
                 diagnostic_project_snapshot=self._project_snapshot_export_zip,
+                obs_reconfigure=self._reconfigure_obs_integration,
+                obs_test_connection=self._test_obs_connection,
+                obs_status_getter=self._obs_status_label,
+                idle_highlight_refresh=self._sync_idle_highlight_playlist,
             )
             self.settings_dlg.finished.connect(self.on_settings_closed)
         dlg = PixelActionDialog(None, self.settings_dlg, gx, gy, bgr)
@@ -20273,7 +21602,7 @@ class MainApp(QObject):
             key_down = (_user32.GetAsyncKeyState(vk) & 0x8000) != 0
             if key_down and not self._prev_detect_key:
                 if (not mods["ctrl"] or ctrl) and (not mods["alt"] or alt) and (not mods["shift"] or shift) and not _recent("detect"):
-                    self._toggle_screen_detector()
+                    self._toggle_detectors()
                     self._hotkey_last_fired["detect"] = time.time()
             self._prev_detect_key = bool(key_down)
         action_pick_info = self._hotkey_info(self.cfg.action_pick_hotkey or "")
@@ -20388,7 +21717,7 @@ class MainApp(QObject):
                 self._hotkey_last_fired["roi"] = time.time()
             return
         if _match(self.cfg.detect_hotkey):
-            self._toggle_screen_detector()
+            self._toggle_detectors()
             self._hotkey_last_fired["detect"] = time.time()
             return
         if _match(self.cfg.action_pick_hotkey):
@@ -20530,6 +21859,8 @@ class MainApp(QObject):
             update["blueHasImage"] = bool(overlay.image_path("blue"))
             update["redHasImage"] = bool(overlay.image_path("red"))
             try:
+                overlay.set_asset_path("kd", str(getattr(self.cfg, "overlay_kd_image_path", "assets/images/overlays/KD.png") or "assets/images/overlays/KD.png"))
+                overlay.set_asset_path("tko", str(getattr(self.cfg, "overlay_tko_image_path", "assets/images/overlays/TKO.png") or "assets/images/overlays/TKO.png"))
                 overlay.set_asset_path("blueflag", _player_flag_path_for_gid(self.cfg, ids.get("blue", "")))
                 overlay.set_asset_path("redflag", _player_flag_path_for_gid(self.cfg, ids.get("red", "")))
             except Exception:
@@ -20550,6 +21881,29 @@ class MainApp(QObject):
                     "overlayUiScale": float(getattr(self.cfg, "overlay_ui_scale", 1.0) or 1.0),
                     "browserOverlayScale": float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),
                     "browserFullscreenFxIntensity": max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6))),
+                    "koImageScalePct": int(max(30, min(200, int(getattr(self.cfg, "overlay_ko_image_scale_pct", 100) or 100)))),
+                    "koImageX": int(max(-800, min(800, int(getattr(self.cfg, "overlay_ko_x", 0) or 0)))),
+                    "koImageY": int(max(-450, min(450, int(getattr(self.cfg, "overlay_ko_y", 0) or 0)))),
+                    "koMotionBlurPct": int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_motion_blur_pct", 100) or 0)))),
+                    "koFlashIntensityPct": int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_flash_intensity_pct", 100) or 0)))),
+                    "koTrailIntensityPct": int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_trail_intensity_pct", 100) or 0)))),
+                    "koShakeIntensityPct": int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_shake_intensity_pct", 100) or 0)))),
+                    "koPerspectivePx": int(max(700, min(3000, int(getattr(self.cfg, "overlay_ko_perspective_px", 1400) or 1400)))),
+                    "koStartZPx": int(max(100, min(2400, int(getattr(self.cfg, "overlay_ko_start_z_px", 760) or 760)))),
+                    "koImpactDepthPx": int(max(0, min(180, int(getattr(self.cfg, "overlay_ko_impact_depth_px", 34) or 0)))),
+                    "koReboundPx": int(max(0, min(120, int(getattr(self.cfg, "overlay_ko_rebound_px", 20) or 0)))),
+                    "koEntryMs": int(max(250, min(1200, int(getattr(self.cfg, "overlay_ko_entry_ms", 500) or 500)))),
+                    "koDropYPx": int(max(0, min(500, int(getattr(self.cfg, "overlay_ko_drop_y_px", 190) or 0)))),
+                    "koScreenShake": bool(getattr(self.cfg, "overlay_ko_screen_shake", True)),
+                    "koKdHoldMs": int(max(800, min(10000, float(getattr(self.cfg, "overlay_kd_hold_sec", 2.2) or 2.2) * 1000))),
+                    "koTkoHoldMs": int(max(800, min(10000, float(getattr(self.cfg, "overlay_tko_hold_sec", 2.6) or 2.6) * 1000))),
+                    "spBarX": int(getattr(self.cfg, "spectator_sp_bar_x", 0) or 0),
+                    "spBarY": int(getattr(self.cfg, "spectator_sp_bar_y", 0) or 0),
+                    "spBarLengthPct": int(getattr(self.cfg, "spectator_sp_bar_length_pct", 100) or 100),
+                    "spBarThickness": int(getattr(self.cfg, "spectator_sp_bar_thickness", 10) or 10),
+                    "spBarColor": str(getattr(self.cfg, "spectator_sp_bar_color", "#1876d3") or "#1876d3"),
+                    "nameBarX": int(getattr(self.cfg, "spectator_name_bar_x", 0) or 0),
+                    "nameBarY": int(getattr(self.cfg, "spectator_name_bar_y", 0) or 0),
                     "overlayTimerFontSize": int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54),
                     "overlayTimerX": int(getattr(self.cfg, "overlay_timer_x", 0) or 0),
                     "overlayTimerY": int(getattr(self.cfg, "overlay_timer_y", 0) or 0),
@@ -20730,6 +22084,10 @@ class MainApp(QObject):
             if ("blue_player_id" in d or "red_player_id" in d or "vs_intro_event" in d
                     or "blue_player_img" in d or "red_player_img" in d or "arena_name" in d):
                 update.update(self._sync_browser_overlay_player_assets(d))
+            if "overlay_kd_image_path" in d:
+                overlay.set_asset_path("kd", str(d.get("overlay_kd_image_path") or "assets/images/overlays/KD.png"))
+            if "overlay_tko_image_path" in d:
+                overlay.set_asset_path("tko", str(d.get("overlay_tko_image_path") or "assets/images/overlays/TKO.png"))
 
             for ev in list(d.get("spectator_hit_effect_events") or []):
                 ev = dict(ev or {})
@@ -20782,14 +22140,13 @@ class MainApp(QObject):
             update["redHpRatio"] = float(red_hp)
             update["redHpGhostRatio"] = float(red_ghost)
 
+            spectator_time_mode = str(d.get("spectator_time_mode", "") or "")
             if "round_current" in d or "round_total" in d or "seconds_left" in d:
                 cur = _int(d.get("round_current", self.cfg.timer_current_round), self.cfg.timer_current_round)
                 total = _int(d.get("round_total", self.cfg.timer_total_rounds), self.cfg.timer_total_rounds)
                 sec = _int(d.get("seconds_left", self.cfg.timer_seconds_left), self.cfg.timer_seconds_left)
                 update["timeText"] = "%d:%02d" % (max(0, sec) // 60, max(0, sec) % 60)
                 update["roundText"] = "RD %d OF %d" % (max(1, cur), max(1, total))
-                if str(d.get("spectator_time_mode", "") or "").startswith("knockdown"):
-                    update["timeText"] = "KD"
 
             if "timer_seconds_left" in d or "timer_current_round" in d or "timer_total_rounds" in d:
                 cur = _int(d.get("timer_current_round", self.cfg.timer_current_round), self.cfg.timer_current_round)
@@ -20797,6 +22154,9 @@ class MainApp(QObject):
                 sec = _int(d.get("timer_seconds_left", self.cfg.timer_seconds_left), self.cfg.timer_seconds_left)
                 update["timeText"] = "%d:%02d" % (max(0, sec) // 60, max(0, sec) % 60)
                 update["roundText"] = "RD %d OF %d" % (max(1, cur), max(1, total))
+            if spectator_time_mode.startswith("knockdown"):
+                # Apply after every numeric source so timer sync cannot overwrite KD.
+                update["timeText"] = "KD"
 
             if bool(d.get("spectator_match_clear", False)) or bool(d.get("spectator_match_stats_reset", False)):
                 update.update({
@@ -20829,6 +22189,31 @@ class MainApp(QObject):
                     or bool(d.get("spectator_sp_reset", False))
                     or bool(d.get("spectator_match_stats_reset", False))):
                 update.update(self._browser_overlay_sp_update(d, state))
+
+            # Reports must show the final in-fight gauges, not the values after
+            # break recovery or a result/new-match reset.  The browser SP state is
+            # authoritative here because it is the same value rendered in the HUD.
+            if bool(d.get("spectator_match_clear", False)) or bool(d.get("spectator_match_stats_reset", False)):
+                self._browser_last_fight_vitals = {}
+            elif spectator_time_mode.lower() in ("fight", "knockdown", "foul"):
+                try:
+                    active_round = _int(
+                        d.get("round_current", d.get("timer_current_round", 0)), 0
+                    )
+                    browser_sp = dict(getattr(self, "_browser_sp_ratio", {}) or {})
+                    self._browser_last_fight_vitals = {
+                        "round": max(0, int(active_round or 0)),
+                        "blue": {
+                            "staminaPct": int(round(max(0.0, min(1.0, float(browser_sp.get("blue", update.get("blueSpRatio", state.get("blueSpRatio", 1.0))) or 0.0))) * 100.0)),
+                            "healthPct": int(round(max(0.0, min(1.0, float(update.get("blueHpRatio", state.get("blueHpRatio", 1.0)) or 0.0))) * 100.0)),
+                        },
+                        "red": {
+                            "staminaPct": int(round(max(0.0, min(1.0, float(browser_sp.get("red", update.get("redSpRatio", state.get("redSpRatio", 1.0))) or 0.0))) * 100.0)),
+                            "healthPct": int(round(max(0.0, min(1.0, float(update.get("redHpRatio", state.get("redHpRatio", 1.0)) or 0.0))) * 100.0)),
+                        },
+                    }
+                except Exception:
+                    logging.exception("SPECTATORLOG_REPORT_VITAL_CAPTURE_FAIL")
 
             if ("spectator_effect_events" in d or "spectator_log_info" in d
                     or "round_current" in d
@@ -20867,6 +22252,27 @@ class MainApp(QObject):
                 "browser_overlay_scale": "browserOverlayScale",
                 "overlay_vs_bg_opacity": "vsBgOpacity",
                 "browser_fullscreen_fx_intensity": "browserFullscreenFxIntensity",
+                "overlay_ko_image_scale_pct": "koImageScalePct",
+                "overlay_ko_x": "koImageX",
+                "overlay_ko_y": "koImageY",
+                "overlay_ko_motion_blur_pct": "koMotionBlurPct",
+                "overlay_ko_flash_intensity_pct": "koFlashIntensityPct",
+                "overlay_ko_trail_intensity_pct": "koTrailIntensityPct",
+                "overlay_ko_shake_intensity_pct": "koShakeIntensityPct",
+                "overlay_ko_perspective_px": "koPerspectivePx",
+                "overlay_ko_start_z_px": "koStartZPx",
+                "overlay_ko_impact_depth_px": "koImpactDepthPx",
+                "overlay_ko_rebound_px": "koReboundPx",
+                "overlay_ko_entry_ms": "koEntryMs",
+                "overlay_ko_drop_y_px": "koDropYPx",
+                "overlay_ko_screen_shake": "koScreenShake",
+                "spectator_sp_bar_x": "spBarX",
+                "spectator_sp_bar_y": "spBarY",
+                "spectator_sp_bar_length_pct": "spBarLengthPct",
+                "spectator_sp_bar_thickness": "spBarThickness",
+                "spectator_sp_bar_color": "spBarColor",
+                "spectator_name_bar_x": "nameBarX",
+                "spectator_name_bar_y": "nameBarY",
                 "overlay_timer_font_size": "overlayTimerFontSize",
                 "overlay_timer_x": "overlayTimerX",
                 "overlay_timer_y": "overlayTimerY",
@@ -20904,6 +22310,16 @@ class MainApp(QObject):
                     update["overlayVsHoldMs"] = int(max(500, min(15000, float(d.get("overlay_vs_hold_sec", 2.85) or 2.85) * 1000)))
                 except Exception:
                     pass
+            if "overlay_kd_hold_sec" in d:
+                try:
+                    update["koKdHoldMs"] = int(max(800, min(10000, float(d.get("overlay_kd_hold_sec", 2.2) or 2.2) * 1000)))
+                except Exception:
+                    pass
+            if "overlay_tko_hold_sec" in d:
+                try:
+                    update["koTkoHoldMs"] = int(max(800, min(10000, float(d.get("overlay_tko_hold_sec", 2.6) or 2.6) * 1000)))
+                except Exception:
+                    pass
             update.setdefault("overlayBgColor", str(getattr(self.cfg, "overlay_bg_color", "transparent") or "transparent"))
             update.setdefault("overlayBgOpacity", max(0.0, min(1.0, float(getattr(self.cfg, "overlay_bg_opacity", 0.0) or 0.0))))
             update.setdefault("vsBgOpacity", max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))))
@@ -20911,6 +22327,29 @@ class MainApp(QObject):
             update.setdefault("showCinematic", bool(getattr(self.cfg, "overlay_show_cinematic", True)))
             update.setdefault("browserOverlayScale", float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0))
             update.setdefault("browserFullscreenFxIntensity", max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6))))
+            update.setdefault("koImageScalePct", int(max(30, min(200, int(getattr(self.cfg, "overlay_ko_image_scale_pct", 100) or 100)))))
+            update.setdefault("koImageX", int(max(-800, min(800, int(getattr(self.cfg, "overlay_ko_x", 0) or 0)))))
+            update.setdefault("koImageY", int(max(-450, min(450, int(getattr(self.cfg, "overlay_ko_y", 0) or 0)))))
+            update.setdefault("koMotionBlurPct", int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_motion_blur_pct", 100) or 0)))))
+            update.setdefault("koFlashIntensityPct", int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_flash_intensity_pct", 100) or 0)))))
+            update.setdefault("koTrailIntensityPct", int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_trail_intensity_pct", 100) or 0)))))
+            update.setdefault("koShakeIntensityPct", int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_shake_intensity_pct", 100) or 0)))))
+            update.setdefault("koPerspectivePx", int(max(700, min(3000, int(getattr(self.cfg, "overlay_ko_perspective_px", 1400) or 1400)))))
+            update.setdefault("koStartZPx", int(max(100, min(2400, int(getattr(self.cfg, "overlay_ko_start_z_px", 760) or 760)))))
+            update.setdefault("koImpactDepthPx", int(max(0, min(180, int(getattr(self.cfg, "overlay_ko_impact_depth_px", 34) or 0)))))
+            update.setdefault("koReboundPx", int(max(0, min(120, int(getattr(self.cfg, "overlay_ko_rebound_px", 20) or 0)))))
+            update.setdefault("koEntryMs", int(max(250, min(1200, int(getattr(self.cfg, "overlay_ko_entry_ms", 500) or 500)))))
+            update.setdefault("koDropYPx", int(max(0, min(500, int(getattr(self.cfg, "overlay_ko_drop_y_px", 190) or 0)))))
+            update.setdefault("koScreenShake", bool(getattr(self.cfg, "overlay_ko_screen_shake", True)))
+            update.setdefault("koKdHoldMs", int(max(800, min(10000, float(getattr(self.cfg, "overlay_kd_hold_sec", 2.2) or 2.2) * 1000))))
+            update.setdefault("koTkoHoldMs", int(max(800, min(10000, float(getattr(self.cfg, "overlay_tko_hold_sec", 2.6) or 2.6) * 1000))))
+            update.setdefault("spBarX", int(getattr(self.cfg, "spectator_sp_bar_x", 0) or 0))
+            update.setdefault("spBarY", int(getattr(self.cfg, "spectator_sp_bar_y", 0) or 0))
+            update.setdefault("spBarLengthPct", int(getattr(self.cfg, "spectator_sp_bar_length_pct", 100) or 100))
+            update.setdefault("spBarThickness", int(getattr(self.cfg, "spectator_sp_bar_thickness", 10) or 10))
+            update.setdefault("spBarColor", str(getattr(self.cfg, "spectator_sp_bar_color", "#1876d3") or "#1876d3"))
+            update.setdefault("nameBarX", int(getattr(self.cfg, "spectator_name_bar_x", 0) or 0))
+            update.setdefault("nameBarY", int(getattr(self.cfg, "spectator_name_bar_y", 0) or 0))
             update.setdefault("overlayUiScale", float(getattr(self.cfg, "overlay_ui_scale", 1.0) or 1.0))
             update.setdefault("overlayTimerFontSize", int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54))
             update.setdefault("overlayTimerX", int(getattr(self.cfg, "overlay_timer_x", 0) or 0))
@@ -20950,7 +22389,7 @@ class MainApp(QObject):
             # Fast path: screen hit FX must be emitted before heavy fullscreen/report events.
             _push_hit_impacts_fast()
 
-            if "round_intro_event" in d:
+            if "round_intro_event" in d and bool(getattr(self.cfg, "overlay_show_round", True)):
                 ev = dict(d.get("round_intro_event") or {})
                 overlay.push_event("round_intro", round=ev.get("round", ""))
             if "vs_intro_event" in d:
@@ -20967,28 +22406,91 @@ class MainApp(QObject):
                 )
             elif "spectator_round_report" in d and isinstance(d.get("spectator_round_report"), dict):
                 report_payloads.append(dict(d.get("spectator_round_report") or {}))
-            queued_delay_ms = 0
+            fallback_report_delay_ms = 0
             for report_index, report_payload in enumerate(report_payloads):
                 try:
-                    if report_index > 0:
-                        report_payload["showDelayMs"] = queued_delay_ms
-                    else:
-                        queued_delay_ms = max(0, int(report_payload.get("showDelayMs", 0) or 0))
-                    # Freeze HUD vitals at report creation time. Browser reports
-                    # must not infer stamina from punishment or follow later resets.
-                    for side, sp_ratio in (
-                        ("blue", float(getattr(self.timer_win._backend, "blueSpRatio", 1.0))),
-                        ("red", float(getattr(self.timer_win._backend, "redSpRatio", 1.0))),
-                    ):
+                    # Each report stage needs its own timer. Sending both stages
+                    # to the browser at once made the second stage cancel the
+                    # first stage's single browser-side delay timer.
+                    report_delay_ms = max(0, int(report_payload.get("showDelayMs", 0) or 0))
+                    if report_index > 0 and report_delay_ms <= 0:
+                        report_delay_ms = fallback_report_delay_ms
+                    # Freeze each round's vitals once. Late score/winner writes can
+                    # rebuild a report after break recovery has already started.
+                    cache = getattr(self, "_browser_round_vitals", None)
+                    if not isinstance(cache, dict):
+                        cache = {}
+                        self._browser_round_vitals = cache
+                    report_session_id = str(report_payload.get("matchSessionId") or "")
+                    cached_session_id = str(getattr(self, "_browser_round_vitals_session", "") or "")
+                    if report_session_id and report_session_id != cached_session_id:
+                        cache.clear()
+                        self._browser_round_vitals_session = report_session_id
+                    round_key = (
+                        report_session_id,
+                        str(dict(report_payload.get("blue") or {}).get("name") or ""),
+                        str(dict(report_payload.get("red") or {}).get("name") or ""),
+                        int(report_payload.get("round", 0) or 0),
+                    )
+                    snapshot = cache.get(round_key)
+                    if snapshot is None:
+                        last_fight_vitals = dict(getattr(self, "_browser_last_fight_vitals", {}) or {})
+                        report_round = int(report_payload.get("round", 0) or 0)
+                        use_fight_snapshot = bool(last_fight_vitals) and (
+                            not report_round
+                            or not int(last_fight_vitals.get("round", 0) or 0)
+                            or int(last_fight_vitals.get("round", 0) or 0) == report_round
+                        )
+                        snapshot = {}
+                        browser_sp = dict(getattr(self, "_browser_sp_ratio", {}) or {})
+                        for side in ("blue", "red"):
+                            side_payload = dict(report_payload.get(side) or {})
+                            punishment = dict(side_payload.get("punishment") or {})
+                            hp_ratio = punishment.get("hp_ratio")
+                            stored_vital = dict(last_fight_vitals.get(side) or {}) if use_fight_snapshot else {}
+                            sp_ratio = float(browser_sp.get(side, 1.0) or 0.0)
+                            snapshot[side] = {
+                                "staminaPct": int(stored_vital.get("staminaPct", round(max(0.0, min(1.0, sp_ratio)) * 100.0)) or 0),
+                                "healthPct": (
+                                    int(stored_vital["healthPct"])
+                                    if "healthPct" in stored_vital
+                                    else (int(round(max(0.0, min(1.0, float(hp_ratio))) * 100.0)) if hp_ratio is not None else None)
+                                ),
+                            }
+                        logging.info(
+                            "SPECTATORLOG_REPORT_VITAL_SNAPSHOT session=%s round=%s source=%s blue_sp=%s red_sp=%s blue_hp=%s red_hp=%s",
+                            report_session_id or "-",
+                            round_key[-1],
+                            "last_fight" if use_fight_snapshot else "browser_current",
+                            snapshot["blue"]["staminaPct"],
+                            snapshot["red"]["staminaPct"],
+                            snapshot["blue"].get("healthPct"),
+                            snapshot["red"].get("healthPct"),
+                        )
+                        cache[round_key] = snapshot
+                    for side in ("blue", "red"):
                         side_payload = dict(report_payload.get(side) or {})
-                        side_payload["staminaPct"] = int(round(max(0.0, min(1.0, sp_ratio)) * 100.0))
-                        punishment = dict(side_payload.get("punishment") or {})
-                        hp_ratio = punishment.get("hp_ratio")
-                        if hp_ratio is not None:
-                            side_payload["healthPct"] = int(round(max(0.0, min(1.0, float(hp_ratio))) * 100.0))
+                        vital = dict(snapshot.get(side) or {})
+                        side_payload["staminaPct"] = int(vital.get("staminaPct", 100) or 0)
+                        if vital.get("healthPct") is not None:
+                            side_payload["healthPct"] = int(vital["healthPct"])
                         report_payload[side] = side_payload
-                    overlay.push_event("round_report", **report_payload)
-                    queued_delay_ms += max(0, int(report_payload.get("displayMs", 0) or 0))
+                    fallback_report_delay_ms = max(
+                        fallback_report_delay_ms,
+                        report_delay_ms + max(0, int(report_payload.get("displayMs", 0) or 0)),
+                    )
+                    report_payload["showDelayMs"] = 0
+
+                    def _push_report(payload=dict(report_payload), delay_ms=report_delay_ms) -> None:
+                        try:
+                            overlay.push_event("round_report", **payload)
+                        except Exception:
+                            logging.exception("BROWSER_OVERLAY_DELAYED_REPORT_EVENT_FAIL")
+
+                    if report_delay_ms > 0:
+                        QTimer.singleShot(report_delay_ms, _push_report)
+                    else:
+                        _push_report()
                 except Exception:
                     logging.exception("BROWSER_OVERLAY_ROUND_REPORT_EVENT_FAIL")
             if bool(d.get("spectator_lobby_hide")):
@@ -21129,6 +22631,65 @@ class MainApp(QObject):
             )
         except Exception:
             pass
+        if (bool(getattr(self.cfg, "obs_auto_replay_stop_on_round", True))
+                and ("round_intro_event" in d or "vs_intro_event" in d)):
+            self._cancel_obs_auto_replay("round_or_match_start")
+        if ("spectator_match_active" in d or "spectator_round_state" in d
+                or bool(d.get("spectator_match_clear", False))
+                or "vs_intro_event" in d or "round_intro_event" in d):
+            try:
+                if bool(d.get("spectator_match_clear", False)):
+                    self._match_active = False
+                elif "spectator_match_active" in d:
+                    self._match_active = bool(d.get("spectator_match_active"))
+                elif "vs_intro_event" in d or "round_intro_event" in d:
+                    self._match_active = True
+                self.browser_overlay.update(
+                    matchActive=bool(self._match_active),
+                    roundState=str(d.get("spectator_round_state", "") or ""),
+                )
+            except Exception:
+                logging.exception("BROWSER_MATCH_STATE_UPDATE_FAIL")
+        try:
+            real_hit_events = [
+                dict(item or {}) for item in list(d.get("spectator_hit_effect_events") or [])
+                if isinstance(item, dict) and str((item or {}).get("event_id") or "").strip()
+            ]
+            for event in real_hit_events:
+                effect_kind = str(event.get("effect_kind") or "").lower().strip()
+                damage = float(event.get("damage", 0.0) or 0.0)
+                if effect_kind == "tko":
+                    highlight_kind = "tko"
+                elif effect_kind in ("knockdown", "down", "ko"):
+                    highlight_kind = "knockdown"
+                elif effect_kind == "stun":
+                    highlight_kind = "stun"
+                elif bool(event.get("is_counter", False)):
+                    highlight_kind = "counter"
+                else:
+                    highlight_kind = "heavy"
+                self._maybe_save_obs_highlight(
+                    highlight_kind,
+                    event_key="hit:" + str(event.get("event_id") or ""),
+                    damage=damage,
+                )
+            info = dict(d.get("spectator_log_info") or {}) if isinstance(d.get("spectator_log_info"), dict) else {}
+            has_real_event = bool(real_hit_events)
+            for side in ("blue", "red"):
+                text = str(info.get(f"{side}_combo_hit_text", self._obs_combo_text.get(side, "")) or "").strip()
+                previous = str(self._obs_combo_text.get(side, "") or "")
+                self._obs_combo_text[side] = text
+                match = re.search(r"(\d+)\s*HIT\s*COMBO", text, re.IGNORECASE)
+                if has_real_event and text != previous and match:
+                    hits = int(match.group(1))
+                    event_id = str(real_hit_events[-1].get("event_id") or "")
+                    self._maybe_save_obs_highlight(
+                        "combo",
+                        event_key=f"combo:{side}:{event_id}:{hits}",
+                        combo_hits=hits,
+                    )
+        except Exception:
+            logging.exception("OBS_HIGHLIGHT_EVENT_APPLY_FAIL")
         if "spectator_lobby_auto_start" in d:
             try:
                 self._schedule_lobby_auto_start_click(dict(d.get("spectator_lobby_auto_start") or {}))
@@ -21320,10 +22881,11 @@ class MainApp(QObject):
                 pass
         if "round_intro_event" in d:
             try:
-                if qml_effects:
+                show_round_intro = bool(getattr(self.cfg, "overlay_show_round", True))
+                if qml_effects and show_round_intro:
                     self.timer_win._backend.request_round_intro()
                 ev = dict(d.get("round_intro_event") or {})
-                if not browser_output_only:
+                if show_round_intro and not browser_output_only:
                     self.browser_overlay.push_event("round_intro", round=ev.get("round", ""))
             except Exception:
                 pass
@@ -21480,16 +23042,13 @@ class MainApp(QObject):
                 except Exception:
                     pass
             if qml_visuals:
+                if "spectator_time_mode" in d:
+                    self.timer_win.set_log_time_mode(d.get("spectator_time_mode"))
                 self.timer_win.set_round_time(
                     d.get("round_current", None),
                     d.get("round_total", None),
                     d.get("seconds_left", None),
                 )
-                if str(d.get("spectator_time_mode", "") or "").startswith("knockdown"):
-                    backend = getattr(self.timer_win, "_backend", None)
-                    if backend is not None and getattr(backend, "_time_text", "") != "KD":
-                        backend._time_text = "KD"
-                        backend.timeTextChanged.emit()
             try:
                 logging.info(
                     "TIMER_SYNC_APPLY_DONE source=%s round_current=%s round_total=%s seconds_left=%s in_rest=%s text=%s round_text=%s",
@@ -21650,6 +23209,44 @@ class MainApp(QObject):
                     self.cfg.overlay_vs_bg_opacity,
                 )
                 self.timer_win._backend.set_overlay_vs_hold_sec(self.cfg.overlay_vs_hold_sec)
+        if ("overlay_kd_image_path" in d or "overlay_tko_image_path" in d
+                or "overlay_ko_image_scale_pct" in d or "overlay_ko_x" in d
+                or "overlay_ko_y" in d or "overlay_ko_motion_blur_pct" in d
+                or "overlay_ko_flash_intensity_pct" in d
+                or "overlay_ko_trail_intensity_pct" in d
+                or "overlay_ko_shake_intensity_pct" in d
+                or "overlay_ko_perspective_px" in d or "overlay_ko_start_z_px" in d
+                or "overlay_ko_impact_depth_px" in d or "overlay_ko_rebound_px" in d
+                or "overlay_ko_entry_ms" in d
+                or "overlay_ko_drop_y_px" in d
+                or "overlay_ko_screen_shake" in d or "overlay_kd_hold_sec" in d
+                or "overlay_tko_hold_sec" in d):
+            self.cfg.overlay_kd_image_path = str(
+                d.get("overlay_kd_image_path", getattr(self.cfg, "overlay_kd_image_path", "assets/images/overlays/KD.png")) or "assets/images/overlays/KD.png"
+            )
+            self.cfg.overlay_tko_image_path = str(
+                d.get("overlay_tko_image_path", getattr(self.cfg, "overlay_tko_image_path", "assets/images/overlays/TKO.png")) or "assets/images/overlays/TKO.png"
+            )
+            try:
+                self.cfg.overlay_ko_image_scale_pct = max(30, min(200, int(d.get("overlay_ko_image_scale_pct", getattr(self.cfg, "overlay_ko_image_scale_pct", 100)) or 100)))
+                self.cfg.overlay_ko_x = max(-800, min(800, int(d.get("overlay_ko_x", getattr(self.cfg, "overlay_ko_x", 0)) or 0)))
+                self.cfg.overlay_ko_y = max(-450, min(450, int(d.get("overlay_ko_y", getattr(self.cfg, "overlay_ko_y", 0)) or 0)))
+                self.cfg.overlay_ko_motion_blur_pct = max(0, min(200, int(d.get("overlay_ko_motion_blur_pct", getattr(self.cfg, "overlay_ko_motion_blur_pct", 100)) or 0)))
+                self.cfg.overlay_ko_flash_intensity_pct = max(0, min(200, int(d.get("overlay_ko_flash_intensity_pct", getattr(self.cfg, "overlay_ko_flash_intensity_pct", 100)) or 0)))
+                self.cfg.overlay_ko_trail_intensity_pct = max(0, min(200, int(d.get("overlay_ko_trail_intensity_pct", getattr(self.cfg, "overlay_ko_trail_intensity_pct", 100)) or 0)))
+                self.cfg.overlay_ko_shake_intensity_pct = max(0, min(200, int(d.get("overlay_ko_shake_intensity_pct", getattr(self.cfg, "overlay_ko_shake_intensity_pct", 100)) or 0)))
+                self.cfg.overlay_ko_perspective_px = max(700, min(3000, int(d.get("overlay_ko_perspective_px", getattr(self.cfg, "overlay_ko_perspective_px", 1400)) or 1400)))
+                self.cfg.overlay_ko_start_z_px = max(100, min(2400, int(d.get("overlay_ko_start_z_px", getattr(self.cfg, "overlay_ko_start_z_px", 760)) or 760)))
+                self.cfg.overlay_ko_impact_depth_px = max(0, min(180, int(d.get("overlay_ko_impact_depth_px", getattr(self.cfg, "overlay_ko_impact_depth_px", 34)) or 0)))
+                self.cfg.overlay_ko_rebound_px = max(0, min(120, int(d.get("overlay_ko_rebound_px", getattr(self.cfg, "overlay_ko_rebound_px", 20)) or 0)))
+                self.cfg.overlay_ko_entry_ms = max(250, min(1200, int(d.get("overlay_ko_entry_ms", getattr(self.cfg, "overlay_ko_entry_ms", 500)) or 500)))
+                self.cfg.overlay_ko_drop_y_px = max(0, min(500, int(d.get("overlay_ko_drop_y_px", getattr(self.cfg, "overlay_ko_drop_y_px", 190)) or 0)))
+                self.cfg.overlay_kd_hold_sec = max(0.8, min(10.0, float(d.get("overlay_kd_hold_sec", getattr(self.cfg, "overlay_kd_hold_sec", 2.2)) or 2.2)))
+                self.cfg.overlay_tko_hold_sec = max(0.8, min(10.0, float(d.get("overlay_tko_hold_sec", getattr(self.cfg, "overlay_tko_hold_sec", 2.6)) or 2.6)))
+            except (TypeError, ValueError):
+                logging.exception("OVERLAY_KO_SETTINGS_NORMALIZE_FAIL")
+            if "overlay_ko_screen_shake" in d:
+                self.cfg.overlay_ko_screen_shake = bool(d.get("overlay_ko_screen_shake", True))
         if ("overlay_timer_font_size" in d or "overlay_timer_x" in d or "overlay_timer_y" in d
                 or "overlay_round_font_size" in d or "overlay_round_x" in d or "overlay_round_y" in d):
             try:

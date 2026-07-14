@@ -13,6 +13,20 @@ import sys
 
 _APP_BASE_DIR = None
 
+# Built-in assets used to live beside the executable.  Keep old profiles and
+# imported settings working after the release layout moved them under assets.
+_LEGACY_ASSET_PATHS = {
+    "kd.png": os.path.join("assets", "images", "overlays", "KD.png"),
+    "tko.png": os.path.join("assets", "images", "overlays", "TKO.png"),
+    "stun.wav": os.path.join("assets", "audio", "effects", "stun.wav"),
+    "game-bonus-02-294436.mp3": os.path.join("assets", "audio", "effects", "game-bonus-02-294436.mp3"),
+    "glass-crack-363162.mp3": os.path.join("assets", "audio", "effects", "glass-crack-363162.mp3"),
+    "level-up-08-402152.mp3": os.path.join("assets", "audio", "effects", "level-up-08-402152.mp3"),
+    "ting-sound-197759.mp3": os.path.join("assets", "audio", "effects", "ting-sound-197759.mp3"),
+}
+for _level in range(1, 8):
+    _LEGACY_ASSET_PATHS[f"level/{_level}.png"] = os.path.join("assets", "images", "levels", f"{_level}.png")
+
 def get_app_base_dir() -> str:
     global _APP_BASE_DIR
     if _APP_BASE_DIR:
@@ -50,6 +64,19 @@ def to_app_rel(path: str) -> str:
     except Exception:
         pass
     return path
+
+
+def normalize_builtin_asset_path(path: str) -> str:
+    """Map only known legacy relative asset paths to the bundled layout.
+
+    Absolute paths stay untouched because they may be user-selected files
+    outside the app folder.
+    """
+    raw = str(path or "").strip()
+    if not raw or os.path.isabs(os.path.expanduser(raw)):
+        return raw
+    key = raw.replace("\\", "/").lstrip("./").lower()
+    return _LEGACY_ASSET_PATHS.get(key, raw)
 
 def _candidate_documents_dirs() -> list[str]:
     candidates = []

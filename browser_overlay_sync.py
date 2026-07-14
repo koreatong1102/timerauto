@@ -79,6 +79,8 @@ class BrowserOverlaySync:
                 except Exception:
                     vs_bg_path = str(getattr(b, "_overlay_vs_bg_path", "") or "")
                 self._set_asset_path_if_changed("vsbg", vs_bg_path)
+                self._set_asset_path_if_changed("kd", str(getattr(self.cfg, "overlay_kd_image_path", "assets/images/overlays/KD.png") or "assets/images/overlays/KD.png"))
+                self._set_asset_path_if_changed("tko", str(getattr(self.cfg, "overlay_tko_image_path", "assets/images/overlays/TKO.png") or "assets/images/overlays/TKO.png"))
             except Exception:
                 pass
             try:
@@ -129,6 +131,23 @@ class BrowserOverlaySync:
                 showArenaName=bool(getattr(b, "_overlay_show_arena_name", True)),
                 showFlags=bool(getattr(b, "_overlay_show_flags", True)),
                 showCinematic=bool(getattr(self.cfg, "overlay_show_cinematic", True)),
+                browserFullscreenFxIntensity=float(max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6)))),
+                koImageScalePct=int(max(30, min(200, int(getattr(self.cfg, "overlay_ko_image_scale_pct", 100) or 100)))),
+                koImageX=int(max(-800, min(800, int(getattr(self.cfg, "overlay_ko_x", 0) or 0)))),
+                koImageY=int(max(-450, min(450, int(getattr(self.cfg, "overlay_ko_y", 0) or 0)))),
+                koMotionBlurPct=int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_motion_blur_pct", 100) or 0)))),
+                koFlashIntensityPct=int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_flash_intensity_pct", 100) or 0)))),
+                koTrailIntensityPct=int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_trail_intensity_pct", 100) or 0)))),
+                koShakeIntensityPct=int(max(0, min(200, int(getattr(self.cfg, "overlay_ko_shake_intensity_pct", 100) or 0)))),
+                koScreenShake=bool(getattr(self.cfg, "overlay_ko_screen_shake", True)),
+                koPerspectivePx=int(max(700, min(3000, int(getattr(self.cfg, "overlay_ko_perspective_px", 1400) or 1400)))),
+                koStartZPx=int(max(100, min(2400, int(getattr(self.cfg, "overlay_ko_start_z_px", 760) or 760)))),
+                koImpactDepthPx=int(max(0, min(180, int(getattr(self.cfg, "overlay_ko_impact_depth_px", 34) or 0)))),
+                koReboundPx=int(max(0, min(120, int(getattr(self.cfg, "overlay_ko_rebound_px", 20) or 0)))),
+                koEntryMs=int(max(250, min(1200, int(getattr(self.cfg, "overlay_ko_entry_ms", 500) or 500)))),
+                koDropYPx=int(max(0, min(500, int(getattr(self.cfg, "overlay_ko_drop_y_px", 190) or 0)))),
+                koKdHoldMs=int(max(800, min(10000, float(getattr(self.cfg, "overlay_kd_hold_sec", 2.2) or 2.2) * 1000))),
+                koTkoHoldMs=int(max(800, min(10000, float(getattr(self.cfg, "overlay_tko_hold_sec", 2.6) or 2.6) * 1000))),
                 vsBgOpacity=float(max(0.0, min(1.0, float(getattr(b, "_overlay_vs_bg_opacity", 1.0) or 1.0)))),
                 overlayVsHoldMs=int(max(500, float(getattr(b, "_overlay_vs_hold_sec", 2.85) or 2.85) * 1000)),
                 overlayUiScale=float(getattr(b, "_overlay_ui_scale", 1.0) or 1.0),
@@ -146,6 +165,12 @@ class BrowserOverlaySync:
                 redImageRev=int(getattr(b, "_red_image_rev", 0) or 0),
                 blueHasImage=bool(self.browser_overlay.image_path("blue")),
                 redHasImage=bool(self.browser_overlay.image_path("red")),
+                idleHighlightEnabled=bool(getattr(self.cfg, "idle_highlight_enabled", False)),
+                idleHighlightRandom=bool(getattr(self.cfg, "idle_highlight_random", True)),
+                idleHighlightMuted=bool(getattr(self.cfg, "idle_highlight_muted", True)),
+                idleHighlightVolume=int(max(0, min(100, int(getattr(self.cfg, "idle_highlight_volume", 0) or 0)))),
+                idleHighlightFit=str(getattr(self.cfg, "idle_highlight_fit", "cover") or "cover"),
+                idleHighlightFadeMs=int(max(0, min(3000, int(getattr(self.cfg, "idle_highlight_fade_ms", 350) or 350)))),
             )
             if payload != self._last_payload:
                 self._last_payload = dict(payload)

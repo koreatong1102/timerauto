@@ -10,6 +10,7 @@ Window {
 
     property bool tekkenPreset: backend && backend.overlayPreset === "tekken8"
     property bool cinematicEnabled: backend && backend.overlayShowCinematic
+    property bool roundEnabled: backend && backend.overlayShowRound
     property string _vsKey: ""
     property string _roundIntroKey: ""
     property real _vsOpacity: 0
@@ -49,7 +50,7 @@ Window {
     }
 
     function maybeStartVsIntro() {
-        if (!tekkenPreset || !cinematicEnabled || !backend)
+        if (!tekkenPreset || !cinematicEnabled || !roundEnabled || !backend)
             return
         var key = String(backend.blueName || "") + "\u001f" + String(backend.redName || "")
         if (key === "\u001f" || key === _vsKey)
@@ -294,6 +295,13 @@ Window {
                 root._vsOpacity = 0
                 root._introOpacity = 0
                 root._koOpacity = 0
+            }
+        }
+        function onOverlayShowRoundChanged() {
+            root.roundEnabled = backend && backend.overlayShowRound
+            if (!root.roundEnabled) {
+                roundIntroAnim.stop()
+                root._introOpacity = 0
             }
         }
         function onVsIntroResetRequested() {

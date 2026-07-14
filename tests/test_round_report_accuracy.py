@@ -79,6 +79,20 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertEqual(breakdown["over"]["count"], 1)
         self.assertEqual(breakdown["hook"]["count"], 1)
 
+    def test_unmatched_opponent_throw_marks_whiff_counter(self):
+        hit = {"attacker_side": "blue", "receiver_side": "red", "time": 99.5, "damage": 34.0}
+        throws = [{"side": "red", "time": 100.0, "hand": "left", "punch": "Jab"}]
+        self.watcher._annotate_whiff_counters_from_throws([hit], throws, [hit])
+        self.assertTrue(hit["is_counter"])
+        self.assertEqual(hit["counter_reason"], "whiff")
+
+    def test_landed_opponent_throw_is_not_whiff_counter(self):
+        previous = {"attacker_side": "red", "receiver_side": "blue", "time": 100.0, "damage": 18.0}
+        hit = {"attacker_side": "blue", "receiver_side": "red", "time": 99.5, "damage": 34.0}
+        throws = [{"side": "red", "time": 100.0, "hand": "left", "punch": "Jab"}]
+        self.watcher._annotate_whiff_counters_from_throws([hit], throws, [previous, hit])
+        self.assertFalse(bool(hit.get("is_counter")))
+
     def test_duplicate_damage_rows_count_as_one_landed_throw(self):
         thrown = [
             {"side": "blue", "hand": "left", "punch": "LeadHook", "time": 168.04},
@@ -239,6 +253,132 @@ class RoundReportAccuracyTests(unittest.TestCase):
             report = self.watcher._build_round_report_payload(damage_path, 2, ("BLUE", "RED"), force_final=False)
         self.assertEqual(report["blue"]["officialScore"], 10)
         self.assertEqual(report["red"]["officialScore"], 7)
+
+    def test_tko_report_uses_last_completed_score_when_log_round_already_advanced(self):
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\t64\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tRearHook\tTechnicalKnockout\tChin\n")
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("100.0\tblue\tleft\tRearHook\n")
+            with open(os.path.join(root, "scores.csv"), "w", encoding="utf-8") as stream:
+                stream.write("round,blue_score,red_score,blue_total,red_total\n")
+                stream.write("2,10,7,20,17\n")
+            self.watcher._last_round_state = "knockout"
+            report = self.watcher._build_round_report_payload(damage_path, 3, ("BLUE", "RED"), force_final=False)
+
+        self.assertEqual(report["round"], 2)
+        self.assertEqual(report["blue"]["officialScore"], 10)
+        self.assertEqual(report["red"]["officialScore"], 7)
+
+    def test_tko_report_drops_future_placeholder_score_rows(self):
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("1.0\t44\t1.0\tblue\tright\t.4\t.4\t0\t0\t0\tCross\tTechnicalKnockout\tChin\n")
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("1.0\tred\tright\tCross\n")
+            with open(os.path.join(root, "scores.csv"), "w", encoding="utf-8") as stream:
+                stream.write("round,blue_score,red_score,blue_total,red_total,blue_damage_taken,red_damage_taken,blue_kds,red_kds\n")
+                stream.write("1,8,10,8,10,2530,2570,3,2\n")
+                stream.write("2,10,10,18,20,0,0,0,0\n")
+                stream.write("3,10,10,28,30,0,0,0,0\n")
+            with open(os.path.join(root, "winner.txt"), "w", encoding="utf-8") as stream:
+                stream.write("red\tRED\n")
+            self.watcher._last_round_state = "knockout"
+            report = self.watcher._build_round_report_payload(
+                damage_path, 1, ("BLUE", "RED"), force_final=False
+            )
+
+        self.assertEqual(report["round"], 1)
+        self.assertEqual(report["blue"]["officialScore"], 8)
+        self.assertEqual(report["red"]["officialScore"], 10)
+        self.assertEqual([row["round"] for row in report["officialScorecard"]["rounds"]], [1])
+
+    def test_report_exposes_attack_target_and_event_average_per_fighter(self):
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\t20\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tJab\tHit\tChin\n")
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("100.0\tblue\tleft\tJab\n")
+            with open(os.path.join(root, "scores.csv"), "w", encoding="utf-8") as stream:
+                stream.write("round,blue_score,red_score,blue_total,red_total,blue_damage_taken,red_damage_taken,blue_kds,red_kds\n")
+                stream.write("1,10,8,10,8,300,800,0,0\n")
+            self.watcher._last_round_state = "break"
+            report = self.watcher._build_round_report_payload(damage_path, 1, ("BLUE", "RED"))
+
+        self.assertEqual(report["blue"]["damage"], 800)
+        self.assertEqual(report["blue"]["landedDamage"], 20.0)
+        self.assertEqual(report["blue"]["averageDamage"], 20.0)
+        self.assertEqual(report["blue"]["weakHitAll"][0]["label"], "턱")
+        self.assertEqual(report["red"]["weakReceivedAll"][0]["label"], "턱")
+
+    def test_next_round_hides_break_report_and_stops_both_commentary_roles(self):
+        self.watcher.cfg.players = {}
+        with tempfile.TemporaryDirectory() as root:
+            for folder in ("blue", "red", "match"):
+                os.makedirs(os.path.join(root, folder), exist_ok=True)
+            with open(os.path.join(root, "blue", "name.txt"), "w", encoding="utf-8") as stream:
+                stream.write("BLUE")
+            with open(os.path.join(root, "red", "name.txt"), "w", encoding="utf-8") as stream:
+                stream.write("RED")
+            for name, value in (("round_number.txt", "1"), ("round_total.txt", "3"), ("round_time.txt", "60"), ("round_state.txt", "RoundBreak")):
+                with open(os.path.join(root, "match", name), "w", encoding="utf-8") as stream:
+                    stream.write(value)
+            with open(os.path.join(root, "match", "damage_events.txt"), "w", encoding="utf-8") as stream:
+                stream.write("100.0\t20\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tJab\tHit\tChin\n")
+            with open(os.path.join(root, "match", "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("100.0\tblue\tleft\tJab\n")
+            self.watcher._runtime_baseline_ready = True
+            self.watcher._last_round_state = "fight"
+            self.watcher._read_update(root)
+            with open(os.path.join(root, "match", "round_number.txt"), "w", encoding="utf-8") as stream:
+                stream.write("2")
+            with open(os.path.join(root, "match", "round_state.txt"), "w", encoding="utf-8") as stream:
+                stream.write("RoundFight")
+            update = self.watcher._read_update(root)
+
+        self.assertTrue(update.get("spectator_round_report_hide"))
+        self.assertEqual(update.get("commentary_tts_stop_roles"), ["caster", "analyst"])
+
+    def test_unmatched_tko_event_still_resolves_correct_winner(self):
+        watcher = SpectatorLogWatcher(SimpleNamespace(
+            spectator_fight_style_enabled=True,
+            spectator_fight_style_min_attempts=1,
+            spectator_fight_style_min_landed=1,
+        ))
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                # The corner column is the receiver. Red is stopped, so blue won.
+                stream.write("100.0\t64\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tRearHook\tTechnicalKnockout\tChin\n")
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                # Deliberately outside matching tolerance.
+                stream.write("98.0\tblue\tleft\tRearHook\n")
+            watcher._last_round_state = "knockout"
+            report = watcher._build_round_report_payload(
+                damage_path, 2, ("BLUE", "RED"), force_final=True
+            )
+
+        self.assertEqual(report["winner"], "blue")
+        self.assertEqual(report["resultMethod"], "TKO")
+        self.assertEqual(report["matchResult"]["winner"], "blue")
+        self.assertIn("fightStyle", report["blue"])
+        self.assertIn("fightStyle", report["red"])
+
+    def test_report_keeps_highest_damage_when_throw_match_is_missing(self):
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\t82\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tRearHook\tHit\tChin\n")
+            # Deliberately outside the 0.35-second matching tolerance.
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("98.0\tblue\tleft\tRearHook\n")
+            self.watcher._last_round_state = "break"
+            report = self.watcher._build_round_report_payload(damage_path, 1, ("BLUE", "RED"))
+
+        self.assertEqual(report["blue"]["maxPunch"]["damage"], 82.0)
 
     def test_live_sp_throw_reader_consumes_only_appended_rows(self):
         with tempfile.TemporaryDirectory() as root:

@@ -111,6 +111,24 @@ class LobbyAutoStartTests(unittest.TestCase):
         self.cfg.spectator_lobby_auto_start_reference_width = 1920
         self.cfg.spectator_lobby_auto_start_reference_height = 1080
         self.cfg.spectator_final_report_delay_sec = 7.5
+        self.cfg.overlay_kd_image_path = "assets/images/overlays/KD.png"
+        self.cfg.overlay_tko_image_path = "assets/images/overlays/TKO.png"
+        self.cfg.overlay_ko_image_scale_pct = 125
+        self.cfg.overlay_ko_x = -36
+        self.cfg.overlay_ko_y = 42
+        self.cfg.overlay_ko_motion_blur_pct = 140
+        self.cfg.overlay_ko_flash_intensity_pct = 135
+        self.cfg.overlay_ko_trail_intensity_pct = 125
+        self.cfg.overlay_ko_shake_intensity_pct = 145
+        self.cfg.overlay_ko_perspective_px = 1600
+        self.cfg.overlay_ko_start_z_px = 820
+        self.cfg.overlay_ko_impact_depth_px = 48
+        self.cfg.overlay_ko_rebound_px = 26
+        self.cfg.overlay_ko_entry_ms = 580
+        self.cfg.overlay_ko_drop_y_px = 230
+        self.cfg.overlay_ko_screen_shake = False
+        self.cfg.overlay_kd_hold_sec = 3.1
+        self.cfg.overlay_tko_hold_sec = 3.8
 
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "config.json")
@@ -128,6 +146,24 @@ class LobbyAutoStartTests(unittest.TestCase):
         self.assertEqual(loaded.spectator_lobby_auto_start_reference_width, 1920)
         self.assertEqual(loaded.spectator_lobby_auto_start_reference_height, 1080)
         self.assertEqual(loaded.spectator_final_report_delay_sec, 7.5)
+        self.assertEqual(loaded.overlay_kd_image_path, os.path.join("assets", "images", "overlays", "KD.png"))
+        self.assertEqual(loaded.overlay_tko_image_path, os.path.join("assets", "images", "overlays", "TKO.png"))
+        self.assertEqual(loaded.overlay_ko_image_scale_pct, 125)
+        self.assertEqual(loaded.overlay_ko_x, -36)
+        self.assertEqual(loaded.overlay_ko_y, 42)
+        self.assertEqual(loaded.overlay_ko_motion_blur_pct, 140)
+        self.assertEqual(loaded.overlay_ko_flash_intensity_pct, 135)
+        self.assertEqual(loaded.overlay_ko_trail_intensity_pct, 125)
+        self.assertEqual(loaded.overlay_ko_shake_intensity_pct, 145)
+        self.assertEqual(loaded.overlay_ko_perspective_px, 1600)
+        self.assertEqual(loaded.overlay_ko_start_z_px, 820)
+        self.assertEqual(loaded.overlay_ko_impact_depth_px, 48)
+        self.assertEqual(loaded.overlay_ko_rebound_px, 26)
+        self.assertEqual(loaded.overlay_ko_entry_ms, 580)
+        self.assertEqual(loaded.overlay_ko_drop_y_px, 230)
+        self.assertFalse(loaded.overlay_ko_screen_shake)
+        self.assertEqual(loaded.overlay_kd_hold_sec, 3.1)
+        self.assertEqual(loaded.overlay_tko_hold_sec, 3.8)
 
     def test_default_window_title_and_zero_commentary_cooldown(self):
         cfg = AppConfig()

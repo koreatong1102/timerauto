@@ -41,6 +41,7 @@ if (-not $SkipPip) {
     "numpy",
     "pillow",
     "edge-tts",
+    "aiohttp",
     "pywin32"
   )
   python -m pip install --upgrade --prefer-binary $deps
@@ -238,7 +239,9 @@ $requiredReleaseFiles = @(
   "SIMPLE_MANUAL.md",
   "timer_ui.qml",
   "cinematic_overlay.qml",
-  "timer_controls.qml"
+  "timer_controls.qml",
+  "assets\\images\\overlays\\KD.png",
+  "assets\\images\\overlays\\TKO.png"
 )
 foreach ($required in $requiredReleaseFiles) {
   $requiredPath = Join-Path $dist $required

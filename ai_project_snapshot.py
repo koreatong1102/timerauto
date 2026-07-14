@@ -45,6 +45,7 @@ KNOWN_ROLES = {
     "timerauto.py": "메인 Qt 앱/설정창/타이머/HUD 연결/자동해설/진단 UI",
     "spectator_log_watcher.py": "TOTF2 SpectatorLog 파일 감시 및 파싱",
     "browser_overlay.py": "OBS/PRISM 브라우저 오버레이 서버와 HTML/CSS/JS",
+    "obs_integration.py": "OBS WebSocket 연결, 방송 상태 감지, 리플레이 버퍼 저장",
     "browser_overlay_sync.py": "Qt 앱 상태를 브라우저 오버레이 상태로 동기화",
     "config_model.py": "AppConfig 설정 모델, JSON 저장/로드",
     "actions.py": "이벤트 액션/사운드/후킹 실행 로직",
@@ -240,6 +241,7 @@ def make_project_docs(root: str, code_index: Dict[str, Any], file_manifest: Dict
     py_files = code_index.get("files", {}) if isinstance(code_index, dict) else {}
     key_files = [
         "timerauto.py", "spectator_log_watcher.py", "browser_overlay.py", "browser_overlay_sync.py",
+        "obs_integration.py",
         "config_model.py", "diagnostics.py", "ai_project_snapshot.py", "actions.py", "hotkey_engine.py",
     ]
     roles = []
@@ -390,7 +392,7 @@ round_time final_damage corner hand screen_x screen_y world_x world_y world_z pu
 ## 대표 DOM/이벤트
 - `blueImg`, `redImg`: 선수 초상화 이미지
 - `bluePortraitFx`, `redPortraitFx`: 과거 초상화 FX 레이어. stage40 이후 clone/이미지 기반 수정이 들어감.
-- `screenImpact`: 화면 피격 이펙트 노드 풀
+- `impactCanvas`: 화면 피격 이펙트 노드 풀
 - impact 이벤트: 피격 위치/데미지/side/hand를 받아 화면 폭발 및 초상화 반응 실행
 
 ## 초상화 FX 주의

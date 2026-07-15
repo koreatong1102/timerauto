@@ -664,6 +664,12 @@ class AppConfig:
     obs_auto_replay_volume: int = 100
     obs_auto_replay_fit: str = "cover"
     obs_auto_replay_fade_ms: int = 140
+    obs_replay_transition_enabled: bool = True
+    obs_replay_transition_before_path: str = "assets\\video\\logo.webm"
+    obs_replay_transition_after_path: str = "assets\\video\\logo.webm"
+    obs_replay_transition_test_video_path: str = "assets\\video\\logo.webm"
+    obs_replay_transition_before_ms: int = 500
+    obs_replay_transition_after_ms: int = 400
     obs_auto_replay_stop_on_round: bool = True
     idle_highlight_enabled: bool = False
     idle_highlight_path: str = ""
@@ -720,6 +726,7 @@ class AppConfig:
     spectator_sp_bar_color: str = "#1876d3"
     spectator_name_bar_x: int = 0
     spectator_name_bar_y: int = 0
+    browser_round_damage_width: int = 150
     spectator_fight_style_enabled: bool = True
     spectator_fight_style_min_attempts: int = 20
     spectator_fight_style_min_landed: int = 10
@@ -930,6 +937,12 @@ class AppConfig:
         if cfg.obs_auto_replay_fit not in ("cover", "contain"):
             cfg.obs_auto_replay_fit = "cover"
         cfg.obs_auto_replay_fade_ms = max(0, min(2000, int(raw.get("obs_auto_replay_fade_ms", 140) or 0)))
+        cfg.obs_replay_transition_enabled = bool(raw.get("obs_replay_transition_enabled", cfg.obs_replay_transition_enabled))
+        cfg.obs_replay_transition_before_path = str(raw.get("obs_replay_transition_before_path", cfg.obs_replay_transition_before_path) or "")
+        cfg.obs_replay_transition_after_path = str(raw.get("obs_replay_transition_after_path", cfg.obs_replay_transition_after_path) or "")
+        cfg.obs_replay_transition_test_video_path = str(raw.get("obs_replay_transition_test_video_path", cfg.obs_replay_transition_test_video_path) or "")
+        cfg.obs_replay_transition_before_ms = max(0, min(10000, int(raw.get("obs_replay_transition_before_ms", 500) or 0)))
+        cfg.obs_replay_transition_after_ms = max(0, min(10000, int(raw.get("obs_replay_transition_after_ms", 400) or 0)))
         cfg.obs_auto_replay_stop_on_round = bool(raw.get("obs_auto_replay_stop_on_round", True))
         cfg.idle_highlight_enabled = bool(raw.get("idle_highlight_enabled", False))
         cfg.idle_highlight_path = str(raw.get("idle_highlight_path", "") or "")
@@ -999,6 +1012,12 @@ class AppConfig:
         cfg.spectator_sp_bar_color = _normalize_hex_color(str(raw.get("spectator_sp_bar_color", "#1876d3") or "#1876d3"))
         cfg.spectator_name_bar_x = max(-300, min(300, int(raw.get("spectator_name_bar_x", 0) or 0)))
         cfg.spectator_name_bar_y = max(-100, min(100, int(raw.get("spectator_name_bar_y", 0) or 0)))
+        try:
+            cfg.browser_round_damage_width = max(
+                80, min(320, int(raw.get("browser_round_damage_width", 150) or 150))
+            )
+        except (TypeError, ValueError):
+            cfg.browser_round_damage_width = 150
         cfg.spectator_fight_style_enabled = bool(raw.get("spectator_fight_style_enabled", True))
         try:
             cfg.spectator_fight_style_min_attempts = max(
@@ -1508,6 +1527,12 @@ class AppConfig:
             "obs_auto_replay_volume": int(max(0, min(100, self.obs_auto_replay_volume))),
             "obs_auto_replay_fit": str(self.obs_auto_replay_fit or "cover"),
             "obs_auto_replay_fade_ms": int(max(0, min(2000, self.obs_auto_replay_fade_ms))),
+            "obs_replay_transition_enabled": bool(self.obs_replay_transition_enabled),
+            "obs_replay_transition_before_path": str(self.obs_replay_transition_before_path or ""),
+            "obs_replay_transition_after_path": str(self.obs_replay_transition_after_path or ""),
+            "obs_replay_transition_test_video_path": str(self.obs_replay_transition_test_video_path or ""),
+            "obs_replay_transition_before_ms": int(max(0, min(10000, self.obs_replay_transition_before_ms))),
+            "obs_replay_transition_after_ms": int(max(0, min(10000, self.obs_replay_transition_after_ms))),
             "obs_auto_replay_stop_on_round": bool(self.obs_auto_replay_stop_on_round),
             "idle_highlight_enabled": bool(self.idle_highlight_enabled),
             "idle_highlight_path": to_app_rel(str(self.idle_highlight_path or "")),
@@ -1563,6 +1588,7 @@ class AppConfig:
             "spectator_sp_bar_color": _normalize_hex_color(str(self.spectator_sp_bar_color or "#1876d3")),
             "spectator_name_bar_x": int(max(-300, min(300, self.spectator_name_bar_x))),
             "spectator_name_bar_y": int(max(-100, min(100, self.spectator_name_bar_y))),
+            "browser_round_damage_width": int(max(80, min(320, self.browser_round_damage_width))),
             "spectator_fight_style_enabled": bool(self.spectator_fight_style_enabled),
             "spectator_fight_style_min_attempts": int(
                 max(1, min(500, self.spectator_fight_style_min_attempts))

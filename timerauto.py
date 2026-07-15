@@ -6113,6 +6113,7 @@ class SettingsDialog(QDialog):
         diagnostic_project_snapshot: Optional[Callable[[], str]] = None,
         obs_reconfigure: Optional[Callable[[], None]] = None,
         obs_test_connection: Optional[Callable[[], None]] = None,
+        obs_replay_transition_test: Optional[Callable[[], None]] = None,
         obs_status_getter: Optional[Callable[[], str]] = None,
         idle_highlight_refresh: Optional[Callable[[], None]] = None,
     ):
@@ -6162,6 +6163,7 @@ class SettingsDialog(QDialog):
         self._diagnostic_project_snapshot = diagnostic_project_snapshot
         self._obs_reconfigure = obs_reconfigure
         self._obs_test_connection = obs_test_connection
+        self._obs_replay_transition_test = obs_replay_transition_test
         self._obs_status_getter = obs_status_getter
         self._idle_highlight_refresh = idle_highlight_refresh
         timer_target = self._timer_win or getattr(self.controller, "timer_win", None)
@@ -8249,6 +8251,12 @@ class SettingsDialog(QDialog):
         self.sp_obs_highlight_cooldown.setRange(0.0, 120.0)
         self.sp_obs_highlight_cooldown.setDecimals(1)
         self.sp_obs_highlight_cooldown.setValue(float(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0) or 8.0))
+        self.sp_obs_highlight_cooldown.setToolTip(
+            "OBS 저장 쿨타임\n"
+            "하이라이트 이벤트가 연속으로 발생할 때 중복 저장 요청을 막는 시간입니다.\n"
+            "값이 낮으면 더 자주 저장하고, 높이면 같은 장면의 반복 저장이 줄어듭니다.\n"
+            "0초는 쿨타임을 사용하지 않습니다."
+        )
         automation.addWidget(QLabel("최소 콤보"), 4, 0)
         automation.addWidget(self.sp_obs_combo_min, 4, 1)
         automation.addWidget(QLabel("강타 최소 데미지"), 4, 2)
@@ -8257,6 +8265,7 @@ class SettingsDialog(QDialog):
         automation.addWidget(self.sp_obs_counter_damage_min, 5, 1)
         automation.addWidget(QLabel("저장 쿨타임(초)"), 5, 2)
         automation.addWidget(self.sp_obs_highlight_cooldown, 5, 3)
+        automation.itemAtPosition(5, 2).widget().setToolTip(self.sp_obs_highlight_cooldown.toolTip())
         replay_hint = QLabel("OBS 출력 설정에서 리플레이 버퍼 사용을 허용해야 합니다. 자동 시작을 켜면 연결 후 버퍼를 시작하며, 브라우저 이펙트와 별도 스레드로 동작합니다.")
         replay_hint.setWordWrap(True)
         replay_hint.setStyleSheet("color:#94a3b8;")
@@ -8281,12 +8290,21 @@ class SettingsDialog(QDialog):
         self.sp_obs_auto_replay_capture_delay.setSingleStep(0.1)
         self.sp_obs_auto_replay_capture_delay.setSuffix(" 초")
         self.sp_obs_auto_replay_capture_delay.setValue(float(getattr(self.cfg, "obs_auto_replay_capture_delay_sec", 1.0) or 0.0))
+        self.sp_obs_auto_replay_capture_delay.setToolTip(
+            "이벤트 후 저장 대기\n"
+            "이벤트가 감지된 뒤 OBS 리플레이 버퍼를 저장하기 전 기다리는 시간입니다.\n"
+            "KO 장면처럼 이벤트 직후의 장면까지 영상에 포함할 때 사용합니다."
+        )
         self.sp_obs_auto_replay_delay = QDoubleSpinBox()
         self.sp_obs_auto_replay_delay.setRange(0.0, 15.0)
         self.sp_obs_auto_replay_delay.setDecimals(1)
         self.sp_obs_auto_replay_delay.setSingleStep(0.1)
         self.sp_obs_auto_replay_delay.setSuffix(" 초")
         self.sp_obs_auto_replay_delay.setValue(float(getattr(self.cfg, "obs_auto_replay_delay_sec", 2.0) or 0.0))
+        self.sp_obs_auto_replay_delay.setToolTip(
+            "감지 후 재생 목표\n"
+            "이벤트 감지 후 브라우저 오버레이에서 저장된 리플레이를 재생하기까지의 목표 시간입니다."
+        )
         self.chk_obs_auto_replay_muted = QCheckBox("리플레이 음소거")
         self.chk_obs_auto_replay_muted.setChecked(bool(getattr(self.cfg, "obs_auto_replay_muted", True)))
         self.sp_obs_auto_replay_volume = QSpinBox()
@@ -8306,6 +8324,22 @@ class SettingsDialog(QDialog):
         self.sp_obs_auto_replay_fade.setValue(int(getattr(self.cfg, "obs_auto_replay_fade_ms", 140) or 0))
         self.chk_obs_auto_replay_stop_round = QCheckBox("다음 라운드 또는 새 경기 시작 시 즉시 종료")
         self.chk_obs_auto_replay_stop_round.setChecked(bool(getattr(self.cfg, "obs_auto_replay_stop_on_round", True)))
+        self.chk_obs_replay_transition = QCheckBox("Replay transition media")
+        self.chk_obs_replay_transition.setChecked(bool(getattr(self.cfg, "obs_replay_transition_enabled", False)))
+        self.chk_obs_replay_transition.setToolTip("Optional media before and after KD/TKO replay. Leave either path empty to skip that part.")
+        self.btn_obs_replay_transition_test = QPushButton("Test transition")
+        self.btn_obs_replay_transition_test.clicked.connect(self._test_obs_replay_transition_from_settings)
+        self.le_obs_replay_transition_before = QLineEdit(str(getattr(self.cfg, "obs_replay_transition_before_path", "") or ""))
+        self.le_obs_replay_transition_after = QLineEdit(str(getattr(self.cfg, "obs_replay_transition_after_path", "") or ""))
+        self.le_obs_replay_transition_test_video = QLineEdit(str(getattr(self.cfg, "obs_replay_transition_test_video_path", "") or ""))
+        self.btn_obs_replay_transition_before = QPushButton("Before file")
+        self.btn_obs_replay_transition_after = QPushButton("After file")
+        self.btn_obs_replay_transition_test_video = QPushButton("KO video")
+        self.btn_obs_replay_transition_before.clicked.connect(lambda: self._pick_obs_replay_transition("before"))
+        self.btn_obs_replay_transition_after.clicked.connect(lambda: self._pick_obs_replay_transition("after"))
+        self.btn_obs_replay_transition_test_video.clicked.connect(lambda: self._pick_obs_replay_transition("test_video"))
+        self.sp_obs_replay_transition_before = QSpinBox(); self.sp_obs_replay_transition_before.setRange(0, 10000); self.sp_obs_replay_transition_before.setSuffix(" ms"); self.sp_obs_replay_transition_before.setValue(int(getattr(self.cfg, "obs_replay_transition_before_ms", 500) or 0))
+        self.sp_obs_replay_transition_after = QSpinBox(); self.sp_obs_replay_transition_after.setRange(0, 10000); self.sp_obs_replay_transition_after.setSuffix(" ms"); self.sp_obs_replay_transition_after.setValue(int(getattr(self.cfg, "obs_replay_transition_after_ms", 400) or 0))
         auto_replay.addWidget(self.chk_obs_auto_replay, 0, 0, 1, 4)
         auto_replay.addWidget(self.chk_obs_auto_replay_kd, 1, 0)
         auto_replay.addWidget(self.chk_obs_auto_replay_tko, 1, 1)
@@ -8320,12 +8354,25 @@ class SettingsDialog(QDialog):
         auto_replay.addWidget(QLabel("전환 시간"), 4, 0)
         auto_replay.addWidget(self.sp_obs_auto_replay_fade, 4, 1)
         auto_replay.addWidget(self.chk_obs_auto_replay_stop_round, 4, 2, 1, 2)
+        auto_replay.addWidget(self.chk_obs_replay_transition, 5, 0, 1, 4)
+        auto_replay.addWidget(self.btn_obs_replay_transition_test, 5, 3)
+        auto_replay.addWidget(QLabel("Before"), 6, 0)
+        auto_replay.addWidget(self.le_obs_replay_transition_before, 6, 1)
+        auto_replay.addWidget(self.btn_obs_replay_transition_before, 6, 2)
+        auto_replay.addWidget(self.sp_obs_replay_transition_before, 6, 3)
+        auto_replay.addWidget(QLabel("After"), 7, 0)
+        auto_replay.addWidget(self.le_obs_replay_transition_after, 7, 1)
+        auto_replay.addWidget(self.btn_obs_replay_transition_after, 7, 2)
+        auto_replay.addWidget(self.sp_obs_replay_transition_after, 7, 3)
+        auto_replay.addWidget(QLabel("KO test replay"), 8, 0)
+        auto_replay.addWidget(self.le_obs_replay_transition_test_video, 8, 1, 1, 2)
+        auto_replay.addWidget(self.btn_obs_replay_transition_test_video, 8, 3)
         auto_replay_hint = QLabel(
             "저장 전 대기 동안 KO 장면까지 버퍼에 담습니다. 감지 후 재생 목표가 저장 전 대기보다 작으면 저장 완료 직후 재생됩니다."
         )
         auto_replay_hint.setWordWrap(True)
         auto_replay_hint.setStyleSheet("color:#94a3b8;")
-        auto_replay.addWidget(auto_replay_hint, 5, 0, 1, 4)
+        auto_replay.addWidget(auto_replay_hint, 9, 0, 1, 4)
         auto_replay.setColumnStretch(1, 1)
         auto_replay.setColumnStretch(3, 1)
         outer.addWidget(auto_replay_group)
@@ -8385,6 +8432,24 @@ class SettingsDialog(QDialog):
         tab_layout.setContentsMargins(0, 0, 0, 0)
         tab_layout.addWidget(scroll)
         self._refresh_obs_status_label()
+
+    def _pick_obs_replay_transition(self, kind: str):
+        if kind == "before":
+            edit = self.le_obs_replay_transition_before
+        elif kind == "after":
+            edit = self.le_obs_replay_transition_after
+        else:
+            edit = self.le_obs_replay_transition_test_video
+        start = normalize_app_path(str(edit.text() or ""))
+        if not os.path.isdir(start):
+            start = os.path.dirname(start) if start else get_app_base_dir()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "KO test replay" if kind == "test_video" else "Replay transition media", start,
+            "Video (*.mp4 *.webm *.mov *.m4v *.avi *.ogv *.ogg);;All Files (*)" if kind == "test_video" else "Media (*.mp4 *.webm *.m4v *.ogv *.ogg *.png *.jpg *.jpeg *.gif *.webp);;All Files (*)",
+        )
+        if path:
+            edit.setText(to_app_rel(path))
+            self._schedule_apply()
 
     def _pick_idle_highlight_file(self):
         start = normalize_app_path(str(self.le_idle_highlight_path.text() or ""))
@@ -8447,6 +8512,12 @@ class SettingsDialog(QDialog):
         self.chk_obs_auto_replay_kd.setChecked(bool(getattr(self.cfg, "obs_auto_replay_kd", True)))
         self.chk_obs_auto_replay_tko.setChecked(bool(getattr(self.cfg, "obs_auto_replay_tko", True)))
         self.sp_obs_auto_replay_capture_delay.setValue(float(getattr(self.cfg, "obs_auto_replay_capture_delay_sec", 1.0) or 0.0))
+        self.chk_obs_replay_transition.setChecked(bool(getattr(self.cfg, "obs_replay_transition_enabled", False)))
+        self.le_obs_replay_transition_before.setText(str(getattr(self.cfg, "obs_replay_transition_before_path", "") or ""))
+        self.le_obs_replay_transition_after.setText(str(getattr(self.cfg, "obs_replay_transition_after_path", "") or ""))
+        self.le_obs_replay_transition_test_video.setText(str(getattr(self.cfg, "obs_replay_transition_test_video_path", "") or ""))
+        self.sp_obs_replay_transition_before.setValue(int(getattr(self.cfg, "obs_replay_transition_before_ms", 500) or 0))
+        self.sp_obs_replay_transition_after.setValue(int(getattr(self.cfg, "obs_replay_transition_after_ms", 400) or 0))
         self.sp_obs_auto_replay_delay.setValue(float(getattr(self.cfg, "obs_auto_replay_delay_sec", 2.0) or 0.0))
         self.chk_obs_auto_replay_muted.setChecked(bool(getattr(self.cfg, "obs_auto_replay_muted", True)))
         self.sp_obs_auto_replay_volume.setValue(int(getattr(self.cfg, "obs_auto_replay_volume", 100) or 0))
@@ -8465,6 +8536,13 @@ class SettingsDialog(QDialog):
         self.cmb_idle_highlight_fit.setCurrentIndex(max(0, fit_index))
         self.sp_idle_highlight_fade.setValue(int(getattr(self.cfg, "idle_highlight_fade_ms", 350) or 350))
         self._refresh_obs_status_label()
+
+    def _test_obs_replay_transition_from_settings(self):
+        self.apply_only(silent=True)
+        if callable(self._obs_replay_transition_test):
+            self._obs_replay_transition_test()
+        else:
+            QMessageBox.information(self, "Transition test", "Transition test is not available.")
 
     def _test_obs_connection_from_settings(self):
         self.apply_only(silent=True)
@@ -12919,6 +12997,23 @@ class SettingsDialog(QDialog):
         overlay_lay.addWidget(_build_style_group("Browser text - Combo / Counter", "browser_combo"))
         overlay_lay.addWidget(_build_style_group("Browser text - Recent Hit", "browser_recent"))
 
+        browser_dmg_layout_group = QGroupBox("Browser Round DMG box")
+        browser_dmg_layout = QHBoxLayout(browser_dmg_layout_group)
+        browser_dmg_layout.addWidget(QLabel("Box width"))
+        self.sp_browser_round_damage_width = QSpinBox()
+        self.sp_browser_round_damage_width.setRange(80, 320)
+        self.sp_browser_round_damage_width.setSuffix(" px")
+        self.sp_browser_round_damage_width.setValue(
+            int(getattr(self.cfg, "browser_round_damage_width", 150) or 150)
+        )
+        self.sp_browser_round_damage_width.setToolTip(
+            "Width of the blue and red round damage boxes. Increase it when the damage number wraps."
+        )
+        self.sp_browser_round_damage_width.valueChanged.connect(self._schedule_apply)
+        browser_dmg_layout.addWidget(self.sp_browser_round_damage_width)
+        browser_dmg_layout.addStretch(1)
+        overlay_lay.addWidget(browser_dmg_layout_group)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(content)
@@ -16906,6 +17001,12 @@ class SettingsDialog(QDialog):
             self.cfg.obs_auto_replay_enabled = bool(self.chk_obs_auto_replay.isChecked())
             self.cfg.obs_auto_replay_kd = bool(self.chk_obs_auto_replay_kd.isChecked())
             self.cfg.obs_auto_replay_tko = bool(self.chk_obs_auto_replay_tko.isChecked())
+            self.cfg.obs_replay_transition_enabled = bool(self.chk_obs_replay_transition.isChecked())
+            self.cfg.obs_replay_transition_before_path = str(self.le_obs_replay_transition_before.text() or "").strip()
+            self.cfg.obs_replay_transition_after_path = str(self.le_obs_replay_transition_after.text() or "").strip()
+            self.cfg.obs_replay_transition_test_video_path = str(self.le_obs_replay_transition_test_video.text() or "").strip()
+            self.cfg.obs_replay_transition_before_ms = int(self.sp_obs_replay_transition_before.value())
+            self.cfg.obs_replay_transition_after_ms = int(self.sp_obs_replay_transition_after.value())
             self.cfg.obs_auto_replay_capture_delay_sec = float(self.sp_obs_auto_replay_capture_delay.value())
             self.cfg.obs_auto_replay_delay_sec = float(self.sp_obs_auto_replay_delay.value())
             self.cfg.obs_auto_replay_muted = bool(self.chk_obs_auto_replay_muted.isChecked())
@@ -17200,6 +17301,8 @@ class SettingsDialog(QDialog):
             self.cfg.overlay_show_flags = bool(self.chk_overlay_flags.isChecked())
         if hasattr(self, "chk_overlay_cinematic"):
             self.cfg.overlay_show_cinematic = bool(self.chk_overlay_cinematic.isChecked())
+        if hasattr(self, "sp_browser_round_damage_width"):
+            self.cfg.browser_round_damage_width = int(self.sp_browser_round_damage_width.value())
         if hasattr(self, "_overlay_style_widgets"):
             try:
                 self.cfg.overlay_style_round = self._collect_overlay_style("round")
@@ -17231,6 +17334,7 @@ class SettingsDialog(QDialog):
                     "overlay_show_arena_name": self.cfg.overlay_show_arena_name,
                     "overlay_show_flags": self.cfg.overlay_show_flags,
                     "overlay_show_cinematic": self.cfg.overlay_show_cinematic,
+                    "browser_round_damage_width": self.cfg.browser_round_damage_width,
                     "browser_overlay_output_only": self.cfg.browser_overlay_output_only,
                     "browser_fullscreen_fx_intensity": self.cfg.browser_fullscreen_fx_intensity,
                     "overlay_kd_image_path": self.cfg.overlay_kd_image_path,
@@ -17760,6 +17864,10 @@ class SettingsDialog(QDialog):
             self.lbl_browser_overlay_status.setStyleSheet("color:#0f766e;font-weight:700;" if is_browser_running else "color:#64748b;")
         if hasattr(self, "txt_overlay_vs_bg_map"):
             self.txt_overlay_vs_bg_map.setPlainText(self._format_overlay_vs_bg_map(getattr(self.cfg, "overlay_vs_bg_by_arena", {}) or {}))
+        if hasattr(self, "sp_browser_round_damage_width"):
+            self.sp_browser_round_damage_width.setValue(
+                int(getattr(self.cfg, "browser_round_damage_width", 150) or 150)
+            )
         if hasattr(self, "_overlay_style_widgets"):
             for key in ("round", "time", "blue_name", "red_name", "arena", "browser_time", "browser_total", "browser_dmg", "browser_combo", "browser_recent"):
                 style = self._overlay_style_for_key(key)
@@ -17839,6 +17947,7 @@ class MainApp(QObject):
         self._update_download_ready.connect(self._confirm_apply_update)
         self.cfg_path = cfg_path
         self.cfg = AppConfig.from_json(cfg_path)
+        self._restore_bundled_replay_transition_paths()
         try:
             DIAG.set_options(
                 enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
@@ -18002,6 +18111,8 @@ class MainApp(QObject):
         self.spectator_watcher = _make_spectator_log_watcher(self.cfg)
         self._log_detector_transition = False
         self._log_detector_stopping = False
+        # Preserve a start click that arrives while the Windows file watcher is closing.
+        self._log_detector_start_pending = False
         self.action_runner = ActionRunner(self.controller, self.timer_win, self.timer_win.set_status)
         QTimer.singleShot(1800, self._prewarm_commentary_tts_cache)
         try:
@@ -18061,6 +18172,38 @@ class MainApp(QObject):
         self._apply_global_hotkeys()
 
         self.timer_win.set_status("대기 중")
+
+    def _restore_bundled_replay_transition_paths(self) -> None:
+        """Repair stale absolute transition paths after a portable update."""
+        bundled = os.path.join("assets", "video", "logo.webm")
+        try:
+            if not os.path.isfile(normalize_app_path(bundled)):
+                return
+        except Exception:
+            return
+        changed = []
+        for attr in (
+            "obs_replay_transition_before_path",
+            "obs_replay_transition_after_path",
+            "obs_replay_transition_test_video_path",
+        ):
+            raw = str(getattr(self.cfg, attr, "") or "").strip()
+            if not raw:
+                continue
+            try:
+                valid = os.path.isfile(normalize_app_path(raw))
+            except Exception:
+                valid = False
+            if not valid:
+                setattr(self.cfg, attr, bundled)
+                changed.append(attr)
+        if not changed:
+            return
+        try:
+            self.cfg.to_json(self.cfg_path)
+        except Exception:
+            logging.exception("OBS_TRANSITION_PATH_REPAIR_SAVE_FAIL")
+        logging.info("OBS_TRANSITION_PATH_REPAIRED fields=%s path=%s", ",".join(changed), bundled)
 
     def _play_burst_sfx(self, path: str):
         raw = str(path or "").strip()
@@ -19767,6 +19910,11 @@ class MainApp(QObject):
                 pass
 
     def _start_spectator_watcher_if_enabled(self, *, force_enable: bool = False):
+        if bool(getattr(self, "_log_detector_transition", False)):
+            if force_enable:
+                self._log_detector_start_pending = True
+                logging.info("SPECTATORLOG_START_QUEUED reason=watcher_transition")
+            return
         if force_enable and not bool(getattr(self.cfg, "spectatorlog_enabled", False)):
             self._set_spectatorlog_enabled_runtime(True)
         if not bool(getattr(self.cfg, "spectatorlog_enabled", False)):
@@ -19775,10 +19923,21 @@ class MainApp(QObject):
                 self._stop_log_detector()
             return
         if getattr(self, "spectator_watcher", None) and not self.spectator_watcher.is_running():
-            self.spectator_watcher.start()
             try:
                 root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
-                self.timer_win.set_status(f"SpectatorLog 감시 시작: {root}")
+            except Exception:
+                root = ""
+            if not root or not os.path.isdir(root):
+                logging.warning("SPECTATORLOG_START_FOLDER_MISSING path=%s", root or "<empty>")
+                try:
+                    self.timer_win.set_status("SpectatorLog folder not found")
+                except Exception:
+                    pass
+                return
+            self.spectator_watcher.start()
+            logging.info("SPECTATORLOG_START_REQUEST path=%s", root)
+            try:
+                self.timer_win.set_status(f"SpectatorLog started: {root}")
             except Exception:
                 pass
 
@@ -19818,15 +19977,18 @@ class MainApp(QObject):
 
     def _start_log_detector(self):
         if bool(getattr(self, "_log_detector_transition", False)):
+            # The stop worker owns the directory handle. Do not lose a start click
+            # while it releases that handle; restart immediately after cleanup.
+            self._log_detector_start_pending = True
+            logging.info("SPECTATORLOG_START_QUEUED reason=stop_transition")
             try:
-                self.timer_win.set_status("SpectatorLog 감시 전환 중")
+                self.timer_win.set_status("SpectatorLog restart queued")
             except Exception:
                 pass
             return
         self._log_detector_stopping = False
-        # Overlay/QML "log detect" start must also enable SpectatorLog on first-run
-        # release builds.  The public build intentionally does not ship SWa's
-        # config.json, so spectatorlog_enabled starts false unless we force it here.
+        self._log_detector_start_pending = False
+        # Overlay/QML log start must also enable SpectatorLog on first-run builds.
         self._start_spectator_watcher_if_enabled(force_enable=True)
         if self.settings_dlg:
             self.settings_dlg._sync_watcher_labels()
@@ -19837,8 +19999,10 @@ class MainApp(QObject):
         self._update_backend_detect_flags()
 
     def _finish_log_detector_stop(self):
+        restart_requested = bool(getattr(self, "_log_detector_start_pending", False))
         self._log_detector_transition = False
         self._log_detector_stopping = False
+        self._log_detector_start_pending = False
         if self.settings_dlg:
             self.settings_dlg._sync_watcher_labels()
             try:
@@ -19846,8 +20010,13 @@ class MainApp(QObject):
             except Exception:
                 pass
         self._update_backend_detect_flags()
+        if restart_requested:
+            logging.info("SPECTATORLOG_RESTART_AFTER_STOP")
+            QTimer.singleShot(0, self._start_log_detector)
+            return
+        logging.info("SPECTATORLOG_STOPPED")
         try:
-            self.timer_win.set_status("SpectatorLog 감시 중지")
+            self.timer_win.set_status("SpectatorLog stopped")
         except Exception:
             pass
 
@@ -19857,6 +20026,9 @@ class MainApp(QObject):
             return
         self._log_detector_transition = True
         self._log_detector_stopping = True
+        # A deliberate stop cancels any earlier restart request.
+        self._log_detector_start_pending = False
+        logging.info("SPECTATORLOG_STOP_REQUEST")
         # Treat the top menu toggle as a real off switch, not only a thread stop.
         # This prevents Settings auto-apply from immediately starting the watcher again.
         try:
@@ -19910,6 +20082,36 @@ class MainApp(QObject):
             self.settings_dlg._sync_watcher_labels()
         self._update_backend_detect_flags()
 
+    def _toggle_detectors(self):
+        """Toggle the F11 detection bundle: screen actions and SpectatorLog together."""
+        screen_status = getattr(self, "_screen_detection_running", None)
+        log_status = getattr(self, "_log_detection_running", None)
+        if callable(screen_status) and callable(log_status):
+            screen_running = bool(screen_status())
+            log_running = bool(log_status())
+        else:
+            # Keep lightweight tests and legacy controllers compatible with the
+            # original single combined detection state.
+            combined_status = getattr(self, "_detection_running", None)
+            combined_running = bool(combined_status()) if callable(combined_status) else False
+            screen_running = combined_running
+            log_running = combined_running
+        if screen_running and log_running:
+            logging.info("DETECTORS_TOGGLE action=stop screen=True log=True")
+            self._stop_detectors()
+        else:
+            logging.info(
+                "DETECTORS_TOGGLE action=start screen=%s log=%s",
+                screen_running,
+                log_running,
+            )
+            self._start_detectors()
+        if self.settings_dlg:
+            self.settings_dlg._sync_watcher_labels()
+        update_flags = getattr(self, "_update_backend_detect_flags", None)
+        if callable(update_flags):
+            update_flags()
+
     def _toggle_screen_detector(self):
         running = self._screen_detection_running()
         if running:
@@ -19931,10 +20133,8 @@ class MainApp(QObject):
 
     def _toggle_log_detector(self):
         if bool(getattr(self, "_log_detector_transition", False)):
-            try:
-                self.timer_win.set_status("SpectatorLog 감시 전환 중")
-            except Exception:
-                pass
+            # The UI already shows off while shutdown is pending, so this click means start.
+            self._start_log_detector()
             return
         running = self._log_detection_running()
         if running:
@@ -19944,78 +20144,6 @@ class MainApp(QObject):
         if self.settings_dlg:
             self.settings_dlg._sync_watcher_labels()
         self._update_backend_detect_flags()
-
-    def _on_overlay_visibility_request(self, key: str, visible: bool):
-        key = str(key or "").strip().lower()
-        vis = bool(visible)
-        field = None
-        if key == "round":
-            field = "overlay_show_round"
-        elif key == "time":
-            field = "overlay_show_time"
-        elif key == "blue_img":
-            field = "overlay_show_blue_img"
-        elif key == "blue_name":
-            field = "overlay_show_blue_name"
-        elif key == "red_img":
-            field = "overlay_show_red_img"
-        elif key == "red_name":
-            field = "overlay_show_red_name"
-        elif key == "arena_name":
-            field = "overlay_show_arena_name"
-        if not field:
-            return
-        try:
-            setattr(self.cfg, field, vis)
-        except Exception:
-            pass
-        try:
-            if self.settings_dlg:
-                self.settings_dlg._suspend_apply = True
-                if key == "round" and hasattr(self.settings_dlg, "chk_overlay_round"):
-                    self.settings_dlg.chk_overlay_round.setChecked(vis)
-                if key == "time" and hasattr(self.settings_dlg, "chk_overlay_time"):
-                    self.settings_dlg.chk_overlay_time.setChecked(vis)
-                if key == "blue_img" and hasattr(self.settings_dlg, "chk_overlay_blue_img"):
-                    self.settings_dlg.chk_overlay_blue_img.setChecked(vis)
-                if key == "blue_name" and hasattr(self.settings_dlg, "chk_overlay_blue_name"):
-                    self.settings_dlg.chk_overlay_blue_name.setChecked(vis)
-                if key == "red_img" and hasattr(self.settings_dlg, "chk_overlay_red_img"):
-                    self.settings_dlg.chk_overlay_red_img.setChecked(vis)
-                if key == "red_name" and hasattr(self.settings_dlg, "chk_overlay_red_name"):
-                    self.settings_dlg.chk_overlay_red_name.setChecked(vis)
-                if key == "arena_name" and hasattr(self.settings_dlg, "chk_overlay_arena_name"):
-                    self.settings_dlg.chk_overlay_arena_name.setChecked(vis)
-        except Exception:
-            pass
-        finally:
-            try:
-                if self.settings_dlg:
-                    self.settings_dlg._suspend_apply = False
-            except Exception:
-                pass
-        try:
-            if self.controller:
-                self.controller.ui_update.emit({field: vis})
-        except Exception:
-            pass
-        try:
-            self.cfg.to_json(self.cfg_path)
-        except Exception:
-            pass
-
-    def _toggle_detectors(self):
-        try:
-            if self.settings_dlg:
-                self.settings_dlg.apply_only(silent=True)
-        except Exception:
-            pass
-        # F11 is the global all-detectors toggle.  Keep SpectatorLog in the
-        # same lifecycle as the legacy screen/pixel detector.
-        if self._detection_running():
-            self._stop_detectors()
-        else:
-            self._start_detectors()
 
     def _select_player_from_overlay(self, side: str):
         side = (side or "").lower().strip()
@@ -20302,6 +20430,7 @@ class MainApp(QObject):
                 diagnostic_project_snapshot=self._project_snapshot_export_zip,
                 obs_reconfigure=self._reconfigure_obs_integration,
                 obs_test_connection=self._test_obs_connection,
+                obs_replay_transition_test=self._test_obs_replay_transition,
                 obs_status_getter=self._obs_status_label,
                 idle_highlight_refresh=self._sync_idle_highlight_playlist,
             )
@@ -20456,6 +20585,48 @@ class MainApp(QObject):
         integration.reconfigure(self.cfg)
         integration.test_connection()
 
+    def _test_obs_replay_transition(self) -> None:
+        before = str(getattr(self.cfg, "obs_replay_transition_before_path", "") or "").strip()
+        after = str(getattr(self.cfg, "obs_replay_transition_after_path", "") or "").strip()
+        replay_path = str(getattr(self.cfg, "obs_replay_transition_test_video_path", "") or "").strip()
+        try:
+            replay_path = normalize_app_path(replay_path) if replay_path else ""
+        except Exception:
+            replay_path = ""
+        ext = os.path.splitext(replay_path)[1].lower()
+        if not replay_path or ext not in (".mp4", ".webm", ".m4v", ".ogv", ".ogg"):
+            QMessageBox.information(
+                None,
+                "Transition test",
+                "Select a KO test replay video first.\n"
+                "The test plays: Before transition -> KO replay -> After transition.",
+            )
+            return
+        overlay = getattr(self, "browser_overlay", None)
+        if overlay is None:
+            QMessageBox.warning(None, "Transition test", "Browser overlay is not running.")
+            return
+        try:
+            overlay.set_obs_transition_paths(before, after)
+            token = overlay.play_obs_replay(
+                replay_path,
+                muted=bool(getattr(self.cfg, "obs_auto_replay_muted", True)),
+                volume=int(getattr(self.cfg, "obs_auto_replay_volume", 100) or 0),
+                fit=str(getattr(self.cfg, "obs_auto_replay_fit", "cover") or "cover"),
+                fade_ms=int(getattr(self.cfg, "obs_auto_replay_fade_ms", 140) or 0),
+                transition_enabled=True,
+                transition_before_ms=int(getattr(self.cfg, "obs_replay_transition_before_ms", 500) or 0),
+                transition_after_ms=int(getattr(self.cfg, "obs_replay_transition_after_ms", 400) or 0),
+            )
+            if not token:
+                raise RuntimeError("replay start rejected")
+            logging.info(
+                "OBS_REPLAY_TRANSITION_TEST token=%s replay=%s before=%s after=%s",
+                token, replay_path, before, after,
+            )
+        except Exception as exc:
+            logging.exception("OBS_REPLAY_TRANSITION_TEST_FAIL")
+            QMessageBox.warning(None, "Transition test", f"Transition test could not start.\n{exc}")
     def _poll_obs_integration(self) -> None:
         integration = getattr(self, "obs_integration", None)
         if integration is None:
@@ -20691,6 +20862,7 @@ class MainApp(QObject):
                 spBarColor=str(getattr(self.cfg, "spectator_sp_bar_color", "#1876d3") or "#1876d3"),
                 nameBarX=int(getattr(self.cfg, "spectator_name_bar_x", 0) or 0),
                 nameBarY=int(getattr(self.cfg, "spectator_name_bar_y", 0) or 0),
+                roundDamageWidth=int(getattr(self.cfg, "browser_round_damage_width", 150) or 150),
                 overlayTimerFontSize=int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54),
                 overlayTimerX=int(getattr(self.cfg, "overlay_timer_x", 0) or 0),
                 overlayTimerY=int(getattr(self.cfg, "overlay_timer_y", 0) or 0),
@@ -20902,6 +21074,63 @@ class MainApp(QObject):
                     self.timer_win.set_status(f"VS 오버레이 테스트 실패: {e}")
                 except Exception:
                     pass
+
+    def _on_overlay_visibility_request(self, key: str, visible: bool):
+        """Persist an element visibility toggle initiated from the QML overlay."""
+        visibility_map = {
+            "round": ("overlay_show_round", "round_visible", "showRound", "chk_overlay_round"),
+            "time": ("overlay_show_time", "time_visible", "showTime", "chk_overlay_time"),
+            "blue_img": ("overlay_show_blue_img", "blue_img_visible", "showBlueImage", "chk_overlay_blue_img"),
+            "blue_name": ("overlay_show_blue_name", "blue_name_visible", "showBlueName", "chk_overlay_blue_name"),
+            "red_img": ("overlay_show_red_img", "red_img_visible", "showRedImage", "chk_overlay_red_img"),
+            "red_name": ("overlay_show_red_name", "red_name_visible", "showRedName", "chk_overlay_red_name"),
+            "arena_name": ("overlay_show_arena_name", "arena_name_visible", "showArenaName", "chk_overlay_arena_name"),
+            "flags": ("overlay_show_flags", "flags_visible", "showFlags", "chk_overlay_flags"),
+            "cinematic": ("overlay_show_cinematic", "cinematic_visible", "showCinematic", "chk_overlay_cinematic"),
+        }
+        normalized_key = str(key or "").strip().lower()
+        target = visibility_map.get(normalized_key)
+        if target is None:
+            logging.warning("OVERLAY_VISIBILITY_UNKNOWN_KEY key=%r", key)
+            return
+
+        config_key, qml_key, browser_key, settings_key = target
+        is_visible = bool(visible)
+        setattr(self.cfg, config_key, is_visible)
+
+        try:
+            self.timer_win.set_overlay_visibility(**{qml_key: is_visible})
+        except Exception:
+            logging.exception("OVERLAY_VISIBILITY_QML_UPDATE_FAIL key=%s", normalized_key)
+
+        try:
+            overlay = getattr(self, "browser_overlay", None)
+            if overlay is not None:
+                overlay.update(**{browser_key: is_visible})
+        except Exception:
+            logging.exception("OVERLAY_VISIBILITY_BROWSER_UPDATE_FAIL key=%s", normalized_key)
+
+        settings = getattr(self, "settings_dlg", None)
+        checkbox = getattr(settings, settings_key, None) if settings is not None else None
+        if checkbox is not None:
+            try:
+                checkbox.blockSignals(True)
+                checkbox.setChecked(is_visible)
+            except RuntimeError:
+                pass
+            except Exception:
+                logging.debug("OVERLAY_VISIBILITY_SETTINGS_SYNC_FAIL", exc_info=True)
+            finally:
+                try:
+                    checkbox.blockSignals(False)
+                except Exception:
+                    pass
+
+        try:
+            self.cfg.to_json(self.cfg_path)
+        except Exception:
+            logging.exception("OVERLAY_VISIBILITY_SAVE_FAIL key=%s", normalized_key)
+        logging.info("OVERLAY_VISIBILITY_SET key=%s visible=%s", normalized_key, is_visible)
 
     def _on_overlay_ui_scale_changed(self):
         try:
@@ -22273,6 +22502,7 @@ class MainApp(QObject):
                 "spectator_sp_bar_color": "spBarColor",
                 "spectator_name_bar_x": "nameBarX",
                 "spectator_name_bar_y": "nameBarY",
+                "browser_round_damage_width": "roundDamageWidth",
                 "overlay_timer_font_size": "overlayTimerFontSize",
                 "overlay_timer_x": "overlayTimerX",
                 "overlay_timer_y": "overlayTimerY",
@@ -22350,6 +22580,7 @@ class MainApp(QObject):
             update.setdefault("spBarColor", str(getattr(self.cfg, "spectator_sp_bar_color", "#1876d3") or "#1876d3"))
             update.setdefault("nameBarX", int(getattr(self.cfg, "spectator_name_bar_x", 0) or 0))
             update.setdefault("nameBarY", int(getattr(self.cfg, "spectator_name_bar_y", 0) or 0))
+            update.setdefault("roundDamageWidth", int(getattr(self.cfg, "browser_round_damage_width", 150) or 150))
             update.setdefault("overlayUiScale", float(getattr(self.cfg, "overlay_ui_scale", 1.0) or 1.0))
             update.setdefault("overlayTimerFontSize", int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54))
             update.setdefault("overlayTimerX", int(getattr(self.cfg, "overlay_timer_x", 0) or 0))

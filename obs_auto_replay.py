@@ -81,12 +81,20 @@ class ObsAutoReplayController:
         if overlay is None:
             return False
         try:
+            if hasattr(overlay, "set_obs_transition_paths"):
+                overlay.set_obs_transition_paths(
+                    str(getattr(cfg, "obs_replay_transition_before_path", "") or ""),
+                    str(getattr(cfg, "obs_replay_transition_after_path", "") or ""),
+                )
             token = overlay.play_obs_replay(
                 path,
                 muted=bool(getattr(cfg, "obs_auto_replay_muted", True)),
                 volume=int(getattr(cfg, "obs_auto_replay_volume", 100) or 0),
                 fit=str(getattr(cfg, "obs_auto_replay_fit", "cover") or "cover"),
                 fade_ms=int(getattr(cfg, "obs_auto_replay_fade_ms", 140) or 0),
+                transition_enabled=bool(getattr(cfg, "obs_replay_transition_enabled", False)),
+                transition_before_ms=int(getattr(cfg, "obs_replay_transition_before_ms", 500) or 0),
+                transition_after_ms=int(getattr(cfg, "obs_replay_transition_after_ms", 400) or 0),
             )
         except Exception:
             logging.exception("OBS_AUTO_REPLAY_START_FAIL kind=%s path=%s", kind, path)

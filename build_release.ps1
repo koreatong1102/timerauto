@@ -132,6 +132,17 @@ foreach ($af in $audioFiles) {
   Copy-RelativeFile $af.FullName $root $dist
 }
 
+# Replay transition and test clips are runtime assets too.  Keep their relative
+# paths so the same config works after an update on another user's PC.
+$videoFiles = @()
+foreach ($extension in @("*.mp4", "*.webm", "*.mov", "*.m4v", "*.avi", "*.ogv", "*.ogg")) {
+  $videoFiles += Get-ChildItem -Path $root -Recurse -Filter $extension -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\logs\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
+}
+foreach ($video in $videoFiles) {
+  Copy-RelativeFile $video.FullName $root $dist
+}
+
 $imageFiles = @()
 $imageFiles += Get-ChildItem -Path $root -Recurse -Filter *.png -File -ErrorAction SilentlyContinue |
   Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\logs\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
@@ -219,6 +230,10 @@ if (-not $IncludeUserConfig) {
     spectatorlog_file_watch_enabled = $true
     spectatorlog_poll_ms = 150
     spectatorlog_backup_poll_ms = 1500
+    obs_replay_transition_enabled = $true
+    obs_replay_transition_before_path = "assets\\video\\logo.webm"
+    obs_replay_transition_after_path = "assets\\video\\logo.webm"
+    obs_replay_transition_test_video_path = "assets\\video\\logo.webm"
     spectator_commentary_enabled = $true
     spectator_commentary_mode = "standard"
     spectator_commentary_voice = "ko-KR-InJoonNeural"

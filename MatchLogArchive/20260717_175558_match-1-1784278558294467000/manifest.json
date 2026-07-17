@@ -1,0 +1,10 @@
+{
+  "session_id": "match-1-1784278558294467000",
+  "pair": [
+    "BLUE",
+    "RED"
+  ],
+  "updated_at": 1784278558.3028743,
+  "purpose": "Per-match report source. scores.csv is authoritative for official score, damage and knockdowns.",
+  "update_only": false
+}

@@ -61,6 +61,7 @@ class ObsIntegration:
         self._status_lock = threading.Lock()
         self._status = "disabled" if not self._settings.enabled else "starting"
         self._pending_replay_requests = deque()
+        self._pending_input_mute_requests: Dict[str, Dict[str, Any]] = {}
 
     @property
     def status(self) -> str:
@@ -118,10 +119,44 @@ class ObsIntegration:
             }
         )
 
+    def save_source_record_replay(
+        self,
+        context_name: str,
+        reason: str = "",
+        *,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Save a Source Record plugin replay buffer through OBS WebSocket."""
+        if not self._settings.enabled or not str(context_name or "").strip():
+            return
+        self._commands.put(
+            {
+                "type": "request",
+                "requestType": "TriggerHotkeyByName",
+                "requestData": {
+                    "hotkeyName": "ReplayBuffer.Save",
+                    "contextName": str(context_name).strip(),
+                },
+                "reason": str(reason or ""),
+                "context": dict(context or {}),
+                "source_record": True,
+            }
+        )
+
     def ensure_replay_buffer(self) -> None:
         if not self._settings.enabled:
             return
         self._commands.put({"type": "request", "requestType": "GetReplayBufferStatus"})
+
+    def get_input_mute(self, input_name: str, *, context: Optional[Dict[str, Any]] = None) -> None:
+        if not self._settings.enabled or not str(input_name or "").strip():
+            return
+        self._commands.put({"type": "input_mute_get", "inputName": str(input_name).strip(), "context": dict(context or {})})
+
+    def set_input_mute(self, input_name: str, muted: bool) -> None:
+        if not self._settings.enabled or not str(input_name or "").strip():
+            return
+        self._commands.put({"type": "request", "requestType": "SetInputMute", "requestData": {"inputName": str(input_name).strip(), "inputMuted": bool(muted)}})
 
     def drain_events(self, limit: int = 100) -> List[Dict[str, Any]]:
         result: List[Dict[str, Any]] = []
@@ -229,7 +264,10 @@ class ObsIntegration:
                 elif kind == "request":
                     request_type = str(command.get("requestType") or "")
                     request_id = await self._send_request(
-                        ws, request_type, reason=str(command.get("reason") or "")
+                        ws,
+                        request_type,
+                        reason=str(command.get("reason") or ""),
+                        request_data=dict(command.get("requestData") or {}),
                     )
                     if request_type == "SaveReplayBuffer" and request_id:
                         self._pending_replay_requests.append(
@@ -239,12 +277,28 @@ class ObsIntegration:
                                 "context": dict(command.get("context") or {}),
                             }
                         )
+                elif kind == "input_mute_get":
+                    input_name = str(command.get("inputName") or "").strip()
+                    request_id = await self._send_request(ws, "GetInputMute", request_data={"inputName": input_name})
+                    if request_id:
+                        self._pending_input_mute_requests[request_id] = {"inputName": input_name, "context": dict(command.get("context") or {})}
 
-    async def _send_request(self, ws: Any, request_type: str, *, request_id: str = "", reason: str = "") -> str:
+    async def _send_request(
+        self,
+        ws: Any,
+        request_type: str,
+        *,
+        request_id: str = "",
+        reason: str = "",
+        request_data: Optional[Dict[str, Any]] = None,
+    ) -> str:
         if not request_type:
             return ""
         rid = request_id or uuid.uuid4().hex
-        await ws.send_json({"op": 6, "d": {"requestType": request_type, "requestId": rid}})
+        payload: Dict[str, Any] = {"requestType": request_type, "requestId": rid}
+        if request_data:
+            payload["requestData"] = dict(request_data)
+        await ws.send_json({"op": 6, "d": payload})
         if reason:
             self._events.put({"type": "request_sent", "requestType": request_type, "reason": reason})
         return rid
@@ -302,3 +356,12 @@ class ObsIntegration:
                         item for item in self._pending_replay_requests
                         if str(item.get("request_id") or "") != request_id
                     )
+            elif request_type == "TriggerHotkeyByName":
+                self._events.put(
+                    {"type": "source_record_replay_saved", "ok": ok, "message": str(status.get("comment") or "")}
+                )
+            elif request_type == "GetInputMute":
+                request_id = str(data.get("requestId") or "")
+                pending = self._pending_input_mute_requests.pop(request_id, {})
+                response = data.get("responseData") or {}
+                self._events.put({"type": "input_mute_state", "ok": ok, "inputName": str(pending.get("inputName") or ""), "muted": bool(response.get("inputMuted", False)), "context": dict(pending.get("context") or {}), "message": str(status.get("comment") or "")})

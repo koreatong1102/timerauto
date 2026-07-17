@@ -1,0 +1,14 @@
+{
+  "blue": {
+    "mid": 100.0,
+    "long": 41.6,
+    "hp_ratio": 0.584,
+    "lost_pct": 41.6
+  },
+  "red": {
+    "mid": 0.0,
+    "long": 39.1,
+    "hp_ratio": 0.609,
+    "lost_pct": 39.1
+  }
+}

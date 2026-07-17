@@ -349,7 +349,11 @@ class DiagnosticRecorder:
         if last:
             parts = last.split("\t")
             info["damage_events_columns"] = len(parts)
-            info["damage_events_has_hand_column"] = bool(len(parts) >= 12 and str(parts[3]).lower() in ("left", "right"))
+            # Current SpectatorLog layout is: time, damage, multiplier,
+            # receiving-corner, hand, ... .  The former index 3 check was the
+            # receiver (blue/red), so diagnostics always falsely said no hand
+            # column existed.
+            info["damage_events_has_hand_column"] = bool(len(parts) >= 12 and str(parts[4]).lower() in ("left", "right"))
             info["damage_events_last_sample"] = _safe_json(parts, mask_sensitive=True, max_depth=2, max_list=20)
         for rel in ("match/punches_thrown.txt", "match/scores.csv", "match/winner.txt", "match/round_total.txt", "match/camera_input.txt"):
             path = os.path.join(root, *rel.split("/"))

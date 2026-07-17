@@ -653,6 +653,65 @@ class AppConfig:
     obs_highlight_combo_min: int = 3
     obs_highlight_damage_min: float = 55.0
     obs_highlight_cooldown_sec: float = 8.0
+    # Optional per-source replay buffer provided by the OBS Source Record plugin.
+    # It is independent from OBS's Program-output replay buffer.
+    obs_source_record_enabled: bool = False
+    obs_source_record_context: str = "게임 캡처 - Source Record"
+    obs_source_record_incoming_dir: str = ""
+    obs_source_record_archive_dir: str = ""
+    # Ordinary player clips are deleted oldest-first when this archive limit is exceeded.
+    obs_source_record_archive_limit_gb: int = 5
+    # The incoming folder contains only temporary Source Record originals.
+    obs_source_record_clear_incoming_on_stream_stop: bool = True
+    # Copy native OBS Replay Buffer files into the same per-player archive.
+    # They stay in OBS's own output folder for browser-overlay replay safety.
+    obs_replay_buffer_archive_enabled: bool = False
+    # Play of the Match (best technical moment across the entire bout).
+    potm_enabled: bool = False
+    potm_capture_source: str = "source_record"  # source_record | replay_buffer
+    potm_min_score: int = 45
+    potm_window_sec: float = 10.0
+    potm_play_delay_sec: float = 4.0
+    potm_technique_max: int = 40
+    potm_result_max: int = 40
+    potm_damage_max: int = 20
+    potm_intro_hold_sec: float = 2.1
+    potm_bgm_path: str = ""
+    potm_bgm_volume: int = 75
+    potm_test_video_path: str = ""
+    potm_name_color: str = "#FFC62B"
+    potm_title_text: str = "PLAY OF THE MATCH"
+    potm_title_color: str = "#FFFFFF"
+    potm_reason_color: str = "#FFFFFF"
+    potm_left_pct: int = 16
+    potm_top_pct: int = 30
+    potm_portrait_right_pct: int = 4
+    potm_portrait_size_pct: int = 57
+    potm_reason_bottom_pct: int = 16
+    potm_title_font_px: int = 31
+    potm_name_font_px: int = 106
+    potm_reason_font_px: int = 25
+    potm_announce_enabled: bool = True
+    potm_announce_text: str = "PLAY OF THE MATCH, {name}님 축하드립니다."
+    potm_announce_role: str = "caster"
+    potm_obs_bgm_mute_enabled: bool = False
+    potm_obs_bgm_source: str = ""
+    potm_score_counter: int = 14
+    potm_score_whiff_counter: int = 10
+    potm_score_counter_followup: int = 6
+    potm_score_combo3: int = 6
+    potm_score_combo4: int = 10
+    potm_score_combo5: int = 18
+    potm_score_clean_finish: int = 6
+    potm_score_stun: int = 12
+    potm_score_knockdown: int = 30
+    potm_score_tko: int = 40
+    potm_damage_total_max: int = 12
+    potm_damage_peak_max: int = 8
+    # Local highlight compilation uses the external ffmpeg executable.  It is
+    # intentionally configurable because OBS does not expose its bundled one.
+    obs_highlight_ffmpeg_path: str = ""
+    obs_highlight_merge_transition_ms: int = 500
     obs_auto_replay_enabled: bool = True
     obs_auto_replay_kd: bool = True
     obs_auto_replay_tko: bool = True
@@ -664,12 +723,17 @@ class AppConfig:
     obs_auto_replay_volume: int = 100
     obs_auto_replay_fit: str = "cover"
     obs_auto_replay_fade_ms: int = 140
+    obs_auto_replay_speed: float = 1.0
+    # Shared position for KD/TKO and idle-video replay labels. Positive Y moves upward.
+    replay_label_x: int = 0
+    replay_label_y: int = 0
     obs_replay_transition_enabled: bool = True
     obs_replay_transition_before_path: str = "assets\\video\\logo.webm"
     obs_replay_transition_after_path: str = "assets\\video\\logo.webm"
     obs_replay_transition_test_video_path: str = "assets\\video\\logo.webm"
     obs_replay_transition_before_ms: int = 500
     obs_replay_transition_after_ms: int = 400
+    obs_replay_transition_speed: float = 1.0
     obs_auto_replay_stop_on_round: bool = True
     idle_highlight_enabled: bool = False
     idle_highlight_path: str = ""
@@ -696,11 +760,16 @@ class AppConfig:
     spectatorlog_blackbox_sample_ms: int = 250
     spectatorlog_blackbox_max_snapshot_mb: int = 64
     spectatorlog_blackbox_zip_on_close: bool = False
+    # Match reports need their own compact archive because the live files can
+    # discard old rows while a bout is still running.
+    spectator_match_archive_dir: str = "MatchLogArchive"
     spectator_realtime_gauge_min_interval_ms: int = 75
     spectatorlog_sync_timer: bool = True
     spectatorlog_sync_players: bool = True
     spectator_lobby_auto_start_enabled: bool = False
     spectator_lobby_auto_start_target_title: str = "The Thrill of the Fight 2"
+    spectator_lobby_auto_start_mode: str = "click"  # click / f5 / f5_then_click
+    spectator_lobby_auto_start_capture_hotkey: str = "F12"
     spectator_lobby_auto_start_client_x: int = 0
     spectator_lobby_auto_start_client_y: int = 0
     spectator_lobby_auto_start_reference_width: int = 0
@@ -715,8 +784,8 @@ class AppConfig:
     spectator_sp_throw_cost_scale: float = 1.8
     spectator_sp_impact_cost_scale: float = 1.25
     spectator_sp_fight_recovery_pct: float = 5.0
-    # Rest recovery is applied to the missing portion of SP, not as a flat
-    # addition to the full gauge.  Thirty percent keeps a tired fighter tired.
+    # During a break this is a recovery ceiling, not an extra recovery rate.
+    # Fighters already above the ceiling are never reduced.
     spectator_sp_break_recovery_pct: float = 30.0
     spectator_sp_recovery_delay_sec: float = 1.5
     spectator_sp_bar_x: int = 0
@@ -810,6 +879,7 @@ class AppConfig:
     overlay_player_mask: str = "square"
     overlay_show_round: bool = True
     overlay_show_time: bool = True
+    overlay_show_time_during_knockdown: bool = False
     overlay_show_blue_img: bool = True
     overlay_show_blue_name: bool = True
     overlay_show_red_img: bool = True
@@ -926,6 +996,49 @@ class AppConfig:
         cfg.obs_highlight_combo_min = max(2, min(20, int(raw.get("obs_highlight_combo_min", 3) or 3)))
         cfg.obs_highlight_damage_min = max(0.0, min(300.0, float(raw.get("obs_highlight_damage_min", 55.0) or 55.0)))
         cfg.obs_highlight_cooldown_sec = max(0.0, min(120.0, float(raw.get("obs_highlight_cooldown_sec", 8.0) or 8.0)))
+        cfg.obs_source_record_enabled = bool(raw.get("obs_source_record_enabled", False))
+        cfg.obs_source_record_context = str(raw.get("obs_source_record_context", "게임 캡처 - Source Record") or "").strip()
+        cfg.obs_source_record_incoming_dir = str(raw.get("obs_source_record_incoming_dir", "") or "").strip()
+        cfg.obs_source_record_archive_dir = str(raw.get("obs_source_record_archive_dir", "") or "").strip()
+        cfg.obs_source_record_archive_limit_gb = max(1, min(500, int(raw.get("obs_source_record_archive_limit_gb", 5) or 5)))
+        cfg.obs_source_record_clear_incoming_on_stream_stop = bool(raw.get("obs_source_record_clear_incoming_on_stream_stop", True))
+        cfg.obs_replay_buffer_archive_enabled = bool(raw.get("obs_replay_buffer_archive_enabled", False))
+        cfg.potm_enabled = bool(raw.get("potm_enabled", False))
+        cfg.potm_capture_source = str(raw.get("potm_capture_source", "source_record") or "source_record").strip().lower()
+        if cfg.potm_capture_source not in ("source_record", "replay_buffer"):
+            cfg.potm_capture_source = "source_record"
+        cfg.potm_min_score = max(1, min(100, int(raw.get("potm_min_score", 45) or 45)))
+        cfg.potm_window_sec = max(0.5, min(10.0, float(raw.get("potm_window_sec", 10.0) or 10.0)))
+        cfg.potm_play_delay_sec = max(0.0, min(30.0, float(raw.get("potm_play_delay_sec", 4.0) or 0.0)))
+        cfg.potm_technique_max = max(0, min(100, int(raw.get("potm_technique_max", 40) or 0)))
+        cfg.potm_result_max = max(0, min(100, int(raw.get("potm_result_max", 40) or 0)))
+        cfg.potm_damage_max = max(0, min(100, int(raw.get("potm_damage_max", 20) or 0)))
+        cfg.potm_intro_hold_sec = max(0.5, min(8.0, float(raw.get("potm_intro_hold_sec", 2.1) or 2.1)))
+        cfg.potm_bgm_path = str(raw.get("potm_bgm_path", "") or "").strip()
+        cfg.potm_bgm_volume = max(0, min(100, int(raw.get("potm_bgm_volume", 75) or 0)))
+        cfg.potm_test_video_path = str(raw.get("potm_test_video_path", "") or "").strip()
+        cfg.potm_name_color = _normalize_hex_color(raw.get("potm_name_color", "#FFC62B"))
+        cfg.potm_title_text = str(raw.get("potm_title_text", "PLAY OF THE MATCH") or "PLAY OF THE MATCH").strip()[:80]
+        cfg.potm_title_color = _normalize_hex_color(raw.get("potm_title_color", "#FFFFFF"))
+        cfg.potm_reason_color = _normalize_hex_color(raw.get("potm_reason_color", "#FFFFFF"))
+        cfg.potm_left_pct = max(0, min(45, int(raw.get("potm_left_pct", 16) or 16)))
+        cfg.potm_top_pct = max(0, min(75, int(raw.get("potm_top_pct", 30) or 30)))
+        cfg.potm_portrait_right_pct = max(0, min(40, int(raw.get("potm_portrait_right_pct", 4) or 4)))
+        cfg.potm_portrait_size_pct = max(25, min(80, int(raw.get("potm_portrait_size_pct", 57) or 57)))
+        cfg.potm_reason_bottom_pct = max(0, min(45, int(raw.get("potm_reason_bottom_pct", 16) or 16)))
+        cfg.potm_title_font_px = max(14, min(80, int(raw.get("potm_title_font_px", 31) or 31)))
+        cfg.potm_name_font_px = max(30, min(180, int(raw.get("potm_name_font_px", 106) or 106)))
+        cfg.potm_reason_font_px = max(12, min(70, int(raw.get("potm_reason_font_px", 25) or 25)))
+        cfg.potm_announce_enabled = bool(raw.get("potm_announce_enabled", True))
+        cfg.potm_announce_text = str(raw.get("potm_announce_text", "PLAY OF THE MATCH, {name}님 축하드립니다.") or "").strip()[:240]
+        cfg.potm_announce_role = str(raw.get("potm_announce_role", "caster") or "caster").strip().lower()
+        if cfg.potm_announce_role not in ("analyst", "caster"): cfg.potm_announce_role = "caster"
+        cfg.potm_obs_bgm_mute_enabled = bool(raw.get("potm_obs_bgm_mute_enabled", False))
+        cfg.potm_obs_bgm_source = str(raw.get("potm_obs_bgm_source", "") or "").strip()
+        for name, default in (("potm_score_counter", 14), ("potm_score_whiff_counter", 10), ("potm_score_counter_followup", 6), ("potm_score_combo3", 6), ("potm_score_combo4", 10), ("potm_score_combo5", 18), ("potm_score_clean_finish", 6), ("potm_score_stun", 12), ("potm_score_knockdown", 30), ("potm_score_tko", 40), ("potm_damage_total_max", 12), ("potm_damage_peak_max", 8)):
+            setattr(cfg, name, max(0, min(100, int(raw.get(name, default) or 0))))
+        cfg.obs_highlight_ffmpeg_path = str(raw.get("obs_highlight_ffmpeg_path", "") or "").strip()
+        cfg.obs_highlight_merge_transition_ms = max(0, min(3000, int(raw.get("obs_highlight_merge_transition_ms", 500) or 0)))
         cfg.obs_auto_replay_enabled = bool(raw.get("obs_auto_replay_enabled", True))
         cfg.obs_auto_replay_kd = bool(raw.get("obs_auto_replay_kd", True))
         cfg.obs_auto_replay_tko = bool(raw.get("obs_auto_replay_tko", True))
@@ -937,12 +1050,16 @@ class AppConfig:
         if cfg.obs_auto_replay_fit not in ("cover", "contain"):
             cfg.obs_auto_replay_fit = "cover"
         cfg.obs_auto_replay_fade_ms = max(0, min(2000, int(raw.get("obs_auto_replay_fade_ms", 140) or 0)))
+        cfg.obs_auto_replay_speed = max(0.25, min(2.0, float(raw.get("obs_auto_replay_speed", 1.0) or 1.0)))
+        cfg.replay_label_x = max(-800, min(800, int(raw.get("replay_label_x", 0) or 0)))
+        cfg.replay_label_y = max(-500, min(500, int(raw.get("replay_label_y", 0) or 0)))
         cfg.obs_replay_transition_enabled = bool(raw.get("obs_replay_transition_enabled", cfg.obs_replay_transition_enabled))
         cfg.obs_replay_transition_before_path = str(raw.get("obs_replay_transition_before_path", cfg.obs_replay_transition_before_path) or "")
         cfg.obs_replay_transition_after_path = str(raw.get("obs_replay_transition_after_path", cfg.obs_replay_transition_after_path) or "")
         cfg.obs_replay_transition_test_video_path = str(raw.get("obs_replay_transition_test_video_path", cfg.obs_replay_transition_test_video_path) or "")
         cfg.obs_replay_transition_before_ms = max(0, min(10000, int(raw.get("obs_replay_transition_before_ms", 500) or 0)))
         cfg.obs_replay_transition_after_ms = max(0, min(10000, int(raw.get("obs_replay_transition_after_ms", 400) or 0)))
+        cfg.obs_replay_transition_speed = max(0.25, min(2.0, float(raw.get("obs_replay_transition_speed", 1.0) or 1.0)))
         cfg.obs_auto_replay_stop_on_round = bool(raw.get("obs_auto_replay_stop_on_round", True))
         cfg.idle_highlight_enabled = bool(raw.get("idle_highlight_enabled", False))
         cfg.idle_highlight_path = str(raw.get("idle_highlight_path", "") or "")
@@ -962,6 +1079,14 @@ class AppConfig:
             raw.get("spectator_lobby_auto_start_target_title", "The Thrill of the Fight 2")
             or "The Thrill of the Fight 2"
         )
+        cfg.spectator_lobby_auto_start_mode = str(
+            raw.get("spectator_lobby_auto_start_mode", "click") or "click"
+        ).strip().lower()
+        if cfg.spectator_lobby_auto_start_mode not in ("click", "f5", "f5_then_click"):
+            cfg.spectator_lobby_auto_start_mode = "click"
+        cfg.spectator_lobby_auto_start_capture_hotkey = str(
+            raw.get("spectator_lobby_auto_start_capture_hotkey", "F12") or ""
+        ).strip()
         try:
             cfg.spectator_lobby_auto_start_client_x = max(0, int(raw.get("spectator_lobby_auto_start_client_x", 0) or 0))
             cfg.spectator_lobby_auto_start_client_y = max(0, int(raw.get("spectator_lobby_auto_start_client_y", 0) or 0))
@@ -1164,6 +1289,7 @@ class AppConfig:
         except Exception:
             cfg.spectatorlog_blackbox_max_snapshot_mb = 64
         cfg.spectatorlog_blackbox_zip_on_close = bool(raw.get("spectatorlog_blackbox_zip_on_close", False))
+        cfg.spectator_match_archive_dir = str(raw.get("spectator_match_archive_dir", "MatchLogArchive") or "MatchLogArchive")
         try:
             cfg.spectator_realtime_gauge_min_interval_ms = max(30, min(350, int(raw.get("spectator_realtime_gauge_min_interval_ms", 75) or 75)))
         except Exception:
@@ -1265,6 +1391,7 @@ class AppConfig:
         cfg.overlay_player_mask = _normalize_player_mask(raw.get("overlay_player_mask", "square"))
         cfg.overlay_show_round = bool(raw.get("overlay_show_round", True))
         cfg.overlay_show_time = bool(raw.get("overlay_show_time", True))
+        cfg.overlay_show_time_during_knockdown = bool(raw.get("overlay_show_time_during_knockdown", False))
         cfg.overlay_show_blue_img = bool(raw.get("overlay_show_blue_img", True))
         cfg.overlay_show_blue_name = bool(raw.get("overlay_show_blue_name", True))
         cfg.overlay_show_red_img = bool(raw.get("overlay_show_red_img", True))
@@ -1518,6 +1645,56 @@ class AppConfig:
             "obs_highlight_combo_min": int(max(2, min(20, self.obs_highlight_combo_min))),
             "obs_highlight_damage_min": float(max(0.0, min(300.0, self.obs_highlight_damage_min))),
             "obs_highlight_cooldown_sec": float(max(0.0, min(120.0, self.obs_highlight_cooldown_sec))),
+            "obs_source_record_enabled": bool(self.obs_source_record_enabled),
+            "obs_source_record_context": str(self.obs_source_record_context or ""),
+            "obs_source_record_incoming_dir": to_app_rel(str(self.obs_source_record_incoming_dir or "")),
+            "obs_source_record_archive_dir": to_app_rel(str(self.obs_source_record_archive_dir or "")),
+            "obs_source_record_archive_limit_gb": int(max(1, min(500, self.obs_source_record_archive_limit_gb))),
+            "obs_source_record_clear_incoming_on_stream_stop": bool(self.obs_source_record_clear_incoming_on_stream_stop),
+            "obs_replay_buffer_archive_enabled": bool(self.obs_replay_buffer_archive_enabled),
+            "potm_enabled": bool(self.potm_enabled),
+            "potm_capture_source": str(self.potm_capture_source or "source_record"),
+            "potm_min_score": int(max(1, min(100, self.potm_min_score))),
+            "potm_window_sec": float(max(0.5, min(10.0, self.potm_window_sec))),
+            "potm_play_delay_sec": float(max(0.0, min(30.0, self.potm_play_delay_sec))),
+            "potm_technique_max": int(max(0, min(100, self.potm_technique_max))),
+            "potm_result_max": int(max(0, min(100, self.potm_result_max))),
+            "potm_damage_max": int(max(0, min(100, self.potm_damage_max))),
+            "potm_intro_hold_sec": float(max(0.5, min(8.0, self.potm_intro_hold_sec))),
+            "potm_bgm_path": to_app_rel(str(self.potm_bgm_path or "")),
+            "potm_bgm_volume": int(max(0, min(100, self.potm_bgm_volume))),
+            "potm_test_video_path": to_app_rel(str(self.potm_test_video_path or "")),
+            "potm_name_color": _normalize_hex_color(self.potm_name_color),
+            "potm_title_text": str(self.potm_title_text or "PLAY OF THE MATCH")[:80],
+            "potm_title_color": _normalize_hex_color(self.potm_title_color),
+            "potm_reason_color": _normalize_hex_color(self.potm_reason_color),
+            "potm_left_pct": int(max(0, min(45, self.potm_left_pct))),
+            "potm_top_pct": int(max(0, min(75, self.potm_top_pct))),
+            "potm_portrait_right_pct": int(max(0, min(40, self.potm_portrait_right_pct))),
+            "potm_portrait_size_pct": int(max(25, min(80, self.potm_portrait_size_pct))),
+            "potm_reason_bottom_pct": int(max(0, min(45, self.potm_reason_bottom_pct))),
+            "potm_title_font_px": int(max(14, min(80, self.potm_title_font_px))),
+            "potm_name_font_px": int(max(30, min(180, self.potm_name_font_px))),
+            "potm_reason_font_px": int(max(12, min(70, self.potm_reason_font_px))),
+            "potm_announce_enabled": bool(self.potm_announce_enabled),
+            "potm_announce_text": str(self.potm_announce_text or "")[:240],
+            "potm_announce_role": str(self.potm_announce_role or "caster"),
+            "potm_obs_bgm_mute_enabled": bool(self.potm_obs_bgm_mute_enabled),
+            "potm_obs_bgm_source": str(self.potm_obs_bgm_source or ""),
+            "potm_score_counter": int(max(0, min(100, self.potm_score_counter))),
+            "potm_score_whiff_counter": int(max(0, min(100, self.potm_score_whiff_counter))),
+            "potm_score_counter_followup": int(max(0, min(100, self.potm_score_counter_followup))),
+            "potm_score_combo3": int(max(0, min(100, self.potm_score_combo3))),
+            "potm_score_combo4": int(max(0, min(100, self.potm_score_combo4))),
+            "potm_score_combo5": int(max(0, min(100, self.potm_score_combo5))),
+            "potm_score_clean_finish": int(max(0, min(100, self.potm_score_clean_finish))),
+            "potm_score_stun": int(max(0, min(100, self.potm_score_stun))),
+            "potm_score_knockdown": int(max(0, min(100, self.potm_score_knockdown))),
+            "potm_score_tko": int(max(0, min(100, self.potm_score_tko))),
+            "potm_damage_total_max": int(max(0, min(100, self.potm_damage_total_max))),
+            "potm_damage_peak_max": int(max(0, min(100, self.potm_damage_peak_max))),
+            "obs_highlight_ffmpeg_path": to_app_rel(str(self.obs_highlight_ffmpeg_path or "")),
+            "obs_highlight_merge_transition_ms": int(max(0, min(3000, self.obs_highlight_merge_transition_ms))),
             "obs_auto_replay_enabled": bool(self.obs_auto_replay_enabled),
             "obs_auto_replay_kd": bool(self.obs_auto_replay_kd),
             "obs_auto_replay_tko": bool(self.obs_auto_replay_tko),
@@ -1527,12 +1704,16 @@ class AppConfig:
             "obs_auto_replay_volume": int(max(0, min(100, self.obs_auto_replay_volume))),
             "obs_auto_replay_fit": str(self.obs_auto_replay_fit or "cover"),
             "obs_auto_replay_fade_ms": int(max(0, min(2000, self.obs_auto_replay_fade_ms))),
+            "obs_auto_replay_speed": float(max(0.25, min(2.0, self.obs_auto_replay_speed))),
+            "replay_label_x": int(max(-800, min(800, self.replay_label_x))),
+            "replay_label_y": int(max(-500, min(500, self.replay_label_y))),
             "obs_replay_transition_enabled": bool(self.obs_replay_transition_enabled),
             "obs_replay_transition_before_path": str(self.obs_replay_transition_before_path or ""),
             "obs_replay_transition_after_path": str(self.obs_replay_transition_after_path or ""),
             "obs_replay_transition_test_video_path": str(self.obs_replay_transition_test_video_path or ""),
             "obs_replay_transition_before_ms": int(max(0, min(10000, self.obs_replay_transition_before_ms))),
             "obs_replay_transition_after_ms": int(max(0, min(10000, self.obs_replay_transition_after_ms))),
+            "obs_replay_transition_speed": float(max(0.25, min(2.0, self.obs_replay_transition_speed))),
             "obs_auto_replay_stop_on_round": bool(self.obs_auto_replay_stop_on_round),
             "idle_highlight_enabled": bool(self.idle_highlight_enabled),
             "idle_highlight_path": to_app_rel(str(self.idle_highlight_path or "")),
@@ -1554,12 +1735,21 @@ class AppConfig:
             "spectatorlog_blackbox_sample_ms": int(self.spectatorlog_blackbox_sample_ms or 250),
             "spectatorlog_blackbox_max_snapshot_mb": int(self.spectatorlog_blackbox_max_snapshot_mb or 64),
             "spectatorlog_blackbox_zip_on_close": bool(self.spectatorlog_blackbox_zip_on_close),
+            "spectator_match_archive_dir": to_app_rel(str(self.spectator_match_archive_dir or "MatchLogArchive")),
             "spectator_realtime_gauge_min_interval_ms": int(self.spectator_realtime_gauge_min_interval_ms or 75),
             "spectatorlog_sync_timer": bool(self.spectatorlog_sync_timer),
             "spectatorlog_sync_players": bool(self.spectatorlog_sync_players),
             "spectator_lobby_auto_start_enabled": bool(self.spectator_lobby_auto_start_enabled),
             "spectator_lobby_auto_start_target_title": str(
                 self.spectator_lobby_auto_start_target_title or "The Thrill of the Fight 2"
+            ),
+            "spectator_lobby_auto_start_mode": str(
+                self.spectator_lobby_auto_start_mode
+                if self.spectator_lobby_auto_start_mode in ("click", "f5", "f5_then_click")
+                else "click"
+            ),
+            "spectator_lobby_auto_start_capture_hotkey": str(
+                self.spectator_lobby_auto_start_capture_hotkey or ""
             ),
             "spectator_lobby_auto_start_client_x": int(max(0, self.spectator_lobby_auto_start_client_x)),
             "spectator_lobby_auto_start_client_y": int(max(0, self.spectator_lobby_auto_start_client_y)),
@@ -1666,6 +1856,7 @@ class AppConfig:
             "overlay_player_mask": self.overlay_player_mask,
             "overlay_show_round": self.overlay_show_round,
             "overlay_show_time": self.overlay_show_time,
+            "overlay_show_time_during_knockdown": bool(self.overlay_show_time_during_knockdown),
             "overlay_show_blue_img": self.overlay_show_blue_img,
             "overlay_show_blue_name": self.overlay_show_blue_name,
             "overlay_show_red_img": self.overlay_show_red_img,

@@ -21,6 +21,8 @@ from match_analytics import (
     resolve_match_result,
 )
 from commentary_director import CommentaryCandidate, CommentaryDirector
+from app_paths import app_path
+from match_log_archive import MatchLogArchive
 from spectator_log_blackbox import SpectatorLogBlackboxRecorder
 
 
@@ -169,6 +171,9 @@ class SpectatorLogWatcher(QObject):
         self._terminal_report_session_id = ""
         self._terminal_report_final_due_at = 0.0
         self._terminal_report_revision = 0
+        # The spectator tool can rewrite scores.csv shortly after a terminal state.
+        # Refresh the archived final score once that write has settled.
+        self._terminal_scores_refresh_due_at = 0.0
         self._last_final_commentary_session = ""
         self._commentary_recent_lines: deque[Tuple[str, float]] = deque(maxlen=24)
         self._commentary_category_last_at: Dict[str, float] = {}
@@ -207,6 +212,9 @@ class SpectatorLogWatcher(QObject):
         self._change_root: str = ""
         self._change_handle: Optional[int] = None
         self._blackbox = SpectatorLogBlackboxRecorder(cfg)
+        # The live log files can be truncated while a match is in progress.
+        # Keep a compact per-match ledger for reports and post-match analysis.
+        self._match_archive = MatchLogArchive()
         # Stage55 realtime hot-path state.  The first read is a baseline so
         # stale lobby/score/winner files are not replayed as fresh overlays.
         self._runtime_baseline_ready = False
@@ -694,6 +702,14 @@ class SpectatorLogWatcher(QObject):
             round_total_no = int(float(round_total_raw)) if round_total_raw else self._configured_total_rounds()
         except Exception:
             round_total_no = self._configured_total_rounds()
+        if self._match_archive.active() and round_no is not None and state in ("intro", "fight", "break", "knockdown", "results", "end", "knockout", "disqualified"):
+            try:
+                self._match_archive.record_throws(
+                    max(1, int(round_no or 1)),
+                    self._read_punches_thrown_file(os.path.join(match_dir, "punches_thrown.txt")),
+                )
+            except Exception:
+                logging.debug("SPECTATORLOG_MATCH_ARCHIVE_THROW_FAIL", exc_info=True)
         # Break/result logs can arrive without a fresh round value.  Keep the
         # last fight round as the caster/summary round so rest-time commentary
         # still fires on fight -> break transitions.
@@ -705,6 +721,7 @@ class SpectatorLogWatcher(QObject):
             # from the previous bout before queuing the new VS introduction.
             out["commentary_tts_stop_roles"] = ["caster", "analyst"]
             out["commentary_tts_stop_reason"] = "new_match"
+            out["spectator_round_report_hide"] = True
             self._reset_damage_session(dmg_path)
             self._last_fight_round_no = None
             self._last_round_time_value = None
@@ -1025,6 +1042,11 @@ class SpectatorLogWatcher(QObject):
                 logging.exception("SPECTATORLOG_ROUND_SUMMARY_FAIL")
         if state == "break" and prev_round_state != "break" and not baseline_read:
             try:
+                self._match_archive.snapshot_scores(caster_round_no or 1, scores_path)
+                self._match_archive.snapshot_vitals(
+                    caster_round_no or 1,
+                    self._report_punishment_snapshot(caster_round_no or 1, self._punishment_snapshot(dmg_path)),
+                )
                 break_seconds_left = None
                 try:
                     if self._last_rest_seconds_left is not None:
@@ -1041,7 +1063,17 @@ class SpectatorLogWatcher(QObject):
             except Exception:
                 logging.exception("SPECTATORLOG_ROUND_REPORT_FAIL")
 
-        terminal_states = ("results", "end", "knockout", "disqualified")
+        # TOTF2 can write ``Cancel`` after a legitimate decision.  Do not treat
+        # every cancel as a result (a user can genuinely cancel a lobby), but
+        # when it immediately follows a live bout and both official sidecars are
+        # present it is the final state and must freeze the report source.
+        cancel_is_result = bool(
+            state == "cancel"
+            and prev_round_state in ("fight", "break", "knockdown", "foul")
+            and self._read_official_scores(scores_path)
+            and self._current_match_winner_result(winner_path)
+        )
+        terminal_states = ("results", "end", "knockout", "disqualified") + (("cancel",) if cancel_is_result else ())
         if state in terminal_states and prev_round_state not in terminal_states and not baseline_read:
             self._break_presentation_active = False
             # A rest summary belongs only to the break. Stop it before the
@@ -1050,7 +1082,22 @@ class SpectatorLogWatcher(QObject):
             out["commentary_tts_stop_reason"] = "match_end"
             final_report: Dict[str, Any] = {}
             try:
+                report_snapshot_round = self._terminal_snapshot_round_no(
+                    scores_path, winner_path, caster_round_no
+                )
+                self._match_archive.snapshot_scores(report_snapshot_round, scores_path, final=True)
+                self._match_archive.snapshot_winner(winner_path)
+                self._match_archive.snapshot_vitals(
+                    report_snapshot_round,
+                    self._report_punishment_snapshot(report_snapshot_round, self._punishment_snapshot(dmg_path)),
+                )
+                self._match_archive.snapshot_vitals(
+                    report_snapshot_round,
+                    self._report_punishment_snapshot(report_snapshot_round, self._punishment_snapshot(dmg_path)),
+                    final=True,
+                )
                 self._next_report_sequence()
+                self._terminal_scores_refresh_due_at = time.time() + 1.25
                 cinematic_delay_ms = 0
                 round_report = self._build_round_report_payload(
                     dmg_path, caster_round_no, pair_key, force_final=False
@@ -1065,11 +1112,15 @@ class SpectatorLogWatcher(QObject):
                         800,
                         min(10000, float(getattr(self.cfg, "overlay_tko_hold_sec", 2.6) or 2.6) * 1000.0),
                     )) + 350
-                self._terminal_report_final_due_at = time.time() + (cinematic_delay_ms / 1000.0) + 15.0
+                # Preserve the KO/TKO cinematic, then present the decisive round
+                # after five seconds.  The full-match report follows one second
+                # after the 15-second round board ends.
+                round_delay_ms = max(5000, cinematic_delay_ms)
+                self._terminal_report_final_due_at = time.time() + (round_delay_ms / 1000.0) + 16.0
                 if final_report:
                     final_report["isFinal"] = True
-                    final_report["displayMs"] = 30000
-                    final_report["showDelayMs"] = cinematic_delay_ms + 15000
+                    final_report["displayMs"] = 600000 if bool(getattr(self.cfg, "spectator_commentary_enabled", False)) else 30000
+                    final_report["showDelayMs"] = round_delay_ms + 16000
                     final_report = self._attach_report_sequence(final_report, stage=1)
                 if round_report:
                     round_report["isFinal"] = False
@@ -1077,23 +1128,45 @@ class SpectatorLogWatcher(QObject):
                     # Keep the decisive final-round board on screen before
                     # replacing it with the full-match report.
                     round_report["displayMs"] = 15000
-                    round_report["showDelayMs"] = cinematic_delay_ms
+                    round_report["showDelayMs"] = round_delay_ms
                     round_report = self._attach_report_sequence(round_report, stage=0)
                 reports = [item for item in (round_report, final_report) if item]
                 if reports:
                     out["spectator_round_reports"] = reports
             except Exception:
                 logging.exception("SPECTATORLOG_MATCH_REPORT_FAIL")
-            try:
-                self._queue_match_final_commentary(
-                    out, final_report, state=state, round_no=caster_round_no
-                )
-            except Exception:
-                logging.exception("SPECTATORLOG_MATCH_SUMMARY_FAIL")
-        elif state in terminal_states and result_sidecar_changed:
+        elif state in terminal_states and (
+            result_sidecar_changed
+            or (
+                float(getattr(self, "_terminal_scores_refresh_due_at", 0.0) or 0.0) > 0.0
+                and time.time() >= float(self._terminal_scores_refresh_due_at or 0.0)
+            )
+        ):
             final_report = {}
             round_report = {}
             try:
+                # scores.csv is sometimes rewritten after the terminal state.
+                # Update the frozen source before rebuilding the report revision.
+                report_snapshot_round = self._terminal_snapshot_round_no(
+                    scores_path, winner_path, caster_round_no
+                )
+                self._match_archive.snapshot_scores(report_snapshot_round, scores_path, final=True)
+                self._match_archive.snapshot_winner(winner_path)
+                self._match_archive.snapshot_vitals(
+                    report_snapshot_round,
+                    self._report_punishment_snapshot(report_snapshot_round, self._punishment_snapshot(dmg_path)),
+                )
+                self._match_archive.snapshot_vitals(
+                    report_snapshot_round,
+                    self._report_punishment_snapshot(report_snapshot_round, self._punishment_snapshot(dmg_path)),
+                    final=True,
+                )
+                if (
+                    float(getattr(self, "_terminal_scores_refresh_due_at", 0.0) or 0.0) > 0.0
+                    and time.time() >= float(self._terminal_scores_refresh_due_at or 0.0)
+                ):
+                    self._terminal_scores_refresh_due_at = 0.0
+                    logging.info("SPECTATORLOG_FINAL_SCORES_SETTLED path=%s", scores_path)
                 if (
                     not self._terminal_report_sequence_id
                     or self._terminal_report_session_id != str(self._match_session_id or "")
@@ -1107,7 +1180,7 @@ class SpectatorLogWatcher(QObject):
                 final_report = self._build_round_report_payload(
                     dmg_path, caster_round_no, pair_key, force_final=True
                 )
-                round_due_at = float(self._terminal_report_final_due_at or 0.0) - 15.0
+                round_due_at = float(self._terminal_report_final_due_at or 0.0) - 16.0
                 if round_report:
                     round_report["isFinal"] = False
                     round_report["showWinner"] = bool(round_report.get("winner"))
@@ -1120,7 +1193,7 @@ class SpectatorLogWatcher(QObject):
                     )
                 if final_report:
                     final_report["isFinal"] = True
-                    final_report["displayMs"] = 30000
+                    final_report["displayMs"] = 600000 if bool(getattr(self.cfg, "spectator_commentary_enabled", False)) else 30000
                     final_report["showDelayMs"] = int(
                         round(max(0.0, self._terminal_report_final_due_at - time.time()) * 1000.0)
                     )
@@ -1132,12 +1205,15 @@ class SpectatorLogWatcher(QObject):
                     out["spectator_round_reports"] = reports
             except Exception:
                 logging.exception("SPECTATORLOG_MATCH_REPORT_LATE_FAIL")
-            try:
-                self._queue_match_final_commentary(
-                    out, final_report, state=state, round_no=caster_round_no
-                )
-            except Exception:
-                logging.exception("SPECTATORLOG_MATCH_SUMMARY_LATE_FAIL")
+            # Do not lock the end-of-match commentary to an intermediate score
+            # write. It is queued only after the short score-settle window.
+            if float(getattr(self, "_terminal_scores_refresh_due_at", 0.0) or 0.0) <= 0.0:
+                try:
+                    self._queue_match_final_commentary(
+                        out, final_report, state=state, round_no=caster_round_no
+                    )
+                except Exception:
+                    logging.exception("SPECTATORLOG_MATCH_SUMMARY_LATE_FAIL")
         now_for_info = time.time()
         should_read_log_info = bool(damage_update or state_changed_for_ui or player_payload_due or (now_for_info - float(self._last_log_info_emit_at or 0.0) >= 0.12))
         if should_read_log_info:
@@ -1485,7 +1561,8 @@ class SpectatorLogWatcher(QObject):
         except Exception:
             return events, effect_counts
         for line in lines:
-            parts = str(line or "").strip().split("\t")
+            raw_line = str(line or "").strip()
+            parts = raw_line.split("\t")
             ev = self._parse_damage_event_parts(parts)
             if not ev:
                 continue
@@ -1507,7 +1584,8 @@ class SpectatorLogWatcher(QObject):
         except Exception:
             return out
         for line in lines:
-            parts = str(line or "").strip().split("\t")
+            raw_line = str(line or "").strip()
+            parts = raw_line.split("\t")
             if len(parts) < 4:
                 continue
             try:
@@ -1527,6 +1605,7 @@ class SpectatorLogWatcher(QObject):
                 "side": side,
                 "hand": hand,
                 "punch": str(parts[3] or "").strip(),
+                "raw_line": raw_line,
             })
         return out
 
@@ -1966,7 +2045,8 @@ class SpectatorLogWatcher(QObject):
 
     def _build_scorecard_overlay_payload(self, match_dir: str, *, state: Optional[str] = None, round_no: Optional[int] = None, include_all: bool = False) -> dict:
         rows = self._read_official_scores(os.path.join(match_dir, "scores.csv"))
-        winner_file = self._current_match_winner_result(os.path.join(match_dir, "winner.txt"))
+        winner_path = self._match_archive.final_winner_path() or os.path.join(match_dir, "winner.txt")
+        winner_file = self._current_match_winner_result(winner_path)
         rows = self._filter_completed_score_rows(
             rows,
             state=state,
@@ -2059,7 +2139,19 @@ class SpectatorLogWatcher(QObject):
         self._terminal_report_session_id = ""
         self._terminal_report_final_due_at = 0.0
         self._terminal_report_revision = 0
+        self._terminal_scores_refresh_due_at = 0.0
         self._commentary_director.reset_match()
+        try:
+            archive_dir = str(getattr(self.cfg, "spectator_match_archive_dir", "MatchLogArchive") or "MatchLogArchive")
+            # A relative directory used to depend on the launcher's current
+            # working directory.  That changes between source, shortcut and
+            # packaged launches, particularly after moving to another PC.
+            if not os.path.isabs(archive_dir):
+                archive_dir = app_path(archive_dir)
+            self._match_archive = MatchLogArchive(archive_dir)
+            self._match_archive.start(self._match_session_id, self._match_session_pair)
+        except Exception:
+            logging.exception("SPECTATORLOG_MATCH_ARCHIVE_START_FAIL")
         logging.info(
             "SPECTATORLOG_MATCH_SESSION_START id=%s pair=%s winner_baseline=%s",
             self._match_session_id,
@@ -2123,7 +2215,8 @@ class SpectatorLogWatcher(QObject):
         delay_ms = int(round(max(0.0, self._terminal_report_final_due_at - time.time()) * 1000.0))
         out["commentary_tts_followup_text"] = text
         out["commentary_tts_followup_role"] = "analyst"
-        out["commentary_tts_followup_delay_ms"] = min(15000, delay_ms)
+        out["commentary_tts_followup_delay_ms"] = min(60000, delay_ms)
+        out["commentary_tts_followup_hide_report_on_complete"] = True
         self._last_final_commentary_session = session_id
 
     def _set_rest_state_for_log(self, out: Dict[str, Any], is_rest: bool) -> None:
@@ -2353,6 +2446,20 @@ class SpectatorLogWatcher(QObject):
     def _punch_report_group(self, punch: str) -> Tuple[str, str]:
         """Return a compact punch bucket for broadcast round reports."""
         key = re.sub(r"[^a-z0-9]+", "", str(punch or "").lower())
+        # Stable ASCII labels prevent mojibake from leaking into reports.
+        if not key:
+            return "other", "\uAE30\uD0C0"
+        if "jab" in key:
+            return "jab", "\uC7BD"
+        if "cross" in key or "straight" in key:
+            return "cross", "\uC2A4\uD2B8\uB808\uC774\uD2B8"
+        if "hook" in key:
+            return "hook", "\uD6C5"
+        if "upper" in key:
+            return "upper", "\uC5B4\uD37C"
+        if "over" in key:
+            return "over", "\uC624\uBC84\uD578\uB4DC"
+        return "other", "\uAE30\uD0C0"
         if not key:
             return "other", "기타"
         if "jab" in key:
@@ -2497,6 +2604,30 @@ class SpectatorLogWatcher(QObject):
         out.sort(key=lambda x: (float(x.get("damage", 0.0) or 0.0), int(x.get("count", 0) or 0)), reverse=True)
         return out[:max(1, int(limit or 3))]
 
+    def _terminal_snapshot_round_no(
+        self,
+        scores_path: str,
+        winner_path: str,
+        fallback_round: Optional[int],
+    ) -> int:
+        """Use the last official score row for a terminal gauge snapshot."""
+        try:
+            fallback = max(1, int(fallback_round or self._last_fight_round_no or 1))
+        except Exception:
+            fallback = 1
+        try:
+            rows = self._filter_completed_score_rows(
+                self._read_official_scores(scores_path),
+                state=str(getattr(self, "_last_round_state", "") or ""),
+                round_no=fallback,
+                winner_present=bool(self._current_match_winner_result(winner_path)),
+            )
+            return max(
+                [int(row.get("round", 0) or 0) for row in rows] or [fallback]
+            )
+        except Exception:
+            return fallback
+
     def _build_round_report_payload(self, damage_path: str, round_no: Optional[int], pair_key: Tuple[str, str], break_seconds_left: Optional[float] = None, force_final: Optional[bool] = None) -> dict:
         """Build a compact visual break-time report from damage_events.txt.
 
@@ -2532,9 +2663,15 @@ class SpectatorLogWatcher(QObject):
                 pass
         try:
             live_punishment_snapshot = self._punishment_snapshot(damage_path)
-            punishment_snapshot = self._report_punishment_snapshot(
-                r, live_punishment_snapshot
+            # A result/Cancel write may reset the live PUN files to zero.
+            # Report cards must use the gauge captured at round/match end.
+            punishment_snapshot = self._match_archive.load_vitals(
+                r, final=bool(force_final)
             )
+            if not punishment_snapshot:
+                punishment_snapshot = self._report_punishment_snapshot(
+                    r, live_punishment_snapshot
+                )
         except Exception:
             punishment_snapshot = {"blue": {}, "red": {}}
         if not events and not thrown_events:
@@ -3264,6 +3401,70 @@ class SpectatorLogWatcher(QObject):
             report[side]["averageDamage"] = round(
                 float(report[side].get("landedDamage", 0.0) or 0.0) / landed_count, 1
             ) if landed_count else 0.0
+
+        # Style analysis uses only the current match archive.  A missed throw
+        # remains an inferred evade (not an in-game block claim), while a
+        # damage event of 8 or lower is treated as a light/guarded contact.
+        def _defense_metrics(side: str) -> Dict[str, Any]:
+            opponent_side = "red" if side == "blue" else "blue"
+            ordered = sorted(
+                (dict(ev or {}) for ev in metric_events),
+                key=lambda item: float(item.get("time", 0.0) or 0.0),
+            )
+            low_times: List[float] = []
+            low_damage = 0
+            heavy_received = 0
+            return_counters = 0
+            return_power = 0
+            for event in ordered:
+                attacker = str(event.get("attacker_side") or "").lower()
+                receiver = str(event.get("receiver_side") or "").lower()
+                damage = max(0.0, float(event.get("damage", 0.0) or 0.0))
+                event_time = float(event.get("time", 0.0) or 0.0)
+                if attacker == opponent_side and receiver == side:
+                    if damage <= 8.0:
+                        low_damage += 1
+                        low_times.append(event_time)
+                    if damage >= 45.0:
+                        heavy_received += 1
+                    continue
+                if attacker != side or damage < 30.0:
+                    continue
+                while low_times and event_time - low_times[0] > COUNTER_WINDOW_SEC:
+                    low_times.pop(0)
+                if not low_times:
+                    continue
+                if self._is_counter_event(event):
+                    return_counters += 1
+                else:
+                    return_power += 1
+                low_times.clear()
+            return {
+                "opponentMisses": max(0, int(report[opponent_side].get("misses", 0) or 0)),
+                "lowDamageDefenses": low_damage,
+                "heavyReceived": heavy_received,
+                "returnCounters": return_counters,
+                "returnPowerHits": return_power,
+            }
+
+        def _round_trend(side: str) -> Dict[str, Any]:
+            rows = [dict(item or {}) for _, item in sorted(dict(self._scorecard_rounds or {}).items())]
+            if len(rows) < 2:
+                return {}
+            split = max(1, len(rows) // 2)
+            first, second = rows[:split], rows[split:]
+            def _sum(rows_part: List[dict], field: str) -> float:
+                return sum(float(dict(row.get(field) or {}).get(side, 0.0) or 0.0) for row in rows_part)
+            return {
+                "earlyDamage": _sum(first, "dealt"),
+                "lateDamage": _sum(second, "dealt"),
+                "earlyLanded": int(_sum(first, "landed")),
+                "lateLanded": int(_sum(second, "landed")),
+            }
+
+        for side in sides:
+            report[side]["defenseMetrics"] = _defense_metrics(side)
+            report[side]["roundTrend"] = _round_trend(side) if bool(is_final) else {}
         if bool(is_final) and bool(getattr(self.cfg, "spectator_fight_style_enabled", True)):
             min_attempts = max(
                 1, min(500, int(getattr(self.cfg, "spectator_fight_style_min_attempts", 20) or 20))
@@ -3276,6 +3477,13 @@ class SpectatorLogWatcher(QObject):
             )
             report["red"]["fightStyle"] = analyze_fight_style(
                 report["red"], report["blue"], min_attempts=min_attempts, min_landed=min_landed
+            )
+            logging.info(
+                "SPECTATORLOG_FIGHT_STYLE blue=%s/%s red=%s/%s",
+                report["blue"]["fightStyle"].get("label"),
+                ",".join(report["blue"]["fightStyle"].get("chips") or []),
+                report["red"]["fightStyle"].get("label"),
+                ",".join(report["red"]["fightStyle"].get("chips") or []),
             )
         try:
             logging.info(
@@ -5140,9 +5348,108 @@ class SpectatorLogWatcher(QObject):
             "gauge_end": {},
         }
 
+    def _report_scorecard_rounds(self) -> Dict[int, Dict[str, Any]]:
+        """Build report stats from the per-match archive when it is available.
+
+        Live spectator files are rolling buffers.  A report must never rebuild
+        an earlier round from their current contents, because that can mix a
+        later round's throws with an earlier round's landed impacts.
+        """
+        try:
+            archived = self._match_archive.round_records()
+        except Exception:
+            archived = {}
+        if not archived:
+            return {int(key): dict(value) for key, value in dict(self._scorecard_rounds or {}).items()}
+
+        rounds: Dict[int, Dict[str, Any]] = {}
+        for raw_round, records in archived.items():
+            try:
+                round_no = max(1, int(raw_round or 1))
+            except Exception:
+                continue
+            thrown_events = [dict(item or {}) for item in list(dict(records or {}).get("throws") or [])]
+            damage_events = [dict(item or {}) for item in list(dict(records or {}).get("events") or [])]
+            stats = self._new_scorecard_round(round_no)
+            live = dict((self._scorecard_rounds or {}).get(round_no) or {})
+            stats["gauge_start"] = self._scorecard_copy_gauge(live.get("gauge_start"))
+            stats["gauge_end"] = self._scorecard_copy_gauge(live.get("gauge_end"))
+
+            matched = self._match_damage_events_to_throws(thrown_events, damage_events)
+            matched_punch_by_throw = {
+                int(item.get("throw_index")): str(dict(item.get("event") or {}).get("punch") or "")
+                for item in list(matched.get("matches") or [])
+                if item.get("throw_index") is not None
+            }
+            for throw_index, thrown in enumerate(thrown_events):
+                side = str(thrown.get("side") or "").lower()
+                if side not in ("blue", "red"):
+                    continue
+                stats["thrown"][side] += 1
+                key, label = self._punch_report_group(
+                    matched_punch_by_throw.get(throw_index) or str(thrown.get("punch") or "")
+                )
+                item = stats["thrown_punches"][side].setdefault(
+                    key, {"label": label, "count": 0, "damage": 0.0}
+                )
+                item["count"] += 1
+
+            for match in list(matched.get("matches") or []):
+                event = dict(match.get("event") or {})
+                attacker = str(event.get("attacker_side") or "").lower()
+                receiver = str(event.get("receiver_side") or "").lower()
+                punch = str(event.get("punch") or "").strip().lower()
+                if attacker not in ("blue", "red") or receiver not in ("blue", "red") or punch in ("pull", "other"):
+                    continue
+                damage = max(0.0, float(event.get("damage", 0.0) or 0.0))
+                landed = damage >= REPORT_LANDED_MIN_DAMAGE
+                stats["events"] += 1
+                stats["dealt"][attacker] += damage
+                if not landed:
+                    continue
+                stats["landed"][attacker] += 1
+                stats["hits"][attacker] += 1
+                if damage >= 45.0:
+                    stats["bigs"][attacker] += 1
+                key, label = self._punch_report_group(str(event.get("punch") or ""))
+                item = stats["punches"][attacker].setdefault(
+                    key, {"label": label, "count": 0, "damage": 0.0}
+                )
+                item["count"] += 1
+                item["damage"] += damage
+                if damage > float(dict(stats["max_punch"].get(attacker) or {}).get("damage", 0.0) or 0.0):
+                    stats["max_punch"][attacker] = {"key": key, "label": label, "damage": damage}
+                if self._is_counter_event(event):
+                    stats["counters_for"][attacker] += 1
+                effect = self._damage_effect_kind(str(event.get("damage_type") or ""))
+                if effect == "knockdown":
+                    stats["knockdowns_for"][attacker] += 1
+                    stats["knockdowns_against"][receiver] += 1
+                elif effect == "stun":
+                    stats["stuns_for"][attacker] += 1
+                elif effect == "tko":
+                    stats["tkos_for"][attacker] += 1
+                weak = self._weak_point_ko(str(event.get("weak_point") or ""))
+                if weak:
+                    weak_key = f"{receiver}:{weak}"
+                    weak_item = stats["weak"].setdefault(
+                        weak_key, {"receiver": receiver, "weak": weak, "count": 0, "damage": 0.0}
+                    )
+                    weak_item["count"] += 1
+                    weak_item["damage"] += damage
+                    received = stats["weak_received"][receiver].setdefault(
+                        weak, {"label": weak, "count": 0, "damage": 0.0}
+                    )
+                    received["count"] += 1
+                    received["damage"] += damage
+            rounds[round_no] = stats
+        if rounds:
+            logging.info("SPECTATORLOG_REPORT_ARCHIVE_SOURCE rounds=%s", sorted(rounds))
+        return rounds
+
     def _apply_scorecard_round_to_report_stats(self, report_stats: Dict[str, Dict[str, Any]], round_no: int) -> bool:
         """Replace cumulative file totals with the live scorecard's one-round data."""
-        round_stats = dict((self._scorecard_rounds or {}).get(int(round_no or 0)) or {})
+        round_stats = dict(self._report_scorecard_rounds().get(int(round_no or 0)) or {})
         if not round_stats or not int(round_stats.get("events", 0) or 0):
             return False
 
@@ -5597,7 +5904,7 @@ class SpectatorLogWatcher(QObject):
                     )
             except Exception:
                 logging.exception("SPECTATORLOG_SCORECARD_MATCH_REFRESH_FAIL round=%s", round_no)
-        live_rounds = {int(k): dict(v) for k, v in dict(self._scorecard_rounds or {}).items()}
+        live_rounds = self._report_scorecard_rounds()
         rounds = {int(k): dict(v) for k, v in live_rounds.items() if dict(v).get("events")}
         if not rounds and fallback_events:
             rounds = self._scorecard_from_fallback_events(fallback_events, round_no, damage_path)
@@ -5619,7 +5926,12 @@ class SpectatorLogWatcher(QObject):
             }
 
         match_dir = os.path.dirname(str(damage_path or ""))
-        official_scores = self._read_official_scores(os.path.join(match_dir, "scores.csv"))
+        live_scores_path = os.path.join(match_dir, "scores.csv")
+        archived_final_scores = self._match_archive.final_scores_path()
+        scores_path = archived_final_scores or live_scores_path
+        official_scores = self._read_official_scores(scores_path)
+        if archived_final_scores:
+            logging.info("SPECTATORLOG_REPORT_OFFICIAL_SCORE_SOURCE archived_final=%s", archived_final_scores)
         winner_file = self._current_match_winner_result(os.path.join(match_dir, "winner.txt"))
         official_scores = self._filter_completed_score_rows(
             official_scores,
@@ -5868,6 +6180,7 @@ class SpectatorLogWatcher(QObject):
             latest = self._parse_damage_event_parts(parts)
             if not latest:
                 continue
+            latest["raw_line"] = line
             try:
                 damage = float(latest.get("damage", 0.0) or 0.0)
             except Exception:
@@ -6035,31 +6348,6 @@ class SpectatorLogWatcher(QObject):
                 except Exception:
                     logging.exception("HITFX_FAST_EMIT_FAIL")
 
-        # Add impact intensity to the same cumulative stamina budget used by
-        # appended throw rows. A stable key prevents fast/full handoff double cost.
-        sp_cost_changed = False
-        for ev in list(new_events or []):
-            attacker = str((ev or {}).get("attacker_side") or "").lower()
-            if attacker not in ("blue", "red"):
-                continue
-            try:
-                damage = max(0.0, float((ev or {}).get("damage", 0.0) or 0.0))
-                event_time = round(float((ev or {}).get("time", 0.0) or 0.0), 3)
-            except Exception:
-                continue
-            cost_key = (
-                attacker, str((ev or {}).get("hand") or "").lower(), event_time,
-                str((ev or {}).get("punch") or "").lower(), round(damage, 2),
-            )
-            if cost_key in self._sp_damage_cost_keys:
-                continue
-            self._sp_damage_cost_keys.add(cost_key)
-            impact_scale = max(0.0, min(5.0, float(getattr(self.cfg, "spectator_sp_impact_cost_scale", 1.0) or 1.0)))
-            self._sp_activity_spent[attacker] = float(self._sp_activity_spent.get(attacker, 0.0)) + (min(45.0, damage) / 15000.0) * impact_scale
-            sp_cost_changed = True
-        if sp_cost_changed:
-            out["spectator_sp_activity_spent"] = dict(self._sp_activity_spent)
-
         if fast_only:
             # Hand the same new rows to the full pass so TTS/commentary/report
             # logic does not miss them after the hot path has already emitted FX.
@@ -6097,6 +6385,13 @@ class SpectatorLogWatcher(QObject):
 
         punishment_snapshot = self._punishment_snapshot(path)
         self._remember_punishment_snapshot(punishment_snapshot)
+        if parsed_events and self._match_archive.active():
+            try:
+                # Keep the entire current match even when the watcher attached
+                # after the first write. MatchLogArchive deduplicates rows.
+                self._match_archive.record_damage(active_round_no, parsed_events)
+            except Exception:
+                logging.debug("SPECTATORLOG_MATCH_ARCHIVE_DAMAGE_FAIL", exc_info=True)
         try:
             self._record_scorecard_events(new_events, active_round_no, path, punishment_snapshot)
         except Exception:
@@ -6211,7 +6506,14 @@ class SpectatorLogWatcher(QObject):
                     info[f"{active_attacker}_combo_hit_text"] = ""
                     info[f"{active_attacker}_combo_damage_text"] = ""
                     changed = True
-                state = {"attacker_side": "", "receiver_side": "", "last_time": None, "count": 0, "damage": 0.0}
+                state = {
+                    "attacker_side": "",
+                    "receiver_side": "",
+                    "last_time": None,
+                    "count": 0,
+                    "damage": 0.0,
+                    "counter_started": False,
+                }
 
             if dmg < combo_min_damage:
                 continue
@@ -6227,6 +6529,7 @@ class SpectatorLogWatcher(QObject):
                 prev_count = int(state.get("count", 0) or 0)
                 count = int(state.get("count", 0) or 0) + 1
                 total = float(state.get("damage", 0.0) or 0.0) + dmg
+                counter_started = bool(state.get("counter_started", False)) or bool(counter_hit)
             else:
                 prev_count = 0
                 old_attacker = str(state.get("attacker_side") or "")
@@ -6236,15 +6539,22 @@ class SpectatorLogWatcher(QObject):
                     changed = True
                 count = 1
                 total = dmg
+                counter_started = bool(counter_hit)
             state = {
                 "attacker_side": attacker,
                 "receiver_side": receiver,
                 "last_time": t,
                 "count": count,
                 "damage": total,
+                "counter_started": counter_started,
             }
             if count >= 2:
-                info[f"{attacker}_combo_hit_text"] = f"{count} HIT COMBO"
+                combo_label = f"{count} HIT COMBO"
+                if counter_started:
+                    # Counter-combo labels are intentionally stacked so the
+                    # broadcast HUD does not clip them on narrow name bars.
+                    combo_label = f"COUNTER\nHIT {count}"
+                info[f"{attacker}_combo_hit_text"] = combo_label
                 info[f"{attacker}_combo_damage_text"] = f"{int(round(total))} DAMAGE"
                 if prev_count < 2:
                     info["_combo_commentary_text"] = self._commentary_pick(f"combo:{attacker}:{receiver}:{count}:{int(total)}", [
@@ -6257,7 +6567,7 @@ class SpectatorLogWatcher(QObject):
             elif changed:
                 info[f"{attacker}_combo_hit_text"] = ""
                 info[f"{attacker}_combo_damage_text"] = ""
-            if counter_hit:
+            if counter_hit and count < 2:
                 info[f"{attacker}_combo_hit_text"] = "COUNTER"
                 info[f"{attacker}_combo_damage_text"] = f"{int(round(dmg))} DAMAGE"
                 info["_counter_commentary_text"] = self._commentary_pick(f"counter:{attacker}:{receiver}:{int(dmg)}", [

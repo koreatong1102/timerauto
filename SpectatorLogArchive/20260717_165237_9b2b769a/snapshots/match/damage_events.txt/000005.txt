@@ -1,0 +1,3 @@
+176.90	3.80	1.00	red	left	0.286	0.592	-0.390	1.958	-0.568	RearOverhand	Hit	TempleRight
+176.02	1.02	1.00	red	left	0.358	0.544	-0.295	1.833	-0.447	RearOverhand	Hit	None
+175.72	25.95	1.00	blue	left	0.489	0.195	0.493	1.529	-0.720	Cross	Hit	SolarPlexus

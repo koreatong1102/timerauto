@@ -24,6 +24,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Set, Tuple
 
+from app_paths import normalize_app_path
+
 
 _TEXT_SUFFIXES = {".txt", ".csv", ".json", ".jsonl", ".log", ".ini", ".cfg"}
 _HIGH_FREQ_BASENAMES = {
@@ -188,8 +190,10 @@ class SpectatorLogBlackboxRecorder:
             configured = "SpectatorLogArchive"
         if not os.path.isabs(configured):
             # Keep archives outside the live SpectatorLog tree by default so the
-            # recorder does not record its own output.
-            configured = os.path.abspath(os.path.join(os.getcwd(), configured))
+            # recorder does not record its own output.  Do not use the process
+            # working directory: portable EXEs launched from a shortcut often
+            # inherit C:\\Windows\\System32, which is not writable.
+            configured = normalize_app_path(configured)
         os.makedirs(configured, exist_ok=True)
         return configured
 

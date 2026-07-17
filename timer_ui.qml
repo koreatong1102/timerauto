@@ -14,7 +14,7 @@ ApplicationWindow {
     visibility: Window.Windowed
     color: "transparent"
     title: "Box Timer (Output)"
-    flags: Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+    flags: Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowMinimizeButtonHint
 
     property bool editMode: false
     property bool showControls: true
@@ -30,6 +30,9 @@ ApplicationWindow {
     property int overlayTopPad: 40
     property int overlayLeftPad: 50
     property int overlayPad: 60
+    // Keep a small safety space at the sides, but do not leave an empty strip
+    // under the player-name rows.
+    property int overlayBottomPad: 0
     property real overlayLeftExtra: 0
     property bool topBarHover: false
     property var layoutHistory: []
@@ -1217,6 +1220,10 @@ ApplicationWindow {
     }
 
     function updateWindowBounds() {
+        // Resizing a frameless QWindow while it is being minimized can restore
+        // it immediately on Windows. Keep the last bounds until it is restored.
+        if (root.visibility === Window.Minimized)
+            return
         if (root.tekkenPreset) {
             if (root.mainCaptureFullscreen) {
                 root.width = Screen.width
@@ -1258,7 +1265,7 @@ ApplicationWindow {
             minW = Math.max(minW, topBarButtonsW + topBarRightW + 60)
         }
         root.width = Math.max(minW, Math.ceil((maxX + pad + overlayLeftPad + overlayLeftExtra) * uiScale))
-        root.height = Math.max(120, Math.ceil((maxY + pad + overlayTopPad) * uiScale))
+        root.height = Math.max(120, Math.ceil((maxY + overlayBottomPad + overlayTopPad) * uiScale))
     }
 
 
@@ -1269,7 +1276,14 @@ ApplicationWindow {
     }
 
     function scheduleBoundsUpdate() {
+        if (root.visibility === Window.Minimized)
+            return
         boundsTimer.restart()
+    }
+
+    onVisibilityChanged: {
+        if (root.visibility !== Window.Minimized)
+            scheduleBoundsUpdate()
     }
 
     Timer {
@@ -1481,11 +1495,14 @@ ApplicationWindow {
         Column {
             id: topBarRightControls
             anchors.right: parent.right
-            anchors.rightMargin: 150
+            anchors.rightMargin: 8
             anchors.verticalCenter: parent.verticalCenter
             spacing: 2
             z: 5
-            visible: true
+            // Scale and opacity are advanced layout tools.  Keep them in
+            // Settings, not in the live broadcast bar.
+            visible: false
+            width: 0
 
             Row {
                 spacing: 6
@@ -1603,6 +1620,7 @@ ApplicationWindow {
                 onClicked: showControls = true
                 ToolTip.visible: hovered
                 ToolTip.text: "\uC0C1\uB2E8 \uB3C4\uAD6C \uD56D\uC0C1 \uD45C\uC2DC"
+                visible: false
             }
             Button {
                 text: "\uC124\uC815"
@@ -1723,7 +1741,9 @@ ApplicationWindow {
                     ToolTip.visible: hovered
                     ToolTip.text: "\uC791\uC5C5 \uBA54\uB274"
                 }
-                visible: true
+                // Development/test actions (timer reset, trigger tests,
+                // replay demos) are intentionally removed from live UI.
+                visible: false
             }
             Item {
                 width: 74
@@ -1752,7 +1772,8 @@ ApplicationWindow {
                     ToolTip.visible: hovered
                     ToolTip.text: "UI \uD3B8\uC9D1 \uBA54\uB274"
                 }
-                visible: true
+                // Layout editing stays available from Settings only.
+                visible: false
             }
             Item {
                 width: 62
@@ -1867,7 +1888,9 @@ ApplicationWindow {
     Rectangle {
         id: miniDock
         parent: root
-        z: 1205
+        // This must sit above the transparent top-bar hover zones; otherwise
+        // their MouseAreas receive the click before the minimize button does.
+        z: 3002
         width: 74
         height: 28
         radius: 6
@@ -1886,9 +1909,11 @@ ApplicationWindow {
             anchors.fill: parent
             hoverEnabled: true
             onClicked: {
-                root.showControls = true
-                root.topBarHover = true
-                root.showMinimized()
+                // Queue the minimize after this click has finished; otherwise
+                // the pending bounds update can immediately restore the window.
+                root.showControls = false
+                root.topBarHover = false
+                Qt.callLater(function() { root.showMinimized() })
             }
         }
         Text {

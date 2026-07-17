@@ -92,9 +92,12 @@ class ObsAutoReplayController:
                 volume=int(getattr(cfg, "obs_auto_replay_volume", 100) or 0),
                 fit=str(getattr(cfg, "obs_auto_replay_fit", "cover") or "cover"),
                 fade_ms=int(getattr(cfg, "obs_auto_replay_fade_ms", 140) or 0),
+                replay_speed=float(getattr(cfg, "obs_auto_replay_speed", 1.0) or 1.0),
+                replay_kind=kind,
                 transition_enabled=bool(getattr(cfg, "obs_replay_transition_enabled", False)),
                 transition_before_ms=int(getattr(cfg, "obs_replay_transition_before_ms", 500) or 0),
                 transition_after_ms=int(getattr(cfg, "obs_replay_transition_after_ms", 400) or 0),
+                transition_speed=float(getattr(cfg, "obs_replay_transition_speed", 1.0) or 1.0),
             )
         except Exception:
             logging.exception("OBS_AUTO_REPLAY_START_FAIL kind=%s path=%s", kind, path)

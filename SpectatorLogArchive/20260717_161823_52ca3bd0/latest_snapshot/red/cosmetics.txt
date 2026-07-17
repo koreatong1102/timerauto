@@ -1,0 +1,3 @@
+Gloves:Puma:totf2:red:white:white
+Shoes:PumaOriginalBlack:Black:red:white:white
+Shorts:PumaOriginalBlack:Black:red:white:white

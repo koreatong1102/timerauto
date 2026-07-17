@@ -1,0 +1,8 @@
+slot_0: type=DesktopSpectator occupied=True name=roomfightclub ready=False
+
+venue_id: 0
+rounds: 6
+round_duration: 180
+break_duration: 60
+
+ready_to_start: False

@@ -1,0 +1,3 @@
+Gloves:Default:Teal:teal:white:white
+Shoes:Base:Black:black:white:white
+Shorts:Default:Yellow:yellow:white:white

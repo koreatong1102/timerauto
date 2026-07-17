@@ -4,6 +4,65 @@ from match_analytics import analyze_fight_style, build_match_commentary, detect_
 
 
 class MatchAnalyticsTests(unittest.TestCase):
+    def test_style_keeps_roles_distinct_and_limits_total_styles(self):
+        style = analyze_fight_style(
+            {
+                "thrown": 96,
+                "landed": 48,
+                "accuracy": 62,
+                "averageDamage": 41,
+                "bigHits": 12,
+                "powerHits55": 4,
+                "knockdowns": 2,
+                "counterHits": 14,
+                "maxComboHits": 5,
+                "weakHitAll": [
+                    {"label": "턱", "count": 8},
+                    {"label": "관자놀이", "count": 4},
+                ],
+                "landedBreakdown": [{"key": "hook", "count": 24}],
+                "defenseMetrics": {
+                    "opponentMisses": 31,
+                    "lowDamageDefenses": 12,
+                    "returnCounters": 5,
+                    "returnPowerHits": 2,
+                    "heavyReceived": 1,
+                },
+                "roundTrend": {"earlyDamage": 100, "lateDamage": 180, "earlyLanded": 8, "lateLanded": 12},
+            },
+            {"thrown": 60, "landed": 24},
+            min_attempts=20,
+            min_landed=10,
+        )
+
+        labels = [style.get("label")] + list(style.get("chips") or [])
+        self.assertLessEqual(len(labels), 5)
+        self.assertEqual(len(set(labels)), len(labels))
+        self.assertIn(style.get("tier"), {"발동", "폭주", "지배"})
+        self.assertIn("헤드 헌터", style.get("chips") or [])
+
+    def test_style_can_add_one_defensive_chip_from_inferred_events(self):
+        style = analyze_fight_style(
+            {
+                "thrown": 25,
+                "landed": 12,
+                "accuracy": 50,
+                "counterHits": 4,
+                "defenseMetrics": {
+                    "opponentMisses": 12,
+                    "lowDamageDefenses": 4,
+                    "returnCounters": 5,
+                    "returnPowerHits": 2,
+                },
+            },
+            {"thrown": 30, "landed": 10},
+            min_attempts=20,
+            min_landed=10,
+        )
+
+        self.assertEqual(style["label"], "카운터 마스터")
+        self.assertIn("유도 반격형", style.get("chips") or [])
+
     def test_direct_tko_event_resolves_attacker_as_winner(self):
         stoppage = detect_stoppage([
             {
@@ -99,7 +158,7 @@ class MatchAnalyticsTests(unittest.TestCase):
             min_landed=10,
         )
 
-        self.assertEqual(style["label"], "바디 헌터")
+        self.assertIn("바디 헌터", style.get("chips") or [])
 
     def test_match_commentary_interprets_styles_instead_of_reading_table(self):
         text = build_match_commentary({

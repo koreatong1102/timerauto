@@ -1,0 +1,4 @@
+0.00	red	right	RearOverhand
+176.82	blue	left	Cross
+175.90	blue	left	RearHook
+175.62	red	left	Cross

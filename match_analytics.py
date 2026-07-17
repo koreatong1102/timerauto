@@ -145,7 +145,12 @@ def analyze_fight_style(
     min_attempts: int = 20,
     min_landed: int = 10,
 ) -> Dict[str, Any]:
-    """Classify a fighter with inexpensive, deterministic Korean labels."""
+    """Classify one fighter into non-overlapping broadcast style roles.
+
+    The result intentionally separates a main identity from attack, defense and
+    fight-flow chips.  That prevents five near-identical power labels from
+    appearing together in the final report.
+    """
     data = dict(stats or {})
     opponent = dict(opponent_stats or {})
     attempts = _count(data.get("thrown") or data.get("activity"))
@@ -157,6 +162,9 @@ def analyze_fight_style(
             "description": "기록이 더 쌓이면 경기 스타일을 판정합니다.",
             "confidence": 0,
             "evidence": [],
+            "tier": "",
+            "chips": [],
+            "styles": [],
         }
 
     accuracy = _number(data.get("accuracy"), -1.0)
@@ -176,77 +184,114 @@ def analyze_fight_style(
     punch_counts = _punch_count_map(data)
     targets = _target_profile(data, opponent)
     landed_base = max(1, landed)
-    candidates: List[tuple] = []
+    opponent_attempts = _count(opponent.get("thrown") or opponent.get("activity"))
+    defense = dict(data.get("defenseMetrics") or {})
+    opponent_misses = _count(defense.get("opponentMisses", opponent.get("misses")))
+    low_damage_defenses = _count(defense.get("lowDamageDefenses"))
+    return_counters = _count(defense.get("returnCounters"))
+    return_power = _count(defense.get("returnPowerHits"))
+    heavy_received = _count(defense.get("heavyReceived"))
+    defense_base = max(1, opponent_attempts)
+    evade_rate = opponent_misses / defense_base
+    soft_defense_rate = low_damage_defenses / max(1, _count(opponent.get("landed")))
 
+    # Tuple: score, label, signature, description, evidence.
+    main: List[tuple] = []
     counter_rate = counters / landed_base
     if counters >= 4 and counter_rate >= 0.16:
-        score = 55 + min(22, counter_rate * 80) + min(12, counters * 1.5)
-        candidates.append((score, "카운터 마스터", "빈틈을 읽는 반격", "상대의 공격 뒤 빈틈을 읽고 반격으로 흐름을 가져가는 유형입니다.", [f"카운터 {counters}회"]))
-
+        main.append((58 + min(26, counter_rate * 100) + min(20, counters * 0.42), "카운터 마스터", "빈틈을 읽는 반격", "상대의 공격 뒤 빈틈을 읽고 반격으로 흐름을 가져가는 유형입니다.", [f"카운터 {counters}회"]))
     power_signals = sum((big45 >= 4, big55 >= 2, knockdowns > 0, average >= 32.0))
     if power_signals >= 2:
-        power_rate = big45 / landed_base
-        score = 56 + min(18, power_rate * 40) + min(12, big55 * 4) + min(15, knockdowns * 5) + min(7, max(0.0, average - 30.0) * 0.7)
-        candidates.append((score, "슬러거", "한 방으로 판을 바꾸는 힘", "강한 정타와 다운 위협으로 한순간에 경기 흐름을 바꾸는 유형입니다.", [f"45 이상 강타 {big45}회", f"다운 {knockdowns}회"]))
-
-    if combo >= 3:
-        score = 59 + min(30, combo * 6) + min(8, stuns * 2)
-        candidates.append((score, "연타 장인", "끊기지 않는 연속 공격", "첫 타 이후 공격을 자연스럽게 연결해 상대에게 대응할 틈을 주지 않는 유형입니다.", [f"최대 {combo}연타"]))
-
-    if attempts >= max(1, int(min_attempts)) and accuracy >= 58.0:
-        score = 58 + min(28, (accuracy - 55.0) * 1.2) + min(6, landed / 8.0)
-        candidates.append((score, "정밀 타격가", "낭비를 줄인 정확한 운영", "무리하게 손을 내기보다 높은 적중률로 효율적인 공격을 만드는 유형입니다.", [f"적중률 {int(round(accuracy))}%"]))
-
-    opponent_attempts = _count(opponent.get("thrown") or opponent.get("activity"))
+        main.append((56 + min(18, (big45 / landed_base) * 40) + min(12, big55 * 4) + min(15, knockdowns * 5) + min(7, max(0.0, average - 30.0) * 0.7), "슬러거", "한 방으로 판을 바꾸는 힘", "강한 정타와 다운 위협으로 한순간에 경기 흐름을 바꾸는 유형입니다.", [f"45 이상 강타 {big45}회", f"다운 {knockdowns}회"]))
     if attempts >= max(45, int(min_attempts)) and (opponent_attempts <= 0 or attempts >= opponent_attempts * 1.12):
-        volume_edge = attempts / max(1, opponent_attempts) if opponent_attempts > 0 else 1.25
-        score = 54 + min(24, attempts / 6.0) + min(14, max(0.0, volume_edge - 1.0) * 35)
-        candidates.append((score, "압박형 파이터", "공격량으로 주도권 장악", "꾸준한 공격량으로 상대의 선택지를 줄이고 경기를 앞으로 끌고 가는 유형입니다.", [f"공격 시도 {attempts}회"]))
+        main.append((54 + min(24, attempts / 6.0) + min(14, max(0.0, attempts / max(1, opponent_attempts) - 1.0) * 35), "압박형 파이터", "공격량으로 주도권 장악", "꾸준한 공격량으로 상대의 선택지를 줄이고 경기를 앞으로 끌고 가는 유형입니다.", [f"공격 시도 {attempts}회"]))
+    if attempts >= max(1, int(min_attempts)) and accuracy >= 58.0:
+        main.append((58 + min(28, (accuracy - 55.0) * 1.2) + min(6, landed / 8.0), "정밀 타격가", "낭비를 줄인 정확한 운영", "무리하게 손을 내기보다 높은 적중률로 효율적인 공격을 만드는 유형입니다.", [f"적중률 {int(round(accuracy))}%"]))
+    if combo >= 3:
+        main.append((59 + min(30, combo * 6) + min(8, stuns * 2), "연타 장인", "끊기지 않는 연속 공격", "첫 타 이후 공격을 자연스럽게 연결해 상대에게 대응할 틈을 주지 않는 유형입니다.", [f"최대 {combo}연타"]))
 
-    if targets["total"] >= 4 and targets["body"] / max(1, targets["total"]) >= 0.45:
-        body_rate = targets["body"] / max(1, targets["total"])
-        score = 58 + min(18, max(0.0, body_rate - 0.45) * 40) + min(18, targets["body"] * 1.5)
-        candidates.append((score, "바디 헌터", "몸통을 무너뜨리는 집요함", "명치와 간을 반복해서 공략하며 상대의 움직임과 체력을 깎는 유형입니다.", [f"몸통 급소 {targets['body']}회"]))
-
+    attack: List[tuple] = []
     if targets["total"] >= 5 and targets["head"] / max(1, targets["total"]) >= 0.55:
-        head_rate = targets["head"] / max(1, targets["total"])
-        score = 57 + min(18, max(0.0, head_rate - 0.55) * 40) + min(18, targets["head"] * 1.3) + min(6, stuns * 2)
-        candidates.append((score, "헤드 헌터", "얼굴 급소 집중 공략", "턱과 관자놀이 등 얼굴 급소를 집요하게 노리는 유형입니다.", [f"얼굴 급소 {targets['head']}회"]))
+        attack.append((57 + min(20, targets["head"] * 1.7) + min(8, stuns * 2), "헤드 헌터", "얼굴 급소 집중 공략", "턱과 관자놀이 등 얼굴 급소를 집요하게 노리는 유형입니다.", [f"얼굴 급소 {targets['head']}회"]))
+    if targets["total"] >= 4 and targets["body"] / max(1, targets["total"]) >= 0.45:
+        attack.append((58 + min(20, targets["body"] * 1.7), "바디 헌터", "몸통을 무너뜨리는 집요함", "명치와 간을 반복해서 공략하며 상대의 움직임과 체력을 깎는 유형입니다.", [f"몸통 급소 {targets['body']}회"]))
+    total_punches = max(1, sum(punch_counts.values()))
+    punch_styles = (("jab", "잽 스페셜리스트"), ("hook", "훅 파이터"), ("over", "오버핸드 헌터"))
+    for key, label in punch_styles:
+        count = punch_counts.get(key, 0)
+        share = count / total_punches
+        if count >= 6 and share >= 0.30:
+            attack.append((54 + min(28, max(0.0, share - 0.25) * 70) + min(12, count * 0.8), label, "주무기 집중", "한 종류의 공격을 반복해서 성공시킨 유형입니다.", [f"{label} 비중 {int(round(share * 100))}%"]))
 
-    jab_share = punch_counts.get("jab", 0) / max(1, sum(punch_counts.values()))
-    if punch_counts.get("jab", 0) >= 6 and jab_share >= 0.38:
-        score = 55 + min(22, max(0.0, jab_share - 0.30) * 55) + min(12, punch_counts.get("jab", 0) * 0.8)
-        candidates.append((score, "잽 스페셜리스트", "앞손으로 만드는 거리", "잽으로 거리와 박자를 선점한 뒤 다음 공격의 길을 여는 유형입니다.", [f"잽 비중 {int(round(jab_share * 100))}%"]))
+    defense_styles: List[tuple] = []
+    if opponent_attempts >= 25 and evade_rate >= 0.40:
+        defense_styles.append((58 + min(28, (evade_rate - 0.35) * 70) + min(10, opponent_misses / 3.0), "회피 장인", "상대 공격을 흘리는 운영", "상대 시도 대비 유효타를 허용하지 않아 공격을 비워내는 유형입니다.", [f"미적중 유도 {opponent_misses}회"]))
+    if opponent_attempts >= 20 and soft_defense_rate >= 0.35 and heavy_received <= max(2, opponent_attempts // 18):
+        defense_styles.append((56 + min(26, (soft_defense_rate - 0.25) * 70) + min(8, low_damage_defenses), "철벽 방어", "큰 피해를 억제하는 수비", "낮은 피해로 버티며 큰 유효타를 최소화한 유형입니다.", [f"저피해 방어 {low_damage_defenses}회"]))
+    if (return_counters + return_power) >= 3:
+        defense_styles.append((60 + min(28, (return_counters + return_power) * 5), "유도 반격형", "방어 뒤 즉시 되받아치기", "상대 공격을 흘리거나 막은 뒤 빠르게 반격을 연결한 유형입니다.", [f"방어 뒤 반격 {return_counters + return_power}회"]))
 
-    if not candidates:
-        return {
-            "label": "균형형 파이터",
-            "signature": "상황에 맞춘 다재다능함",
-            "description": "특정 공격 하나에 치우치지 않고 상황에 따라 운영을 바꾸는 유형입니다.",
-            "confidence": 55,
-            "evidence": [f"유효타 {landed}회"],
-        }
+    flow: List[tuple] = []
+    if knockdowns > 0:
+        flow.append((62 + min(24, knockdowns * 9) + min(10, big55 * 3), "다운 마무리", "결정타로 흐름 완성", "결정적인 다운으로 우세를 승부로 연결한 유형입니다.", [f"다운 {knockdowns}회"]))
+    trend = dict(data.get("roundTrend") or {})
+    early_damage = _number(trend.get("earlyDamage"))
+    late_damage = _number(trend.get("lateDamage"))
+    early_landed = _count(trend.get("earlyLanded"))
+    late_landed = _count(trend.get("lateLanded"))
+    if early_damage > 0 and late_damage >= early_damage * 1.25 and late_landed >= early_landed:
+        flow.append((59 + min(22, (late_damage / max(1.0, early_damage) - 1.0) * 38), "후반 집중형", "후반으로 갈수록 살아난 공격", "경기 후반으로 갈수록 유효타와 데미지를 끌어올린 유형입니다.", ["후반 공격 상승"]))
+    if attempts <= max(1, opponent_attempts) and accuracy >= max(56.0, _number(opponent.get("accuracy"), 0.0) + 6.0) and average >= _number(opponent.get("averageDamage"), 0.0):
+        flow.append((57 + min(22, accuracy - 52.0) + min(12, max(0.0, average - 20.0)), "효율형 파이터", "적은 낭비로 만든 우세", "공격 수를 낭비하지 않고 정확한 유효타로 차이를 만든 유형입니다.", [f"적중률 {int(round(accuracy))}%"]))
+    if attempts >= max(55, int(min_attempts) * 2) and accuracy < 52.0:
+        flow.append((54 + min(20, attempts / 7.0) + min(12, 52.0 - accuracy), "난타형 파이터", "끊임없이 이어진 공방", "공격량으로 전장을 넓히며 난전의 흐름을 만든 유형입니다.", [f"공격 시도 {attempts}회"]))
 
-    score, label, signature, description, evidence = max(candidates, key=lambda item: item[0])
-    if score < 63:
-        return {
-            "label": "균형형 파이터",
-            "signature": "상황에 맞춘 다재다능함",
-            "description": "특정 공격 하나에 치우치지 않고 상황에 따라 운영을 바꾸는 유형입니다.",
-            "confidence": max(55, int(round(score))),
-            "evidence": [f"유효타 {landed}회"],
-        }
+    main_ranked = sorted(main, key=lambda item: item[0], reverse=True)
+    if main_ranked and main_ranked[0][0] >= 63:
+        primary = main_ranked[0]
+    else:
+        primary = (55.0, "균형형 파이터", "상황에 맞춘 다재다능함", "특정 공격 하나에 치우치지 않고 상황에 따라 운영을 바꾸는 유형입니다.", [f"유효타 {landed}회"])
+    supplements: List[tuple] = []
+    for bucket, limit in ((attack, 2), (defense_styles, 1), (flow, 1)):
+        selected = 0
+        for item in sorted(bucket, key=lambda candidate: candidate[0], reverse=True):
+            if item[0] < 63 or item[1] == primary[1] or any(old[1] == item[1] for old in supplements):
+                continue
+            supplements.append(item)
+            selected += 1
+            if selected >= limit:
+                break
+    chips = [str(item[1]) for item in supplements[:4]]
+    score, label, signature, description, evidence = primary
+    tier = "지배" if score >= 88 else "폭주" if score >= 75 else "발동"
     return {
         "label": label,
         "signature": signature,
         "description": description,
         "confidence": max(1, min(99, int(round(score)))),
         "evidence": evidence,
+        "tier": tier,
+        "chips": chips,
+        "styles": [{"label": label, "tier": tier, "role": "main"}] + [
+            {"label": item[1], "tier": "", "role": "support"} for item in supplements[:4]
+        ],
+        "secondaryLabel": chips[0] if len(chips) >= 1 else "",
+        "secondarySignature": supplements[0][2] if len(supplements) >= 1 else "",
+        "tertiaryLabel": chips[1] if len(chips) >= 2 else "",
+        "tertiarySignature": supplements[1][2] if len(supplements) >= 2 else "",
     }
 
 
 def _style_label(side: dict) -> str:
     return str(dict(side.get("fightStyle") or {}).get("label") or "균형형 파이터")
+
+
+def _style_phrase(side: dict) -> str:
+    style = dict(side.get("fightStyle") or {})
+    primary = str(style.get("label") or "균형형 파이터")
+    chips = [str(item).strip() for item in list(style.get("chips") or []) if str(item).strip()]
+    secondary = chips[0] if chips else str(style.get("secondaryLabel") or "").strip()
+    return f"{primary}과 {secondary}" if secondary else primary
 
 
 def _official_rounds(payload: dict) -> List[dict]:
@@ -369,14 +414,14 @@ def build_match_commentary(report: Optional[dict]) -> str:
     if weapon:
         lines.append(weapon)
 
-    blue_style = _style_label(blue)
-    red_style = _style_label(red)
+    blue_style = _style_phrase(blue)
+    red_style = _style_phrase(red)
     if blue_style != "분석 중" and red_style != "분석 중":
         lines.append(f"스타일로 보면 {blue_name}는 {blue_style}, {red_name}는 {red_style}의 색깔을 뚜렷하게 보여줬습니다.")
 
     if winner in ("blue", "red"):
         loser = "red" if winner == "blue" else "blue"
-        winner_style = _style_label(payload.get(winner) or {})
+        winner_style = _style_phrase(payload.get(winner) or {})
         if winner_style != "분석 중":
             lines.append(f"결국 {names[winner]}가 자신의 {winner_style} 강점을 더 오래 유지했고, {names[loser]}는 그 흐름을 끊을 해답을 만들지 못했습니다.")
         else:

@@ -200,6 +200,8 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
         html = BrowserOverlayServer()._html()
         self.assertIn('id="idleHighlightVideo"', html)
         self.assertIn("function idleHighlightBlocked", html)
+        self.assertIn("function canPlayIdleHighlight", html)
+        self.assertIn("if(s.matchActive===true)return true", html)
         self.assertIn("syncIdleHighlight(s)", html)
         self.assertIn("body.idle-highlight-active #root>.hud", html)
 
@@ -207,6 +209,10 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
         html = BrowserOverlayServer()._html()
         self.assertIn('id="obsReplayVideo"', html)
         self.assertIn("function syncObsReplay", html)
+        self.assertIn("function prepareObsReplay", html)
+        self.assertIn("afterTransition", html)
+        self.assertIn("preparingReplay", html)
+        self.assertIn("styleTertiary", html)
         self.assertIn("/api/obs-replay/ended", html)
 
     def test_replay_buffer_saved_event_keeps_path_and_context(self):

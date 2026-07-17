@@ -72,7 +72,7 @@ def _write_update_script(zip_path: str, app_dir: str, exe_path: str, process_id:
         "Expand-Archive -LiteralPath $zip -DestinationPath $extractDir -Force",
         "Write-UpdateLog 'archive extracted'",
         "$protectedFiles = @('config.json','profile.json','profile1.json','as.json','test.json','latest.json')",
-        "$protectedDirs = @('logs','image','ThrillOfTheFight2','TheThrillOfTheFight2')",
+        "$protectedDirs = @('logs','image','ThrillOfTheFight2','TheThrillOfTheFight2','diagnostics','MatchLogArchive','SpectatorLogArchive')",
         "Get-ChildItem -LiteralPath $appDir -Force | Where-Object { $protectedFiles -notcontains $_.Name -and $protectedDirs -notcontains $_.Name } | Remove-Item -Recurse -Force",
         "Get-ChildItem -LiteralPath $extractDir -Force | Where-Object { $protectedFiles -notcontains $_.Name } | Copy-Item -Destination $appDir -Recurse -Force",
         "Write-UpdateLog 'application files replaced; user data preserved'",

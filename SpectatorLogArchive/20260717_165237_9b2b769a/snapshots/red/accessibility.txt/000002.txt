@@ -1,1 +1,0 @@
-[Accessibility] red (Exadata): enabled=False, bodyEffort=0.00, hook=1.00, jab=1.00, cross=1.00, uppercut=1.00, overhand=1.00, damageReceived=1.00, allowSlaps=False

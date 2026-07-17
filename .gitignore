@@ -13,6 +13,9 @@ release/
 logs/
 *.log
 *.jsonl
+diagnostics/
+MatchLogArchive/
+SpectatorLogArchive/
 
 # Local backups and scratch files
 .git_backup_*/

@@ -1,3 +1,0 @@
-Gloves:DefaultGold:Gold:red:white:white
-Shoes:BaseGold:Gold:red:white:white
-Shorts:DefaultGold:Gold:red:white:white

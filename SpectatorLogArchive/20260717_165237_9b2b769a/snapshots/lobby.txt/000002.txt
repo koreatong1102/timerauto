@@ -1,9 +1,0 @@
-slot_0: type=PlayerBlue occupied=True name=zmsdhfl ready=False
-slot_1: type=DesktopSpectator occupied=True name=roomfightclub ready=False
-
-venue_id: 4
-rounds: 10
-round_duration: 180
-break_duration: 60
-
-ready_to_start: False

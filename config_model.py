@@ -653,6 +653,17 @@ class AppConfig:
     obs_highlight_combo_min: int = 3
     obs_highlight_damage_min: float = 55.0
     obs_highlight_cooldown_sec: float = 8.0
+    # Shared broadcast-event rules.  Stage one runs in shadow mode so legacy
+    # on-air behaviour is not changed until comparisons have been verified.
+    event_engine_enabled: bool = True
+    event_engine_shadow_mode: bool = True
+    event_heavy_damage: float = 50.0
+    event_signature_damage: float = 60.0
+    event_counter_min_damage: float = 40.0
+    event_combo_min_damage: float = 15.0
+    event_combo_window_sec: float = 0.8
+    event_combo_break_damage: float = 20.0
+    event_combo_emphasis_hits: int = 5
     # Optional per-source replay buffer provided by the OBS Source Record plugin.
     # It is independent from OBS's Program-output replay buffer.
     obs_source_record_enabled: bool = False
@@ -663,6 +674,8 @@ class AppConfig:
     obs_source_record_archive_limit_gb: int = 5
     # The incoming folder contains only temporary Source Record originals.
     obs_source_record_clear_incoming_on_stream_stop: bool = True
+    obs_source_record_auto_enable: bool = True
+    obs_source_record_stop_with_timer: bool = True
     # Copy native OBS Replay Buffer files into the same per-player archive.
     # They stay in OBS's own output folder for browser-overlay replay safety.
     obs_replay_buffer_archive_enabled: bool = False
@@ -671,11 +684,12 @@ class AppConfig:
     potm_capture_source: str = "source_record"  # source_record | replay_buffer
     potm_min_score: int = 45
     potm_window_sec: float = 10.0
-    potm_play_delay_sec: float = 4.0
+    potm_play_delay_sec: float = 0.0
     potm_technique_max: int = 40
     potm_result_max: int = 40
     potm_damage_max: int = 20
     potm_intro_hold_sec: float = 2.1
+    potm_replay_speed: float = 0.85
     potm_bgm_path: str = ""
     potm_bgm_volume: int = 75
     potm_test_video_path: str = ""
@@ -712,6 +726,18 @@ class AppConfig:
     # intentionally configurable because OBS does not expose its bundled one.
     obs_highlight_ffmpeg_path: str = ""
     obs_highlight_merge_transition_ms: int = 500
+    obs_highlight_merge_shuffle: bool = False
+    # Normal 16:9 compilation, or a vertical Shorts layout that keeps the
+    # entire gameplay frame visible over a blurred background.
+    obs_highlight_merge_aspect: str = "landscape"
+    # Captions stamped into the top and bottom blurred panels of the Shorts
+    # promo preset. Newlines are preserved as separate lines in the video.
+    obs_highlight_shorts_top_text: str = "몸으로 직접 하는 VR복싱"
+    obs_highlight_shorts_bottom_text: str = "카카오톡 오픈채팅\n룸파이트클럽 검색"
+    # Optional full-frame end card appended once after a player's compiled
+    # highlights.  Transparent PNG/WebP assets work well here.
+    obs_highlight_merge_transition_image_path: str = ""
+    obs_highlight_merge_transition_image_ms: int = 350
     obs_auto_replay_enabled: bool = True
     obs_auto_replay_kd: bool = True
     obs_auto_replay_tko: bool = True
@@ -780,14 +806,31 @@ class AppConfig:
     spectator_lobby_auto_start_restore_focus: bool = True
     spectator_lobby_auto_start_restore_cursor: bool = True
     spectator_lobby_auto_start_minimize_target: bool = False
+    # After a completed bout returns to the host lobby, clear the two player
+    # slots with the game's K+0 / K+1 / K+2 shortcuts. This is enabled by
+    # default for the host workflow; users can still turn it off in settings.
+    spectator_lobby_post_match_kick_enabled: bool = True
     spectator_final_report_delay_sec: float = 10.0
     spectator_sp_throw_cost_scale: float = 1.8
+    spectator_sp_activity_global_scale: float = 0.6
     spectator_sp_impact_cost_scale: float = 1.25
     spectator_sp_fight_recovery_pct: float = 5.0
     # During a break this is a recovery ceiling, not an extra recovery rate.
     # Fighters already above the ceiling are never reduced.
     spectator_sp_break_recovery_pct: float = 30.0
     spectator_sp_recovery_delay_sec: float = 1.5
+    # Broadcast-only activity stamina: head movement is sampled from the
+    # SpectatorLog poses, never from screen pixels.
+    spectator_sp_head_movement_enabled: bool = True
+    spectator_sp_head_deadzone_cm: float = 8.0
+    spectator_sp_head_cost_scale: float = 1.0
+    spectator_sp_head_max_pct_per_sec: float = 0.25
+    spectator_sp_head_burst_enabled: bool = True
+    spectator_sp_head_burst_cm: float = 25.0
+    spectator_sp_head_burst_cost_pct: float = 0.12
+    spectator_sp_head_burst_cooldown_sec: float = 0.8
+    spectator_sp_combo_extra_pct: float = 15.0
+    spectator_sp_hit_recovery_delay_extra_sec: float = 0.5
     spectator_sp_bar_x: int = 0
     spectator_sp_bar_y: int = 0
     spectator_sp_bar_length_pct: int = 100
@@ -873,6 +916,10 @@ class AppConfig:
     overlay_timer_x: int = 0
     overlay_timer_y: int = 0
     overlay_round_font_size: int = 11
+    # Browser-overlay ROUND/FIGHT intro only. 1.0 is the authored pace.
+    overlay_round_intro_speed: float = 1.0
+    overlay_round_intro_outline_px: int = 3
+    overlay_round_intro_glow_color: str = "#38BDF8"
     overlay_round_x: int = 0
     overlay_round_y: int = 0
     overlay_preset: str = "classic"
@@ -996,12 +1043,23 @@ class AppConfig:
         cfg.obs_highlight_combo_min = max(2, min(20, int(raw.get("obs_highlight_combo_min", 3) or 3)))
         cfg.obs_highlight_damage_min = max(0.0, min(300.0, float(raw.get("obs_highlight_damage_min", 55.0) or 55.0)))
         cfg.obs_highlight_cooldown_sec = max(0.0, min(120.0, float(raw.get("obs_highlight_cooldown_sec", 8.0) or 8.0)))
+        cfg.event_engine_enabled = bool(raw.get("event_engine_enabled", True))
+        cfg.event_engine_shadow_mode = bool(raw.get("event_engine_shadow_mode", True))
+        cfg.event_heavy_damage = max(0.0, min(300.0, float(raw.get("event_heavy_damage", 50.0) or 0.0)))
+        cfg.event_signature_damage = max(0.0, min(300.0, float(raw.get("event_signature_damage", 60.0) or 0.0)))
+        cfg.event_counter_min_damage = max(0.0, min(300.0, float(raw.get("event_counter_min_damage", 40.0) or 0.0)))
+        cfg.event_combo_min_damage = max(0.0, min(300.0, float(raw.get("event_combo_min_damage", 15.0) or 0.0)))
+        cfg.event_combo_window_sec = max(0.1, min(5.0, float(raw.get("event_combo_window_sec", 0.8) or 0.8)))
+        cfg.event_combo_break_damage = max(0.0, min(300.0, float(raw.get("event_combo_break_damage", 20.0) or 0.0)))
+        cfg.event_combo_emphasis_hits = max(2, min(20, int(raw.get("event_combo_emphasis_hits", 5) or 5)))
         cfg.obs_source_record_enabled = bool(raw.get("obs_source_record_enabled", False))
         cfg.obs_source_record_context = str(raw.get("obs_source_record_context", "게임 캡처 - Source Record") or "").strip()
         cfg.obs_source_record_incoming_dir = str(raw.get("obs_source_record_incoming_dir", "") or "").strip()
         cfg.obs_source_record_archive_dir = str(raw.get("obs_source_record_archive_dir", "") or "").strip()
         cfg.obs_source_record_archive_limit_gb = max(1, min(500, int(raw.get("obs_source_record_archive_limit_gb", 5) or 5)))
         cfg.obs_source_record_clear_incoming_on_stream_stop = bool(raw.get("obs_source_record_clear_incoming_on_stream_stop", True))
+        cfg.obs_source_record_auto_enable = bool(raw.get("obs_source_record_auto_enable", True))
+        cfg.obs_source_record_stop_with_timer = bool(raw.get("obs_source_record_stop_with_timer", True))
         cfg.obs_replay_buffer_archive_enabled = bool(raw.get("obs_replay_buffer_archive_enabled", False))
         cfg.potm_enabled = bool(raw.get("potm_enabled", False))
         cfg.potm_capture_source = str(raw.get("potm_capture_source", "source_record") or "source_record").strip().lower()
@@ -1009,11 +1067,12 @@ class AppConfig:
             cfg.potm_capture_source = "source_record"
         cfg.potm_min_score = max(1, min(100, int(raw.get("potm_min_score", 45) or 45)))
         cfg.potm_window_sec = max(0.5, min(10.0, float(raw.get("potm_window_sec", 10.0) or 10.0)))
-        cfg.potm_play_delay_sec = max(0.0, min(30.0, float(raw.get("potm_play_delay_sec", 4.0) or 0.0)))
+        cfg.potm_play_delay_sec = max(0.0, min(30.0, float(raw.get("potm_play_delay_sec", 0.0) or 0.0)))
         cfg.potm_technique_max = max(0, min(100, int(raw.get("potm_technique_max", 40) or 0)))
         cfg.potm_result_max = max(0, min(100, int(raw.get("potm_result_max", 40) or 0)))
         cfg.potm_damage_max = max(0, min(100, int(raw.get("potm_damage_max", 20) or 0)))
         cfg.potm_intro_hold_sec = max(0.5, min(8.0, float(raw.get("potm_intro_hold_sec", 2.1) or 2.1)))
+        cfg.potm_replay_speed = max(0.5, min(2.0, float(raw.get("potm_replay_speed", 0.85) or 0.85)))
         cfg.potm_bgm_path = str(raw.get("potm_bgm_path", "") or "").strip()
         cfg.potm_bgm_volume = max(0, min(100, int(raw.get("potm_bgm_volume", 75) or 0)))
         cfg.potm_test_video_path = str(raw.get("potm_test_video_path", "") or "").strip()
@@ -1039,6 +1098,13 @@ class AppConfig:
             setattr(cfg, name, max(0, min(100, int(raw.get(name, default) or 0))))
         cfg.obs_highlight_ffmpeg_path = str(raw.get("obs_highlight_ffmpeg_path", "") or "").strip()
         cfg.obs_highlight_merge_transition_ms = max(0, min(3000, int(raw.get("obs_highlight_merge_transition_ms", 500) or 0)))
+        cfg.obs_highlight_merge_shuffle = bool(raw.get("obs_highlight_merge_shuffle", False))
+        merge_aspect = str(raw.get("obs_highlight_merge_aspect", "landscape") or "landscape").strip().lower()
+        cfg.obs_highlight_merge_aspect = merge_aspect if merge_aspect in {"landscape", "shorts_promo"} else "landscape"
+        cfg.obs_highlight_shorts_top_text = str(raw.get("obs_highlight_shorts_top_text", "몸으로 직접 하는 VR복싱") or "")[:240]
+        cfg.obs_highlight_shorts_bottom_text = str(raw.get("obs_highlight_shorts_bottom_text", "카카오톡 오픈채팅\n룸파이트클럽 검색") or "")[:240]
+        cfg.obs_highlight_merge_transition_image_path = str(raw.get("obs_highlight_merge_transition_image_path", "") or "").strip()
+        cfg.obs_highlight_merge_transition_image_ms = max(50, min(3000, int(raw.get("obs_highlight_merge_transition_image_ms", 350) or 350)))
         cfg.obs_auto_replay_enabled = bool(raw.get("obs_auto_replay_enabled", True))
         cfg.obs_auto_replay_kd = bool(raw.get("obs_auto_replay_kd", True))
         cfg.obs_auto_replay_tko = bool(raw.get("obs_auto_replay_tko", True))
@@ -1115,15 +1181,29 @@ class AppConfig:
         cfg.spectator_lobby_auto_start_minimize_target = bool(
             raw.get("spectator_lobby_auto_start_minimize_target", False)
         )
+        cfg.spectator_lobby_post_match_kick_enabled = bool(
+            raw.get("spectator_lobby_post_match_kick_enabled", True)
+        )
         try:
             cfg.spectator_final_report_delay_sec = max(0.0, min(30.0, float(raw.get("spectator_final_report_delay_sec", 10.0) or 0.0)))
         except Exception:
             cfg.spectator_final_report_delay_sec = 10.0
         cfg.spectator_sp_throw_cost_scale = max(0.1, min(5.0, float(raw.get("spectator_sp_throw_cost_scale", 1.8) or 1.8)))
+        cfg.spectator_sp_activity_global_scale = max(0.0, min(3.0, float(raw.get("spectator_sp_activity_global_scale", 0.6) or 0.0)))
         cfg.spectator_sp_impact_cost_scale = max(0.0, min(5.0, float(raw.get("spectator_sp_impact_cost_scale", 1.25))))
         cfg.spectator_sp_fight_recovery_pct = max(0.0, min(100.0, float(raw.get("spectator_sp_fight_recovery_pct", 5.0) or 0.0)))
         cfg.spectator_sp_break_recovery_pct = max(0.0, min(100.0, float(raw.get("spectator_sp_break_recovery_pct", 30.0) or 0.0)))
         cfg.spectator_sp_recovery_delay_sec = max(0.0, min(10.0, float(raw.get("spectator_sp_recovery_delay_sec", 1.5) or 0.0)))
+        cfg.spectator_sp_head_movement_enabled = bool(raw.get("spectator_sp_head_movement_enabled", True))
+        cfg.spectator_sp_head_deadzone_cm = max(0.0, min(50.0, float(raw.get("spectator_sp_head_deadzone_cm", 8.0) or 0.0)))
+        cfg.spectator_sp_head_cost_scale = max(0.0, min(5.0, float(raw.get("spectator_sp_head_cost_scale", 1.0) or 0.0)))
+        cfg.spectator_sp_head_max_pct_per_sec = max(0.0, min(5.0, float(raw.get("spectator_sp_head_max_pct_per_sec", 0.25) or 0.0)))
+        cfg.spectator_sp_head_burst_enabled = bool(raw.get("spectator_sp_head_burst_enabled", True))
+        cfg.spectator_sp_head_burst_cm = max(5.0, min(100.0, float(raw.get("spectator_sp_head_burst_cm", 25.0) or 0.0)))
+        cfg.spectator_sp_head_burst_cost_pct = max(0.0, min(5.0, float(raw.get("spectator_sp_head_burst_cost_pct", 0.12) or 0.0)))
+        cfg.spectator_sp_head_burst_cooldown_sec = max(0.0, min(10.0, float(raw.get("spectator_sp_head_burst_cooldown_sec", 0.8) or 0.0)))
+        cfg.spectator_sp_combo_extra_pct = max(0.0, min(200.0, float(raw.get("spectator_sp_combo_extra_pct", 15.0) or 0.0)))
+        cfg.spectator_sp_hit_recovery_delay_extra_sec = max(0.0, min(10.0, float(raw.get("spectator_sp_hit_recovery_delay_extra_sec", 0.5) or 0.0)))
         try:
             cfg.spectator_sp_bar_x = max(-300, min(300, int(raw.get("spectator_sp_bar_x", 0) or 0)))
             cfg.spectator_sp_bar_y = max(-100, min(100, int(raw.get("spectator_sp_bar_y", 0) or 0)))
@@ -1377,6 +1457,17 @@ class AppConfig:
             cfg.overlay_round_font_size = max(6, min(40, int(raw.get("overlay_round_font_size", 11) or 11)))
         except Exception:
             cfg.overlay_round_font_size = 11
+        try:
+            cfg.overlay_round_intro_speed = max(0.4, min(2.5, float(raw.get("overlay_round_intro_speed", 1.0) or 1.0)))
+        except Exception:
+            cfg.overlay_round_intro_speed = 1.0
+        try:
+            cfg.overlay_round_intro_outline_px = max(0, min(12, int(raw.get("overlay_round_intro_outline_px", 3))))
+        except Exception:
+            cfg.overlay_round_intro_outline_px = 3
+        cfg.overlay_round_intro_glow_color = _normalize_hex_color(
+            str(raw.get("overlay_round_intro_glow_color", "#38BDF8") or "#38BDF8")
+        )
         try:
             cfg.overlay_round_x = max(-160, min(160, int(raw.get("overlay_round_x", 0) or 0)))
         except Exception:
@@ -1645,12 +1736,23 @@ class AppConfig:
             "obs_highlight_combo_min": int(max(2, min(20, self.obs_highlight_combo_min))),
             "obs_highlight_damage_min": float(max(0.0, min(300.0, self.obs_highlight_damage_min))),
             "obs_highlight_cooldown_sec": float(max(0.0, min(120.0, self.obs_highlight_cooldown_sec))),
+            "event_engine_enabled": bool(self.event_engine_enabled),
+            "event_engine_shadow_mode": bool(self.event_engine_shadow_mode),
+            "event_heavy_damage": float(max(0.0, min(300.0, self.event_heavy_damage))),
+            "event_signature_damage": float(max(0.0, min(300.0, self.event_signature_damage))),
+            "event_counter_min_damage": float(max(0.0, min(300.0, self.event_counter_min_damage))),
+            "event_combo_min_damage": float(max(0.0, min(300.0, self.event_combo_min_damage))),
+            "event_combo_window_sec": float(max(0.1, min(5.0, self.event_combo_window_sec))),
+            "event_combo_break_damage": float(max(0.0, min(300.0, self.event_combo_break_damage))),
+            "event_combo_emphasis_hits": int(max(2, min(20, self.event_combo_emphasis_hits))),
             "obs_source_record_enabled": bool(self.obs_source_record_enabled),
             "obs_source_record_context": str(self.obs_source_record_context or ""),
             "obs_source_record_incoming_dir": to_app_rel(str(self.obs_source_record_incoming_dir or "")),
             "obs_source_record_archive_dir": to_app_rel(str(self.obs_source_record_archive_dir or "")),
             "obs_source_record_archive_limit_gb": int(max(1, min(500, self.obs_source_record_archive_limit_gb))),
             "obs_source_record_clear_incoming_on_stream_stop": bool(self.obs_source_record_clear_incoming_on_stream_stop),
+            "obs_source_record_auto_enable": bool(self.obs_source_record_auto_enable),
+            "obs_source_record_stop_with_timer": bool(self.obs_source_record_stop_with_timer),
             "obs_replay_buffer_archive_enabled": bool(self.obs_replay_buffer_archive_enabled),
             "potm_enabled": bool(self.potm_enabled),
             "potm_capture_source": str(self.potm_capture_source or "source_record"),
@@ -1661,6 +1763,7 @@ class AppConfig:
             "potm_result_max": int(max(0, min(100, self.potm_result_max))),
             "potm_damage_max": int(max(0, min(100, self.potm_damage_max))),
             "potm_intro_hold_sec": float(max(0.5, min(8.0, self.potm_intro_hold_sec))),
+            "potm_replay_speed": float(max(0.5, min(2.0, self.potm_replay_speed))),
             "potm_bgm_path": to_app_rel(str(self.potm_bgm_path or "")),
             "potm_bgm_volume": int(max(0, min(100, self.potm_bgm_volume))),
             "potm_test_video_path": to_app_rel(str(self.potm_test_video_path or "")),
@@ -1695,6 +1798,12 @@ class AppConfig:
             "potm_damage_peak_max": int(max(0, min(100, self.potm_damage_peak_max))),
             "obs_highlight_ffmpeg_path": to_app_rel(str(self.obs_highlight_ffmpeg_path or "")),
             "obs_highlight_merge_transition_ms": int(max(0, min(3000, self.obs_highlight_merge_transition_ms))),
+            "obs_highlight_merge_shuffle": bool(self.obs_highlight_merge_shuffle),
+            "obs_highlight_merge_aspect": str(self.obs_highlight_merge_aspect or "landscape"),
+            "obs_highlight_shorts_top_text": str(self.obs_highlight_shorts_top_text or "")[:240],
+            "obs_highlight_shorts_bottom_text": str(self.obs_highlight_shorts_bottom_text or "")[:240],
+            "obs_highlight_merge_transition_image_path": to_app_rel(str(self.obs_highlight_merge_transition_image_path or "")),
+            "obs_highlight_merge_transition_image_ms": int(max(50, min(3000, self.obs_highlight_merge_transition_image_ms))),
             "obs_auto_replay_enabled": bool(self.obs_auto_replay_enabled),
             "obs_auto_replay_kd": bool(self.obs_auto_replay_kd),
             "obs_auto_replay_tko": bool(self.obs_auto_replay_tko),
@@ -1765,12 +1874,26 @@ class AppConfig:
             "spectator_lobby_auto_start_minimize_target": bool(
                 self.spectator_lobby_auto_start_minimize_target
             ),
+            "spectator_lobby_post_match_kick_enabled": bool(
+                self.spectator_lobby_post_match_kick_enabled
+            ),
             "spectator_final_report_delay_sec": float(max(0.0, min(30.0, self.spectator_final_report_delay_sec))),
             "spectator_sp_throw_cost_scale": float(max(0.1, min(5.0, self.spectator_sp_throw_cost_scale))),
+            "spectator_sp_activity_global_scale": float(max(0.0, min(3.0, self.spectator_sp_activity_global_scale))),
             "spectator_sp_impact_cost_scale": float(max(0.0, min(5.0, self.spectator_sp_impact_cost_scale))),
             "spectator_sp_fight_recovery_pct": float(max(0.0, min(100.0, self.spectator_sp_fight_recovery_pct))),
             "spectator_sp_break_recovery_pct": float(max(0.0, min(100.0, self.spectator_sp_break_recovery_pct))),
             "spectator_sp_recovery_delay_sec": float(max(0.0, min(10.0, self.spectator_sp_recovery_delay_sec))),
+            "spectator_sp_head_movement_enabled": bool(self.spectator_sp_head_movement_enabled),
+            "spectator_sp_head_deadzone_cm": float(max(0.0, min(50.0, self.spectator_sp_head_deadzone_cm))),
+            "spectator_sp_head_cost_scale": float(max(0.0, min(5.0, self.spectator_sp_head_cost_scale))),
+            "spectator_sp_head_max_pct_per_sec": float(max(0.0, min(5.0, self.spectator_sp_head_max_pct_per_sec))),
+            "spectator_sp_head_burst_enabled": bool(self.spectator_sp_head_burst_enabled),
+            "spectator_sp_head_burst_cm": float(max(5.0, min(100.0, self.spectator_sp_head_burst_cm))),
+            "spectator_sp_head_burst_cost_pct": float(max(0.0, min(5.0, self.spectator_sp_head_burst_cost_pct))),
+            "spectator_sp_head_burst_cooldown_sec": float(max(0.0, min(10.0, self.spectator_sp_head_burst_cooldown_sec))),
+            "spectator_sp_combo_extra_pct": float(max(0.0, min(200.0, self.spectator_sp_combo_extra_pct))),
+            "spectator_sp_hit_recovery_delay_extra_sec": float(max(0.0, min(10.0, self.spectator_sp_hit_recovery_delay_extra_sec))),
             "spectator_sp_bar_x": int(max(-300, min(300, self.spectator_sp_bar_x))),
             "spectator_sp_bar_y": int(max(-100, min(100, self.spectator_sp_bar_y))),
             "spectator_sp_bar_length_pct": int(max(25, min(160, self.spectator_sp_bar_length_pct))),
@@ -1850,6 +1973,9 @@ class AppConfig:
             "overlay_timer_x": int(self.overlay_timer_x or 0),
             "overlay_timer_y": int(self.overlay_timer_y or 0),
             "overlay_round_font_size": int(self.overlay_round_font_size or 11),
+            "overlay_round_intro_speed": float(self.overlay_round_intro_speed or 1.0),
+            "overlay_round_intro_outline_px": int(self.overlay_round_intro_outline_px or 0),
+            "overlay_round_intro_glow_color": _normalize_hex_color(str(self.overlay_round_intro_glow_color or "#38BDF8")),
             "overlay_round_x": int(self.overlay_round_x or 0),
             "overlay_round_y": int(self.overlay_round_y or 0),
             "overlay_preset": self.overlay_preset,

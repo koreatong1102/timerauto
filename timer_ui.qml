@@ -2204,7 +2204,7 @@ ApplicationWindow {
                 height: 22
                 radius: 3
                 color: (backend && backend.logDetectRunning) ? "#ef4444" : "#2a2a2a"
-                Text { anchors.centerIn: parent; text: (backend && backend.logDetectRunning) ? "\uB85C\uADF8 \uAC10\uC9C0 \uCF1C\uC9D0" : "\uB85C\uADF8 \uAC10\uC9C0"; color: "#ffffff"; font.pixelSize: 12 }
+                Text { anchors.centerIn: parent; text: (backend && backend.logDetectRunning) ? "\uB85C\uADF8 \uAC10\uC9C0 \uC911\uC9C0" : "\uB85C\uADF8 \uAC10\uC9C0 \uC2DC\uC791"; color: "#ffffff"; font.pixelSize: 12 }
                 MouseArea {
                     anchors.fill: parent
                     onClicked: {

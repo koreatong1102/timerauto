@@ -405,7 +405,9 @@ class RoundReportAccuracyTests(unittest.TestCase):
             second = {}
             self.watcher._update_live_sp_activity(root, second)
 
-        self.assertAlmostEqual(first["spectator_sp_activity_spent"]["blue"], 0.0018)
+        # Default global SP activity scale is 60%, preserving the relative
+        # per-punch costs while reducing total drain by the requested 40%.
+        self.assertAlmostEqual(first["spectator_sp_activity_spent"]["blue"], 0.00108)
         self.assertNotIn("spectator_sp_activity_spent", second)
 
     def test_live_commentary_keeps_only_current_sentence(self):
@@ -444,6 +446,26 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertEqual(report["blue"]["powerHits55"], 1)
         self.assertEqual(report["blue"]["maxComboHits"], 2)
         self.assertEqual(report["blue"]["maxComboDamage"], 80)
+
+    def test_terminal_result_without_live_events_still_builds_report(self):
+        """A resignation may clear the live event files before Results arrives."""
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            open(damage_path, "w", encoding="utf-8").close()
+            open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8").close()
+            with open(os.path.join(root, "scores.csv"), "w", encoding="utf-8") as stream:
+                stream.write("round,blue_score,red_score,blue_total,red_total\n")
+                stream.write("3,9,10,28,30\n")
+            with open(os.path.join(root, "winner.txt"), "w", encoding="utf-8") as stream:
+                stream.write("red\tRED\n")
+            self.watcher._last_round_state = "results"
+            report = self.watcher._build_round_report_payload(
+                damage_path, 3, ("BLUE", "RED"), force_final=False
+            )
+
+        self.assertEqual(report["round"], 3)
+        self.assertEqual(report["winner"], "red")
+        self.assertEqual(report["red"]["officialScore"], 10)
 
 
 if __name__ == "__main__":

@@ -9,10 +9,18 @@ from urllib.request import Request, urlopen
 from browser_overlay import BrowserOverlayServer
 from config_model import AppConfig
 from obs_auto_replay import ObsAutoReplayController
-from obs_integration import ObsIntegration, ObsSettings, build_obs_auth
+from obs_integration import ObsIntegration, ObsSettings, build_obs_auth, source_record_hotkey_context, source_record_source_name
 
 
 class ObsHighlightIntegrationTests(unittest.TestCase):
+    def test_source_record_scene_name_converts_to_obs_filter_context(self):
+        self.assertEqual(source_record_hotkey_context("장면 2"), "장면 2 - Source Record")
+        self.assertEqual(
+            source_record_hotkey_context("장면 2 - Source Record"),
+            "장면 2 - Source Record",
+        )
+        self.assertEqual(source_record_source_name("장면 2 - Source Record"), "장면 2")
+
     def test_auto_replay_uses_event_relative_delay_and_config(self):
         class FakeOverlay:
             def __init__(self):
@@ -211,6 +219,8 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
         self.assertIn("function syncObsReplay", html)
         self.assertIn("function prepareObsReplay", html)
         self.assertIn("afterTransition", html)
+        self.assertIn("function startObsReplayAfterTransition", html)
+        self.assertIn("obsReplayAfterTimer", html)
         self.assertIn("preparingReplay", html)
         self.assertIn("styleTertiary", html)
         self.assertIn("/api/obs-replay/ended", html)

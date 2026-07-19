@@ -22,6 +22,35 @@ except Exception:  # pragma: no cover - handled as a runtime status
 OBS_OUTPUT_SUBSCRIPTION = 1 << 6
 
 
+def source_record_hotkey_context(target_name: str) -> str:
+    """Return the OBS hotkey context used by Source Record's replay save.
+
+    The Settings UI intentionally stores the scene/source name (for example
+    ``장면 2``), because that is what the broadcaster sees in OBS.  Source
+    Record registers its save hotkey under the *filter* context instead:
+    ``장면 2 - Source Record``.  Keeping this conversion here makes automatic
+    WebSocket saves work without asking the user to type OBS's internal name.
+
+    A full context is still accepted for installations whose filter was named
+    something other than the default ``Source Record``.
+    """
+    value = str(target_name or "").strip()
+    if not value:
+        return ""
+    if value.casefold().endswith(" - source record"):
+        return value
+    return f"{value} - Source Record"
+
+
+def source_record_source_name(target_name: str) -> str:
+    """Convert the UI's Source Record context back to the OBS source name."""
+    value = str(target_name or "").strip()
+    suffix = " - source record"
+    if value.casefold().endswith(suffix):
+        return value[: -len(suffix)].strip()
+    return value
+
+
 def build_obs_auth(password: str, salt: str, challenge: str) -> str:
     secret = base64.b64encode(
         hashlib.sha256((str(password or "") + str(salt or "")).encode("utf-8")).digest()
@@ -96,11 +125,15 @@ class ObsIntegration:
         if settings == self._settings:
             if settings.enabled and (not self._thread or not self._thread.is_alive()):
                 self.start()
+            # OBS may already be connected when the user enables either
+            # automation checkbox. Queue the idempotent start requests again.
+            self.ensure_capture_outputs()
             return
         self._settings = settings
         self._commands.put({"type": "reconfigure"})
         if not self._thread or not self._thread.is_alive():
             self.start()
+        self.ensure_capture_outputs()
 
     def test_connection(self) -> None:
         self._commands.put({"type": "test"})
@@ -127,15 +160,17 @@ class ObsIntegration:
         context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Save a Source Record plugin replay buffer through OBS WebSocket."""
-        if not self._settings.enabled or not str(context_name or "").strip():
+        hotkey_context = source_record_hotkey_context(context_name)
+        if not self._settings.enabled or not hotkey_context:
             return
+        logging.info("OBS_SOURCE_RECORD_SAVE_REQUEST context=%s", hotkey_context)
         self._commands.put(
             {
                 "type": "request",
                 "requestType": "TriggerHotkeyByName",
                 "requestData": {
                     "hotkeyName": "ReplayBuffer.Save",
-                    "contextName": str(context_name).strip(),
+                    "contextName": hotkey_context,
                 },
                 "reason": str(reason or ""),
                 "context": dict(context or {}),
@@ -143,10 +178,42 @@ class ObsIntegration:
             }
         )
 
+    def set_source_record_enabled(self, target_name: str, enabled: bool = True) -> None:
+        """Idempotently enable/disable the default Source Record filter."""
+        source_name = source_record_source_name(target_name)
+        if not self._settings.enabled or not source_name:
+            return
+        self._commands.put(
+            {
+                "type": "request",
+                "requestType": "SetSourceFilterEnabled",
+                "requestData": {
+                    "sourceName": source_name,
+                    "filterName": "Source Record",
+                    "filterEnabled": bool(enabled),
+                },
+                "source_record_filter": True,
+                "source_record_source": source_name,
+            }
+        )
+
     def ensure_replay_buffer(self) -> None:
         if not self._settings.enabled:
             return
         self._commands.put({"type": "request", "requestType": "GetReplayBufferStatus"})
+
+    def ensure_capture_outputs(self) -> None:
+        """Make both configured capture buffers active; safe to call repeatedly."""
+        if not self._settings.enabled:
+            return
+        if (bool(getattr(self._cfg, "obs_replay_buffer_enabled", False))
+                and bool(getattr(self._cfg, "obs_replay_buffer_auto_start", True))):
+            self.ensure_replay_buffer()
+        if (bool(getattr(self._cfg, "obs_source_record_enabled", False))
+                and bool(getattr(self._cfg, "obs_source_record_auto_enable", True))):
+            target = str(getattr(self._cfg, "obs_source_record_context", "") or "").strip()
+            if target:
+                self.set_source_record_enabled(target, True)
 
     def get_input_mute(self, input_name: str, *, context: Optional[Dict[str, Any]] = None) -> None:
         if not self._settings.enabled or not str(input_name or "").strip():
@@ -233,6 +300,9 @@ class ObsIntegration:
                     raise RuntimeError("OBS authentication rejected")
                 self._pending_replay_requests.clear()
                 self._set_status("connected")
+                # Do this in the websocket worker as well as from the UI. It
+                # removes any dependency on Qt's event-poll timing at startup.
+                self.ensure_capture_outputs()
                 await self._send_request(ws, "GetStreamStatus", request_id="startup-stream")
                 await self._session_loop(ws, settings)
 
@@ -359,6 +429,14 @@ class ObsIntegration:
             elif request_type == "TriggerHotkeyByName":
                 self._events.put(
                     {"type": "source_record_replay_saved", "ok": ok, "message": str(status.get("comment") or "")}
+                )
+            elif request_type == "SetSourceFilterEnabled":
+                self._events.put(
+                    {
+                        "type": "source_record_filter_enabled",
+                        "ok": ok,
+                        "message": str(status.get("comment") or ""),
+                    }
                 )
             elif request_type == "GetInputMute":
                 request_id = str(data.get("requestId") or "")

@@ -1,11 +1,10 @@
 """Shared, data-driven fight event classification.
 
 This module deliberately has no Qt/OBS/browser dependencies.  It converts a
-raw spectator damage row into stable broadcast event names once, so consumers
-can eventually stop implementing their own slightly different thresholds.
-
-The first rollout is shadow-only: callers may compare its output with legacy
-behaviour without changing what is on air.
+raw spectator damage row into stable broadcast event names once, so the live
+HUD, commentary metadata, OBS highlight capture, POTM scoring, and diagnostics
+can share the same verdict.  A shadow switch remains for diagnostic comparison
+and safe rollback.
 """
 from __future__ import annotations
 

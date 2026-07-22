@@ -2,6 +2,7 @@ from types import SimpleNamespace
 import unittest
 
 from event_engine import FightEventEngine
+from spectator_log_watcher import SpectatorLogWatcher
 
 
 def config():
@@ -42,3 +43,41 @@ class FightEventEngineTests(unittest.TestCase):
         self.assertEqual(row["primary"], "decisive")
         self.assertIn("knockdown", row["tags"])
 
+    def test_live_watcher_attachment_is_canonical_and_idempotent(self):
+        cfg = config()
+        cfg.event_engine_shadow_mode = False
+        watcher = SpectatorLogWatcher.__new__(SpectatorLogWatcher)
+        watcher.cfg = cfg
+        watcher._event_engine = FightEventEngine(cfg)
+        rows = [{
+            "event_id": "one",
+            "time": 1.0,
+            "attacker_side": "blue",
+            "receiver_side": "red",
+            "damage": 55,
+            "is_counter": True,
+        }]
+        first = watcher._attach_central_event_classification(rows)
+        second = watcher._attach_central_event_classification(rows)
+        self.assertEqual(first, second)
+        self.assertEqual(rows[0]["combo_hits"], 1)
+        self.assertIn("heavy", rows[0]["event_tags"])
+        self.assertIn("counter", rows[0]["event_tags"])
+
+    def test_shadow_attachment_does_not_change_live_fields(self):
+        cfg = config()
+        cfg.event_engine_shadow_mode = True
+        watcher = SpectatorLogWatcher.__new__(SpectatorLogWatcher)
+        watcher.cfg = cfg
+        watcher._event_engine = FightEventEngine(cfg)
+        rows = [{
+            "event_id": "shadow-one",
+            "time": 1.0,
+            "attacker_side": "blue",
+            "receiver_side": "red",
+            "damage": 55,
+        }]
+        watcher._attach_central_event_classification(rows)
+        self.assertIn("_central_event", rows[0])
+        self.assertNotIn("event_tags", rows[0])
+        self.assertNotIn("combo_hits", rows[0])

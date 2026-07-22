@@ -23,8 +23,10 @@ class BrowserOverlayResponsiveTests(unittest.TestCase):
         self.assertIn(".roundReport{position:absolute!important;width:1920px!important;height:1080px!important", self.html)
 
     def test_report_reserves_vitals_row(self):
-        self.assertIn("grid-template-rows:156px 2px 78px minmax(0,1fr) 94px!important", self.html)
-        self.assertIn("height:94px!important;min-height:94px!important", self.html)
+        self.assertIn('grid-template-areas:"player" "style" "accent" "highlight" "details" "vitals"!important', self.html)
+        self.assertIn("grid-area:vitals", self.html)
+        self.assertIn("minmax(270px,2.25fr)", self.html)
+        self.assertIn("grid-template-rows:repeat(2,minmax(0,1fr))!important", self.html)
 
     def test_sp_bar_layout_is_runtime_configurable(self):
         state = BrowserOverlayServer().snapshot()
@@ -49,8 +51,9 @@ class BrowserOverlayResponsiveTests(unittest.TestCase):
         self.assertIn("경기 스타일", self.html)
         self.assertIn("rrFightStyle", self.html)
         self.assertIn("styleLabel!=='분석 중'", self.html)
-        self.assertIn(".rrFightStyle{margin-top:10px;min-height:36px", self.html)
-        self.assertIn("font-size:28px;line-height:1.2", self.html)
+        self.assertIn("grid-area:style", self.html)
+        self.assertIn("grid-template-rows:minmax(48px,.58fr) minmax(74px,1fr)", self.html)
+        self.assertIn("font-size:clamp(28px,1.65vw,33px)", self.html)
 
     def test_report_sequence_rejects_late_stale_stage(self):
         self.assertIn("roundReportFlow", self.html)

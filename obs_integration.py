@@ -12,6 +12,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 try:
     import aiohttp
@@ -20,6 +21,22 @@ except Exception:  # pragma: no cover - handled as a runtime status
 
 
 OBS_OUTPUT_SUBSCRIPTION = 1 << 6
+BROWSER_OVERLAY_PORT = 17872
+
+
+def is_timerauto_browser_overlay_url(value: str) -> bool:
+    """Return whether an OBS browser input points at this app's overlay.
+
+    Only the loopback overlay on the app's fixed HTTP port is accepted.  This
+    deliberately avoids changing audio routing for the broadcaster's other
+    browser sources (alerts, chat, widgets, and so on).
+    """
+    try:
+        parsed = urlparse(str(value or "").strip())
+        host = str(parsed.hostname or "").lower()
+        return host in {"127.0.0.1", "localhost", "::1"} and int(parsed.port or 0) == BROWSER_OVERLAY_PORT
+    except Exception:
+        return False
 
 
 def source_record_hotkey_context(target_name: str) -> str:
@@ -91,6 +108,7 @@ class ObsIntegration:
         self._status = "disabled" if not self._settings.enabled else "starting"
         self._pending_replay_requests = deque()
         self._pending_input_mute_requests: Dict[str, Dict[str, Any]] = {}
+        self._pending_input_settings_requests: Dict[str, str] = {}
 
     @property
     def status(self) -> str:
@@ -203,7 +221,7 @@ class ObsIntegration:
         self._commands.put({"type": "request", "requestType": "GetReplayBufferStatus"})
 
     def ensure_capture_outputs(self) -> None:
-        """Make both configured capture buffers active; safe to call repeatedly."""
+        """Make capture buffers and browser-overlay audio ready; idempotent."""
         if not self._settings.enabled:
             return
         if (bool(getattr(self._cfg, "obs_replay_buffer_enabled", False))
@@ -214,6 +232,13 @@ class ObsIntegration:
             target = str(getattr(self._cfg, "obs_source_record_context", "") or "").strip()
             if target:
                 self.set_source_record_enabled(target, True)
+        # With OBS's browser-source audio control disabled, Chromium sends the
+        # sound to the Windows playback device: the operator hears it, but OBS
+        # may not.  Discover our one loopback overlay source and route it into
+        # the OBS mixer instead.  The response handler also disables local
+        # monitoring, so stream/program audio remains audible without echoing
+        # on the broadcast PC.
+        self._commands.put({"type": "request", "requestType": "GetInputList"})
 
     def get_input_mute(self, input_name: str, *, context: Optional[Dict[str, Any]] = None) -> None:
         if not self._settings.enabled or not str(input_name or "").strip():
@@ -299,6 +324,7 @@ class ObsIntegration:
                 if int(identified.get("op", -1)) != 2:
                     raise RuntimeError("OBS authentication rejected")
                 self._pending_replay_requests.clear()
+                self._pending_input_settings_requests.clear()
                 self._set_status("connected")
                 # Do this in the websocket worker as well as from the UI. It
                 # removes any dependency on Qt's event-poll timing at startup.
@@ -443,3 +469,52 @@ class ObsIntegration:
                 pending = self._pending_input_mute_requests.pop(request_id, {})
                 response = data.get("responseData") or {}
                 self._events.put({"type": "input_mute_state", "ok": ok, "inputName": str(pending.get("inputName") or ""), "muted": bool(response.get("inputMuted", False)), "context": dict(pending.get("context") or {}), "message": str(status.get("comment") or "")})
+            elif request_type == "GetInputList" and ok:
+                response = data.get("responseData") or {}
+                for item in list(response.get("inputs") or []):
+                    item = dict(item or {})
+                    input_name = str(item.get("inputName") or "").strip()
+                    input_kind = str(item.get("unversionedInputKind") or item.get("inputKind") or "").lower()
+                    if not input_name or input_kind != "browser_source":
+                        continue
+                    request_id = await self._send_request(
+                        ws,
+                        "GetInputSettings",
+                        request_data={"inputName": input_name},
+                    )
+                    if request_id:
+                        self._pending_input_settings_requests[request_id] = input_name
+            elif request_type == "GetInputSettings":
+                request_id = str(data.get("requestId") or "")
+                input_name = str(self._pending_input_settings_requests.pop(request_id, "") or "")
+                response = data.get("responseData") or {}
+                input_settings = dict(response.get("inputSettings") or {})
+                if ok and input_name and is_timerauto_browser_overlay_url(str(input_settings.get("url") or "")):
+                    if input_settings.get("reroute_audio") is not True:
+                        await self._send_request(
+                            ws,
+                            "SetInputSettings",
+                            request_data={
+                                "inputName": input_name,
+                                "inputSettings": {"reroute_audio": True},
+                                "overlay": True,
+                            },
+                        )
+                    await self._send_request(
+                        ws,
+                        "SetInputAudioMonitorType",
+                        request_data={
+                            "inputName": input_name,
+                            "monitorType": "OBS_MONITORING_TYPE_NONE",
+                        },
+                    )
+                    logging.info(
+                        "OBS_BROWSER_OVERLAY_AUDIO_ROUTE source=%s reroute_was=%s monitor=none",
+                        input_name,
+                        bool(input_settings.get("reroute_audio", False)),
+                    )
+                    self._events.put({
+                        "type": "browser_overlay_audio_routed",
+                        "ok": True,
+                        "inputName": input_name,
+                    })

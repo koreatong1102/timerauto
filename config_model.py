@@ -653,10 +653,10 @@ class AppConfig:
     obs_highlight_combo_min: int = 3
     obs_highlight_damage_min: float = 55.0
     obs_highlight_cooldown_sec: float = 8.0
-    # Shared broadcast-event rules.  Stage one runs in shadow mode so legacy
-    # on-air behaviour is not changed until comparisons have been verified.
+    # Shared broadcast-event rules.  Live mode is now the normal path; shadow
+    # remains available as a diagnostic rollback switch.
     event_engine_enabled: bool = True
-    event_engine_shadow_mode: bool = True
+    event_engine_shadow_mode: bool = False
     event_heavy_damage: float = 50.0
     event_signature_damage: float = 60.0
     event_counter_min_damage: float = 40.0
@@ -810,6 +810,7 @@ class AppConfig:
     # slots with the game's K+0 / K+1 / K+2 shortcuts. This is enabled by
     # default for the host workflow; users can still turn it off in settings.
     spectator_lobby_post_match_kick_enabled: bool = True
+    spectator_lobby_post_match_kick_delay_sec: float = 5.0
     spectator_final_report_delay_sec: float = 10.0
     spectator_sp_throw_cost_scale: float = 1.8
     spectator_sp_activity_global_scale: float = 0.6
@@ -844,6 +845,8 @@ class AppConfig:
     spectator_fight_style_min_landed: int = 10
     spectator_commentary_enabled: bool = True
     spectator_commentary_mode: str = "standard"
+    spectator_break_promo_enabled: bool = True
+    spectator_break_promo_text: str = "구독과 좋아요 부탁드려요"
     spectator_commentary_min_damage: float = 25.0
     spectator_hit_effect_damage: float = 45.0
     spectator_hit_effect_color_preset: str = "classic"
@@ -1044,7 +1047,7 @@ class AppConfig:
         cfg.obs_highlight_damage_min = max(0.0, min(300.0, float(raw.get("obs_highlight_damage_min", 55.0) or 55.0)))
         cfg.obs_highlight_cooldown_sec = max(0.0, min(120.0, float(raw.get("obs_highlight_cooldown_sec", 8.0) or 8.0)))
         cfg.event_engine_enabled = bool(raw.get("event_engine_enabled", True))
-        cfg.event_engine_shadow_mode = bool(raw.get("event_engine_shadow_mode", True))
+        cfg.event_engine_shadow_mode = bool(raw.get("event_engine_shadow_mode", False))
         cfg.event_heavy_damage = max(0.0, min(300.0, float(raw.get("event_heavy_damage", 50.0) or 0.0)))
         cfg.event_signature_damage = max(0.0, min(300.0, float(raw.get("event_signature_damage", 60.0) or 0.0)))
         cfg.event_counter_min_damage = max(0.0, min(300.0, float(raw.get("event_counter_min_damage", 40.0) or 0.0)))
@@ -1185,6 +1188,13 @@ class AppConfig:
             raw.get("spectator_lobby_post_match_kick_enabled", True)
         )
         try:
+            cfg.spectator_lobby_post_match_kick_delay_sec = max(
+                0.0,
+                min(30.0, float(raw.get("spectator_lobby_post_match_kick_delay_sec", 5.0) or 0.0)),
+            )
+        except Exception:
+            cfg.spectator_lobby_post_match_kick_delay_sec = 5.0
+        try:
             cfg.spectator_final_report_delay_sec = max(0.0, min(30.0, float(raw.get("spectator_final_report_delay_sec", 10.0) or 0.0)))
         except Exception:
             cfg.spectator_final_report_delay_sec = 10.0
@@ -1236,6 +1246,11 @@ class AppConfig:
             cfg.spectator_fight_style_min_landed = 10
         cfg.spectator_commentary_enabled = bool(raw.get("spectator_commentary_enabled", True))
         cfg.spectator_commentary_mode = str(raw.get("spectator_commentary_mode", "standard") or "standard")
+        cfg.spectator_break_promo_enabled = bool(raw.get("spectator_break_promo_enabled", True))
+        cfg.spectator_break_promo_text = str(
+            raw.get("spectator_break_promo_text", "구독과 좋아요 부탁드려요")
+            or ""
+        ).strip()
         cfg.spectator_commentary_voice = str(raw.get("spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
         cfg.spectator_caster_voice = str(raw.get("spectator_caster_voice", "ko-KR-InJoonNeural") or "ko-KR-InJoonNeural")
         cfg.spectator_stun_sfx_path = normalize_builtin_asset_path(str(raw.get("spectator_stun_sfx_path", "") or ""))
@@ -1877,6 +1892,9 @@ class AppConfig:
             "spectator_lobby_post_match_kick_enabled": bool(
                 self.spectator_lobby_post_match_kick_enabled
             ),
+            "spectator_lobby_post_match_kick_delay_sec": float(
+                max(0.0, min(30.0, self.spectator_lobby_post_match_kick_delay_sec))
+            ),
             "spectator_final_report_delay_sec": float(max(0.0, min(30.0, self.spectator_final_report_delay_sec))),
             "spectator_sp_throw_cost_scale": float(max(0.1, min(5.0, self.spectator_sp_throw_cost_scale))),
             "spectator_sp_activity_global_scale": float(max(0.0, min(3.0, self.spectator_sp_activity_global_scale))),
@@ -1911,6 +1929,8 @@ class AppConfig:
             ),
             "spectator_commentary_enabled": bool(self.spectator_commentary_enabled),
             "spectator_commentary_mode": str(self.spectator_commentary_mode or "standard"),
+            "spectator_break_promo_enabled": bool(self.spectator_break_promo_enabled),
+            "spectator_break_promo_text": str(self.spectator_break_promo_text or "").strip(),
             "spectator_commentary_min_damage": float(self.spectator_commentary_min_damage or 25.0),
             "spectator_hit_effect_damage": float(self.spectator_hit_effect_damage or 45.0),
             "spectator_hit_effect_color_preset": str(self.spectator_hit_effect_color_preset or "classic"),

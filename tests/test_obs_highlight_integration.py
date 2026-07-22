@@ -9,10 +9,23 @@ from urllib.request import Request, urlopen
 from browser_overlay import BrowserOverlayServer
 from config_model import AppConfig
 from obs_auto_replay import ObsAutoReplayController
-from obs_integration import ObsIntegration, ObsSettings, build_obs_auth, source_record_hotkey_context, source_record_source_name
+from obs_integration import (
+    ObsIntegration,
+    ObsSettings,
+    build_obs_auth,
+    is_timerauto_browser_overlay_url,
+    source_record_hotkey_context,
+    source_record_source_name,
+)
 
 
 class ObsHighlightIntegrationTests(unittest.TestCase):
+    def test_browser_overlay_audio_url_match_is_loopback_and_port_scoped(self):
+        self.assertTrue(is_timerauto_browser_overlay_url("http://127.0.0.1:17872/"))
+        self.assertTrue(is_timerauto_browser_overlay_url("http://localhost:17872/?source=obs"))
+        self.assertFalse(is_timerauto_browser_overlay_url("https://alerts.example/17872"))
+        self.assertFalse(is_timerauto_browser_overlay_url("http://127.0.0.1:17873/"))
+
     def test_source_record_scene_name_converts_to_obs_filter_context(self):
         self.assertEqual(source_record_hotkey_context("장면 2"), "장면 2 - Source Record")
         self.assertEqual(
@@ -318,6 +331,79 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
         event = client.drain_events(1)[0]
         self.assertEqual(event["type"], "replay_buffer_status")
         self.assertFalse(event["active"])
+
+    def test_obs_browser_overlay_audio_is_routed_to_mixer_without_monitoring(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.messages = []
+
+            async def send_json(self, payload):
+                self.messages.append(payload)
+
+        client = ObsIntegration(AppConfig())
+        websocket = FakeWebSocket()
+        client._pending_input_settings_requests["settings-1"] = "스오파 브라우저"
+        asyncio.run(
+            client._handle_message(
+                websocket,
+                {
+                    "op": 7,
+                    "d": {
+                        "requestId": "settings-1",
+                        "requestType": "GetInputSettings",
+                        "requestStatus": {"result": True},
+                        "responseData": {
+                            "inputSettings": {
+                                "url": "http://127.0.0.1:17872/",
+                                "reroute_audio": False,
+                            }
+                        },
+                    },
+                },
+            )
+        )
+        requests = [message["d"] for message in websocket.messages]
+        self.assertEqual([item["requestType"] for item in requests], [
+            "SetInputSettings",
+            "SetInputAudioMonitorType",
+        ])
+        self.assertTrue(requests[0]["requestData"]["inputSettings"]["reroute_audio"])
+        self.assertTrue(requests[0]["requestData"]["overlay"])
+        self.assertEqual(
+            requests[1]["requestData"]["monitorType"],
+            "OBS_MONITORING_TYPE_NONE",
+        )
+        event = client.drain_events(1)[0]
+        self.assertEqual(event["type"], "browser_overlay_audio_routed")
+        self.assertEqual(event["inputName"], "스오파 브라우저")
+
+    def test_other_obs_browser_sources_are_not_reconfigured(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.messages = []
+
+            async def send_json(self, payload):
+                self.messages.append(payload)
+
+        client = ObsIntegration(AppConfig())
+        websocket = FakeWebSocket()
+        client._pending_input_settings_requests["settings-other"] = "알림 위젯"
+        asyncio.run(
+            client._handle_message(
+                websocket,
+                {
+                    "op": 7,
+                    "d": {
+                        "requestId": "settings-other",
+                        "requestType": "GetInputSettings",
+                        "requestStatus": {"result": True},
+                        "responseData": {"inputSettings": {"url": "https://alerts.example/widget"}},
+                    },
+                },
+            )
+        )
+        self.assertEqual(websocket.messages, [])
+        self.assertEqual(client.drain_events(), [])
 
 
 if __name__ == "__main__":

@@ -7292,9 +7292,9 @@ class SettingsDialog(QDialog):
         blackbox_lay.setColumnStretch(1, 1)
         record_lay.addWidget(blackbox_group)
 
-        report_analysis_group = QGroupBox("경기 종료 리포트 분석")
+        report_analysis_group = QGroupBox("라운드 / 경기 종료 리포트 분석")
         report_analysis_lay = QGridLayout(report_analysis_group)
-        self.chk_spectator_fight_style = QCheckBox("경기 종료 리포트에 한글 경기 스타일 표시")
+        self.chk_spectator_fight_style = QCheckBox("라운드 / 경기 종료 리포트에 한글 경기 스타일 표시")
         self.chk_spectator_fight_style.setChecked(
             bool(getattr(self.cfg, "spectator_fight_style_enabled", True))
         )
@@ -7660,6 +7660,20 @@ class SettingsDialog(QDialog):
         self.sp_spectator_commentary_pitch.setValue(int(getattr(self.cfg, "spectator_commentary_pitch", 0) or 0))
         sound_lay.addWidget(QLabel("피치"), 9, 4)
         sound_lay.addWidget(self.sp_spectator_commentary_pitch, 9, 5)
+        self.chk_spectator_break_promo = QCheckBox("휴식 리포트 앞 안내 멘트")
+        self.chk_spectator_break_promo.setChecked(
+            bool(getattr(self.cfg, "spectator_break_promo_enabled", True))
+        )
+        self.chk_spectator_break_promo.setToolTip(
+            "휴식시간 라운드 리포트 해설 전에 캐스터 음성으로 먼저 읽습니다."
+        )
+        sound_lay.addWidget(self.chk_spectator_break_promo, 10, 0)
+        self.le_spectator_break_promo_text = QLineEdit(
+            str(getattr(self.cfg, "spectator_break_promo_text", "구독과 좋아요 부탁드려요") or "")
+        )
+        self.le_spectator_break_promo_text.setPlaceholderText("구독과 좋아요 부탁드려요")
+        self.le_spectator_break_promo_text.setMaxLength(180)
+        sound_lay.addWidget(self.le_spectator_break_promo_text, 10, 1, 1, 4)
         self.sp_spectator_replay_speed = QDoubleSpinBox()
         self.sp_spectator_replay_speed.setRange(0.1, 20.0)
         self.sp_spectator_replay_speed.setSingleStep(0.5)
@@ -7988,6 +8002,8 @@ class SettingsDialog(QDialog):
         self.btn_spectator_tko_sfx_test.clicked.connect(lambda: self._test_spectator_sfx("tko"))
         self.chk_spectator_commentary.stateChanged.connect(self._schedule_apply)
         self.cmb_spectator_commentary_mode.currentIndexChanged.connect(self._schedule_apply)
+        self.chk_spectator_break_promo.stateChanged.connect(self._schedule_apply)
+        self.le_spectator_break_promo_text.textChanged.connect(self._schedule_apply)
         self.cmb_spectator_commentary_voice.currentIndexChanged.connect(self._schedule_apply)
         self.cmb_spectator_caster_voice.currentIndexChanged.connect(self._schedule_apply)
         self.sp_spectator_commentary_damage.valueChanged.connect(self._schedule_apply)
@@ -8231,9 +8247,22 @@ class SettingsDialog(QDialog):
             bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False))
         )
         self.chk_spectator_lobby_post_match_kick.setToolTip(
-            "경기 종료 뒤 lobby.txt가 다시 확인되면 2초 후 점유된 0·1·2번 슬롯만 강퇴하고, 1초 뒤 다시 읽어 남아 있는 슬롯만 한 번 더 강퇴합니다."
+            "경기 종료 뒤 lobby.txt가 다시 확인되면, 설정한 시간 후 점유된 0·1·2번 슬롯에 K+0·K+1·K+2를 한 번씩만 보냅니다. 다음 경기 시작 전에는 다시 강퇴하지 않습니다."
         )
-        auto_start_lay.addWidget(self.chk_spectator_lobby_post_match_kick, 10, 0, 1, 5)
+        auto_start_lay.addWidget(self.chk_spectator_lobby_post_match_kick, 10, 0, 1, 3)
+        self.sp_spectator_lobby_post_match_kick_delay = QDoubleSpinBox()
+        self.sp_spectator_lobby_post_match_kick_delay.setRange(0.0, 30.0)
+        self.sp_spectator_lobby_post_match_kick_delay.setDecimals(1)
+        self.sp_spectator_lobby_post_match_kick_delay.setSingleStep(0.5)
+        self.sp_spectator_lobby_post_match_kick_delay.setSuffix(" 초 후")
+        self.sp_spectator_lobby_post_match_kick_delay.setValue(
+            float(getattr(self.cfg, "spectator_lobby_post_match_kick_delay_sec", 5.0) or 0.0)
+        )
+        self.sp_spectator_lobby_post_match_kick_delay.setToolTip(
+            "로비 복귀가 확인된 뒤 강퇴 단축키를 보내기 전 대기 시간입니다. 기본값은 5초입니다."
+        )
+        auto_start_lay.addWidget(QLabel("강퇴 대기"), 10, 3)
+        auto_start_lay.addWidget(self.sp_spectator_lobby_post_match_kick_delay, 10, 4)
         auto_start_lay.setColumnStretch(1, 1)
 
         self.btn_spectator_lobby_auto_start_capture.clicked.connect(self._capture_spectator_lobby_auto_start_point)
@@ -8250,6 +8279,7 @@ class SettingsDialog(QDialog):
             (self.chk_spectator_lobby_auto_start_restore_cursor, "stateChanged"),
             (self.chk_spectator_lobby_auto_start_minimize_target, "stateChanged"),
             (self.chk_spectator_lobby_post_match_kick, "stateChanged"),
+            (self.sp_spectator_lobby_post_match_kick_delay, "valueChanged"),
             (self.sp_spectator_final_report_delay, "valueChanged"),
         ):
             getattr(widget, signal_name).connect(self._schedule_apply)
@@ -8486,13 +8516,13 @@ class SettingsDialog(QDialog):
         automation.addWidget(QLabel("저장 쿨타임(초)"), 5, 2)
         automation.addWidget(self.sp_obs_highlight_cooldown, 5, 3)
         automation.itemAtPosition(5, 2).widget().setToolTip(self.sp_obs_highlight_cooldown.toolTip())
-        event_rules_group = QGroupBox("공통 이벤트 기준 (현재 비교 모드)")
+        event_rules_group = QGroupBox("공통 이벤트 기준 (실시간 적용)")
         event_rules = QGridLayout(event_rules_group)
         self.chk_event_engine = QCheckBox("공통 판정 엔진 켜기")
         self.chk_event_engine.setChecked(bool(getattr(self.cfg, "event_engine_enabled", True)))
         self.chk_event_engine_shadow = QCheckBox("기존 방식과 비교만 하기")
-        self.chk_event_engine_shadow.setChecked(bool(getattr(self.cfg, "event_engine_shadow_mode", True)))
-        self.chk_event_engine_shadow.setToolTip("켜진 동안 방송 화면/저장 동작은 기존 방식 그대로입니다. 새 판정 결과는 진단에만 기록됩니다.")
+        self.chk_event_engine_shadow.setChecked(bool(getattr(self.cfg, "event_engine_shadow_mode", False)))
+        self.chk_event_engine_shadow.setToolTip("문제 진단용 롤백 옵션입니다. 켜면 방송 화면/저장은 기존 방식으로 되돌리고 새 판정은 진단에만 기록합니다.")
         self.sp_event_heavy_damage = QDoubleSpinBox(); self.sp_event_heavy_damage.setRange(0.0, 300.0); self.sp_event_heavy_damage.setSuffix(" dmg"); self.sp_event_heavy_damage.setValue(float(getattr(self.cfg, "event_heavy_damage", 50.0) or 0.0))
         self.sp_event_signature_damage = QDoubleSpinBox(); self.sp_event_signature_damage.setRange(0.0, 300.0); self.sp_event_signature_damage.setSuffix(" dmg"); self.sp_event_signature_damage.setValue(float(getattr(self.cfg, "event_signature_damage", 60.0) or 0.0))
         self.sp_event_counter_damage = QDoubleSpinBox(); self.sp_event_counter_damage.setRange(0.0, 300.0); self.sp_event_counter_damage.setSuffix(" dmg"); self.sp_event_counter_damage.setValue(float(getattr(self.cfg, "event_counter_min_damage", 40.0) or 0.0))
@@ -9476,7 +9506,7 @@ class SettingsDialog(QDialog):
         self.sp_obs_counter_damage_min.setValue(float(getattr(self.cfg, "obs_highlight_counter_damage_min", 30.0) or 0.0))
         self.sp_obs_highlight_cooldown.setValue(float(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0) or 8.0))
         self.chk_event_engine.setChecked(bool(getattr(self.cfg, "event_engine_enabled", True)))
-        self.chk_event_engine_shadow.setChecked(bool(getattr(self.cfg, "event_engine_shadow_mode", True)))
+        self.chk_event_engine_shadow.setChecked(bool(getattr(self.cfg, "event_engine_shadow_mode", False)))
         self.sp_event_heavy_damage.setValue(float(getattr(self.cfg, "event_heavy_damage", 50.0) or 0.0))
         self.sp_event_signature_damage.setValue(float(getattr(self.cfg, "event_signature_damage", 60.0) or 0.0))
         self.sp_event_counter_damage.setValue(float(getattr(self.cfg, "event_counter_min_damage", 40.0) or 0.0))
@@ -10607,7 +10637,8 @@ class SettingsDialog(QDialog):
                     "signature": "한 방으로 판을 바꾸는 힘",
                     "description": "강한 정타와 다운 위협으로 경기 흐름을 바꾸는 유형입니다.",
                     "confidence": 88,
-                    "tier": "지배",
+                    "level": 9,
+                    "tier": "레벨 9",
                     "chips": ["헤드 헌터", "훅 파이터", "다운 마무리"],
                     "secondaryLabel": "헤드 헌터",
                     "tertiaryLabel": "훅 파이터",
@@ -10617,7 +10648,8 @@ class SettingsDialog(QDialog):
                     "signature": "빈틈을 읽는 반격",
                     "description": "상대 공격 뒤 빈틈을 읽고 반격으로 흐름을 가져가는 유형입니다.",
                     "confidence": 84,
-                    "tier": "폭주",
+                    "level": 8,
+                    "tier": "레벨 8",
                     "chips": ["유도 반격형", "정밀 타격가", "효율형 파이터"],
                     "secondaryLabel": "유도 반격형",
                     "tertiaryLabel": "정밀 타격가",
@@ -18278,6 +18310,9 @@ class SettingsDialog(QDialog):
             self.cfg.spectator_lobby_post_match_kick_enabled = bool(
                 self.chk_spectator_lobby_post_match_kick.isChecked()
             )
+            self.cfg.spectator_lobby_post_match_kick_delay_sec = float(
+                self.sp_spectator_lobby_post_match_kick_delay.value()
+            )
             self.cfg.spectator_final_report_delay_sec = float(self.sp_spectator_final_report_delay.value())
         if hasattr(self, "le_spectatorlog_path"):
             self.cfg.spectatorlog_path = str(self.le_spectatorlog_path.text() or "").strip()
@@ -18332,6 +18367,10 @@ class SettingsDialog(QDialog):
             self.cfg.spectator_commentary_enabled = bool(self.chk_spectator_commentary.isChecked())
         if hasattr(self, "cmb_spectator_commentary_mode"):
             self.cfg.spectator_commentary_mode = str(self.cmb_spectator_commentary_mode.currentData() or "standard")
+        if hasattr(self, "chk_spectator_break_promo"):
+            self.cfg.spectator_break_promo_enabled = bool(self.chk_spectator_break_promo.isChecked())
+        if hasattr(self, "le_spectator_break_promo_text"):
+            self.cfg.spectator_break_promo_text = str(self.le_spectator_break_promo_text.text() or "").strip()
         if hasattr(self, "cmb_spectator_commentary_voice"):
             self.cfg.spectator_commentary_voice = str(self.cmb_spectator_commentary_voice.currentData() or "ko-KR-SunHiNeural")
         if hasattr(self, "cmb_spectator_caster_voice"):
@@ -18899,6 +18938,9 @@ class SettingsDialog(QDialog):
             self.chk_spectator_lobby_post_match_kick.setChecked(
                 bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False))
             )
+            self.sp_spectator_lobby_post_match_kick_delay.setValue(
+                float(getattr(self.cfg, "spectator_lobby_post_match_kick_delay_sec", 5.0) or 0.0)
+            )
             self.sp_spectator_final_report_delay.setValue(
                 float(getattr(self.cfg, "spectator_final_report_delay_sec", 10.0) or 0.0)
             )
@@ -18959,6 +19001,14 @@ class SettingsDialog(QDialog):
         if hasattr(self, "cmb_spectator_commentary_mode"):
             idx = self.cmb_spectator_commentary_mode.findData(str(getattr(self.cfg, "spectator_commentary_mode", "standard") or "standard"))
             self.cmb_spectator_commentary_mode.setCurrentIndex(idx if idx >= 0 else 1)
+        if hasattr(self, "chk_spectator_break_promo"):
+            self.chk_spectator_break_promo.setChecked(
+                bool(getattr(self.cfg, "spectator_break_promo_enabled", True))
+            )
+        if hasattr(self, "le_spectator_break_promo_text"):
+            self.le_spectator_break_promo_text.setText(
+                str(getattr(self.cfg, "spectator_break_promo_text", "구독과 좋아요 부탁드려요") or "")
+            )
         if hasattr(self, "cmb_spectator_commentary_voice"):
             idx = self.cmb_spectator_commentary_voice.findData(str(getattr(self.cfg, "spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural"))
             self.cmb_spectator_commentary_voice.setCurrentIndex(idx if idx >= 0 else 0)
@@ -19266,6 +19316,7 @@ class MainApp(QObject):
         self._lobby_auto_start_lock = threading.Lock()
         self._lobby_auto_start_last_at = 0.0
         self._lobby_post_match_kick_lock = threading.Lock()
+        self._lobby_post_match_kick_last_session_id = ""
 
         self.timer_win = QmlTimerWindow(self.cfg, self.cfg_path)
         try:
@@ -19689,6 +19740,58 @@ class MainApp(QObject):
         )
         logging.info("COMMENTARY_TTS_ROUND_SUMMARY_QUEUE role=%s mode=single delay_ms=%s chars=%s", role, delay_ms, len(text))
 
+    def _schedule_round_break_commentary_tts(
+        self,
+        text: str,
+        role: str = "analyst",
+        delay_ms: int = 0,
+    ) -> None:
+        """Queue the optional caster notice, then the round recap.
+
+        The recap is not scheduled until the notice actually starts.  This
+        keeps the order deterministic even when a round-end caster line is
+        still playing or Edge TTS takes a moment to prepare the notice.
+        """
+        summary_text = str(text or "").strip()
+        if not summary_text:
+            return
+        try:
+            base_delay_ms = max(0, int(delay_ms or 0))
+        except Exception:
+            base_delay_ms = 0
+        promo_enabled = bool(getattr(self.cfg, "spectator_break_promo_enabled", True))
+        promo_text = str(
+            getattr(self.cfg, "spectator_break_promo_text", "구독과 좋아요 부탁드려요") or ""
+        ).strip()
+        if not promo_enabled or not promo_text:
+            self._schedule_commentary_round_summary_tts(
+                summary_text, role, delay_ms=base_delay_ms
+            )
+            return
+
+        # The busy-channel retry in _schedule_commentary_followup_tts waits for
+        # any round-end callout.  Once the notice starts, the recap gets its own
+        # busy retry and therefore cannot overlap the caster.
+        def _queue_summary_after_promo_start() -> None:
+            gap_ms = self._estimate_commentary_sentence_ms(promo_text) + 350
+            self._schedule_commentary_round_summary_tts(
+                summary_text, role, delay_ms=max(1, int(gap_ms))
+            )
+
+        self._schedule_commentary_followup_tts(
+            promo_text,
+            "caster",
+            delay_ms=max(1, base_delay_ms),
+            retries=30,
+            allow_slow=True,
+            on_started=_queue_summary_after_promo_start,
+        )
+        logging.info(
+            "COMMENTARY_TTS_BREAK_PROMO_QUEUE delay_ms=%s chars=%s",
+            base_delay_ms,
+            len(promo_text),
+        )
+
     def _schedule_commentary_followup_tts(
         self,
         text: str,
@@ -19697,6 +19800,7 @@ class MainApp(QObject):
         retries: int = 5,
         allow_slow: bool = False,
         hide_round_report_on_complete: bool = False,
+        on_started: Optional[Callable[[], None]] = None,
     ):
         text = str(text or "").strip()
         if not text:
@@ -19730,6 +19834,11 @@ class MainApp(QObject):
                     allow_slow=allow_slow,
                     hide_round_report_on_complete=hide_round_report_on_complete,
                 )
+                if callable(on_started):
+                    try:
+                        on_started()
+                    except Exception:
+                        logging.exception("COMMENTARY_TTS_FOLLOWUP_STARTED_CALLBACK_FAIL")
             except Exception:
                 logging.exception("COMMENTARY_TTS_FOLLOWUP_FAIL")
 
@@ -20018,6 +20127,13 @@ class MainApp(QObject):
                 "막판 한 번의 정타가 인상에 남을 수 있습니다.",
                 "마지막 진입 타이밍을 보고 있습니다.",
             )
+            promo_text = str(
+                getattr(self.cfg, "spectator_break_promo_text", "구독과 좋아요 부탁드려요") or ""
+            ).strip()
+            if bool(getattr(self.cfg, "spectator_break_promo_enabled", True)) and promo_text:
+                # Put the configured break notice first so the first rest-time
+                # presentation does not wait on network TTS generation.
+                jobs.append(("caster", caster_voice, promo_text))
             for text in analyst_lines:
                 jobs.append(("analyst", analyst_voice, text))
             for text in caster_lines:
@@ -25517,7 +25633,7 @@ class MainApp(QObject):
         threading.Thread(target=_worker, daemon=True, name="match-end-spectator-window").start()
 
     def _schedule_lobby_post_match_kick(self, payload: Optional[dict] = None) -> None:
-        """Clear the prior bout's player slots only after lobby.txt confirms return."""
+        """Kick the prior bout's occupied lobby slots exactly once per match."""
         if not bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False)):
             logging.info("LOBBY_POST_MATCH_KICK_SKIP reason=disabled")
             return
@@ -25526,12 +25642,25 @@ class MainApp(QObject):
             logging.warning("LOBBY_POST_MATCH_KICK_SKIP reason=empty_window_title")
             return
         session_id = str(dict(payload or {}).get("matchSessionId") or "")
+        if session_id and session_id == str(
+            getattr(self, "_lobby_post_match_kick_last_session_id", "") or ""
+        ):
+            logging.info(
+                "LOBBY_POST_MATCH_KICK_SKIP reason=already_handled session=%s",
+                session_id,
+            )
+            return
         lock = getattr(self, "_lobby_post_match_kick_lock", None)
         if lock is None or not lock.acquire(blocking=False):
             logging.info("LOBBY_POST_MATCH_KICK_SKIP reason=busy")
             return
+        if session_id:
+            # The watcher already emits one lobby-return edge per match. Keep a
+            # second guard here so even an accidentally duplicated UI payload
+            # can never send another kick wave for the same bout.
+            self._lobby_post_match_kick_last_session_id = session_id
 
-        def _occupied_targets(lobby: dict, *, expected_names: Optional[Dict[int, str]] = None) -> Tuple[List[int], Dict[int, str]]:
+        def _occupied_targets(lobby: dict) -> Tuple[List[int], Dict[int, str]]:
             targets: List[int] = []
             names: Dict[int, str] = {}
             for raw_slot in list(dict(lobby or {}).get("slots") or []):
@@ -25542,12 +25671,6 @@ class MainApp(QObject):
                 if slot not in (0, 1, 2) or not bool(dict(raw_slot or {}).get("occupied", False)):
                     continue
                 name = str(dict(raw_slot or {}).get("name") or "").strip()
-                if expected_names is not None and name != str(expected_names.get(slot, "") or ""):
-                    logging.info(
-                        "LOBBY_POST_MATCH_KICK_RETRY_SKIP slot=%s reason=occupant_changed expected=%r current=%r",
-                        slot, expected_names.get(slot, ""), name,
-                    )
-                    continue
                 targets.append(slot)
                 names[slot] = name
             return targets, names
@@ -25574,8 +25697,15 @@ class MainApp(QObject):
 
         def _worker():
             try:
-                # Give TOTF2 time to finish returning and write a stable lobby.txt.
-                time.sleep(2.0)
+                # Let TOTF2 finish its return animation and settle lobby.txt
+                # before issuing the K+0/K+1/K+2 chords.  This is intentionally
+                # configurable because slower PCs can take longer to restore the
+                # host lobby after a results screen.
+                delay_sec = max(
+                    0.0,
+                    min(30.0, float(getattr(self.cfg, "spectator_lobby_post_match_kick_delay_sec", 5.0) or 0.0)),
+                )
+                time.sleep(delay_sec)
                 if not _same_match_session():
                     logging.info("LOBBY_POST_MATCH_KICK_SKIP reason=new_match_session")
                     return
@@ -25585,28 +25715,9 @@ class MainApp(QObject):
                     return
                 ok, detail = kick_lobby_slots_for_window_title(first_slots, title)
                 logging.info(
-                    "LOBBY_POST_MATCH_KICK_FIRST ok=%s slots=%s names=%s detail=%s",
-                    ok, first_slots, first_names, detail,
+                    "LOBBY_POST_MATCH_KICK_ONCE ok=%s delay=%.1fs slots=%s names=%s detail=%s",
+                    ok, delay_sec, first_slots, first_names, detail,
                 )
-                if not ok:
-                    return
-                # Retry only the same named occupants. This confirms a failed
-                # first command without accidentally kicking a newly joined player.
-                time.sleep(1.0)
-                if not _same_match_session():
-                    logging.info("LOBBY_POST_MATCH_KICK_RETRY_SKIP reason=new_match_session")
-                    return
-                retry_slots, _retry_names = _occupied_targets(
-                    _read_current_lobby(), expected_names=first_names
-                )
-                if retry_slots:
-                    retry_ok, retry_detail = kick_lobby_slots_for_window_title(retry_slots, title)
-                    logging.info(
-                        "LOBBY_POST_MATCH_KICK_RETRY ok=%s slots=%s detail=%s",
-                        retry_ok, retry_slots, retry_detail,
-                    )
-                else:
-                    logging.info("LOBBY_POST_MATCH_KICK_RETRY_SKIP reason=already_cleared_or_occupant_changed")
             except Exception:
                 logging.exception("LOBBY_POST_MATCH_KICK_FAIL")
             finally:
@@ -25615,7 +25726,11 @@ class MainApp(QObject):
                 except Exception:
                     pass
 
-        logging.info("LOBBY_POST_MATCH_KICK_SCHEDULE session=%s", session_id or "<unknown>")
+        logging.info(
+            "LOBBY_POST_MATCH_KICK_SCHEDULE session=%s delay=%.1fs",
+            session_id or "<unknown>",
+            max(0.0, min(30.0, float(getattr(self.cfg, "spectator_lobby_post_match_kick_delay_sec", 5.0) or 0.0))),
+        )
         threading.Thread(target=_worker, daemon=True, name="LobbyPostMatchKick").start()
 
     def apply_ui_update(self, d: dict):
@@ -25711,17 +25826,21 @@ class MainApp(QObject):
                 dict(item or {}) for item in list(d.get("spectator_hit_effect_events") or [])
                 if isinstance(item, dict) and str((item or {}).get("event_id") or "").strip()
             ]
+            central_combo_available = False
             for event in real_hit_events:
                 potm_candidate = self._consider_potm_event(event)
                 effect_kind = str(event.get("effect_kind") or "").lower().strip()
                 damage = float(event.get("damage", 0.0) or 0.0)
+                event_tags = {str(tag or "").lower().strip() for tag in list(event.get("event_tags") or [])}
+                central_live = bool(event_tags)
+                central_combo_available = central_combo_available or central_live
                 if effect_kind == "tko":
                     highlight_kind = "tko"
                 elif effect_kind in ("knockdown", "down", "ko"):
                     highlight_kind = "knockdown"
                 elif effect_kind == "stun":
                     highlight_kind = "stun"
-                elif bool(event.get("is_counter", False)):
+                elif "counter" in event_tags or bool(event.get("is_counter", False)):
                     highlight_kind = "counter"
                 else:
                     highlight_kind = "heavy"
@@ -25732,6 +25851,14 @@ class MainApp(QObject):
                     attacker_side=str(event.get("attacker_side") or ""),
                     potm_candidate=potm_candidate,
                 )
+                combo_hits = int(event.get("combo_hits", 0) or 0)
+                if central_live and combo_hits >= 2:
+                    self._maybe_save_obs_highlight(
+                        "combo",
+                        event_key=f"combo:{str(event.get('attacker_side') or '')}:{str(event.get('event_id') or '')}:{combo_hits}",
+                        combo_hits=combo_hits,
+                        attacker_side=str(event.get("attacker_side") or ""),
+                    )
             info = dict(d.get("spectator_log_info") or {}) if isinstance(d.get("spectator_log_info"), dict) else {}
             has_real_event = bool(real_hit_events)
             for side in ("blue", "red"):
@@ -25739,7 +25866,7 @@ class MainApp(QObject):
                 previous = str(self._obs_combo_text.get(side, "") or "")
                 self._obs_combo_text[side] = text
                 match = re.search(r"(\d+)\s*HIT\s*COMBO", text, re.IGNORECASE)
-                if has_real_event and text != previous and match:
+                if has_real_event and not central_combo_available and text != previous and match:
                     hits = int(match.group(1))
                     event_id = str(real_hit_events[-1].get("event_id") or "")
                     self._maybe_save_obs_highlight(
@@ -26047,7 +26174,9 @@ class MainApp(QObject):
                     except Exception:
                         delay_ms = 0
                     summary_role = str(d.get("commentary_tts_round_summary_role") or "analyst")
-                    self._schedule_commentary_round_summary_tts(summary_text, summary_role, delay_ms=delay_ms)
+                    self._schedule_round_break_commentary_tts(
+                        summary_text, summary_role, delay_ms=delay_ms
+                    )
             except Exception:
                 logging.exception("COMMENTARY_TTS_ROUND_SUMMARY_QUEUE_FAIL")
         if "commentary_tts_followup_text" in d:

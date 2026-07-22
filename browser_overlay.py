@@ -3163,25 +3163,36 @@ html,body{
 .vsBlue{left:100px!important}.vsRed{right:100px!important}
 .stagePanel{top:788px!important;width:653px!important;height:81px!important;}
 .stageName{font-size:35px!important;}
-/* Reserve every report row explicitly; no section may push the vitals outside. */
+/* Shared fighter-column layout.  Every semantic block owns one responsive row,
+   so the final and per-round reports use the panel height instead of stacking
+   fixed cards at the top and leaving a dead band below the vitals. */
 .rrFighter{
   display:grid!important;
-  grid-template-rows:156px 2px 78px minmax(0,1fr) 94px!important;
-  row-gap:10px!important;
+  grid-template-columns:minmax(0,1fr)!important;
+  grid-template-rows:minmax(146px,1.05fr) minmax(126px,.95fr) 2px minmax(74px,.56fr) minmax(270px,2.25fr) minmax(92px,.70fr)!important;
+  grid-template-areas:"player" "style" "accent" "highlight" "details" "vitals"!important;
+  row-gap:clamp(7px,.82vh,10px)!important;
   align-content:stretch!important;
 }
-.rrHead{height:156px!important;min-height:0!important;}
-.rrAccent{height:2px!important;margin:0!important;}
-.rrHighlight{height:78px!important;min-height:0!important;margin:0!important;}
-.rrHighlightCard{min-height:0!important;height:78px!important;}
-.rrSideStack{
-  display:grid!important;grid-template-rows:auto auto!important;align-content:start!important;
-  gap:8px!important;min-height:0!important;height:100%!important;overflow:hidden!important;
+.rrFighter.noFightStyle{
+  grid-template-rows:minmax(146px,1.05fr) 0 2px minmax(74px,.56fr) minmax(310px,2.55fr) minmax(92px,.70fr)!important;
 }
-.rrSection{flex:none!important;overflow:visible!important;}
+.rrHead{grid-area:player;height:auto!important;min-height:0!important;}
+.rrFightStyle{grid-area:style;}
+.rrAccent{grid-area:accent;height:2px!important;margin:0!important;}
+.rrHighlight{grid-area:highlight;height:auto!important;min-height:0!important;margin:0!important;}
+.rrHighlightCard{min-height:0!important;height:100%!important;}
+.rrSideStack{
+  grid-area:details;display:grid!important;grid-template-rows:repeat(2,minmax(0,1fr))!important;align-content:stretch!important;
+  gap:clamp(7px,.74vh,9px)!important;min-height:0!important;height:100%!important;overflow:hidden!important;
+}
+.rrSection{display:grid!important;grid-template-rows:auto minmax(0,1fr)!important;row-gap:clamp(6px,.65vh,8px)!important;flex:none!important;min-height:0!important;overflow:hidden!important;}
+.rrSectionTitle{align-self:center!important;margin:0!important;}
+.rrInfoGrid{min-height:0!important;height:100%!important;grid-auto-rows:minmax(0,1fr)!important;align-content:stretch!important;overflow:hidden!important;}
+.rrInfoCard{min-height:0!important;height:100%!important;padding-block:clamp(6px,.72vh,8px)!important;}
 .rrVitalsBox,.rrFighter.red .rrVitalsBox{
-  align-self:stretch!important;height:94px!important;min-height:94px!important;
-  margin:0!important;padding:10px 12px 0!important;overflow:visible!important;
+  grid-area:vitals;align-self:stretch!important;height:auto!important;min-height:0!important;
+  margin:0!important;padding:clamp(9px,1vh,12px) 12px 0!important;overflow:hidden!important;
 }
 .rrVitals{height:100%!important;justify-content:center!important;gap:10px!important;}
 .rrBar{height:30px!important;}
@@ -3261,14 +3272,13 @@ body.idle-highlight-active #root>.hud{opacity:0!important;visibility:hidden!impo
 .roundReport.hide{display:block!important;animation:rrBoardOut .34s cubic-bezier(.4,0,1,1) both!important}
 @keyframes rrBoardIn{0%{opacity:0;filter:blur(9px);transform:scale(1.024)}100%{opacity:1;filter:blur(0);transform:scale(1)}}
 @keyframes rrBoardOut{0%{opacity:1;filter:blur(0);transform:scale(1)}100%{opacity:0;filter:blur(7px);transform:scale(.987)}}
-/* === Final report: aligned style panel and consistent vital rows === */
-.rrFighter{grid-template-rows:156px 2px 78px minmax(0,1fr) 92px 94px!important;}
-.rrFightStyle{position:relative;display:grid!important;grid-template-columns:minmax(0,1fr)!important;grid-template-rows:42px 42px!important;gap:7px!important;align-self:stretch!important;margin:0!important;min-height:92px!important;padding:0 12px!important;overflow:hidden!important;box-sizing:border-box!important;}
-.rrFightStyle>b{display:flex!important;align-items:center!important;justify-content:center!important;min-width:0!important;padding:5px 12px!important;border:1px solid rgba(250,204,21,.72)!important;background:linear-gradient(90deg,rgba(90,55,4,.40),rgba(22,16,5,.66),rgba(90,55,4,.40))!important;color:#ffe38d!important;font-size:28px;line-height:1.2!important;font-weight:1000!important;letter-spacing:1.1px!important;text-shadow:0 2px 3px #000,0 0 12px rgba(250,204,21,.35)!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;}
-.rrFightStyle>b small{margin-left:10px!important;font-size:15px!important;letter-spacing:1.2px!important;color:#fff7cc!important;}
-.rrFightStyle>b.tier-burst{box-shadow:0 0 10px rgba(250,204,21,.20)!important}.rrFightStyle>b.tier-rage{border-color:rgba(251,146,60,.86)!important;box-shadow:0 0 14px rgba(251,146,60,.34)!important}.rrFightStyle>b.tier-dominate{border-color:rgba(250,204,21,.98)!important;box-shadow:0 0 17px rgba(250,204,21,.52),inset 0 0 12px rgba(250,204,21,.16)!important}
-.rrFightChips{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;grid-template-rows:repeat(2,1fr)!important;gap:5px 7px!important;min-width:0!important;}
-.rrFightChip{display:flex!important;align-items:center!important;justify-content:center!important;min-width:0!important;padding:3px 7px!important;border:1px solid rgba(255,255,255,.22)!important;background:rgba(10,17,30,.72)!important;color:#e5efff!important;font-size:17px!important;line-height:1!important;font-weight:950!important;letter-spacing:.25px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;text-shadow:0 1px 3px #000!important;}
+/* Fight style is a first-class report section, separate from the portrait/name. */
+.rrFightStyle{position:relative;display:grid!important;grid-template-columns:minmax(0,1fr)!important;grid-template-rows:minmax(48px,.58fr) minmax(74px,1fr)!important;gap:clamp(7px,.74vh,9px)!important;align-self:stretch!important;margin:0!important;min-width:0!important;min-height:0!important;height:100%!important;padding:0 clamp(7px,.55vw,11px)!important;overflow:hidden!important;box-sizing:border-box!important;}
+.rrFightStyle>b{display:flex!important;align-items:center!important;justify-content:center!important;min-width:0!important;padding:6px 12px!important;border:1px solid rgba(250,204,21,.72)!important;background:linear-gradient(90deg,rgba(90,55,4,.40),rgba(22,16,5,.66),rgba(90,55,4,.40))!important;color:#ffe38d!important;font-size:clamp(28px,1.65vw,33px)!important;line-height:1.15!important;font-weight:1000!important;letter-spacing:1.1px!important;text-shadow:0 2px 3px #000,0 0 12px rgba(250,204,21,.35)!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;}
+.rrFightStyle>b small{flex:0 0 auto;margin-left:10px!important;font-size:clamp(15px,.9vw,18px)!important;letter-spacing:1.2px!important;color:#fff7cc!important;}
+.rrFightStyle>b.tier-level-1,.rrFightStyle>b.tier-level-2,.rrFightStyle>b.tier-level-3{border-color:rgba(148,163,184,.82)!important;color:#dbeafe!important;box-shadow:0 0 8px rgba(96,165,250,.18)!important}.rrFightStyle>b.tier-level-4,.rrFightStyle>b.tier-level-5{border-color:rgba(96,165,250,.90)!important;color:#dbeafe!important;box-shadow:0 0 11px rgba(59,130,246,.32)!important}.rrFightStyle>b.tier-level-6,.rrFightStyle>b.tier-level-7{border-color:rgba(167,139,250,.92)!important;color:#ede9fe!important;box-shadow:0 0 14px rgba(139,92,246,.38)!important}.rrFightStyle>b.tier-level-8,.rrFightStyle>b.tier-level-9{border-color:rgba(251,146,60,.96)!important;color:#ffedd5!important;box-shadow:0 0 17px rgba(251,146,60,.46)!important}.rrFightStyle>b.tier-level-10{border-color:rgba(250,204,21,1)!important;color:#fff7cc!important;box-shadow:0 0 21px rgba(250,204,21,.64),inset 0 0 12px rgba(250,204,21,.18)!important}
+.rrFightChips{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;grid-template-rows:repeat(2,minmax(0,1fr))!important;gap:clamp(6px,.62vh,8px)!important;min-width:0!important;min-height:0!important;}
+.rrFightChip{display:flex!important;align-items:center!important;justify-content:center!important;min-width:0!important;min-height:0!important;padding:5px 9px!important;border:1px solid rgba(255,255,255,.22)!important;background:rgba(10,17,30,.72)!important;color:#e5efff!important;font-size:clamp(17px,1.02vw,20px)!important;line-height:1.12!important;font-weight:950!important;letter-spacing:.25px!important;text-align:center!important;white-space:normal!important;word-break:keep-all!important;overflow-wrap:anywhere!important;overflow:hidden!important;text-shadow:0 1px 3px #000!important;}
 .rrFightChip:nth-child(2n){border-color:rgba(251,113,133,.42)!important;background:rgba(94,17,36,.30)!important;color:#ffe2e7!important}.rrFightChip.empty{visibility:hidden!important;}
 .rrFighter.red .rrFightStyle{margin:0!important;justify-content:stretch!important;}
 .rrVital,.rrFighter.red .rrVital{grid-template-columns:96px minmax(180px,1fr) 62px!important;}
@@ -3616,14 +3626,19 @@ function rrV4Fighter(side,data,opp,s,winner,leader,isFinal,showResult){
   const styleSecondary=String(style.secondaryLabel||style.signature||'').trim();
   const styleTertiary=String(style.tertiaryLabel||style.tertiarySignature||'').trim();
   const styleChips=Array.isArray(style.chips)?style.chips.map(value=>String(value||'').trim()).filter(Boolean).slice(0,4):[styleSecondary,styleTertiary].filter(Boolean);
-  const styleTier=String(style.tier||'').trim();
-  const tierClass=styleTier==='\uC9C0\uBC30'?'tier-dominate':(styleTier==='\uD3ED\uC8FC'?'tier-rage':'tier-burst');
+  const rawLevel=Number(style.level);
+  const tierLevel=Number.isFinite(rawLevel)&&rawLevel>0?Math.max(1,Math.min(10,Math.round(rawLevel))):0;
+  const styleTier=String(style.tier|| (tierLevel?('레벨 '+tierLevel):'')).trim();
+  const tierClass=tierLevel?('tier-level-'+tierLevel):'tier-level-1';
   const styleDescription=String(style.description||'').trim();
-  const styleVisible=isFinal&&styleLabel&&styleLabel!=='분석 중';
+  // Round reports use the same style card format as the final report.  Keep
+  // the final report's old low-sample behavior, but show "분석 중" during a
+  // sparse round so every round still has an honest style status.
+  const styleVisible=!!styleLabel&&(isFinal?styleLabel!=='분석 중':true);
   const styleSlots=Array.from({length:4},(_,index)=>{const chip=styleChips[index]||'';return '<span class="rrFightChip'+(chip?'':' empty')+'">'+escapeHtml(chip||'\u00a0')+'</span>'}).join('');
   const styleHtml=styleVisible?'<div class="rrFightStyle" aria-label="경기 스타일" title="'+escapeHtml(styleDescription)+'"><b class="'+tierClass+'">'+escapeHtml(styleLabel)+(styleTier?'<small>'+escapeHtml(styleTier)+'</small>':'')+'</b><div class="rrFightChips">'+styleSlots+'</div></div>':'';
   const photo='<img class="rrPhoto'+(portrait?'':' empty')+'"'+(portrait?' src="'+escapeHtml(portrait)+'"':'')+'>';
-  const meta='<div class="rrPlayerMeta"><div class="rrNameLine">'+(red?resultBadge:'')+'<div class="rrNameBig">'+escapeHtml(name)+'</div>'+(!red?resultBadge:'')+'</div>'+styleHtml+'</div>';
+  const meta='<div class="rrPlayerMeta"><div class="rrNameLine">'+(red?resultBadge:'')+'<div class="rrNameBig">'+escapeHtml(name)+'</div>'+(!red?resultBadge:'')+'</div></div>';
   const comboHits=rrV4Num(data.maxComboHits),comboDamage=rrV4Num(data.maxComboDamage);
   const roundItems=[
     {key:'average',label:'\uD3C9\uADE0 \uC720\uD6A8\uD0C0 \uB370\uBBF8\uC9C0',value:(Number(data.averageDamage)||0).toFixed(1)},
@@ -3634,7 +3649,7 @@ function rrV4Fighter(side,data,opp,s,winner,leader,isFinal,showResult){
   const head=red?(meta+photo):(photo+meta);
   const highlight='<div class="rrHighlight"><div class="rrHighlightCard"><span class="rrHighlightLabel">\uCD5C\uACE0 \uB370\uBBF8\uC9C0 \uD380\uCE58</span><b class="rrHighlightValue">'+escapeHtml(rrV4TopPunch(data))+'</b></div><div class="rrHighlightCard rrHighlightDamage"><span class="rrHighlightLabel">'+(isFinal?'\uACBD\uAE30 \uB370\uBBF8\uC9C0':'\uB77C\uC6B4\uB4DC \uB370\uBBF8\uC9C0')+'</span><b class="rrHighlightValue">'+rrV4Num(data.damage)+'</b></div></div>';
   const weak=(data.weakHitAll||data.weakHitTop||[]).slice(0,4);
-  return '<section class="rrFighter '+side+'"><div class="rrHead">'+head+'</div><div class="rrAccent"></div>'+highlight+'<div class="rrSideStack"><div class="rrSection"><div class="rrSectionTitle">\uC8FC\uC694 \uB54C\uB9B0 \uAE09\uC18C \uBD80\uC704</div><div class="rrInfoGrid">'+rrV4InfoCards(weak,'weak')+'</div></div><div class="rrSection"><div class="rrSectionTitle">'+(isFinal?'\uACBD\uAE30 \uC218\uCE58':'\uB77C\uC6B4\uB4DC \uC218\uCE58')+'</div><div class="rrInfoGrid">'+rrV4InfoCards(roundItems,'metric')+'</div></div></div><div class="rrVitalsBox"><div class="rrVitals">'+rrV4Vitals(stamina,health,red)+'</div></div></section>';
+  return '<section class="rrFighter '+side+(styleVisible?'':' noFightStyle')+'"><div class="rrHead">'+head+'</div>'+styleHtml+'<div class="rrAccent"></div>'+highlight+'<div class="rrSideStack"><div class="rrSection"><div class="rrSectionTitle">\uC8FC\uC694 \uB54C\uB9B0 \uAE09\uC18C \uBD80\uC704</div><div class="rrInfoGrid">'+rrV4InfoCards(weak,'weak')+'</div></div><div class="rrSection"><div class="rrSectionTitle">'+(isFinal?'\uACBD\uAE30 \uC218\uCE58':'\uB77C\uC6B4\uB4DC \uC218\uCE58')+'</div><div class="rrInfoGrid">'+rrV4InfoCards(roundItems,'metric')+'</div></div></div><div class="rrVitalsBox"><div class="rrVitals">'+rrV4Vitals(stamina,health,red)+'</div></div></section>';
 }
 function rrV4Vitals(stamina,health,red){
   const staminaRow='<div class="rrVital rrStamina"><span class="rrVitalLabel">\uC2E4\uC81C\uCCB4\uB825</span><div class="rrBar"><div class="rrBarFill" style="--w:'+stamina+'%"></div></div><b>'+stamina+'%</b></div>';

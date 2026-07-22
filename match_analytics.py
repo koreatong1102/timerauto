@@ -263,12 +263,18 @@ def analyze_fight_style(
                 break
     chips = [str(item[1]) for item in supplements[:4]]
     score, label, signature, description, evidence = primary
-    tier = "지배" if score >= 88 else "폭주" if score >= 75 else "발동"
+    # A three-name tier made very different performances look identical on the
+    # report. Keep the style qualitative, but expose its strength on a stable
+    # ten-level scale. It is based on the style score, not raw damage alone.
+    level = max(1, min(10, int(round((float(score) - 50.0) / 5.0)) + 1))
+    tier = f"레벨 {level}"
     return {
         "label": label,
         "signature": signature,
         "description": description,
         "confidence": max(1, min(99, int(round(score)))),
+        "level": level,
+        "styleScore": round(float(score), 1),
         "evidence": evidence,
         "tier": tier,
         "chips": chips,

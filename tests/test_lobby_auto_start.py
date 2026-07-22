@@ -109,6 +109,7 @@ class LobbyAutoStartTests(unittest.TestCase):
         self.cfg.spectator_lobby_auto_start_restore_focus = False
         self.cfg.spectator_lobby_auto_start_minimize_target = True
         self.cfg.spectator_lobby_post_match_kick_enabled = True
+        self.cfg.spectator_lobby_post_match_kick_delay_sec = 5.5
         self.cfg.spectator_lobby_auto_start_reference_width = 1920
         self.cfg.spectator_lobby_auto_start_reference_height = 1080
         self.cfg.spectator_final_report_delay_sec = 7.5
@@ -145,6 +146,7 @@ class LobbyAutoStartTests(unittest.TestCase):
         self.assertFalse(loaded.spectator_lobby_auto_start_restore_focus)
         self.assertTrue(loaded.spectator_lobby_auto_start_minimize_target)
         self.assertTrue(loaded.spectator_lobby_post_match_kick_enabled)
+        self.assertEqual(loaded.spectator_lobby_post_match_kick_delay_sec, 5.5)
         self.assertEqual(loaded.spectator_lobby_auto_start_reference_width, 1920)
         self.assertEqual(loaded.spectator_lobby_auto_start_reference_height, 1080)
         self.assertEqual(loaded.spectator_final_report_delay_sec, 7.5)

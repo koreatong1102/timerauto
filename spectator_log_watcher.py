@@ -97,6 +97,7 @@ class SpectatorLogWatcher(QObject):
         self._image_mtimes: Dict[str, float] = {}
         self._portrait_locked: Dict[str, bool] = {"blue": False, "red": False}
         self._portrait_lock_name: Dict[str, str] = {"blue": "", "red": ""}
+        self._portrait_retry_due: Dict[str, float] = {"blue": 0.0, "red": 0.0}
         # Realtime performance guard: player/name/portrait data is static for a bout.
         # Emit it only on a new pair or new MatchIntro, not on every round_time/camera write.
         self._last_player_payload_pair: Tuple[str, str] = ("", "")
@@ -508,6 +509,7 @@ class SpectatorLogWatcher(QObject):
     def _reset_portrait_locks(self) -> None:
         self._portrait_locked = {"blue": False, "red": False}
         self._portrait_lock_name = {"blue": "", "red": ""}
+        self._portrait_retry_due = {"blue": 0.0, "red": 0.0}
         self._image_mtimes.pop("blue", None)
         self._image_mtimes.pop("red", None)
         self._last_signature = tuple()
@@ -520,6 +522,7 @@ class SpectatorLogWatcher(QObject):
         if name != self._portrait_lock_name.get(side, ""):
             self._portrait_lock_name[side] = name
             self._portrait_locked[side] = False
+            self._portrait_retry_due[side] = 0.0
             self._image_mtimes.pop(side, None)
             self._last_signature = tuple()
 
@@ -679,16 +682,31 @@ class SpectatorLogWatcher(QObject):
             # A watcher can attach in the middle of a bout. Establish a session
             # baseline so a winner.txt left by the previous bout is never used.
             self._begin_match_session(pair_key, winner_sig)
-        if sync_players and player_payload_due:
-            # Player/portrait files are stable during a bout and portrait.png is
-            # reused by filename. Read/update them only at bout start or player pair change.
+        portrait_retry_due = bool(
+            pair_ready
+            and any(
+                not bool(self._portrait_locked.get(side, False))
+                and time.time() >= float(self._portrait_retry_due.get(side, 0.0) or 0.0)
+                for side in ("blue", "red")
+            )
+        )
+        if sync_players and (player_payload_due or portrait_retry_due):
+            # portrait.png is reused by filename and can be written a little
+            # after name.txt on a new match. Clear the old portrait immediately,
+            # then retry only the still-unlocked side until the new file is valid.
+            # This prevents the next match from ever inheriting the prior
+            # fighter's face while avoiding a costly image read every poll.
             self._unlock_portrait_if_player_changed("blue", blue_name_raw)
             self._unlock_portrait_if_player_changed("red", red_name_raw)
             b_img_path = os.path.join(root, "blue", "portrait.png")
             r_img_path = os.path.join(root, "red", "portrait.png")
-            b_img_changed, b_img = self._read_image_if_changed("blue", b_img_path)
-            r_img_changed, r_img = self._read_image_if_changed("red", r_img_path)
-            if blue_name_raw:
+            b_img_changed, b_img = (False, None)
+            r_img_changed, r_img = (False, None)
+            if not self._portrait_locked.get("blue", False):
+                b_img_changed, b_img = self._read_image_if_changed("blue", b_img_path)
+            if not self._portrait_locked.get("red", False):
+                r_img_changed, r_img = self._read_image_if_changed("red", r_img_path)
+            if player_payload_due and blue_name_raw:
                 bid, bname, breg, bvalid = self._name_payload(blue_name_raw)
                 out.update({
                     "blue_player_id": bid,
@@ -696,7 +714,8 @@ class SpectatorLogWatcher(QObject):
                     "blue_player_registered": breg,
                     "blue_player_valid": bvalid,
                 })
-            if red_name_raw:
+                out["blue_player_img"] = None
+            if player_payload_due and red_name_raw:
                 rid, rname, rreg, rvalid = self._name_payload(red_name_raw)
                 out.update({
                     "red_player_id": rid,
@@ -704,12 +723,18 @@ class SpectatorLogWatcher(QObject):
                     "red_player_registered": rreg,
                     "red_player_valid": rvalid,
                 })
+                out["red_player_img"] = None
             if b_img_changed and b_img is not None and not self._portrait_locked.get("blue", False):
                 out["blue_player_img"] = b_img
                 self._portrait_locked["blue"] = True
+                self._portrait_retry_due["blue"] = 0.0
             if r_img_changed and r_img is not None and not self._portrait_locked.get("red", False):
                 out["red_player_img"] = r_img
                 self._portrait_locked["red"] = True
+                self._portrait_retry_due["red"] = 0.0
+            for side in ("blue", "red"):
+                if not self._portrait_locked.get(side, False):
+                    self._portrait_retry_due[side] = time.time() + 0.5
             self._last_player_payload_pair = pair_key
 
         try:
@@ -1149,6 +1174,24 @@ class SpectatorLogWatcher(QObject):
             (state in report_terminal_states and prev_round_state not in report_terminal_states)
             or knockout_count_fallback_due
         )
+        # If TimerAuto is launched after the game has already entered its
+        # terminal/cancel state, there is no state edge to arm the later lobby
+        # return. Arm that one existing result too, without replaying its old
+        # reports/commentary on startup.
+        baseline_cancel_result = bool(
+            baseline_read
+            and state == "cancel"
+            and self._read_official_scores(scores_path)
+            and self._read_winner_result(winner_path)
+        )
+        if baseline_read and pair_ready and (state in terminal_states or baseline_cancel_result):
+            self._post_match_lobby_return_armed = True
+            self._post_match_lobby_return_session_id = str(self._match_session_id or "")
+            logging.info(
+                "SPECTATORLOG_LOBBY_RETURN_ARM baseline_terminal state=%s session=%s",
+                state,
+                self._post_match_lobby_return_session_id or "<unknown>",
+            )
         if (
             terminal_report_start
             and not baseline_read
@@ -3085,6 +3128,23 @@ class SpectatorLogWatcher(QObject):
         except Exception:
             logging.exception("SPECTATORLOG_ROUND_REPORT_OFFICIAL_OVERRIDE_FAIL round=%s", r)
 
+        # The match card is cumulative, while scores.csv is authored as one
+        # completed row per round.  Do the same reconciliation here that we do
+        # for a single round card: when every completed round carries a value,
+        # the displayed total damage/KD must be the official sum, not a stale
+        # live event file (which is often truncated as the Results scene opens).
+        if force_final:
+            try:
+                rows = list(completed_score_rows or [])
+                if rows and all(row.get("red_damage_taken") not in (None, "") and row.get("blue_damage_taken") not in (None, "") for row in rows):
+                    stats["blue"]["damage"] = sum(float(row.get("red_damage_taken") or 0.0) for row in rows)
+                    stats["red"]["damage"] = sum(float(row.get("blue_damage_taken") or 0.0) for row in rows)
+                if rows and all(row.get("red_kds") not in (None, "") and row.get("blue_kds") not in (None, "") for row in rows):
+                    stats["blue"]["knockdowns_for"] = sum(int(float(row.get("red_kds") or 0)) for row in rows)
+                    stats["red"]["knockdowns_for"] = sum(int(float(row.get("blue_kds") or 0)) for row in rows)
+            except Exception:
+                logging.exception("SPECTATORLOG_FINAL_REPORT_OFFICIAL_TOTALS_FAIL rounds=%s", len(completed_score_rows or []))
+
         blue_damage = float(stats["blue"].get("damage", 0.0) or 0.0)
         red_damage = float(stats["red"].get("damage", 0.0) or 0.0)
         blue_landed = int(stats["blue"].get("landed", 0) or 0)
@@ -3521,16 +3581,29 @@ class SpectatorLogWatcher(QObject):
         metric_events: List[dict] = []
         try:
             if bool(is_final):
-                for round_stats in dict(self._scorecard_rounds or {}).values():
-                    metric_events.extend(dict(ev or {}) for ev in list(dict(round_stats or {}).get("events") or []))
+                round_source = self._report_scorecard_rounds()
+                for metric_round, round_stats in sorted(dict(round_source or {}).items()):
+                    for sequence, raw_event in enumerate(list(dict(round_stats or {}).get("event_rows") or [])):
+                        event = dict(raw_event or {})
+                        event["_report_round"] = int(metric_round or 0)
+                        event["_report_sequence"] = int(sequence)
+                        metric_events.append(event)
             else:
-                metric_events = [
-                    dict(ev or {}) for ev in list(
-                        dict((self._scorecard_rounds or {}).get(r) or {}).get("events") or matched_events
-                    )
-                ]
+                round_stats = dict(self._report_scorecard_rounds().get(r) or {})
+                source_events = list(round_stats.get("event_rows") or matched_events)
+                metric_events = []
+                for sequence, raw_event in enumerate(source_events):
+                    event = dict(raw_event or {})
+                    event["_report_round"] = int(r or 0)
+                    event["_report_sequence"] = int(sequence)
+                    metric_events.append(event)
         except Exception:
-            metric_events = [dict(ev or {}) for ev in matched_events]
+            metric_events = []
+            for sequence, raw_event in enumerate(matched_events):
+                event = dict(raw_event or {})
+                event["_report_round"] = int(r or 0)
+                event["_report_sequence"] = int(sequence)
+                metric_events.append(event)
 
         def _impact_metrics(side: str) -> Dict[str, Any]:
             side_events = [
@@ -3544,7 +3617,16 @@ class SpectatorLogWatcher(QObject):
             combo_hits = 0
             combo_damage = 0.0
             last_time: Optional[float] = None
+            active_round: Optional[int] = None
             for ev in metric_events:
+                event_round = int((ev or {}).get("_report_round", r) or r or 0)
+                if active_round is not None and event_round != active_round:
+                    # A round break is always a combo break, regardless of the
+                    # game clock format (some builds reset that clock each round).
+                    combo_hits = 0
+                    combo_damage = 0.0
+                    last_time = None
+                active_round = event_round
                 attacker = str((ev or {}).get("attacker_side") or "").lower()
                 damage = max(0.0, float((ev or {}).get("damage", 0.0) or 0.0))
                 if attacker != side:
@@ -3652,7 +3734,11 @@ class SpectatorLogWatcher(QObject):
         for side in sides:
             report[side]["defenseMetrics"] = _defense_metrics(side)
             report[side]["roundTrend"] = _round_trend(side) if bool(is_final) else {}
-        if bool(is_final) and bool(getattr(self.cfg, "spectator_fight_style_enabled", True)):
+        # Analyze the same payload that is shown on screen.  During a break the
+        # payload contains only that round; the terminal payload retains the
+        # existing full-match aggregation and therefore produces the exact same
+        # final style as before.
+        if bool(getattr(self.cfg, "spectator_fight_style_enabled", True)):
             min_attempts = max(
                 1, min(500, int(getattr(self.cfg, "spectator_fight_style_min_attempts", 20) or 20))
             )
@@ -3666,7 +3752,9 @@ class SpectatorLogWatcher(QObject):
                 report["red"], report["blue"], min_attempts=min_attempts, min_landed=min_landed
             )
             logging.info(
-                "SPECTATORLOG_FIGHT_STYLE blue=%s/%s red=%s/%s",
+                "SPECTATORLOG_FIGHT_STYLE round=%s final=%s blue=%s/%s red=%s/%s",
+                r,
+                bool(is_final),
                 report["blue"]["fightStyle"].get("label"),
                 ",".join(report["blue"]["fightStyle"].get("chips") or []),
                 report["red"]["fightStyle"].get("label"),
@@ -5620,6 +5708,9 @@ class SpectatorLogWatcher(QObject):
             "weak_received": {"blue": {}, "red": {}},
             "weak": {},
             "events": 0,
+            # Numeric events remains the compatibility counter above.  Keep the
+            # actual matched rows separately for combo/impact metrics.
+            "event_rows": [],
             "gauge_start": {},
             "gauge_end": {},
         }
@@ -5680,6 +5771,7 @@ class SpectatorLogWatcher(QObject):
                 damage = max(0.0, float(event.get("damage", 0.0) or 0.0))
                 landed = damage >= REPORT_LANDED_MIN_DAMAGE
                 stats["events"] += 1
+                stats["event_rows"].append(event)
                 stats["dealt"][attacker] += damage
                 if not landed:
                     continue
@@ -5970,6 +6062,7 @@ class SpectatorLogWatcher(QObject):
         ):
             stats[field] = matched_stats[field]
         stats["events"] = int(matched_stats.get("events", 0) or 0)
+        stats["event_rows"] = [dict(event or {}) for event in round_events]
         self._scorecard_thrown_last_cumulative = current
         self._scorecard_remember_pair()
 
@@ -6031,6 +6124,7 @@ class SpectatorLogWatcher(QObject):
             except Exception:
                 dmg = 0.0
             stats["events"] = int(stats.get("events", 0) or 0) + 1
+            stats.setdefault("event_rows", []).append(dict(ev or {}))
             stats["dealt"][attacker] = float(stats["dealt"].get(attacker, 0.0) or 0.0) + dmg
             is_report_landed = dmg >= REPORT_LANDED_MIN_DAMAGE
             if is_report_landed:
@@ -6093,6 +6187,7 @@ class SpectatorLogWatcher(QObject):
             except Exception:
                 dmg = 0.0
             stats["events"] += 1
+            stats.setdefault("event_rows", []).append(dict(ev or {}))
             stats["dealt"][attacker] += dmg
             is_report_landed = dmg >= REPORT_LANDED_MIN_DAMAGE
             if is_report_landed:
@@ -6549,6 +6644,16 @@ class SpectatorLogWatcher(QObject):
                     ev["is_counter"] = bool(self._is_counter_event(ev))
                 except Exception:
                     logging.debug("SPECTATORLOG_EVENT_ANNOTATE_FAIL", exc_info=True)
+            # Classify before the low-latency hit-effect emit.  Previously the
+            # shared engine ran only after that emit, so OBS highlight/POTM
+            # consumers saw a legacy event first and deduplicated the later
+            # authoritative one.  The attached result survives the fast-to-full
+            # handoff and is never classified twice.
+            if bool(getattr(self.cfg, "event_engine_enabled", True)):
+                try:
+                    self._attach_central_event_classification(new_events)
+                except Exception:
+                    logging.exception("EVENT_ENGINE_EARLY_CLASSIFY_FAIL")
             self._last_damage_seen_at = time.time()
         if not was_damage_initialized:
             self._damage_total_offset["blue"] = 0.0
@@ -6614,6 +6719,10 @@ class SpectatorLogWatcher(QObject):
                         "event_time": hit_time,
                         "hitfx_key": hitfx_key,
                         "event_id": event_id,
+                        "event_primary": str(ev.get("event_primary") or ""),
+                        "event_tags": list(ev.get("event_tags") or []),
+                        "combo_hits": int(ev.get("combo_hits", 0) or 0),
+                        "combo_damage": round(float(ev.get("combo_damage", 0.0) or 0.0), 2),
                         "hitfx_detect_perf_ms": time.perf_counter() * 1000.0,
                         "hitfx_detect_wall_ms": time.time() * 1000.0,
                     })
@@ -6675,8 +6784,8 @@ class SpectatorLogWatcher(QObject):
         # continue to receive their original raw event fields.
         if new_events and bool(getattr(self.cfg, "event_engine_enabled", True)):
             try:
-                central_events = self._event_engine.classify_many(new_events)
-                if bool(getattr(self.cfg, "event_engine_shadow_mode", True)):
+                central_events = self._attach_central_event_classification(new_events)
+                if bool(getattr(self.cfg, "event_engine_shadow_mode", False)):
                     out["spectator_event_engine_shadow"] = central_events
                     for central in central_events:
                         tags = list(central.get("tags") or [])
@@ -6705,6 +6814,8 @@ class SpectatorLogWatcher(QObject):
                         if central:
                             hitfx["event_primary"] = str(central.get("primary") or "hit")
                             hitfx["event_tags"] = list(central.get("tags") or [])
+                            hitfx["combo_hits"] = int(central.get("combo_hits", 0) or 0)
+                            hitfx["combo_damage"] = float(central.get("combo_damage", 0.0) or 0.0)
             except Exception:
                 logging.exception("EVENT_ENGINE_SHADOW_FAIL")
 
@@ -6721,7 +6832,7 @@ class SpectatorLogWatcher(QObject):
             self._record_scorecard_events(new_events, active_round_no, path, punishment_snapshot)
         except Exception:
             logging.exception("SPECTATORLOG_SCORECARD_RECORD_FAIL")
-        if bool(getattr(self.cfg, "event_engine_enabled", True)) and not bool(getattr(self.cfg, "event_engine_shadow_mode", True)):
+        if bool(getattr(self.cfg, "event_engine_enabled", True)) and not bool(getattr(self.cfg, "event_engine_shadow_mode", False)):
             combo_info = self._build_combo_update_from_engine(new_events)
         else:
             combo_info = self._build_combo_update(new_events)
@@ -6774,6 +6885,49 @@ class SpectatorLogWatcher(QObject):
                 ",".join([f"{e.get('side')}:{e.get('kind')}" for e in effect_events]),
             )
         return out
+
+    def _attach_central_event_classification(self, rows: List[dict]) -> List[dict]:
+        """Attach one canonical classification to each new damage row.
+
+        In comparison mode the private result is retained for diagnostics but
+        no live-facing fields are changed.  In live mode consumers receive the
+        same public tags, primary kind, counter verdict, and combo totals.
+        Existing classifications are reused so the fast watcher pass cannot
+        advance combo state a second time during its full-pass handoff.
+        """
+        normalized = [row for row in list(rows or []) if isinstance(row, dict)]
+        if not normalized or getattr(self, "_event_engine", None) is None:
+            return []
+        missing = [row for row in normalized if not isinstance(row.get("_central_event"), dict)]
+        if missing:
+            classified = self._event_engine.classify_many(missing)
+            by_id = {
+                str(item.get("event_id") or ""): dict(item or {})
+                for item in classified
+                if str(item.get("event_id") or "")
+            }
+            for index, row in enumerate(missing):
+                event_id = str(row.get("event_id") or "")
+                central = by_id.get(event_id)
+                if central is None and index < len(classified):
+                    central = dict(classified[index] or {})
+                if central:
+                    row["_central_event"] = dict(central)
+
+        live = not bool(getattr(self.cfg, "event_engine_shadow_mode", False))
+        result: List[dict] = []
+        for row in normalized:
+            central = dict(row.get("_central_event") or {})
+            if not central:
+                continue
+            result.append(central)
+            if live:
+                row["event_primary"] = str(central.get("primary") or "hit")
+                row["event_tags"] = list(central.get("tags") or [])
+                row["combo_hits"] = int(central.get("combo_hits", 0) or 0)
+                row["combo_damage"] = float(central.get("combo_damage", 0.0) or 0.0)
+                row["is_counter"] = bool(central.get("counter", False))
+        return result
 
     def _build_combo_update_from_engine(self, new_events: List[dict]) -> dict:
         """Render combo/counter HUD from the shared engine's classification.

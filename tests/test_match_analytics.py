@@ -38,7 +38,9 @@ class MatchAnalyticsTests(unittest.TestCase):
         labels = [style.get("label")] + list(style.get("chips") or [])
         self.assertLessEqual(len(labels), 5)
         self.assertEqual(len(set(labels)), len(labels))
-        self.assertIn(style.get("tier"), {"발동", "폭주", "지배"})
+        self.assertRegex(str(style.get("tier") or ""), r"^레벨 (?:10|[1-9])$")
+        self.assertGreaterEqual(int(style.get("level") or 0), 1)
+        self.assertLessEqual(int(style.get("level") or 0), 10)
         self.assertIn("헤드 헌터", style.get("chips") or [])
 
     def test_style_can_add_one_defensive_chip_from_inferred_events(self):
@@ -62,6 +64,24 @@ class MatchAnalyticsTests(unittest.TestCase):
 
         self.assertEqual(style["label"], "카운터 마스터")
         self.assertIn("유도 반격형", style.get("chips") or [])
+
+    def test_style_level_distinguishes_a_plain_sample_from_an_elite_counter_sample(self):
+        plain = analyze_fight_style(
+            {"thrown": 24, "landed": 11, "accuracy": 46, "averageDamage": 18},
+            {"thrown": 24, "landed": 10},
+            min_attempts=20,
+            min_landed=10,
+        )
+        elite = analyze_fight_style(
+            {"thrown": 72, "landed": 35, "accuracy": 62, "averageDamage": 31,
+             "counterHits": 12, "maxComboHits": 5},
+            {"thrown": 60, "landed": 24},
+            min_attempts=20,
+            min_landed=10,
+        )
+
+        self.assertLess(int(plain["level"]), int(elite["level"]))
+        self.assertEqual(elite["label"], "카운터 마스터")
 
     def test_direct_tko_event_resolves_attacker_as_winner(self):
         stoppage = detect_stoppage([

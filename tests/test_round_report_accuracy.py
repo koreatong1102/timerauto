@@ -2,6 +2,7 @@ from types import SimpleNamespace
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from spectator_log_watcher import SpectatorLogWatcher
 
@@ -342,6 +343,60 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertTrue(update.get("spectator_round_report_hide"))
         self.assertEqual(update.get("commentary_tts_stop_roles"), ["caster", "analyst"])
 
+    def test_new_match_clears_a_stale_portrait_before_the_new_file_is_ready(self):
+        self.watcher.cfg.players = {}
+        self.watcher._portrait_locked["blue"] = True
+        self.watcher._portrait_lock_name["blue"] = "PREVIOUS_BLUE"
+        self.watcher._last_player_payload_pair = ("PREVIOUS_BLUE", "PREVIOUS_RED")
+        self.watcher._last_round_state = "fight"
+        with tempfile.TemporaryDirectory() as root:
+            self.watcher.cfg.spectator_match_archive_dir = os.path.join(root, "archive")
+            for folder in ("blue", "red", "match"):
+                os.makedirs(os.path.join(root, folder), exist_ok=True)
+            for path, value in (
+                (os.path.join(root, "blue", "name.txt"), "NEXT_BLUE"),
+                (os.path.join(root, "red", "name.txt"), "NEXT_RED"),
+                (os.path.join(root, "match", "round_number.txt"), "1"),
+                (os.path.join(root, "match", "round_total.txt"), "3"),
+                (os.path.join(root, "match", "round_time.txt"), "180"),
+                (os.path.join(root, "match", "round_state.txt"), "MatchIntro"),
+            ):
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(value)
+            with patch.object(self.watcher, "_read_image_if_changed", return_value=(False, None)):
+                update = self.watcher._read_update(root)
+
+        self.assertIsNone(update.get("blue_player_img"))
+        self.assertEqual(update.get("blue_name"), "NEXT_BLUE")
+        self.assertFalse(self.watcher._portrait_locked["blue"])
+
+    def test_starting_at_completed_cancel_still_arms_one_lobby_kick(self):
+        """Launching TimerAuto on the result screen must not lose the next lobby edge."""
+        self.watcher.cfg.players = {}
+        with tempfile.TemporaryDirectory() as root:
+            self.watcher.cfg.spectator_match_archive_dir = os.path.join(root, "archive")
+            for folder in ("blue", "red", "match"):
+                os.makedirs(os.path.join(root, folder), exist_ok=True)
+            for path, value in (
+                (os.path.join(root, "blue", "name.txt"), "BLUE"),
+                (os.path.join(root, "red", "name.txt"), "RED"),
+                (os.path.join(root, "match", "round_number.txt"), "3"),
+                (os.path.join(root, "match", "round_total.txt"), "3"),
+                (os.path.join(root, "match", "round_time.txt"), "0"),
+                (os.path.join(root, "match", "round_state.txt"), "Cancel"),
+                (os.path.join(root, "match", "scores.csv"), "round,blue_score,red_score\n1,10,9\n"),
+                (os.path.join(root, "match", "winner.txt"), "blue\tBLUE"),
+            ):
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(value)
+            self.watcher._read_update(root)
+            self.assertTrue(self.watcher._post_match_lobby_return_armed)
+            with open(os.path.join(root, "lobby.txt"), "w", encoding="utf-8") as stream:
+                stream.write("slot_0: type=Spectator occupied=true name=HOST ready=false\n")
+            update = self.watcher._read_update(root)
+
+        self.assertIn("spectator_lobby_returned", update)
+
     def test_unmatched_tko_event_still_resolves_correct_winner(self):
         watcher = SpectatorLogWatcher(SimpleNamespace(
             spectator_fight_style_enabled=True,
@@ -379,6 +434,27 @@ class RoundReportAccuracyTests(unittest.TestCase):
             report = self.watcher._build_round_report_payload(damage_path, 1, ("BLUE", "RED"))
 
         self.assertEqual(report["blue"]["maxPunch"]["damage"], 82.0)
+
+    def test_break_report_analyzes_style_from_that_round_payload(self):
+        watcher = SpectatorLogWatcher(SimpleNamespace(
+            spectator_fight_style_enabled=True,
+            spectator_fight_style_min_attempts=1,
+            spectator_fight_style_min_landed=1,
+        ))
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\t36\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tJab\tHit\tChin\n")
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("100.1\tblue\tleft\tJab\n")
+            watcher._last_round_state = "break"
+            report = watcher._build_round_report_payload(
+                damage_path, 1, ("BLUE", "RED"), force_final=False
+            )
+
+        self.assertFalse(report["isFinal"])
+        self.assertIn("fightStyle", report["blue"])
+        self.assertIn("fightStyle", report["red"])
 
     def test_live_sp_throw_reader_consumes_only_appended_rows(self):
         with tempfile.TemporaryDirectory() as root:
@@ -446,6 +522,48 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertEqual(report["blue"]["powerHits55"], 1)
         self.assertEqual(report["blue"]["maxComboHits"], 2)
         self.assertEqual(report["blue"]["maxComboDamage"], 80)
+
+    def test_final_report_uses_all_round_event_rows_without_cross_round_combo(self):
+        """A final card must retain prior-round combos, but a break resets them."""
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\t40\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tJab\tHit\tChin\n")
+                stream.write("99.5\t45\t1.0\tred\tright\t.4\t.4\t0\t0\t0\tCross\tHit\tChin\n")
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("100.0\tblue\tleft\tJab\n99.5\tblue\tright\tCross\n")
+            with open(os.path.join(root, "scores.csv"), "w", encoding="utf-8") as stream:
+                stream.write("round,blue_score,red_score,blue_total,red_total,blue_damage_taken,red_damage_taken,blue_kds,red_kds\n")
+                stream.write("1,10,9,10,9,700,1000,0,1\n")
+                stream.write("2,9,10,19,19,1300,900,1,2\n")
+            with open(os.path.join(root, "winner.txt"), "w", encoding="utf-8") as stream:
+                stream.write("blue\tBLUE")
+
+            round_one = self.watcher._new_scorecard_round(1)
+            round_one["events"] = 2
+            round_one["event_rows"] = [
+                {"attacker_side": "blue", "receiver_side": "red", "punch": "Jab", "damage": 30.0, "time": 100.0},
+                {"attacker_side": "blue", "receiver_side": "red", "punch": "Cross", "damage": 35.0, "time": 99.5},
+            ]
+            round_two = self.watcher._new_scorecard_round(2)
+            round_two["events"] = 2
+            round_two["event_rows"] = [
+                {"attacker_side": "blue", "receiver_side": "red", "punch": "Jab", "damage": 40.0, "time": 100.0},
+                {"attacker_side": "blue", "receiver_side": "red", "punch": "Cross", "damage": 45.0, "time": 99.5},
+            ]
+            self.watcher._scorecard_rounds = {1: round_one, 2: round_two}
+            self.watcher._last_round_state = "results"
+            report = self.watcher._build_round_report_payload(
+                damage_path, 2, ("BLUE", "RED"), force_final=True
+            )
+
+        self.assertTrue(report["isFinal"])
+        self.assertEqual(report["blue"]["maxComboHits"], 2)
+        self.assertEqual(report["blue"]["maxComboDamage"], 85)
+        self.assertEqual(report["blue"]["damage"], 1900)
+        self.assertEqual(report["red"]["damage"], 2000)
+        self.assertEqual(report["blue"]["knockdowns"], 3)
+        self.assertEqual(report["red"]["knockdowns"], 1)
 
     def test_terminal_result_without_live_events_still_builds_report(self):
         """A resignation may clear the live event files before Results arrives."""

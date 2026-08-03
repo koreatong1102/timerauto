@@ -23438,26 +23438,16 @@ class MainApp(QObject):
         self._sync_koth_streak_to_overlay()
 
     def on_pixel_rule(self, name: str):
-        # Old installations can still carry the pre-SpectatorLog lobby-return
-        # automation.  It clicks a fixed screen coordinate, waits, then sends
-        # K1/K2.  Running that rule beside the log-driven F5 start and lobby
-        # kick changes focus/clicks the spectator UI at exactly the wrong
-        # moment.  The log-driven workflow supersedes this legacy rule.
+        # Old installations can still carry a combined lobby recovery rule:
+        # click the recovery button, wait, then send K1/K2.  The click is still
+        # required when the spectator tool falls back to its main menu; only
+        # the K-slot cleanup is superseded by the log-driven lobby kick.
         resolved_name = str(name or "")
         for rule in self.cfg.pixel_rules or []:
             rid = str(rule.get("id") or "")
             if rid and rid == resolved_name:
                 resolved_name = str(rule.get("name") or resolved_name)
                 break
-        if (
-            bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False))
-            and resolved_name.strip() in {"로비복귀", "레드승리로비복귀"}
-        ):
-            logging.info(
-                "ACTION_SKIP key=pixel:%s reason=legacy_lobby_action_superseded",
-                resolved_name,
-            )
-            return
         actions = self.cfg.actions.get(f"pixel:{name}", [])
         key = f"pixel:{name}"
         if not actions:
@@ -23480,6 +23470,32 @@ class MainApp(QObject):
             if rid:
                 actions = self.cfg.actions.get(f"pixel_id:{rid}", [])
                 key = f"pixel_id:{rid}"
+        if (
+            actions
+            and bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False))
+            and resolved_name.strip() in {"로비복귀", "레드승리로비복귀"}
+        ):
+            def _is_legacy_kick_action(action: dict) -> bool:
+                if str((action or {}).get("type", "")).lower() != "hotkey":
+                    return False
+                keys = [str(k or "").strip().lower() for k in ((action or {}).get("keys") or [])]
+                compact = "".join(keys).replace("+", "")
+                return compact in {"k0", "k1", "k2"}
+
+            original_count = len(actions)
+            actions = [dict(action) for action in actions if not _is_legacy_kick_action(action)]
+            # A delay placed immediately before the removed K-slot actions is
+            # now just an orphaned wait.  Do not block later screen actions.
+            while actions and str((actions[-1] or {}).get("type", "")).lower() == "delay_ms":
+                actions.pop()
+            removed_count = original_count - len(actions)
+            if removed_count:
+                logging.info(
+                    "LEGACY_LOBBY_KICK_ACTIONS_FILTERED key=%s removed=%s remaining=%s",
+                    key,
+                    removed_count,
+                    len(actions),
+                )
         if actions:
             self._enqueue_action_run(key, actions)
 

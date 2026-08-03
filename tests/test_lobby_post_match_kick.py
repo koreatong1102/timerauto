@@ -191,7 +191,7 @@ class LobbyPostMatchKickTests(unittest.TestCase):
 
 
 class LobbyWindowInputSafetyTests(unittest.TestCase):
-    def test_log_driven_kick_suppresses_legacy_lobby_pixel_actions(self):
+    def test_log_driven_kick_preserves_recovery_click_and_filters_legacy_kicks(self):
         app = timerauto.MainApp.__new__(timerauto.MainApp)
         app.cfg = SimpleNamespace(
             spectator_lobby_post_match_kick_enabled=True,
@@ -204,7 +204,9 @@ class LobbyWindowInputSafetyTests(unittest.TestCase):
             actions={
                 "pixel_id:pixel_legacy_lobby": [
                     {"type": "mouse_click", "x": 10, "y": 20},
+                    {"type": "delay_ms", "ms": 10000},
                     {"type": "hotkey", "keys": ["k1"]},
+                    {"type": "hotkey", "keys": ["k", "2"]},
                 ]
             },
         )
@@ -212,7 +214,35 @@ class LobbyWindowInputSafetyTests(unittest.TestCase):
 
         app.on_pixel_rule("pixel_legacy_lobby")
 
-        app._enqueue_action_run.assert_not_called()
+        app._enqueue_action_run.assert_called_once_with(
+            "pixel_id:pixel_legacy_lobby",
+            [{"type": "mouse_click", "x": 10, "y": 20}],
+        )
+
+    def test_log_driven_kick_does_not_suppress_recovery_only_rule(self):
+        app = timerauto.MainApp.__new__(timerauto.MainApp)
+        app.cfg = SimpleNamespace(
+            spectator_lobby_post_match_kick_enabled=True,
+            pixel_rules=[
+                {
+                    "id": "pixel_red_return",
+                    "name": "레드승리로비복귀",
+                }
+            ],
+            actions={
+                "pixel_id:pixel_red_return": [
+                    {"type": "mouse_click", "x": 30, "y": 40},
+                ]
+            },
+        )
+        app._enqueue_action_run = Mock()
+
+        app.on_pixel_rule("pixel_red_return")
+
+        app._enqueue_action_run.assert_called_once_with(
+            "pixel_id:pixel_red_return",
+            [{"type": "mouse_click", "x": 30, "y": 40}],
+        )
 
     def test_f5_is_not_sent_when_spectator_window_activation_fails(self):
         fake_user32 = SimpleNamespace(

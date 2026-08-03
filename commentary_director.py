@@ -29,11 +29,11 @@ class CommentaryDecision:
 
 
 class CommentaryDirector:
-    """Small, deterministic match-memory layer for broadcast commentary.
+    """Match-memory and final arbitration for live commentary.
 
-    The director never reads files, performs TTS, or touches the browser path.
-    It only remembers lightweight facts and selects one line from facts that
-    were already produced by the spectator watcher.
+    This class deliberately has no TTS or file I/O.  Its cooldown state is
+    updated only after a candidate wins final arbitration, so a line that was
+    merely considered never silences a later, real broadcast call.
     """
 
     def __init__(self) -> None:
@@ -48,6 +48,7 @@ class CommentaryDirector:
         self._last_live_at = 0.0
         self._last_category_at: Dict[str, float] = {}
         self._last_key_at: Dict[str, float] = {}
+        self._last_text_at: Dict[str, float] = {}
 
     @staticmethod
     def _side(value: Any) -> str:
@@ -101,14 +102,17 @@ class CommentaryDirector:
         events: Iterable[dict],
         names: Optional[Dict[str, str]] = None,
     ) -> Optional[CommentaryCandidate]:
-        """Remember new hits and return one optional flow-level observation."""
+        """Remember hits and offer one contextual line, if it is meaningful."""
         state = self._ensure_round(round_no)
         names = dict(names or {})
         contextual: List[CommentaryCandidate] = []
 
         for raw in events or []:
             event = dict(raw or {})
-            key = self._event_key(event)
+            # Countdown timestamps can repeat in every round.  Without the
+            # round number, an otherwise identical hit in a later round was
+            # incorrectly treated as an already-seen event.
+            key = (int(self._active_round or 1),) + self._event_key(event)
             if key in self._seen_events:
                 continue
             self._seen_events.add(key)
@@ -120,19 +124,26 @@ class CommentaryDirector:
                 continue
 
             previous = self._recent_exchange[-1] if self._recent_exchange else None
-            observed_at = time.monotonic()
             item = {
                 "attacker": attacker,
                 "receiver": receiver,
                 "damage": damage,
                 "game_time": self._number(event.get("time")),
-                "observed_at": observed_at,
+                "observed_at": time.monotonic(),
             }
             self._recent_exchange.append(item)
             state["damage"][attacker] += damage
             if damage >= 10.0:
                 state["landed"][attacker] += 1
-            if damage >= 45.0:
+            event_tags = {
+                str(tag or "").lower().strip()
+                for tag in list(event.get("event_tags") or [])
+            }
+            if (
+                bool(event_tags.intersection({"heavy", "signature", "counter_strong"}))
+                if event_tags
+                else damage >= 45.0
+            ):
                 state["big_hits"][attacker] += 1
             weak = str(event.get("weak_point") or "").strip()
             if weak and damage >= 10.0:
@@ -144,7 +155,7 @@ class CommentaryDirector:
                 if gap <= 1.2 and self._number(previous.get("damage")) >= 25.0:
                     name = self._name(names, attacker)
                     contextual.append(CommentaryCandidate(
-                    text=f"{name}, 맞자마자 곧바로 받아칩니다!",
+                        text=f"{name}, 맞자마자 곧바로 받아칩니다.",
                         role="caster",
                         category="answer_back",
                         priority=72,
@@ -152,8 +163,6 @@ class CommentaryDirector:
                         attacker_side=attacker,
                     ))
 
-        # A short rolling exchange detects genuine flow changes without scanning
-        # the damage file or delaying the immediate browser event path.
         now = time.monotonic()
         while self._recent_exchange and now - self._number(self._recent_exchange[0].get("observed_at")) > 4.0:
             self._recent_exchange.popleft()
@@ -166,7 +175,7 @@ class CommentaryDirector:
             if self._momentum_side and self._momentum_side != leader:
                 name = self._name(names, leader)
                 contextual.append(CommentaryCandidate(
-                    text=f"{name}, 연속 정타로 흐름을 다시 가져옵니다!",
+                    text=f"{name}, 흐름을 다시 가져옵니다!",
                     role="analyst",
                     category="momentum_flip",
                     priority=66,
@@ -174,7 +183,6 @@ class CommentaryDirector:
                     attacker_side=leader,
                 ))
             self._momentum_side = leader
-
         return max(contextual, key=lambda item: item.priority) if contextual else None
 
     def choose_live(
@@ -184,7 +192,7 @@ class CommentaryDirector:
         cooldown_sec: float,
         now: Optional[float] = None,
     ) -> CommentaryDecision:
-        """Select one current line and suppress stale or lower-value lines."""
+        """Choose exactly one line and consume cooldown only for that line."""
         timestamp = float(time.monotonic() if now is None else now)
         items = [item for item in candidates or [] if str(item.text or "").strip()]
         if not items:
@@ -195,7 +203,7 @@ class CommentaryDirector:
         if counter and combo:
             attacker = counter.attacker_side or combo.attacker_side
             name = str(counter.attacker_name or combo.attacker_name or "").strip()
-            merged_text = f"{name}, 카운터로 연타를 연결합니다!" if name else "카운터에 이어 연타까지 연결합니다!"
+            merged_text = f"{name}, 카운터 뒤에 연타까지 연결합니다." if name else "카운터 뒤에 연타까지 연결합니다."
             items = [item for item in items if item.category not in ("counter", "combo")]
             items.append(CommentaryCandidate(
                 text=merged_text,
@@ -212,20 +220,33 @@ class CommentaryDirector:
         suppressed: List[str] = []
         for candidate in items:
             key = str(candidate.key or f"{candidate.category}:{candidate.text}")
-            last_key = float(self._last_key_at.get(key, 0.0) or 0.0)
-            if timestamp - last_key < 4.0:
+            text_key = " ".join(str(candidate.text or "").split()).casefold()
+            if timestamp - float(self._last_key_at.get(key, 0.0) or 0.0) < 4.0:
                 suppressed.append(f"{candidate.category}:duplicate")
                 continue
+            # Generic live calls used to repeat as soon as the six-second
+            # global cooldown expired.  Keep exact non-critical sentences out
+            # of rotation for 45 seconds, while still allowing a genuinely
+            # new knockdown/stun/TKO call to describe the action.
+            if (
+                candidate.category not in ("tko", "knockdown", "stun")
+                and text_key in self._last_text_at
+                and timestamp - float(self._last_text_at[text_key]) < 45.0
+            ):
+                suppressed.append(f"{candidate.category}:text_duplicate")
+                continue
             category_floor = 1.8 if candidate.urgent or candidate.priority >= 80 else 3.0
-            last_category = float(self._last_category_at.get(candidate.category, 0.0) or 0.0)
-            if timestamp - last_category < category_floor:
+            if timestamp - float(self._last_category_at.get(candidate.category, 0.0) or 0.0) < category_floor:
                 suppressed.append(f"{candidate.category}:category_cooldown")
                 continue
-            bypass_global = candidate.urgent or candidate.priority >= 75
+            # Only stoppage/down/stun can ignore the broadcast pacing. Counter
+            # and combo remain important, but must respect the user's cooldown.
+            bypass_global = candidate.category in ("tko", "knockdown", "stun")
             if not bypass_global and timestamp - float(self._last_live_at or 0.0) < max(0.0, float(cooldown_sec)):
                 suppressed.append(f"{candidate.category}:global_cooldown")
                 continue
             self._last_key_at[key] = timestamp
+            self._last_text_at[text_key] = timestamp
             self._last_category_at[candidate.category] = timestamp
             self._last_live_at = timestamp
             suppressed.extend(item.category for item in items if item is not candidate)
@@ -238,7 +259,6 @@ class CommentaryDirector:
         metrics: Dict[str, Any],
         names: Optional[Dict[str, str]] = None,
     ) -> str:
-        """Store one completed round and describe only a meaningful adaptation."""
         state = self._ensure_round(round_no)
         current = dict(metrics or {})
         current["round"] = int(state.get("round", 1) or 1)
@@ -247,29 +267,50 @@ class CommentaryDirector:
         self._rounds[number] = current
         if not previous:
             return ""
-
         names = dict(names or {})
         current_leader = self._side(current.get("leader"))
         previous_leader = self._side(previous.get("leader"))
         if current_leader and previous_leader and current_leader != previous_leader:
-            name = self._name(names, current_leader)
-            return f"전 라운드와 달리 이번에는 {name} 쪽이 흐름을 되찾으며 승부의 방향을 바꿨습니다."
-
+            return f"{self._name(names, current_leader)} 쪽이 흐름을 바꾸며 반등합니다."
         current_damage = dict(current.get("damage") or {})
         previous_damage = dict(previous.get("damage") or {})
         for side in VALID_SIDES:
             before = self._number(previous_damage.get(side))
             after = self._number(current_damage.get(side))
             if before >= 35.0 and after >= before * 1.45 and after - before >= 35.0:
-                name = self._name(names, side)
-                return f"{name}, 전 라운드보다 유효타의 힘과 빈도를 확실히 끌어올렸습니다."
-
+                return f"{self._name(names, side)} 쪽이 지난 라운드보다 유효타 비중을 확실히 끌어올립니다."
         current_top = dict(current.get("top_punch") or {})
         previous_top = dict(previous.get("top_punch") or {})
         for side in VALID_SIDES:
             before = str(previous_top.get(side) or "").strip()
             after = str(current_top.get(side) or "").strip()
             if before and after and before != after:
-                name = self._name(names, side)
-                return f"{name}, 주력 공격을 {before}에서 {after}로 바꾸며 전술에 변화를 줬습니다."
+                return f"{self._name(names, side)} 쪽이 주력 공격을 {before}에서 {after}(으)로 바꾸며 변화를 줍니다."
+        current_kd = dict(current.get("knockdowns") or {})
+        previous_kd = dict(previous.get("knockdowns") or {})
+        for side in VALID_SIDES:
+            if self._number(current_kd.get(side)) > self._number(previous_kd.get(side)):
+                return f"{self._name(names, side)} 쪽이 다운을 만들어내며 지난 라운드와 다른 흐름을 보여줍니다."
+        current_big = dict(current.get("big_hits") or {})
+        previous_big = dict(previous.get("big_hits") or {})
+        for side in VALID_SIDES:
+            if (
+                self._number(current_big.get(side)) >= self._number(previous_big.get(side)) + 2
+                and self._number(current_big.get(side)) >= 3
+            ):
+                return f"{self._name(names, side)} 쪽이 강타 비중을 끌어올리며 교전의 무게를 바꿉니다."
+        # Same leader, wider gap: describe reinforcement rather than repeating
+        # the generic "앞섰습니다" line in every break report.
+        if current_leader and current_leader == previous_leader:
+            current_damage_gap = abs(
+                self._number(current_damage.get("blue"))
+                - self._number(current_damage.get("red"))
+            )
+            previous_damage = dict(previous.get("damage") or {})
+            previous_damage_gap = abs(
+                self._number(previous_damage.get("blue"))
+                - self._number(previous_damage.get("red"))
+            )
+            if current_damage_gap >= previous_damage_gap + 20.0:
+                return f"{self._name(names, current_leader)} 쪽이 같은 흐름을 이어가며 데미지 차이를 더 벌립니다."
         return ""

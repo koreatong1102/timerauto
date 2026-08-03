@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from spectator_log_watcher import SpectatorLogWatcher
+from match_log_archive import MatchLogArchive
 
 
 class RoundReportAccuracyTests(unittest.TestCase):
@@ -93,6 +94,55 @@ class RoundReportAccuracyTests(unittest.TestCase):
         throws = [{"side": "red", "time": 100.0, "hand": "left", "punch": "Jab"}]
         self.watcher._annotate_whiff_counters_from_throws([hit], throws, [previous, hit])
         self.assertFalse(bool(hit.get("is_counter")))
+
+    def test_report_does_not_resurrect_central_false_counter(self):
+        with tempfile.TemporaryDirectory() as root:
+            match_dir = os.path.join(root, "match")
+            os.makedirs(match_dir, exist_ok=True)
+            damage_path = os.path.join(match_dir, "damage_events.txt")
+            throws_path = os.path.join(match_dir, "punches_thrown.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\t8\t1.2\tred\tleft\t.4\t.4\t0\t0\t0\tJab\tHit\tChin\n")
+            with open(throws_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\tblue\tleft\tJab\n")
+
+            event = {
+                "time": 100.0,
+                "attacker_side": "blue",
+                "receiver_side": "red",
+                "hand": "left",
+                "damage": 8.0,
+                "counter_mult": 1.2,
+                "is_counter": False,
+                "punch": "Jab",
+                "damage_type": "Hit",
+                "_central_event": {
+                    "counter": False,
+                    "tags": ["hit"],
+                    "combo_hits": 0,
+                    "combo_damage": 0.0,
+                    "primary": "hit",
+                },
+            }
+            thrown = {
+                "time": 100.0,
+                "side": "blue",
+                "hand": "left",
+                "punch": "Jab",
+            }
+            archive = MatchLogArchive(os.path.join(root, "archive"))
+            archive.start("central-false-counter", ("BLUE", "RED"))
+            archive.record_damage(1, [event])
+            archive.record_throws(1, [thrown])
+            archive.record_classified(1, [event], ruleset_version=self.watcher._event_ruleset_version())
+            self.watcher._match_archive = archive
+            self.watcher._last_round_state = "break"
+
+            report = self.watcher._build_round_report_payload(
+                damage_path, 1, ("BLUE", "RED"), force_final=False
+            )
+
+        self.assertEqual(report["blue"]["counterHits"], 0)
 
     def test_duplicate_damage_rows_count_as_one_landed_throw(self):
         thrown = [
@@ -191,6 +241,51 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertEqual(snapshot["blue"]["mid"], 40.0)
         self.assertEqual(snapshot["blue"]["long"], 25.0)
         self.assertAlmostEqual(snapshot["blue"]["hp_ratio"], 0.75)
+
+    def test_live_gauge_does_not_flash_full_on_one_zero_read(self):
+        first = self.watcher._stabilize_live_punishment_info(
+            {"blue_punishment_long": 32.0, "red_punishment_long": 18.0}, "fight"
+        )
+        self.assertEqual(first["blue_punishment_long"], 32.0)
+
+        # SpectatorLog briefly truncates the file during a rewrite. The HUD
+        # must keep the damaged value instead of rendering 100% for one frame.
+        transient = self.watcher._stabilize_live_punishment_info(
+            {"blue_punishment_long": 0.0}, "fight"
+        )
+        self.assertEqual(transient["blue_punishment_long"], 32.0)
+
+        normal = self.watcher._stabilize_live_punishment_info(
+            {"blue_punishment_long": 33.0}, "fight"
+        )
+        self.assertEqual(normal["blue_punishment_long"], 33.0)
+
+        # Outside an active round, a real reset is allowed through normally.
+        reset = self.watcher._stabilize_live_punishment_info(
+            {"blue_punishment_long": 0.0}, "results"
+        )
+        self.assertEqual(reset["blue_punishment_long"], 0.0)
+
+    def test_resumed_live_gauge_is_emitted_only_once(self):
+        self.watcher._resumed_live_punishment_snapshot = {
+            "blue": {"mid": 0.0, "long": 7.5},
+            "red": {"mid": 0.0, "long": 20.5},
+        }
+        self.watcher._resumed_live_punishment_round = 4
+
+        first = self.watcher._restore_resumed_live_punishment_snapshot()
+        second = self.watcher._restore_resumed_live_punishment_snapshot()
+
+        self.assertEqual(first["blue_punishment_long"], 7.5)
+        self.assertEqual(first["red_punishment_long"], 20.5)
+        self.assertEqual(second, {})
+        self.watcher._live_punishment_long = {"blue": 40.0, "red": 30.0}
+        self.assertEqual(self.watcher._restore_resumed_live_punishment_snapshot(), {})
+        self.assertEqual(self.watcher._live_punishment_long, {"blue": 40.0, "red": 30.0})
+
+    def test_invalid_punishment_number_is_not_treated_as_a_gauge_value(self):
+        self.assertEqual(self.watcher._punishment_percent("nan"), 0.0)
+        self.assertEqual(self.watcher._punishment_percent("inf"), 0.0)
 
     def test_report_health_keeps_last_in_fight_long_snapshot(self):
         self.watcher._last_round_state = "fight"
@@ -394,8 +489,57 @@ class RoundReportAccuracyTests(unittest.TestCase):
             with open(os.path.join(root, "lobby.txt"), "w", encoding="utf-8") as stream:
                 stream.write("slot_0: type=Spectator occupied=true name=HOST ready=false\n")
             update = self.watcher._read_update(root)
+            self.assertNotIn("spectator_lobby_returned", update)
+            self.assertTrue(self.watcher._post_match_lobby_return_armed)
+            with open(os.path.join(root, "lobby.txt"), "w", encoding="utf-8") as stream:
+                stream.write(
+                    "slot_0: type=Spectator occupied=true name=HOST ready=false\n"
+                    "slot_1: type=Player occupied=true name=BLUE ready=false\n"
+                )
+            update = self.watcher._read_update(root)
 
         self.assertIn("spectator_lobby_returned", update)
+        self.assertFalse(self.watcher._post_match_lobby_return_armed)
+
+    def test_knockout_edge_arms_lobby_kick_before_results_state_exists(self):
+        """A TKO may return to lobby without ever writing Results/End."""
+        self.watcher.cfg.players = {}
+        with tempfile.TemporaryDirectory() as root:
+            self.watcher.cfg.spectator_match_archive_dir = os.path.join(root, "archive")
+            for folder in ("blue", "red", "match"):
+                os.makedirs(os.path.join(root, folder), exist_ok=True)
+            files = {
+                "blue/name.txt": "BLUE",
+                "red/name.txt": "RED",
+                "match/round_number.txt": "1",
+                "match/round_total.txt": "3",
+                "match/round_time.txt": "120",
+                "match/round_state.txt": "MatchIntro",
+            }
+            for relative, value in files.items():
+                with open(os.path.join(root, relative), "w", encoding="utf-8") as stream:
+                    stream.write(value)
+            self.watcher._read_update(root)
+            with open(os.path.join(root, "match", "round_state.txt"), "w", encoding="utf-8") as stream:
+                stream.write("Fight")
+            self.watcher._read_update(root)
+            with open(os.path.join(root, "match", "round_state.txt"), "w", encoding="utf-8") as stream:
+                stream.write("RoundKnockout")
+            self.watcher._read_update(root)
+            self.assertTrue(self.watcher._post_match_lobby_return_armed)
+            with open(os.path.join(root, "lobby.txt"), "w", encoding="utf-8") as stream:
+                stream.write("slot_0: type=Spectator occupied=true name=HOST ready=false\n")
+            update = self.watcher._read_update(root)
+            self.assertNotIn("spectator_lobby_returned", update)
+            self.assertTrue(self.watcher._post_match_lobby_return_armed)
+            with open(os.path.join(root, "lobby.txt"), "w", encoding="utf-8") as stream:
+                stream.write(
+                    "slot_0: type=Spectator occupied=true name=HOST ready=false\n"
+                    "slot_2: type=Player occupied=true name=RED ready=false\n"
+                )
+            update = self.watcher._read_update(root)
+        self.assertIn("spectator_lobby_returned", update)
+        self.assertFalse(self.watcher._post_match_lobby_return_armed)
 
     def test_unmatched_tko_event_still_resolves_correct_winner(self):
         watcher = SpectatorLogWatcher(SimpleNamespace(
@@ -434,6 +578,50 @@ class RoundReportAccuracyTests(unittest.TestCase):
             report = self.watcher._build_round_report_payload(damage_path, 1, ("BLUE", "RED"))
 
         self.assertEqual(report["blue"]["maxPunch"]["damage"], 82.0)
+
+    def test_break_report_best_punch_comes_only_from_requested_archive_round(self):
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            throws_path = os.path.join(root, "punches_thrown.txt")
+            round_one_hit = {
+                "time": 100.0, "attacker_side": "blue", "receiver_side": "red",
+                "hand": "left", "punch": "RearHook", "damage": 92.0,
+                "damage_type": "Hit", "weak_point": "Chin",
+            }
+            round_two_hit = {
+                "time": 100.0, "attacker_side": "blue", "receiver_side": "red",
+                "hand": "right", "punch": "Cross", "damage": 41.0,
+                "damage_type": "Hit", "weak_point": "",
+            }
+            round_one_throw = {"time": 100.0, "side": "blue", "hand": "left", "punch": "RearHook"}
+            round_two_throw = {"time": 100.0, "side": "blue", "hand": "right", "punch": "Cross"}
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\t92\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tRearHook\tHit\tChin\n")
+                stream.write("100.0\t41\t1.0\tred\tright\t.4\t.4\t0\t0\t0\tCross\tHit\t\n")
+            with open(throws_path, "w", encoding="utf-8") as stream:
+                stream.write("100.0\tblue\tleft\tRearHook\n")
+                stream.write("100.0\tblue\tright\tCross\n")
+            with open(os.path.join(root, "scores.csv"), "w", encoding="utf-8") as stream:
+                stream.write("round,blue_score,red_score,blue_damage_taken,red_damage_taken,blue_kds,red_kds\n")
+                stream.write("1,10,9,0,92,0,0\n")
+                stream.write("2,10,9,0,41,0,0\n")
+
+            archive = MatchLogArchive(os.path.join(root, "archive"))
+            archive.start("round-local-best", ("BLUE", "RED"))
+            archive.record_damage(1, [round_one_hit])
+            archive.record_throws(1, [round_one_throw])
+            archive.record_damage(2, [round_two_hit])
+            archive.record_throws(2, [round_two_throw])
+            self.watcher._match_archive = archive
+            self.watcher._last_round_state = "break"
+
+            report = self.watcher._build_round_report_payload(
+                damage_path, 2, ("BLUE", "RED"), force_final=False
+            )
+
+        self.assertEqual(41.0, report["blue"]["maxPunch"]["damage"])
+        self.assertEqual(1, report["blue"]["landed"])
+        self.assertEqual(1, report["blue"]["thrown"])
 
     def test_break_report_analyzes_style_from_that_round_payload(self):
         watcher = SpectatorLogWatcher(SimpleNamespace(
@@ -491,6 +679,36 @@ class RoundReportAccuracyTests(unittest.TestCase):
             "블루가 강하게 압박합니다. 이어서 긴 설명이 계속됩니다."
         )
         self.assertEqual(text, "블루가 강하게 압박합니다.")
+
+    def test_live_line_pool_does_not_repeat_recent_sentence(self):
+        first = self.watcher._live_line("first", ["문장 하나", "문장 둘"])
+        second = self.watcher._live_line("first", ["문장 하나", "문장 둘"])
+        third = self.watcher._live_line("first", ["문장 하나", "문장 둘"])
+
+        self.assertIn(first, ("문장 하나", "문장 둘"))
+        self.assertIn(second, ("문장 하나", "문장 둘"))
+        self.assertNotEqual(first, second)
+        self.assertEqual(third, "")
+
+    def test_live_strong_hit_uses_configured_minimum_damage(self):
+        self.watcher.cfg.spectator_commentary_enabled = True
+        self.watcher.cfg.spectator_commentary_mode = "active"
+        self.watcher.cfg.spectator_commentary_min_damage = 30.0
+        with patch.object(self.watcher, "_live_commentary_name", return_value="선수"):
+            text, role = self.watcher._build_fight_summary_commentary(
+                [{
+                    "time": 100.0,
+                    "damage": 35.0,
+                    "attacker_side": "blue",
+                    "receiver_side": "red",
+                    "punch": "Cross",
+                }],
+                [],
+                "",
+            )
+
+        self.assertTrue(text)
+        self.assertEqual(role, "analyst")
 
     def test_current_damage_layout_is_replay_parseable(self):
         parsed = self.watcher._parse_damage_event_parts([
@@ -564,6 +782,122 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertEqual(report["red"]["damage"], 2000)
         self.assertEqual(report["blue"]["knockdowns"], 3)
         self.assertEqual(report["red"]["knockdowns"], 1)
+
+    def test_final_style_metrics_keep_round_boundaries_and_archived_trend(self):
+        with tempfile.TemporaryDirectory() as root:
+            damage_path = os.path.join(root, "damage_events.txt")
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("0.6\t40\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tJab\tHit\tChin\n")
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("0.6\tblue\tleft\tJab\n")
+            with open(os.path.join(root, "winner.txt"), "w", encoding="utf-8") as stream:
+                stream.write("blue\tBLUE\n")
+
+            round_one = self.watcher._new_scorecard_round(1)
+            round_one["events"] = 1
+            round_one["event_rows"] = [{
+                "attacker_side": "red",
+                "receiver_side": "blue",
+                "punch": "Jab",
+                "damage": 5.0,
+                "time": 0.5,
+            }]
+            round_one["dealt"]["red"] = 5.0
+            round_one["landed"]["red"] = 1
+
+            round_two = self.watcher._new_scorecard_round(2)
+            round_two["events"] = 1
+            round_two["event_rows"] = [{
+                "attacker_side": "blue",
+                "receiver_side": "red",
+                "punch": "Jab",
+                "damage": 40.0,
+                "time": 0.6,
+                "_central_event": {"counter": True, "tags": ["hit", "counter"]},
+                "event_tags": ["hit", "counter"],
+                "event_primary": "hit",
+            }]
+            round_two["dealt"]["blue"] = 40.0
+            round_two["landed"]["blue"] = 1
+            round_two["counters_for"]["blue"] = 1
+
+            self.watcher._scorecard_rounds = {1: round_one, 2: round_two}
+            self.watcher._last_round_state = "results"
+            report = self.watcher._build_round_report_payload(
+                damage_path, 2, ("BLUE", "RED"), force_final=True
+            )
+
+        self.assertEqual(report["blue"]["defenseMetrics"]["returnCounters"], 0)
+        self.assertEqual(report["blue"]["roundTrend"]["earlyDamage"], 0.0)
+        self.assertEqual(report["blue"]["roundTrend"]["lateDamage"], 40.0)
+        self.assertEqual(report["red"]["roundTrend"]["earlyDamage"], 5.0)
+        self.assertEqual(report["red"]["roundTrend"]["lateDamage"], 0.0)
+
+    def test_final_report_reads_frozen_archive_not_mutated_live_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            match_dir = os.path.join(root, "live", "match")
+            os.makedirs(match_dir, exist_ok=True)
+            damage_path = os.path.join(match_dir, "damage_events.txt")
+            throws_path = os.path.join(match_dir, "punches_thrown.txt")
+            scores_path = os.path.join(match_dir, "scores.csv")
+            winner_path = os.path.join(match_dir, "winner.txt")
+
+            archived_events = [
+                {"time": 100.0, "attacker_side": "blue", "receiver_side": "red", "hand": "left", "damage": 30.0, "punch": "Jab", "damage_type": "Hit"},
+                {"time": 99.5, "attacker_side": "blue", "receiver_side": "red", "hand": "right", "damage": 50.0, "punch": "Cross", "damage_type": "Hit"},
+            ]
+            archived_throws = [
+                {"time": 100.0, "side": "blue", "hand": "left", "punch": "Jab"},
+                {"time": 99.5, "side": "blue", "hand": "right", "punch": "Cross"},
+            ]
+            with open(scores_path, "w", encoding="utf-8") as stream:
+                stream.write("round,blue_score,red_score,blue_total,red_total,blue_damage_taken,red_damage_taken,blue_kds,red_kds\n")
+                stream.write("1,10,9,10,9,0,80,0,0\n")
+            with open(winner_path, "w", encoding="utf-8") as stream:
+                stream.write("blue\tBLUE\n")
+
+            archive = MatchLogArchive(os.path.join(root, "archive"))
+            archive.start("archive-only", ("BLUE", "RED"))
+            archive.record_damage(1, archived_events)
+            archive.record_throws(1, archived_throws)
+            archive.snapshot_scores(1, scores_path, final=True)
+            archive.snapshot_vitals(
+                1,
+                {
+                    "blue": {"long": 20.0, "hp_ratio": 0.8},
+                    "red": {"long": 45.0, "hp_ratio": 0.55},
+                },
+                final=True,
+            )
+            archive.snapshot_winner(winner_path)
+            self.watcher._match_archive = archive
+            self.watcher._match_session_id = "archive-only"
+            self.watcher._last_round_state = "results"
+
+            # These rolling files represent a cleared/new lobby and must have
+            # no influence on the completed match report.
+            with open(damage_path, "w", encoding="utf-8") as stream:
+                stream.write("1.0\t99\t1.0\tblue\tleft\t.4\t.4\t0\t0\t0\tHook\tHit\tChin\n")
+            with open(throws_path, "w", encoding="utf-8") as stream:
+                stream.write("1.0\tred\tleft\tHook\n")
+            with open(scores_path, "w", encoding="utf-8") as stream:
+                stream.write("round,blue_score,red_score\n1,0,10\n")
+            with open(winner_path, "w", encoding="utf-8") as stream:
+                stream.write("red\tRED\n")
+
+            report = self.watcher._build_round_report_payload(
+                damage_path, 1, ("BLUE", "RED"), force_final=True
+            )
+
+        self.assertEqual(report["winner"], "blue")
+        self.assertEqual(report["blue"]["damage"], 80)
+        self.assertEqual(report["blue"]["landed"], 2)
+        self.assertEqual(report["blue"]["thrown"], 2)
+        self.assertEqual(report["blue"]["maxComboHits"], 2)
+        self.assertEqual(report["blue"]["maxComboDamage"], 80)
+        self.assertEqual(report["blue"]["averageDamage"], 40.0)
+        self.assertEqual(report["blue"]["healthPct"], 80)
+        self.assertEqual(report["red"]["healthPct"], 55)
 
     def test_terminal_result_without_live_events_still_builds_report(self):
         """A resignation may clear the live event files before Results arrives."""

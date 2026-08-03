@@ -35,6 +35,8 @@ ApplicationWindow {
     property int overlayBottomPad: 0
     property real overlayLeftExtra: 0
     property bool topBarHover: false
+    // Operator-only panel. It is not part of the browser overlay / OBS output.
+    property bool lobbyPanelExpanded: true
     property var layoutHistory: []
     property var layoutHistoryJson: []
     property int historyIndex: -1
@@ -2539,12 +2541,14 @@ ApplicationWindow {
                 y: 28
                 width: 338
                 height: 38
-                layer.enabled: true
-                layer.smooth: true
-                layer.samples: 4
                 Canvas {
                     id: tekkenBlueHpCanvas
                     anchors.fill: parent
+                    // Keep the last completed frame on screen while the next
+                    // gauge snapshot is painted.  The previous FBO layer was
+                    // cleared on every SP tick and showed up as a white/black
+                    // flicker in OBS.
+                    renderTarget: Canvas.Image
                     onPaint: {
                         var ctx = getContext("2d")
                         ctx.clearRect(0, 0, width, height)
@@ -2596,10 +2600,17 @@ ApplicationWindow {
                     }
                     Connections {
                         target: backend
-                        function onBluePunishmentMidChanged() { tekkenBlueHpCanvas.requestPaint() }
-                        function onBluePunishmentLongChanged() { tekkenBlueHpCanvas.requestPaint() }
-                        function onBlueSpRatioChanged() { tekkenBlueHpCanvas.requestPaint() }
+                        function onBluePunishmentMidChanged() { tekkenBlueHpPaintTimer.restart() }
+                        function onBluePunishmentLongChanged() { tekkenBlueHpPaintTimer.restart() }
+                        function onBlueSpRatioChanged() { tekkenBlueHpPaintTimer.restart() }
                     }
+                    Timer {
+                        id: tekkenBlueHpPaintTimer
+                        interval: 33
+                        repeat: false
+                        onTriggered: tekkenBlueHpCanvas.requestPaint()
+                    }
+                    Component.onCompleted: requestPaint()
                 }
             }
             Item {
@@ -2770,12 +2781,10 @@ ApplicationWindow {
                 y: 28
                 width: 338
                 height: 38
-                layer.enabled: true
-                layer.smooth: true
-                layer.samples: 4
                 Canvas {
                     id: tekkenRedHpCanvas
                     anchors.fill: parent
+                    renderTarget: Canvas.Image
                     onPaint: {
                         var ctx = getContext("2d")
                         ctx.clearRect(0, 0, width, height)
@@ -2829,10 +2838,17 @@ ApplicationWindow {
                     }
                     Connections {
                         target: backend
-                        function onRedPunishmentMidChanged() { tekkenRedHpCanvas.requestPaint() }
-                        function onRedPunishmentLongChanged() { tekkenRedHpCanvas.requestPaint() }
-                        function onRedSpRatioChanged() { tekkenRedHpCanvas.requestPaint() }
+                        function onRedPunishmentMidChanged() { tekkenRedHpPaintTimer.restart() }
+                        function onRedPunishmentLongChanged() { tekkenRedHpPaintTimer.restart() }
+                        function onRedSpRatioChanged() { tekkenRedHpPaintTimer.restart() }
                     }
+                    Timer {
+                        id: tekkenRedHpPaintTimer
+                        interval: 33
+                        repeat: false
+                        onTriggered: tekkenRedHpCanvas.requestPaint()
+                    }
+                    Component.onCompleted: requestPaint()
                 }
             }
             Item {
@@ -4417,6 +4433,85 @@ ApplicationWindow {
         }
     }
 
+    // Lobby control tower ---------------------------------------------------
+    // It is a separate operator window, physically beside the timer HUD.  It
+    // never shares the HUD canvas, so it cannot cover the RED corner.
+    Window {
+        id: lobbyControlWindow
+        // A separate Window does not inherit root's minimized state. Mirror it
+        // explicitly so operator controls never remain on screen by themselves.
+        visible: root.visible && root.visibility !== Window.Minimized
+                 && backend && backend.lobbyControlText !== ""
+        width: 264
+        // Text may gain lines for long names or all four lobby slots.  Size the
+        // native window from its real wrapped height, including header + both
+        // vertical margins, so the final line can never be clipped.
+        height: root.lobbyPanelExpanded
+            ? Math.max(166, lobbyControlHeader.height + lobbyControlBody.implicitHeight + 20)
+            : 30
+        // Prefer the right side; when the timer window is already near the
+        // monitor edge, place it to the left rather than off-screen or on top.
+        x: {
+            var rightSide = root.x + root.width + 8
+            return (rightSide + width <= Screen.width) ? rightSide : Math.max(0, root.x - width - 8)
+        }
+        y: Math.max(0, Math.min(root.y, Screen.height - height - 8))
+        color: "#08101a"
+        title: "Lobby Control"
+        flags: Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+
+        Rectangle {
+            anchors.fill: parent
+            radius: 8
+            color: Qt.rgba(8 / 255, 15 / 255, 26 / 255, 0.98)
+            border.width: 1
+            border.color: "#2563eb"
+            clip: true
+            Rectangle {
+                id: lobbyControlHeader
+                width: parent.width
+                height: 30
+                color: "#10233d"
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "● LOBBY CONTROL · LIVE"
+                    color: "#dbeafe"
+                    font.bold: true
+                    font.pixelSize: 11
+                }
+                Text {
+                    anchors.right: parent.right
+                    anchors.rightMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.lobbyPanelExpanded ? "접기 ▲" : "열기 ▼"
+                    color: "#93c5fd"
+                    font.pixelSize: 10
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.lobbyPanelExpanded = !root.lobbyPanelExpanded
+                }
+            }
+            Text {
+                id: lobbyControlBody
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: lobbyControlHeader.bottom
+                anchors.margins: 10
+                visible: root.lobbyPanelExpanded
+                text: backend ? backend.lobbyControlText : ""
+                color: "#e5e7eb"
+                font.pixelSize: 12
+                font.family: "Malgun Gothic"
+                lineHeight: 1.28
+                wrapMode: Text.Wrap
+            }
+        }
+    }
+
     Rectangle {
         id: spectatorRecentHitBadge
         parent: scaledRoot
@@ -5407,8 +5502,17 @@ ApplicationWindow {
                 }
                 Connections {
                     target: backend
-                    function onBluePunishmentMidChanged() { blueHpMetalCanvas.requestPaint() }
-                    function onBluePunishmentLongChanged() { blueHpMetalCanvas.requestPaint() }
+                    // The watcher updates the persistent and immediate-damage
+                    // values back-to-back. Coalesce them into one paint so the
+                    // Canvas never shows its cleared frame between the pair.
+                    function onBluePunishmentMidChanged() { blueHpPaintTimer.restart() }
+                    function onBluePunishmentLongChanged() { blueHpPaintTimer.restart() }
+                }
+                Timer {
+                    id: blueHpPaintTimer
+                    interval: 0
+                    repeat: false
+                    onTriggered: blueHpMetalCanvas.requestPaint()
                 }
                 Connections {
                     target: bluePunishmentBadge
@@ -7415,8 +7519,15 @@ ApplicationWindow {
                 }
                 Connections {
                     target: backend
-                    function onRedPunishmentMidChanged() { redHpMetalCanvas.requestPaint() }
-                    function onRedPunishmentLongChanged() { redHpMetalCanvas.requestPaint() }
+                    // See blue: paint one complete health snapshot per event-loop turn.
+                    function onRedPunishmentMidChanged() { redHpPaintTimer.restart() }
+                    function onRedPunishmentLongChanged() { redHpPaintTimer.restart() }
+                }
+                Timer {
+                    id: redHpPaintTimer
+                    interval: 0
+                    repeat: false
+                    onTriggered: redHpMetalCanvas.requestPaint()
                 }
                 Connections {
                     target: redPunishmentBadge

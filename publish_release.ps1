@@ -5,6 +5,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:GIT_PAGER = "cat"
+$env:GIT_TERMINAL_PROMPT = "0"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
@@ -37,12 +39,16 @@ if (-not $SkipChecks) {
   Assert-CommandSuccess "Unit tests"
   python -m py_compile timerauto.py update_manager.py spectator_log_watcher.py browser_overlay.py
   Assert-CommandSuccess "Python compile check"
-  git diff --check
+  # Git for Windows can emit one CRLF warning per modified file and has been
+  # observed to remain attached to the legacy console afterwards.  Disable
+  # safe-CRLF warnings for this read-only whitespace check and bypass all
+  # external diff/pager hooks so publishing cannot stall here.
+  git -c core.safecrlf=false --no-pager diff --check --no-ext-diff 2>$null
   Assert-CommandSuccess "Git diff check"
 }
 
 Write-Host "Staging tracked and new project files..."
-git add -A
+git -c core.safecrlf=false add -A
 Assert-CommandSuccess "Git staging"
 
 $staged = git diff --cached --name-only

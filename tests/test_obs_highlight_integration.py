@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import tempfile
+import time
 import unittest
 from urllib.request import Request, urlopen
 
@@ -20,6 +21,80 @@ from obs_integration import (
 
 
 class ObsHighlightIntegrationTests(unittest.TestCase):
+    def test_source_record_recommended_config_is_queued(self):
+        cfg = AppConfig()
+        cfg.obs_integration_enabled = True
+        client = ObsIntegration(cfg)
+        client.configure_source_record("게임 전용 장면", r"D:\clips\_incoming", replay_duration=10, create=True)
+        command = client._commands.get_nowait()
+        self.assertEqual(command["type"], "source_record_configure")
+        self.assertEqual(command["target"], "게임 전용 장면")
+        self.assertEqual(command["path"], "D:/clips/_incoming")
+        self.assertEqual(command["replay_duration"], 10)
+        self.assertTrue(command["create"])
+
+    def test_source_record_watch_retries_after_obs_not_ready(self):
+        client = ObsIntegration(AppConfig())
+        client._source_record_watch_target = "장면 2"
+        client._source_record_watch_request_id = "source-record-watch-test"
+        before = time.monotonic()
+        client._handle_source_record_watch_response(
+            "source-record-watch-test", False, "OBS is not ready to perform the request."
+        )
+        self.assertEqual(client._source_record_watch_attempt, 1)
+        self.assertFalse(client._source_record_watch_request_id)
+        self.assertGreater(client._source_record_watch_next_at, before)
+        event = client.drain_events(1)[0]
+        self.assertTrue(event["retrying"])
+
+    def test_source_record_watch_success_schedules_health_check(self):
+        client = ObsIntegration(AppConfig())
+        client._source_record_watch_target = "장면 2"
+        client._source_record_watch_attempt = 3
+        client._source_record_watch_request_id = "source-record-watch-test"
+        client._handle_source_record_watch_response("source-record-watch-test", True, "")
+        self.assertEqual(client._source_record_watch_attempt, 0)
+        self.assertFalse(client._source_record_watch_request_id)
+        self.assertGreater(client._source_record_watch_next_at, 0.0)
+        event = client.drain_events(1)[0]
+        self.assertFalse(event["retrying"])
+
+    def test_source_record_diagnostic_finds_only_exact_filter_name(self):
+        client = ObsIntegration(AppConfig())
+        token = "diag-token"
+        request_id = f"source-record-filter-{token}-0"
+        client._source_record_diagnostic = {
+            "token": token,
+            "base_pending": set(),
+            "names": {"게임 리플레이"},
+            "filter_pending": {request_id: "게임 리플레이"},
+            "targets": [],
+        }
+        asyncio.run(
+            client._handle_message(
+                None,
+                {
+                    "op": 7,
+                    "d": {
+                        "requestId": request_id,
+                        "requestType": "GetSourceFilterList",
+                        "requestStatus": {"result": True},
+                        "responseData": {
+                            "filters": [
+                                {"filterName": "Color Correction", "filterEnabled": True},
+                                {"filterName": "Source Record", "filterEnabled": False, "filterKind": "source_record_filter"},
+                            ]
+                        },
+                    },
+                },
+            )
+        )
+        event = client.drain_events(1)[0]
+        self.assertEqual(event["type"], "source_record_diagnostic")
+        self.assertTrue(event["ok"])
+        self.assertEqual(event["targets"][0]["source"], "게임 리플레이")
+        self.assertFalse(event["targets"][0]["enabled"])
+
     def test_browser_overlay_audio_url_match_is_loopback_and_port_scoped(self):
         self.assertTrue(is_timerauto_browser_overlay_url("http://127.0.0.1:17872/"))
         self.assertTrue(is_timerauto_browser_overlay_url("http://localhost:17872/?source=obs"))
@@ -68,7 +143,12 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
                 controller.schedule(
                     replay,
                     "knockdown",
-                    {"auto_replay_kind": "kd", "trigger_monotonic": 99.0},
+                    {
+                        "auto_replay_kind": "kd",
+                        "trigger_monotonic": 99.0,
+                        "replay_start_from_end_sec": 4.9,
+                        "replay_end_from_end_sec": 0.9,
+                    },
                 )
             )
             self.assertEqual(scheduled[0][0], 1000)
@@ -78,6 +158,8 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
         self.assertEqual(overlay.calls[0][1]["volume"], 64)
         self.assertEqual(overlay.calls[0][1]["fit"], "contain")
         self.assertEqual(overlay.calls[0][1]["fade_ms"], 220)
+        self.assertEqual(overlay.calls[0][1]["start_from_end_sec"], 4.9)
+        self.assertEqual(overlay.calls[0][1]["end_from_end_sec"], 0.9)
 
     def test_auto_replay_cancel_blocks_pending_and_late_saved_files(self):
         class FakeOverlay:
@@ -165,6 +247,11 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
         cfg.obs_auto_replay_enabled = True
         cfg.obs_auto_replay_kd = False
         cfg.obs_auto_replay_tko = True
+        cfg.obs_auto_replay_source = "source_record"
+        cfg.obs_auto_replay_source_fallback = True
+        cfg.obs_auto_replay_source_wait_sec = 6.5
+        cfg.obs_auto_replay_pre_event_sec = 3.5
+        cfg.obs_auto_replay_post_event_sec = 1.5
         cfg.obs_auto_replay_capture_delay_sec = 3.4
         cfg.obs_auto_replay_delay_sec = 2.7
         cfg.obs_auto_replay_muted = False
@@ -177,6 +264,12 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
         cfg.idle_highlight_muted = False
         cfg.idle_highlight_volume = 35
         cfg.idle_highlight_fit = "contain"
+        cfg.idle_highlight_cinematic_enabled = True
+        cfg.idle_highlight_cinematic_contrast = 32
+        cfg.idle_highlight_cinematic_sharpen = 35
+        cfg.idle_highlight_cinematic_vignette = 24
+        cfg.idle_highlight_cinematic_kd_tko_enabled = True
+        cfg.idle_highlight_cinematic_potm_enabled = True
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "config.json")
             cfg.to_json(path)
@@ -192,6 +285,11 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
         self.assertTrue(loaded.obs_auto_replay_enabled)
         self.assertFalse(loaded.obs_auto_replay_kd)
         self.assertTrue(loaded.obs_auto_replay_tko)
+        self.assertEqual(loaded.obs_auto_replay_source, "source_record")
+        self.assertTrue(loaded.obs_auto_replay_source_fallback)
+        self.assertEqual(loaded.obs_auto_replay_source_wait_sec, 6.5)
+        self.assertEqual(loaded.obs_auto_replay_pre_event_sec, 3.5)
+        self.assertEqual(loaded.obs_auto_replay_post_event_sec, 1.5)
         self.assertEqual(loaded.obs_auto_replay_capture_delay_sec, 3.4)
         self.assertEqual(loaded.obs_auto_replay_delay_sec, 2.7)
         self.assertFalse(loaded.obs_auto_replay_muted)
@@ -204,6 +302,12 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
         self.assertFalse(loaded.idle_highlight_muted)
         self.assertEqual(loaded.idle_highlight_volume, 35)
         self.assertEqual(loaded.idle_highlight_fit, "contain")
+        self.assertTrue(loaded.idle_highlight_cinematic_enabled)
+        self.assertEqual(loaded.idle_highlight_cinematic_contrast, 32)
+        self.assertEqual(loaded.idle_highlight_cinematic_sharpen, 35)
+        self.assertEqual(loaded.idle_highlight_cinematic_vignette, 24)
+        self.assertTrue(loaded.idle_highlight_cinematic_kd_tko_enabled)
+        self.assertTrue(loaded.idle_highlight_cinematic_potm_enabled)
 
     def test_browser_playlist_accepts_supported_video_only(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -225,12 +329,22 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
         self.assertIn("if(s.matchActive===true)return true", html)
         self.assertIn("syncIdleHighlight(s)", html)
         self.assertIn("body.idle-highlight-active #root>.hud", html)
+        self.assertIn("idleHighlightCinematicEnabled", html)
+        self.assertIn("idleHighlightCinematicKdTkoEnabled", html)
+        self.assertIn("idleHighlightCinematicPotmEnabled", html)
+        self.assertIn(".idleHighlight.cinematic video", html)
+        self.assertIn(".obsReplay.cinematic>#obsReplayVideo", html)
+        self.assertIn("idleSharpenMatrix", html)
 
     def test_browser_html_contains_obs_replay_player(self):
         html = BrowserOverlayServer()._html()
         self.assertIn('id="obsReplayVideo"', html)
         self.assertIn("function syncObsReplay", html)
         self.assertIn("function prepareObsReplay", html)
+        self.assertIn("function obsReplayWindow", html)
+        self.assertIn("function playObsReplayWindow", html)
+        self.assertIn("obsReplayStartFromEndSec", html)
+        self.assertIn("obsReplayEndFromEndSec", html)
         self.assertIn("afterTransition", html)
         self.assertIn("function startObsReplayAfterTransition", html)
         self.assertIn("obsReplayAfterTimer", html)
@@ -277,12 +391,22 @@ class ObsHighlightIntegrationTests(unittest.TestCase):
             overlay = BrowserOverlayServer(port, path_resolver=lambda value: value)
             self.assertTrue(overlay.start())
             try:
-                token = overlay.play_obs_replay(video, muted=False, volume=64, fit="contain", fade_ms=220)
+                token = overlay.play_obs_replay(
+                    video,
+                    muted=False,
+                    volume=64,
+                    fit="contain",
+                    fade_ms=220,
+                    start_from_end_sec=4.9,
+                    end_from_end_sec=0.9,
+                )
                 self.assertTrue(token)
                 state = overlay.snapshot()
                 self.assertTrue(state["obsReplayActive"])
                 self.assertFalse(state["obsReplayMuted"])
                 self.assertEqual(state["obsReplayVolume"], 64)
+                self.assertEqual(state["obsReplayStartFromEndSec"], 4.9)
+                self.assertEqual(state["obsReplayEndFromEndSec"], 0.9)
                 request = Request(
                     f"http://127.0.0.1:{port}/obs-replay/{token}",
                     headers={"Range": "bytes=2-5"},

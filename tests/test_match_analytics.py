@@ -1,9 +1,114 @@
 import unittest
 
-from match_analytics import analyze_fight_style, build_match_commentary, detect_stoppage, resolve_match_result
+from match_analytics import (
+    _josa,
+    analyze_fight_style,
+    analyze_round_approach,
+    build_match_commentary,
+    detect_stoppage,
+    resolve_match_result,
+)
 
 
 class MatchAnalyticsTests(unittest.TestCase):
+    def test_round_approach_keeps_knockdown_as_result_not_style(self):
+        blue = {
+            "thrown": 130,
+            "landed": 67,
+            "accuracy": 52,
+            "counterHits": 17,
+            "maxComboHits": 3,
+            "knockdowns": 1,
+            "stuns": 0,
+            "bigHits": 8,
+            "powerHits55": 2,
+            "staminaPct": 43,
+            "landedBreakdown": [
+                {"key": "jab", "count": 21},
+                {"key": "cross", "count": 27},
+                {"key": "hook", "count": 14},
+            ],
+        }
+        red = {
+            "thrown": 164,
+            "landed": 71,
+            "accuracy": 43,
+            "counterHits": 25,
+            "maxComboHits": 3,
+            "knockdowns": 1,
+            "stuns": 0,
+            "bigHits": 9,
+            "powerHits55": 1,
+            "staminaPct": 26,
+            "landedBreakdown": [
+                {"key": "jab", "count": 33},
+                {"key": "cross", "count": 27},
+                {"key": "hook", "count": 10},
+            ],
+        }
+
+        blue_round = analyze_round_approach(blue, red)
+        red_round = analyze_round_approach(red, blue)
+
+        self.assertNotEqual(blue_round["label"], "다운 마무리")
+        self.assertNotEqual(red_round["label"], "다운 마무리")
+        self.assertIn("다운 1회", blue_round["chips"])
+        self.assertIn("다운 1회", red_round["chips"])
+        self.assertIn("실제체력 부담 43%", blue_round["chips"])
+        self.assertIn("실제체력 위험 26%", red_round["chips"])
+        self.assertTrue(blue_round["roundApproach"])
+        self.assertTrue(red_round["roundApproach"])
+
+    def test_round_approach_separates_method_from_result(self):
+        attacker = {
+            "thrown": 113,
+            "landed": 66,
+            "accuracy": 58,
+            "counterHits": 15,
+            "maxComboHits": 5,
+            "knockdowns": 2,
+            "stuns": 1,
+            "bigHits": 10,
+            "powerHits55": 3,
+            "staminaPct": 78,
+            "landedBreakdown": [{"key": "hook", "count": 23}],
+        }
+        opponent = {
+            "thrown": 116,
+            "landed": 70,
+            "accuracy": 60,
+            "counterHits": 20,
+            "maxComboHits": 3,
+            "knockdowns": 1,
+            "stuns": 0,
+            "bigHits": 7,
+            "powerHits55": 1,
+            "landedBreakdown": [{"key": "jab", "count": 32}],
+        }
+
+        result = analyze_round_approach(attacker, opponent)
+
+        self.assertNotIn("다운", result["label"])
+        self.assertEqual(result["roundResultLabel"], "다운 우세 2:1")
+        self.assertIn("실제체력 안정 78%", result["chips"])
+        self.assertEqual(result["tier"], "")
+
+    def test_commentary_uses_correct_korean_particles_for_display_names(self):
+        self.assertEqual(_josa("통", "이/가"), "통이")
+        self.assertEqual(_josa("통", "은/는"), "통은")
+        self.assertEqual(_josa("가나", "이/가"), "가나가")
+        self.assertEqual(_josa("가나", "은/는"), "가나는")
+
+        text = build_match_commentary({
+            "winner": "blue",
+            "resultMethod": "KO",
+            "blue": {"name": "통", "fightStyle": {"label": "카운터 마스터"}},
+            "red": {"name": "가나", "fightStyle": {"label": "균형형 파이터"}},
+        })
+        self.assertIn("통이 결정적인 한 방", text)
+        self.assertIn("통은 결정적인 교전", text)
+        self.assertIn("가나는 균형형 파이터", text)
+
     def test_style_keeps_roles_distinct_and_limits_total_styles(self):
         style = analyze_fight_style(
             {
@@ -46,10 +151,10 @@ class MatchAnalyticsTests(unittest.TestCase):
     def test_style_can_add_one_defensive_chip_from_inferred_events(self):
         style = analyze_fight_style(
             {
-                "thrown": 25,
-                "landed": 12,
+                "thrown": 180,
+                "landed": 120,
                 "accuracy": 50,
-                "counterHits": 4,
+                "counterHits": 40,
                 "defenseMetrics": {
                     "opponentMisses": 12,
                     "lowDamageDefenses": 4,
@@ -57,7 +162,7 @@ class MatchAnalyticsTests(unittest.TestCase):
                     "returnPowerHits": 2,
                 },
             },
-            {"thrown": 30, "landed": 10},
+            {"thrown": 180, "landed": 90},
             min_attempts=20,
             min_landed=10,
         )
@@ -74,14 +179,73 @@ class MatchAnalyticsTests(unittest.TestCase):
         )
         elite = analyze_fight_style(
             {"thrown": 72, "landed": 35, "accuracy": 62, "averageDamage": 31,
-             "counterHits": 12, "maxComboHits": 5},
-            {"thrown": 60, "landed": 24},
+             "counterHits": 40, "maxComboHits": 5},
+            {"thrown": 180, "landed": 90},
             min_attempts=20,
             min_landed=10,
         )
 
         self.assertLess(int(plain["level"]), int(elite["level"]))
         self.assertEqual(elite["label"], "카운터 마스터")
+
+    def test_counter_mastery_uses_rate_and_sustain_not_early_caps(self):
+        """The archived six-round 121:69 shape must not collapse to one tier."""
+        tong = {
+            "roundsObserved": 6, "thrown": 575, "landed": 319,
+            "accuracy": 55, "counterHits": 121, "maxComboHits": 3,
+        }
+        hyun = {
+            "roundsObserved": 6, "thrown": 507, "landed": 207,
+            "accuracy": 41, "counterHits": 69, "maxComboHits": 3,
+        }
+        tong_style = analyze_fight_style(tong, hyun)
+        hyun_style = analyze_fight_style(hyun, tong)
+        counter_master = "\uce74\uc6b4\ud130 \ub9c8\uc2a4\ud130"
+        self.assertEqual(tong_style["label"], counter_master)
+        self.assertEqual(hyun_style["label"], counter_master)
+        self.assertEqual(tong_style["level"], 8)
+        self.assertEqual(hyun_style["level"], 5)
+        self.assertGreaterEqual(tong_style["level"] - hyun_style["level"], 3)
+        self.assertEqual(tong_style["levelBreakdown"]["roundsObserved"], 6)
+
+    def test_actual_health_creates_operation_medal_and_affects_level(self):
+        protected = analyze_fight_style(
+            {
+                "thrown": 180, "landed": 92, "accuracy": 61, "counterHits": 24,
+                "maxComboHits": 4, "knockdowns": 1,
+                "healthPct": 40, "staminaPct": 82, "isWinner": True,
+            },
+            {
+                "thrown": 120, "landed": 64, "accuracy": 53,
+                "healthPct": 70, "staminaPct": 55,
+            },
+            min_attempts=20,
+            min_landed=10,
+        )
+        worn_down = analyze_fight_style(
+            {
+                "thrown": 180, "landed": 92, "accuracy": 61, "counterHits": 24,
+                "maxComboHits": 4, "knockdowns": 1,
+                "healthPct": 40, "staminaPct": 42, "isWinner": True,
+            },
+            {
+                "thrown": 120, "landed": 64, "accuracy": 53,
+                "healthPct": 70, "staminaPct": 55,
+            },
+            min_attempts=20,
+            min_landed=10,
+        )
+        self.assertEqual(protected["operationMedal"]["label"], "THE READ")
+        self.assertEqual(int(protected["level"]), int(worn_down["level"]))
+        self.assertGreater(int(protected["performanceLevel"]), int(worn_down["performanceLevel"]))
+        self.assertEqual(
+            set(protected["levelBreakdown"]),
+            {"styleStrength", "mastery", "roundsObserved", "components"},
+        )
+        self.assertEqual(
+            set(protected["performanceBreakdown"]),
+            {"technique", "result", "operation", "damage"},
+        )
 
     def test_direct_tko_event_resolves_attacker_as_winner(self):
         stoppage = detect_stoppage([
@@ -120,13 +284,13 @@ class MatchAnalyticsTests(unittest.TestCase):
     def test_style_names_and_descriptions_are_korean(self):
         style = analyze_fight_style(
             {
-                "thrown": 45,
-                "landed": 18,
+                "thrown": 220,
+                "landed": 90,
                 "damage": 720,
                 "averageDamage": 40,
-                "bigHits": 6,
-                "powerHits55": 3,
-                "knockdowns": 1,
+                "bigHits": 24,
+                "powerHits55": 10,
+                "knockdowns": 2,
                 "landedBreakdown": [],
             },
             {},
@@ -158,7 +322,7 @@ class MatchAnalyticsTests(unittest.TestCase):
             min_landed=10,
         )
 
-        self.assertEqual(style["label"], "정밀 타격가")
+        self.assertEqual(style["label"], "균형형 파이터")
 
     def test_style_uses_own_attack_target_payload(self):
         style = analyze_fight_style(

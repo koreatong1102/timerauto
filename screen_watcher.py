@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import mss
@@ -33,9 +33,11 @@ class ScreenWatcher(QObject):
     trigger_fired = pyqtSignal()
     pixel_fired = pyqtSignal(str)
 
-    def __init__(self, cfg: Any):
+    def __init__(self, cfg: Any, foreground_guard: Optional[Callable[[], bool]] = None):
         super().__init__()
         self.cfg = cfg
+        self._foreground_guard = foreground_guard
+        self._foreground_paused = False
         self._actions_by_event = dict(self.cfg.actions or {})
         self._stop = False
         self._thread: Optional[threading.Thread] = None
@@ -132,11 +134,41 @@ class ScreenWatcher(QObject):
     def pixel_detection_enabled(self) -> bool:
         return bool(self._pixel_detection_enabled)
 
+    def set_foreground_guard(self, guard: Optional[Callable[[], bool]]) -> None:
+        self._foreground_guard = guard
+
+    def _foreground_capture_allowed(self) -> bool:
+        guard = self._foreground_guard
+        if guard is None:
+            return True
+        try:
+            return bool(guard())
+        except Exception:
+            logging.exception("SCREEN_DETECT_FOREGROUND_GUARD_FAIL")
+            return False
+
+    def _pause_detection_state(self) -> None:
+        self._window.clear()
+        self._trigger_level_active = False
+        for state in self._pixel_state.values():
+            state["window"] = []
+            state["level_active"] = False
+            state["last_hit"] = False
+
     def _run(self, stop_event: threading.Event):
         try:
             with mss.mss() as sct:
                 while not stop_event.is_set():
                     time.sleep(0.05)  # ~20fps
+                    if not self._foreground_capture_allowed():
+                        self._pause_detection_state()
+                        if not self._foreground_paused:
+                            self._foreground_paused = True
+                            logging.info("SCREEN_DETECT_PAUSED reason=spectator_not_foreground")
+                        continue
+                    if self._foreground_paused:
+                        self._foreground_paused = False
+                        logging.info("SCREEN_DETECT_RESUMED reason=spectator_foreground")
                     if self._pixel_detection_enabled:
                         self._check_pixel_rules(sct)
                     if not self._trigger_detection_enabled:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import glob
 import ctypes
 from ctypes import wintypes
 import json
@@ -22,6 +23,7 @@ import random
 import tempfile
 import fnmatch
 import subprocess
+from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from datetime import datetime
@@ -126,6 +128,8 @@ from actions import ActionRunner
 from browser_overlay import BrowserOverlayServer
 from browser_overlay_sync import BrowserOverlaySync
 from commentary_demo import build_commentary_director_demo
+from event_engine import FightEventEngine
+from match_analytics import analyze_fight_style
 from obs_auto_replay import ObsAutoReplayController
 from obs_integration import ObsIntegration
 from hotkey_engine import build_vk_map, GlobalHotkeys, press_vk_once
@@ -140,12 +144,7 @@ from screen_capture import (
     xy_local_to_global,
 )
 from screen_watcher import ScreenWatcher
-from spectator_log_watcher import (
-    COUNTER_DEALT_DAMAGE_THRESHOLD,
-    COUNTER_PREV_DAMAGE_THRESHOLD,
-    COUNTER_WINDOW_SEC,
-    SpectatorLogWatcher,
-)
+from spectator_log_watcher import SpectatorLogWatcher
 from player_utils import (
     canonical_player_gid_for_cfg as _canonical_player_gid_for_cfg,
     player_gid_key_for_match as _player_gid_key_for_match,
@@ -635,6 +634,197 @@ def _press_vk_sendinput_held(vk: int, hold_sec: float = 0.08) -> Tuple[bool, str
         return False, str(e)
 
 
+def _press_vk_sendinput_virtual_held(vk: int, hold_sec: float = 0.08) -> Tuple[bool, str]:
+    """Send a held key through SendInput using the virtual-key field.
+
+    Some applications ignore scan-code-only synthetic function keys even
+    though SendInput reports success.  Keeping this separate lets callers
+    retry the same foreground window with the representation used by the
+    legacy Windows keyboard APIs.
+    """
+    if os.name != "nt":
+        return press_vk_once(vk)
+    try:
+        vk = int(vk) & 0xFF
+        hold_sec = max(0.02, min(0.3, float(hold_sec or 0.08)))
+    except Exception:
+        return False, "invalid vk"
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    KEYEVENTF_KEYUP = 0x0002
+    extended_vk = {
+        0x21, 0x22, 0x23, 0x24,
+        0x25, 0x26, 0x27, 0x28,
+        0x2D, 0x2E,
+        0xA3, 0xA5,
+    }
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = (
+            ("wVk", ctypes.c_ushort),
+            ("wScan", ctypes.c_ushort),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ULONG_PTR),
+        )
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = (
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ULONG_PTR),
+        )
+
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = (
+            ("uMsg", ctypes.c_ulong),
+            ("wParamL", ctypes.c_short),
+            ("wParamH", ctypes.c_ushort),
+        )
+
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = (
+            ("ki", KEYBDINPUT),
+            ("mi", MOUSEINPUT),
+            ("hi", HARDWAREINPUT),
+        )
+
+    class INPUT(ctypes.Structure):
+        _fields_ = (
+            ("type", ctypes.c_ulong),
+            ("u", INPUT_UNION),
+        )
+
+    try:
+        flags = KEYEVENTF_EXTENDEDKEY if vk in extended_vk else 0
+        down = INPUT()
+        down.type = INPUT_KEYBOARD
+        down.u.ki = KEYBDINPUT(vk, 0, flags, 0, ULONG_PTR(0))
+        ctypes.set_last_error(0)
+        if int(user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))) != 1:
+            return False, f"virtual SendInput down failed err={ctypes.get_last_error()}"
+        time.sleep(hold_sec)
+        up = INPUT()
+        up.type = INPUT_KEYBOARD
+        up.u.ki = KEYBDINPUT(vk, 0, flags | KEYEVENTF_KEYUP, 0, ULONG_PTR(0))
+        ctypes.set_last_error(0)
+        if int(user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(INPUT))) != 1:
+            return False, f"virtual SendInput up failed err={ctypes.get_last_error()}"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _press_vk_keybd_event_held(vk: int, hold_sec: float = 0.08) -> Tuple[bool, str]:
+    """Legacy virtual-key fallback for programs that reject SendInput scans."""
+    if os.name != "nt":
+        return press_vk_once(vk)
+    try:
+        vk = int(vk) & 0xFF
+        hold_sec = max(0.02, min(0.3, float(hold_sec or 0.08)))
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        KEYEVENTF_KEYUP = 0x0002
+        user32.keybd_event(vk, 0, 0, 0)
+        time.sleep(hold_sec)
+        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _send_vk_chord_sendinput(
+    modifier_vk: int,
+    key_vk: int,
+    *,
+    settle_sec: float = 0.10,
+) -> Tuple[bool, str]:
+    """Send one real key chord through Win32 SendInput scan codes."""
+    if os.name != "nt":
+        return False, "Windows only"
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_SCANCODE = 0x0008
+    MAPVK_VK_TO_VSC = 0
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = (
+            ("wVk", ctypes.c_ushort),
+            ("wScan", ctypes.c_ushort),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ULONG_PTR),
+        )
+
+    # INPUT is 40 bytes on 64-bit Windows because its union must reserve room
+    # for MOUSEINPUT, even when this call only sends keyboard input. Keeping
+    # only KEYBDINPUT made this local INPUT 32 bytes; SendInput then rejected
+    # every K+digit chord with ERROR_INVALID_PARAMETER (87).
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = (
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ULONG_PTR),
+        )
+
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = (
+            ("uMsg", ctypes.c_ulong),
+            ("wParamL", ctypes.c_short),
+            ("wParamH", ctypes.c_ushort),
+        )
+
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = (
+            ("ki", KEYBDINPUT),
+            ("mi", MOUSEINPUT),
+            ("hi", HARDWAREINPUT),
+        )
+
+    class INPUT(ctypes.Structure):
+        _fields_ = (("type", ctypes.c_ulong), ("u", INPUT_UNION))
+
+    user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
+    user32.MapVirtualKeyW.restype = wintypes.UINT
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+    user32.SendInput.restype = wintypes.UINT
+
+    def _entry(vk: int, *, key_up: bool = False) -> INPUT:
+        scan = int(user32.MapVirtualKeyW(int(vk) & 0xFF, MAPVK_VK_TO_VSC)) & 0xFFFF
+        item = INPUT()
+        item.type = INPUT_KEYBOARD
+        flags = KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if key_up else 0)
+        item.u.ki = KEYBDINPUT(0, scan, flags, 0, ULONG_PTR(0))
+        return item
+
+    try:
+        # K down -> digit down -> digit up -> K up.  Sending each edge through
+        # SendInput mirrors a physical chord more reliably than keybd_event.
+        down = (INPUT * 2)(_entry(modifier_vk), _entry(key_vk))
+        input_size = ctypes.sizeof(INPUT)
+        ctypes.set_last_error(0)
+        if int(user32.SendInput(2, ctypes.cast(down, ctypes.POINTER(INPUT)), input_size)) != 2:
+            return False, f"SendInput chord-down failed err={ctypes.get_last_error()} input_size={input_size}"
+        time.sleep(max(0.05, min(0.30, float(settle_sec or 0.10))))
+        up = (INPUT * 2)(_entry(key_vk, key_up=True), _entry(modifier_vk, key_up=True))
+        ctypes.set_last_error(0)
+        if int(user32.SendInput(2, ctypes.cast(up, ctypes.POINTER(INPUT)), input_size)) != 2:
+            return False, f"SendInput chord-up failed err={ctypes.get_last_error()} input_size={input_size}"
+        return True, f"method=scan_code_sendinput input_size={input_size}"
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _activate_window_reliably(hwnd: int, *, restore: bool = False) -> Tuple[bool, str]:
     """Activate a window while cooperating with Windows foreground-lock rules."""
     if os.name != "nt" or not hwnd:
@@ -694,7 +884,9 @@ def press_vk_for_window_title(
     *,
     activate: bool = True,
     restore_previous: bool = True,
+    minimize_target_after: bool = False,
     skip_if_fullscreen: bool = False,
+    input_method: str = "scan_code",
 ) -> Tuple[bool, str]:
     if os.name != "nt":
         return press_vk_once(vk)
@@ -722,23 +914,41 @@ def press_vk_for_window_title(
     target_title = _window_title(hwnd)
     try:
         if activate:
-            _activate_window_reliably(hwnd)
+            activated, activation_detail = _activate_window_reliably(hwnd, restore=True)
+            if not activated:
+                return False, (
+                    f"activate failed: {activation_detail} "
+                    f"hwnd={hwnd} target='{target_title}' "
+                    f"prev={prev} prev_title='{before_title}'"
+                ).strip()
             time.sleep(0.28)
         active = 0
         try:
             active = int(user32.GetForegroundWindow())
         except Exception:
             active = 0
-        ok, err = _press_vk_sendinput_held(vk, hold_sec=0.08)
-        method = "held_sendinput"
+        if activate and active != int(hwnd):
+            return False, (
+                f"foreground verification failed requested={hwnd} active={active} "
+                f"target='{target_title}' active_title='{_window_title(active)}' "
+                f"prev={prev} prev_title='{before_title}'"
+            ).strip()
+        requested_method = str(input_method or "scan_code").strip().lower()
+        if requested_method == "virtual_key":
+            ok, err = _press_vk_sendinput_virtual_held(vk, hold_sec=0.08)
+            method = "virtual_key_sendinput"
+        elif requested_method == "keybd_event":
+            ok, err = _press_vk_keybd_event_held(vk, hold_sec=0.08)
+            method = "keybd_event"
+        else:
+            ok, err = _press_vk_sendinput_held(vk, hold_sec=0.08)
+            method = "scan_code_sendinput"
         if not ok:
             fallback_ok, fallback_err = press_vk_once(vk)
             ok = bool(fallback_ok)
             err = f"{err}; fallback={fallback_err}"
             method = "fallback_press_vk_once"
         time.sleep(0.16)
-        if restore_previous and prev and prev != hwnd:
-            _activate_window_reliably(prev, restore=True)
         active_title = _window_title(active)
         return bool(ok), (
             f"{err or ''} method={method} hwnd={hwnd} target='{target_title}' "
@@ -746,6 +956,17 @@ def press_vk_for_window_title(
         ).strip()
     except Exception as e:
         return False, str(e)
+    finally:
+        if minimize_target_after:
+            try:
+                user32.ShowWindow(wintypes.HWND(hwnd), 6)  # SW_MINIMIZE
+            except Exception:
+                pass
+        if restore_previous and prev and prev != hwnd:
+            try:
+                _activate_window_reliably(prev, restore=True)
+            except Exception:
+                pass
 
 
 def kick_lobby_slots_for_window_title(
@@ -753,6 +974,8 @@ def kick_lobby_slots_for_window_title(
     title_part: str,
     *,
     restore_previous: bool = True,
+    minimize_target_after: bool = False,
+    previous_hwnd_override: int = 0,
 ) -> Tuple[bool, str]:
     """Send TOTF2's K+0..3 lobby-kick shortcuts to one focused game window."""
     targets = [int(slot) for slot in list(slots or []) if 0 <= int(slot) <= 3]
@@ -768,30 +991,55 @@ def kick_lobby_slots_for_window_title(
         return False, f"window not found: {title_part}"
     user32 = ctypes.windll.user32
     try:
-        previous_hwnd = int(user32.GetForegroundWindow() or 0)
+        previous_hwnd = int(previous_hwnd_override or user32.GetForegroundWindow() or 0)
     except Exception:
         previous_hwnd = 0
     try:
         activated, activation_detail = _activate_window_reliably(hwnd)
         if not activated:
             return False, f"activate failed: {activation_detail}"
-        time.sleep(0.20)
+        # Let the native lobby finish its foreground/focus transition before
+        # a chord arrives.  The game can ignore keys during that short phase.
+        time.sleep(0.50)
         sent = []
+        send_details = []
         for slot in targets:
-            # VK_K down -> digit down/up -> VK_K up.  The game's lobby command
-            # is a chord, not two sequential standalone key presses.
-            user32.keybd_event(0x4B, 0, 0, 0)  # K
-            time.sleep(0.04)
-            user32.keybd_event(0x30 + slot, 0, 0, 0)
-            time.sleep(0.05)
-            user32.keybd_event(0x30 + slot, 0, 0x0002, 0)
-            user32.keybd_event(0x4B, 0, 0x0002, 0)
+            active = int(user32.GetForegroundWindow() or 0)
+            if active != int(hwnd):
+                reactivated, reactivate_detail = _activate_window_reliably(hwnd, restore=True)
+                if not reactivated:
+                    return False, (
+                        f"slot={slot} foreground lost active={active}; "
+                        f"reactivate failed: {reactivate_detail}"
+                    )
+                time.sleep(0.18)
+                active = int(user32.GetForegroundWindow() or 0)
+                if active != int(hwnd):
+                    return False, (
+                        f"slot={slot} foreground verification failed "
+                        f"requested={hwnd} active={active}"
+                    )
+            ok, send_detail = _send_vk_chord_sendinput(0x4B, 0x30 + slot)
+            if not ok:
+                return False, f"slot={slot} {send_detail}"
             sent.append(slot)
-            time.sleep(0.16)
-        return True, f"slots={sent} hwnd={hwnd} target='{_window_title(hwnd)}'"
+            send_details.append(f"{slot}:{send_detail}")
+            # Lobby slot removal updates UI/network state asynchronously.
+            # Keep each K+digit command clearly separated instead of sending
+            # a burst which can make later slots get swallowed.
+            time.sleep(0.65)
+        return True, (
+            f"input_sent slots={sent} hwnd={hwnd} target='{_window_title(hwnd)}' "
+            f"activation=({activation_detail}) details={send_details}"
+        )
     except Exception as exc:
         return False, str(exc)
     finally:
+        if minimize_target_after:
+            try:
+                user32.ShowWindow(wintypes.HWND(hwnd), 6)  # SW_MINIMIZE
+            except Exception:
+                pass
         if restore_previous and previous_hwnd and previous_hwnd != hwnd:
             try:
                 _activate_window_reliably(previous_hwnd, restore=True)
@@ -846,6 +1094,31 @@ def _refresh_default_audio_device(player) -> None:
             audio_output.setDevice(QMediaDevices.defaultAudioOutput())
     except Exception:
         logging.debug("AUDIO_DEFAULT_DEVICE_REFRESH_FAIL", exc_info=True)
+
+
+def _set_media_audio_device(player, requested_name: str = "") -> str:
+    """Route a QMediaPlayer to the requested Windows output when available."""
+    if player is None:
+        return ""
+    requested = str(requested_name or "").strip()
+    try:
+        audio_output = player.audioOutput()
+        if audio_output is None:
+            return ""
+        if QMediaDevices is None or not requested:
+            _refresh_default_audio_device(player)
+            return ""
+        requested_key = requested.casefold()
+        for device in QMediaDevices.audioOutputs():
+            description = str(device.description() or "")
+            if description.casefold() == requested_key:
+                audio_output.setDevice(device)
+                return description
+        _refresh_default_audio_device(player)
+        logging.warning("AUDIO_OUTPUT_DEVICE_NOT_FOUND requested=%s", requested)
+    except Exception:
+        logging.debug("AUDIO_OUTPUT_DEVICE_SET_FAIL requested=%s", requested, exc_info=True)
+    return ""
 
 
 def window_client_size(title_part: str) -> Tuple[int, int]:
@@ -2730,6 +3003,7 @@ class TimerBackend(QObject):
     blueTotalDamageTextChanged = pyqtSignal()
     redTotalDamageTextChanged = pyqtSignal()
     spectatorMatchTextChanged = pyqtSignal()
+    lobbyControlTextChanged = pyqtSignal()
     spectatorRecentHitTextChanged = pyqtSignal()
     blueRecentHitTextChanged = pyqtSignal()
     redRecentHitTextChanged = pyqtSignal()
@@ -2818,6 +3092,7 @@ class TimerBackend(QObject):
         self._blue_total_damage_text = "0"
         self._red_total_damage_text = "0"
         self._spectator_match_text = ""
+        self._lobby_control_text = ""
         self._spectator_recent_hit_text = ""
         self._blue_recent_hit_text = ""
         self._red_recent_hit_text = ""
@@ -3102,6 +3377,10 @@ class TimerBackend(QObject):
     @pyqtProperty(str, notify=spectatorMatchTextChanged)
     def spectatorMatchText(self) -> str:
         return str(self._spectator_match_text or "")
+
+    @pyqtProperty(str, notify=lobbyControlTextChanged)
+    def lobbyControlText(self) -> str:
+        return str(self._lobby_control_text or "")
 
     @pyqtProperty(str, notify=spectatorRecentHitTextChanged)
     def spectatorRecentHitText(self) -> str:
@@ -3629,6 +3908,7 @@ class TimerBackend(QObject):
         set_text("_spectator_recent_hit_text", self.spectatorRecentHitTextChanged, info.get("recent_hit_text", ""))
         set_text("_blue_recent_hit_text", self.blueRecentHitTextChanged, info.get("blue_recent_hit_text", ""))
         set_text("_red_recent_hit_text", self.redRecentHitTextChanged, info.get("red_recent_hit_text", ""))
+
         if "blue_combo_hit_text" in info:
             set_text("_blue_combo_hit_text", self.blueComboHitTextChanged, info.get("blue_combo_hit_text", ""))
         if "red_combo_hit_text" in info:
@@ -3668,6 +3948,13 @@ class TimerBackend(QObject):
         set_text("_blue_log_meta_text", self.blueLogMetaTextChanged, info.get("blue_meta_text", ""))
         set_text("_red_log_meta_text", self.redLogMetaTextChanged, info.get("red_meta_text", ""))
         set_text("_camera_text", self.cameraTextChanged, info.get("camera_text", ""))
+
+    def set_lobby_control_text(self, text: object):
+        """Update the timer-only lobby control tower (never sent to browser output)."""
+        value = str(text or "")
+        if value != self._lobby_control_text:
+            self._lobby_control_text = value
+            self.lobbyControlTextChanged.emit()
 
     def set_player_info(
         self,
@@ -4185,6 +4472,10 @@ class TimerBackend(QObject):
 
     @pyqtSlot()
     def toggle_log_detection(self):
+        try:
+            DIAG.record("spectator_log_toggle_click")
+        except Exception:
+            pass
         self.toggle_log_detection_requested.emit()
 
     @pyqtSlot()
@@ -4908,6 +5199,9 @@ class QmlTimerWindow(QObject):
 
     def set_spectator_log_info(self, info: Optional[dict]):
         self._backend.set_spectator_log_info(info)
+
+    def set_lobby_control_text(self, text: object):
+        self._backend.set_lobby_control_text(text)
 
     def set_spectator_recent_text_size(self, size: Optional[int]):
         self._backend.set_spectator_recent_text_size(size)
@@ -6163,10 +6457,15 @@ class SettingsDialog(QDialog):
         obs_test_connection: Optional[Callable[[], None]] = None,
         obs_replay_transition_test: Optional[Callable[[], None]] = None,
         obs_status_getter: Optional[Callable[[], str]] = None,
+        obs_source_record_diagnose: Optional[Callable[[], None]] = None,
+        obs_source_record_diagnostic_getter: Optional[Callable[[], Dict[str, Any]]] = None,
+        obs_source_record_test: Optional[Callable[[str], None]] = None,
+        obs_source_record_configure: Optional[Callable[[str, str, bool], None]] = None,
         idle_highlight_refresh: Optional[Callable[[], None]] = None,
         potm_test: Optional[Callable[[], None]] = None,
         broadcast_rehearsal: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         broadcast_rehearsal_stop: Optional[Callable[[], None]] = None,
+        central_engine_test: Optional[Callable[[], Dict[str, Any]]] = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("설정")
@@ -6216,10 +6515,19 @@ class SettingsDialog(QDialog):
         self._obs_test_connection = obs_test_connection
         self._obs_replay_transition_test = obs_replay_transition_test
         self._obs_status_getter = obs_status_getter
+        self._obs_source_record_diagnose = obs_source_record_diagnose
+        self._obs_source_record_diagnostic_getter = obs_source_record_diagnostic_getter
+        self._obs_source_record_test = obs_source_record_test
+        self._obs_source_record_configure = obs_source_record_configure
+        self._obs_source_record_diag_started_at = 0.0
+        self._obs_source_record_test_started_at = 0.0
+        self._obs_source_record_test_before: set[str] = set()
+        self._obs_source_record_test_sizes: Dict[str, int] = {}
         self._idle_highlight_refresh = idle_highlight_refresh
         self._potm_test = potm_test
         self._broadcast_rehearsal = broadcast_rehearsal
         self._broadcast_rehearsal_stop = broadcast_rehearsal_stop
+        self._central_engine_test = central_engine_test
         self._highlight_merge_busy = False
         self.highlight_merge_finished.connect(self._finish_highlight_merge)
         timer_target = self._timer_win or getattr(self.controller, "timer_win", None)
@@ -6282,12 +6590,12 @@ class SettingsDialog(QDialog):
         self.tab_diagnostics = QWidget()
 
         self.tabs.addTab(self.tab_players, "플레이어")
+        self.tabs.addTab(self.tab_auto_start, "자동 시작")
         self.tabs.addTab(self.tab_overlay, "오버레이")
         self.tabs.addTab(self.tab_sp, "SP 관리")
         self.tabs.addTab(self.tab_hit_effects, "피격 효과")
         self.tabs.addTab(self.tab_logs, "로그 감지")
         self.tabs.addTab(self.tab_log_records, "기록")
-        self.tabs.addTab(self.tab_auto_start, "자동 시작")
         self.tabs.addTab(self.tab_obs, "OBS / 하이라이트")
         self.tabs.addTab(self.tab_potm, "POTM")
         self.tabs.addTab(self.tab_sound, "사운드")
@@ -7524,6 +7832,8 @@ class SettingsDialog(QDialog):
         self.chk_rehearsal_tts = QCheckBox("카드와 함께 캐스터 멘트 재생")
         self.chk_rehearsal_tts.setChecked(False)
         self.btn_rehearsal_run = QPushButton("방송 리허설 실행")
+        self.btn_central_engine_full_test = QPushButton("중앙엔진 전체 테스트")
+        self.btn_central_engine_full_test.setToolTip("중앙엔진 판정을 검사한 뒤 카운터·콤보·강타·약점·스턴·KD·TKO를 브라우저 오버레이에 차례로 보여주고 마지막에 POTM 리허설을 실행합니다.")
         self.btn_rehearsal_stop = QPushButton("리허설 중지")
         self.lbl_rehearsal_score = QLabel("시나리오를 선택하면 실제 점수 구성표가 여기에 표시됩니다.")
         self.lbl_rehearsal_score.setWordWrap(True)
@@ -7532,6 +7842,7 @@ class SettingsDialog(QDialog):
         self.txt_rehearsal_log.setMaximumBlockCount(80)
         self.txt_rehearsal_log.setMinimumHeight(150)
         self.btn_rehearsal_run.clicked.connect(self._run_broadcast_rehearsal_from_settings)
+        self.btn_central_engine_full_test.clicked.connect(self._run_central_engine_full_test)
         self.btn_rehearsal_stop.clicked.connect(self._stop_broadcast_rehearsal_from_settings)
         rehearsal.addWidget(rehearsal_hint, 0, 0, 1, 4)
         rehearsal.addWidget(QLabel("블루 닉네임"), 1, 0); rehearsal.addWidget(self.le_rehearsal_blue_name, 1, 1)
@@ -7540,10 +7851,11 @@ class SettingsDialog(QDialog):
         rehearsal.addWidget(QLabel("장면"), 2, 2); rehearsal.addWidget(self.cmb_rehearsal_scenario, 2, 3)
         rehearsal.addWidget(self.chk_rehearsal_tts, 3, 0, 1, 2)
         rehearsal.addWidget(self.btn_rehearsal_run, 3, 2); rehearsal.addWidget(self.btn_rehearsal_stop, 3, 3)
-        rehearsal.addWidget(QLabel("점수 검증"), 4, 0); rehearsal.addWidget(self.lbl_rehearsal_score, 4, 1, 1, 3)
-        rehearsal.addWidget(QLabel("실행 기록"), 5, 0, 1, 4)
-        rehearsal.addWidget(self.txt_rehearsal_log, 6, 0, 1, 4)
-        rehearsal.setRowStretch(6, 1)
+        rehearsal.addWidget(self.btn_central_engine_full_test, 4, 0, 1, 4)
+        rehearsal.addWidget(QLabel("점수 검증"), 5, 0); rehearsal.addWidget(self.lbl_rehearsal_score, 5, 1, 1, 3)
+        rehearsal.addWidget(QLabel("실행 기록"), 6, 0, 1, 4)
+        rehearsal.addWidget(self.txt_rehearsal_log, 7, 0, 1, 4)
+        rehearsal.setRowStretch(7, 1)
         test_tabs.addTab(rehearsal_page, "방송 리허설")
 
         def _test_page(title: str, rows: List[List[QWidget]]) -> None:
@@ -8133,9 +8445,9 @@ class SettingsDialog(QDialog):
 
         auto_start_group = QGroupBox("매치 로비 자동 시작")
         auto_start_lay = QGridLayout(auto_start_group)
-        self.chk_spectator_lobby_auto_start = QCheckBox("양쪽 선수가 레디하면 시작 버튼 자동 클릭")
+        self.chk_spectator_lobby_auto_start = QCheckBox("양쪽 선수가 준비되면 자동 시작")
         self.chk_spectator_lobby_auto_start.setChecked(bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)))
-        self.chk_spectator_lobby_auto_start.setToolTip("lobby.txt의 ready_to_start가 OFF에서 ON으로 바뀌는 순간 한 번만 클릭합니다.")
+        self.chk_spectator_lobby_auto_start.setToolTip("양쪽 선수의 준비 완료가 확인되는 순간, 선택한 시작 방식으로 한 번만 실행합니다.")
         auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start, 0, 0, 1, 5)
 
         auto_start_lay.addWidget(QLabel("관전툴 창 제목"), 1, 0)
@@ -8153,7 +8465,9 @@ class SettingsDialog(QDialog):
         self.le_spectator_lobby_auto_start_title.setToolTip("창 제목 일부만 입력해도 됩니다. 오작동 방지를 위해 비워두면 자동 클릭하지 않습니다.")
         auto_start_lay.addWidget(self.le_spectator_lobby_auto_start_title, 1, 1, 1, 4)
 
-        auto_start_lay.addWidget(QLabel("시작 버튼 위치"), 2, 0)
+        # Legacy mouse-click controls are kept as hidden config migration
+        # objects only.  Automatic start now has one supported path: focus the
+        # spectator tool briefly, send F5, minimize it, restore the prior app.
         self.sp_spectator_lobby_auto_start_x = QSpinBox()
         self.sp_spectator_lobby_auto_start_x.setRange(0, 20000)
         self.sp_spectator_lobby_auto_start_x.setValue(int(getattr(self.cfg, "spectator_lobby_auto_start_client_x", 0) or 0))
@@ -8161,15 +8475,8 @@ class SettingsDialog(QDialog):
         self.sp_spectator_lobby_auto_start_y.setRange(0, 20000)
         self.sp_spectator_lobby_auto_start_y.setValue(int(getattr(self.cfg, "spectator_lobby_auto_start_client_y", 0) or 0))
         self.btn_spectator_lobby_auto_start_capture = QPushButton("2초 후 현재 마우스 위치 찍기")
-        self.btn_spectator_lobby_auto_start_test = QPushButton("자동 클릭 테스트")
-        auto_start_lay.addWidget(QLabel("X"), 2, 1)
-        auto_start_lay.addWidget(self.sp_spectator_lobby_auto_start_x, 2, 2)
-        auto_start_lay.addWidget(QLabel("Y"), 2, 3)
-        auto_start_lay.addWidget(self.sp_spectator_lobby_auto_start_y, 2, 4)
-        auto_start_lay.addWidget(self.btn_spectator_lobby_auto_start_capture, 3, 1, 1, 2)
-        auto_start_lay.addWidget(self.btn_spectator_lobby_auto_start_test, 3, 3, 1, 2)
+        self.btn_spectator_lobby_auto_start_test = QPushButton("선택한 시작 방식 테스트")
 
-        auto_start_lay.addWidget(QLabel("클릭 전 대기"), 4, 0)
         self.sp_spectator_lobby_auto_start_delay = QSpinBox()
         self.sp_spectator_lobby_auto_start_delay.setRange(0, 5000)
         self.sp_spectator_lobby_auto_start_delay.setSingleStep(50)
@@ -8177,15 +8484,12 @@ class SettingsDialog(QDialog):
         self.sp_spectator_lobby_auto_start_delay.setValue(
             int(getattr(self.cfg, "spectator_lobby_auto_start_delay_ms", 300) or 300)
         )
-        auto_start_lay.addWidget(self.sp_spectator_lobby_auto_start_delay, 4, 1)
-        auto_start_lay.addWidget(QLabel("클릭 횟수"), 4, 2)
         self.sp_spectator_lobby_auto_start_click_count = QSpinBox()
         self.sp_spectator_lobby_auto_start_click_count.setRange(1, 10)
         self.sp_spectator_lobby_auto_start_click_count.setSuffix(" 회")
         self.sp_spectator_lobby_auto_start_click_count.setValue(
             int(getattr(self.cfg, "spectator_lobby_auto_start_click_count", 1) or 1)
         )
-        auto_start_lay.addWidget(self.sp_spectator_lobby_auto_start_click_count, 4, 3)
         self.chk_spectator_lobby_auto_start_activate = QCheckBox("클릭 전 관전툴 활성화")
         self.chk_spectator_lobby_auto_start_activate.setChecked(
             bool(getattr(self.cfg, "spectator_lobby_auto_start_activate", True))
@@ -8207,39 +8511,43 @@ class SettingsDialog(QDialog):
         self.sp_spectator_final_report_delay.setSingleStep(0.5)
         self.sp_spectator_final_report_delay.setSuffix(" sec")
         self.sp_spectator_final_report_delay.setValue(float(getattr(self.cfg, "spectator_final_report_delay_sec", 10.0) or 0.0))
-        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_activate, 5, 1)
-        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_restore_focus, 5, 2, 1, 2)
-        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_restore_cursor, 5, 4)
-        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_minimize_target, 6, 1, 1, 2)
-        auto_start_lay.addWidget(QLabel("경기종료 리포트 지연"), 6, 3)
-        auto_start_lay.addWidget(self.sp_spectator_final_report_delay, 6, 4)
+        auto_start_lay.addWidget(QLabel("시작 입력"), 2, 0)
+        fixed_f5 = QLabel("F5 단축키 (자동 실행 후 관전툴 최소화 · 이전 창 복귀)")
+        fixed_f5.setStyleSheet("color:#93c5fd; font-weight:600;")
+        auto_start_lay.addWidget(fixed_f5, 2, 1, 1, 4)
+        auto_start_lay.addWidget(QLabel("F5 입력 전 대기"), 3, 0)
+        auto_start_lay.addWidget(self.sp_spectator_lobby_auto_start_delay, 3, 1)
+        self.btn_spectator_lobby_auto_start_test.setText("F5 자동 시작 테스트")
+        auto_start_lay.addWidget(self.btn_spectator_lobby_auto_start_test, 3, 3, 1, 2)
         self.lbl_spectator_lobby_auto_start_state = QLabel("대기")
         self.lbl_spectator_lobby_auto_start_state.setStyleSheet("color:#94a3b8;")
-        auto_start_lay.addWidget(self.lbl_spectator_lobby_auto_start_state, 7, 0, 1, 5)
-        auto_start_lay.addWidget(QLabel("위치 지정 단축키"), 8, 0)
+        auto_start_lay.addWidget(self.lbl_spectator_lobby_auto_start_state, 4, 0, 1, 5)
         self.edit_spectator_lobby_auto_start_capture_hotkey = QKeySequenceEdit(
             QKeySequence(str(getattr(self.cfg, "spectator_lobby_auto_start_capture_hotkey", "F12") or ""))
         )
         self.edit_spectator_lobby_auto_start_capture_hotkey.setToolTip(
             "한 번 누르면 위치 지정 대기, 시작 버튼 위에서 한 번 더 누르면 그 위치를 저장합니다."
         )
-        auto_start_lay.addWidget(self.edit_spectator_lobby_auto_start_capture_hotkey, 8, 1, 1, 2)
         capture_help = QLabel("1회 대기 → 마우스를 버튼 위로 → 2회 저장")
         capture_help.setStyleSheet("color:#94a3b8;")
-        auto_start_lay.addWidget(capture_help, 8, 3, 1, 2)
-        auto_start_lay.addWidget(QLabel("시작 방식"), 9, 0)
         self.cmb_spectator_lobby_auto_start_mode = QComboBox()
-        self.cmb_spectator_lobby_auto_start_mode.addItem("저장한 버튼 위치 클릭", "click")
         self.cmb_spectator_lobby_auto_start_mode.addItem("게임 F5 단축키", "f5")
-        self.cmb_spectator_lobby_auto_start_mode.addItem("F5 우선 → 실패 시 버튼 클릭", "f5_then_click")
-        saved_start_mode = str(getattr(self.cfg, "spectator_lobby_auto_start_mode", "click") or "click")
-        self.cmb_spectator_lobby_auto_start_mode.setCurrentIndex(
-            max(0, self.cmb_spectator_lobby_auto_start_mode.findData(saved_start_mode))
-        )
+        self.cmb_spectator_lobby_auto_start_mode.setCurrentIndex(0)
         self.cmb_spectator_lobby_auto_start_mode.setToolTip(
             "F5 방식은 준비 완료 후 게임 창을 잠깐 활성화해 F5를 누릅니다. 실패 시 클릭 방식은 저장한 버튼 좌표를 사용합니다."
         )
-        auto_start_lay.addWidget(self.cmb_spectator_lobby_auto_start_mode, 9, 1, 1, 4)
+
+        def _sync_auto_start_mode_widgets(_index: int = -1):
+            mouse_enabled = False
+            for widget in (
+                self.sp_spectator_lobby_auto_start_x,
+                self.sp_spectator_lobby_auto_start_y,
+                self.btn_spectator_lobby_auto_start_capture,
+                self.sp_spectator_lobby_auto_start_click_count,
+                self.chk_spectator_lobby_auto_start_restore_cursor,
+            ):
+                widget.setEnabled(mouse_enabled)
+            self.btn_spectator_lobby_auto_start_test.setText("F5 자동 시작 테스트")
         self.chk_spectator_lobby_post_match_kick = QCheckBox(
             "경기 종료 후 로비 복귀 시 0·1·2번 자동 강퇴"
         )
@@ -8249,7 +8557,7 @@ class SettingsDialog(QDialog):
         self.chk_spectator_lobby_post_match_kick.setToolTip(
             "경기 종료 뒤 lobby.txt가 다시 확인되면, 설정한 시간 후 점유된 0·1·2번 슬롯에 K+0·K+1·K+2를 한 번씩만 보냅니다. 다음 경기 시작 전에는 다시 강퇴하지 않습니다."
         )
-        auto_start_lay.addWidget(self.chk_spectator_lobby_post_match_kick, 10, 0, 1, 3)
+        auto_start_lay.addWidget(self.chk_spectator_lobby_post_match_kick, 5, 0, 1, 3)
         self.sp_spectator_lobby_post_match_kick_delay = QDoubleSpinBox()
         self.sp_spectator_lobby_post_match_kick_delay.setRange(0.0, 30.0)
         self.sp_spectator_lobby_post_match_kick_delay.setDecimals(1)
@@ -8261,8 +8569,8 @@ class SettingsDialog(QDialog):
         self.sp_spectator_lobby_post_match_kick_delay.setToolTip(
             "로비 복귀가 확인된 뒤 강퇴 단축키를 보내기 전 대기 시간입니다. 기본값은 5초입니다."
         )
-        auto_start_lay.addWidget(QLabel("강퇴 대기"), 10, 3)
-        auto_start_lay.addWidget(self.sp_spectator_lobby_post_match_kick_delay, 10, 4)
+        auto_start_lay.addWidget(QLabel("강퇴 대기"), 5, 3)
+        auto_start_lay.addWidget(self.sp_spectator_lobby_post_match_kick_delay, 5, 4)
         auto_start_lay.setColumnStretch(1, 1)
 
         self.btn_spectator_lobby_auto_start_capture.clicked.connect(self._capture_spectator_lobby_auto_start_point)
@@ -8285,6 +8593,8 @@ class SettingsDialog(QDialog):
             getattr(widget, signal_name).connect(self._schedule_apply)
         self.edit_spectator_lobby_auto_start_capture_hotkey.keySequenceChanged.connect(self._schedule_apply)
         self.cmb_spectator_lobby_auto_start_mode.currentIndexChanged.connect(self._schedule_apply)
+        self.cmb_spectator_lobby_auto_start_mode.currentIndexChanged.connect(_sync_auto_start_mode_widgets)
+        _sync_auto_start_mode_widgets()
         auto_start_outer.addWidget(auto_start_group)
         auto_start_outer.addStretch(1)
         log_lay.addStretch(1)
@@ -8463,8 +8773,8 @@ class SettingsDialog(QDialog):
         self.chk_obs_highlight_kd = QCheckBox("KD")
         self.chk_obs_highlight_tko = QCheckBox("TKO")
         self.chk_obs_highlight_stun = QCheckBox("스턴")
-        self.chk_obs_highlight_counter = QCheckBox("카운터")
-        self.chk_obs_highlight_combo = QCheckBox("콤보")
+        self.chk_obs_highlight_counter = QCheckBox("강한 카운터")
+        self.chk_obs_highlight_combo = QCheckBox("강조 콤보")
         self.chk_obs_highlight_heavy = QCheckBox("강타")
         for widget, attr in (
             (self.chk_obs_highlight_kd, "obs_highlight_kd"),
@@ -8486,17 +8796,6 @@ class SettingsDialog(QDialog):
         event_row.addStretch(1)
         automation.addLayout(event_row, 3, 1, 1, 3)
 
-        self.sp_obs_combo_min = QSpinBox()
-        self.sp_obs_combo_min.setRange(2, 20)
-        self.sp_obs_combo_min.setValue(int(getattr(self.cfg, "obs_highlight_combo_min", 3) or 3))
-        self.sp_obs_damage_min = QDoubleSpinBox()
-        self.sp_obs_damage_min.setRange(0.0, 300.0)
-        self.sp_obs_damage_min.setDecimals(1)
-        self.sp_obs_damage_min.setValue(float(getattr(self.cfg, "obs_highlight_damage_min", 55.0) or 55.0))
-        self.sp_obs_counter_damage_min = QDoubleSpinBox()
-        self.sp_obs_counter_damage_min.setRange(0.0, 300.0)
-        self.sp_obs_counter_damage_min.setDecimals(1)
-        self.sp_obs_counter_damage_min.setValue(float(getattr(self.cfg, "obs_highlight_counter_damage_min", 30.0) or 0.0))
         self.sp_obs_highlight_cooldown = QDoubleSpinBox()
         self.sp_obs_highlight_cooldown.setRange(0.0, 120.0)
         self.sp_obs_highlight_cooldown.setDecimals(1)
@@ -8507,35 +8806,37 @@ class SettingsDialog(QDialog):
             "값이 낮으면 더 자주 저장하고, 높이면 같은 장면의 반복 저장이 줄어듭니다.\n"
             "0초는 쿨타임을 사용하지 않습니다."
         )
-        automation.addWidget(QLabel("최소 콤보"), 4, 0)
-        automation.addWidget(self.sp_obs_combo_min, 4, 1)
-        automation.addWidget(QLabel("강타 최소 데미지"), 4, 2)
-        automation.addWidget(self.sp_obs_damage_min, 4, 3)
-        automation.addWidget(QLabel("카운터 최소 데미지"), 5, 0)
-        automation.addWidget(self.sp_obs_counter_damage_min, 5, 1)
+        automation.addWidget(QLabel("중앙 판정 결과를 기준으로 저장합니다"), 4, 0, 1, 4)
+        automation.itemAtPosition(4, 0).widget().setStyleSheet("color:#94a3b8;")
         automation.addWidget(QLabel("저장 쿨타임(초)"), 5, 2)
         automation.addWidget(self.sp_obs_highlight_cooldown, 5, 3)
         automation.itemAtPosition(5, 2).widget().setToolTip(self.sp_obs_highlight_cooldown.toolTip())
         event_rules_group = QGroupBox("공통 이벤트 기준 (실시간 적용)")
         event_rules = QGridLayout(event_rules_group)
-        self.chk_event_engine = QCheckBox("공통 판정 엔진 켜기")
-        self.chk_event_engine.setChecked(bool(getattr(self.cfg, "event_engine_enabled", True)))
-        self.chk_event_engine_shadow = QCheckBox("기존 방식과 비교만 하기")
-        self.chk_event_engine_shadow.setChecked(bool(getattr(self.cfg, "event_engine_shadow_mode", False)))
-        self.chk_event_engine_shadow.setToolTip("문제 진단용 롤백 옵션입니다. 켜면 방송 화면/저장은 기존 방식으로 되돌리고 새 판정은 진단에만 기록합니다.")
         self.sp_event_heavy_damage = QDoubleSpinBox(); self.sp_event_heavy_damage.setRange(0.0, 300.0); self.sp_event_heavy_damage.setSuffix(" dmg"); self.sp_event_heavy_damage.setValue(float(getattr(self.cfg, "event_heavy_damage", 50.0) or 0.0))
         self.sp_event_signature_damage = QDoubleSpinBox(); self.sp_event_signature_damage.setRange(0.0, 300.0); self.sp_event_signature_damage.setSuffix(" dmg"); self.sp_event_signature_damage.setValue(float(getattr(self.cfg, "event_signature_damage", 60.0) or 0.0))
         self.sp_event_counter_damage = QDoubleSpinBox(); self.sp_event_counter_damage.setRange(0.0, 300.0); self.sp_event_counter_damage.setSuffix(" dmg"); self.sp_event_counter_damage.setValue(float(getattr(self.cfg, "event_counter_min_damage", 40.0) or 0.0))
+        self.sp_event_counter_window = QDoubleSpinBox(); self.sp_event_counter_window.setRange(0.05, 5.0); self.sp_event_counter_window.setDecimals(2); self.sp_event_counter_window.setSuffix(" 초"); self.sp_event_counter_window.setValue(float(getattr(self.cfg, "event_counter_window_sec", 0.7) or 0.7))
+        self.sp_event_counter_graze = QDoubleSpinBox(); self.sp_event_counter_graze.setRange(0.0, 300.0); self.sp_event_counter_graze.setSuffix(" dmg"); self.sp_event_counter_graze.setValue(float(getattr(self.cfg, "event_counter_graze_max_damage", 15.0) or 0.0))
+        self.sp_event_counter_response = QDoubleSpinBox(); self.sp_event_counter_response.setRange(25.0, 300.0); self.sp_event_counter_response.setSuffix(" dmg"); self.sp_event_counter_response.setValue(max(25.0, float(getattr(self.cfg, "event_counter_response_min_damage", 30.0) or 0.0)))
+        self.sp_event_combo_min = QDoubleSpinBox(); self.sp_event_combo_min.setRange(0.0, 300.0); self.sp_event_combo_min.setSuffix(" dmg"); self.sp_event_combo_min.setValue(float(getattr(self.cfg, "event_combo_min_damage", 15.0) or 0.0))
+        self.sp_event_combo_window = QDoubleSpinBox(); self.sp_event_combo_window.setRange(0.1, 5.0); self.sp_event_combo_window.setDecimals(2); self.sp_event_combo_window.setSuffix(" 초"); self.sp_event_combo_window.setValue(float(getattr(self.cfg, "event_combo_window_sec", 0.8) or 0.8))
+        self.sp_event_combo_break = QDoubleSpinBox(); self.sp_event_combo_break.setRange(0.0, 300.0); self.sp_event_combo_break.setSuffix(" dmg"); self.sp_event_combo_break.setValue(float(getattr(self.cfg, "event_combo_break_damage", 20.0) or 0.0))
         self.sp_event_combo_emphasis = QSpinBox(); self.sp_event_combo_emphasis.setRange(2, 20); self.sp_event_combo_emphasis.setSuffix(" HIT"); self.sp_event_combo_emphasis.setValue(int(getattr(self.cfg, "event_combo_emphasis_hits", 5) or 5))
-        event_rules.addWidget(self.chk_event_engine, 0, 0, 1, 2)
-        event_rules.addWidget(self.chk_event_engine_shadow, 0, 2, 1, 2)
+        event_rules.addWidget(QLabel("중앙 판정 엔진 (항상 사용)"), 0, 0, 1, 4)
         event_rules.addWidget(QLabel("강타 기준"), 1, 0); event_rules.addWidget(self.sp_event_heavy_damage, 1, 1)
         event_rules.addWidget(QLabel("시그니처 기준"), 1, 2); event_rules.addWidget(self.sp_event_signature_damage, 1, 3)
         event_rules.addWidget(QLabel("강한 카운터 기준"), 2, 0); event_rules.addWidget(self.sp_event_counter_damage, 2, 1)
         event_rules.addWidget(QLabel("강조 콤보"), 2, 2); event_rules.addWidget(self.sp_event_combo_emphasis, 2, 3)
-        event_rules_hint = QLabel("시그니처는 높은 피해만으로는 되지 않고 카운터 또는 3타 이상 연속타가 함께 있어야 합니다. 지금은 비교 모드라 방송에는 적용되지 않습니다.")
+        event_rules.addWidget(QLabel("카운터 반격 시간"), 3, 0); event_rules.addWidget(self.sp_event_counter_window, 3, 1)
+        event_rules.addWidget(QLabel("상대 공격 최대 피해"), 3, 2); event_rules.addWidget(self.sp_event_counter_graze, 3, 3)
+        event_rules.addWidget(QLabel("카운터 반격 최소 피해"), 4, 0); event_rules.addWidget(self.sp_event_counter_response, 4, 1)
+        event_rules.addWidget(QLabel("콤보 인정 최소 피해"), 4, 2); event_rules.addWidget(self.sp_event_combo_min, 4, 3)
+        event_rules.addWidget(QLabel("콤보 연결 시간"), 5, 0); event_rules.addWidget(self.sp_event_combo_window, 5, 1)
+        event_rules.addWidget(QLabel("콤보 차단 반격 피해"), 5, 2); event_rules.addWidget(self.sp_event_combo_break, 5, 3)
+        event_rules_hint = QLabel("공식 로그 카운터와 방송용 규칙을 함께 사용하지만, 방송용 카운터는 항상 25 피해 이상만 인정합니다. 상대가 완전히 헛치면 설정 시간 안에 25 이상 적중해야 하고, 상대가 설정 피해 이하로 스쳤을 때는 설정된 반격 피해(최소 25) 이상이어야 합니다. 이 판정과 콤보 판정을 오버레이·해설·POTM·리포트·경기스타일이 함께 사용합니다.")
         event_rules_hint.setWordWrap(True); event_rules_hint.setStyleSheet("color:#94a3b8;")
-        event_rules.addWidget(event_rules_hint, 3, 0, 1, 4)
+        event_rules.addWidget(event_rules_hint, 6, 0, 1, 4)
         replay_hint = QLabel("OBS 출력 설정에서 리플레이 버퍼 사용을 허용해야 합니다. 자동 시작을 켜면 연결 후 버퍼를 시작하며, 브라우저 이펙트와 별도 스레드로 동작합니다.")
         replay_hint.setWordWrap(True)
         replay_hint.setStyleSheet("color:#94a3b8;")
@@ -8570,6 +8871,10 @@ class SettingsDialog(QDialog):
         self.btn_obs_source_record_archive.clicked.connect(
             lambda: self._pick_obs_source_record_folder(self.le_obs_source_record_archive, "선수별 하이라이트 폴더 선택")
         )
+        self.btn_obs_source_record_wizard = QPushButton("처음 설정 마법사 (설명 포함)")
+        self.btn_obs_source_record_wizard.clicked.connect(self._show_obs_source_record_guide)
+        self.btn_obs_source_record_test = QPushButton("실제 저장 테스트")
+        self.btn_obs_source_record_test.clicked.connect(self._test_obs_source_record_from_settings)
         automation.addWidget(self.chk_obs_source_record, 7, 0, 1, 2)
         automation.addWidget(QLabel("Source Record 대상 장면/소스"), 7, 2)
         automation.addWidget(self.le_obs_source_record_context, 7, 3)
@@ -8672,6 +8977,11 @@ class SettingsDialog(QDialog):
         automation.addWidget(self.chk_obs_replay_buffer_archive, 19, 0, 1, 4)
         automation.addWidget(self.chk_obs_source_record_auto_enable, 20, 0, 1, 4)
         automation.addWidget(self.chk_obs_source_record_stop_with_timer, 21, 0, 1, 4)
+        source_record_tools = QHBoxLayout()
+        source_record_tools.addWidget(self.btn_obs_source_record_wizard)
+        source_record_tools.addWidget(self.btn_obs_source_record_test)
+        source_record_tools.addStretch(1)
+        automation.addLayout(source_record_tools, 22, 0, 1, 4)
         automation.setColumnStretch(1, 1)
         automation.setColumnStretch(3, 1)
         outer.addWidget(automation_group)
@@ -8696,6 +9006,18 @@ class SettingsDialog(QDialog):
         self.le_potm_bgm = QLineEdit(str(getattr(self.cfg, "potm_bgm_path", "") or "")); self.btn_potm_bgm = QPushButton("브금 파일")
         self.btn_potm_bgm.clicked.connect(lambda: self._pick_potm_media(self.le_potm_bgm, "팟지 브금 선택", "Audio (*.mp3 *.wav *.m4a *.ogg);;All Files (*)"))
         self.sp_potm_bgm_volume = QSpinBox(); self.sp_potm_bgm_volume.setRange(0,100); self.sp_potm_bgm_volume.setSuffix(" %"); self.sp_potm_bgm_volume.setValue(int(getattr(self.cfg,"potm_bgm_volume",75) or 0))
+        self.cmb_potm_audio_output = QComboBox()
+        self.cmb_potm_audio_output.addItem("Windows 기본 출력", "")
+        if QMediaDevices is not None:
+            try:
+                for device in QMediaDevices.audioOutputs():
+                    name = str(device.description() or "").strip()
+                    if name:
+                        self.cmb_potm_audio_output.addItem(name, name)
+            except Exception:
+                logging.debug("POTM_AUDIO_OUTPUT_LIST_FAIL", exc_info=True)
+        saved_potm_device = str(getattr(self.cfg, "potm_audio_output_device", "") or "")
+        self.cmb_potm_audio_output.setCurrentIndex(max(0, self.cmb_potm_audio_output.findData(saved_potm_device)))
         self.le_potm_test_video = QLineEdit(str(getattr(self.cfg, "potm_test_video_path", "") or "")); self.btn_potm_test_video = QPushButton("테스트 영상")
         self.btn_potm_test_video.clicked.connect(lambda: self._pick_potm_media(self.le_potm_test_video, "팟지 테스트 영상 선택", "Video (*.mp4 *.webm *.mov *.m4v);;All Files (*)"))
         self.btn_potm_test = QPushButton("팟지 연출 테스트")
@@ -8733,18 +9055,19 @@ class SettingsDialog(QDialog):
         potm.addWidget(QLabel("결과 총점 상한"), 3, 0); potm.addWidget(self.sp_potm_result_max, 3, 1); potm.addWidget(QLabel("피해 총점 상한"), 3, 2); potm.addWidget(self.sp_potm_damage_max, 3, 3)
         potm.addWidget(QLabel("소개 카드 시간"), 4, 0); potm.addWidget(self.sp_potm_intro_hold, 4, 1); potm.addWidget(QLabel("브금 볼륨"), 4, 2); potm.addWidget(self.sp_potm_bgm_volume, 4, 3)
         potm.addWidget(QLabel("팟지 브금"), 5, 0); potm.addWidget(self.le_potm_bgm, 5, 1, 1, 2); potm.addWidget(self.btn_potm_bgm, 5, 3)
-        potm.addWidget(QLabel("테스트 영상"), 6, 0); potm.addWidget(self.le_potm_test_video, 6, 1, 1, 2); potm.addWidget(self.btn_potm_test_video, 6, 3)
-        potm.addWidget(QLabel("닉네임 색상"), 7, 0); potm.addWidget(self.le_potm_name_color, 7, 1, 1, 2); potm.addWidget(self.btn_potm_name_color, 7, 3)
-        potm.addWidget(QLabel("팟지 영상 배속"), 8, 0); potm.addWidget(self.sp_potm_replay_speed, 8, 1); potm.addWidget(self.btn_potm_test, 8, 2, 1, 2)
+        potm.addWidget(QLabel("팟지 오디오 출력"), 6, 0); potm.addWidget(self.cmb_potm_audio_output, 6, 1, 1, 3)
+        potm.addWidget(QLabel("테스트 영상"), 7, 0); potm.addWidget(self.le_potm_test_video, 7, 1, 1, 2); potm.addWidget(self.btn_potm_test_video, 7, 3)
+        potm.addWidget(QLabel("닉네임 색상"), 8, 0); potm.addWidget(self.le_potm_name_color, 8, 1, 1, 2); potm.addWidget(self.btn_potm_name_color, 8, 3)
+        potm.addWidget(QLabel("팟지 영상 배속"), 9, 0); potm.addWidget(self.sp_potm_replay_speed, 9, 1); potm.addWidget(self.btn_potm_test, 9, 2, 1, 2)
         score_specs = [("카운터", "potm_score_counter", 14), ("회피 반격", "potm_score_whiff_counter", 10), ("카운터 후속타", "potm_score_counter_followup", 6), ("3 HIT 콤보", "potm_score_combo3", 6), ("4 HIT 콤보", "potm_score_combo4", 10), ("5+ HIT 콤보", "potm_score_combo5", 18), ("무피격 마무리", "potm_score_clean_finish", 6), ("스턴", "potm_score_stun", 12), ("다운", "potm_score_knockdown", 30), ("TKO", "potm_score_tko", 40), ("누적 피해 상한", "potm_damage_total_max", 12), ("최고 피해 상한", "potm_damage_peak_max", 8)]
         self._potm_score_widgets = {}
         for index, (label, attr, default) in enumerate(score_specs):
             widget = QSpinBox(); widget.setRange(0, 100); widget.setValue(int(getattr(self.cfg, attr, default) or 0)); self._potm_score_widgets[attr] = widget
-            row = 9 + index // 2; column = 0 if index % 2 == 0 else 2
+            row = 10 + index // 2; column = 0 if index % 2 == 0 else 2
             potm.addWidget(QLabel(label), row, column); potm.addWidget(widget, row, column + 1)
         potm_hint = QLabel("기술·결과·피해의 총점 상한과 세부 항목 점수를 모두 조절할 수 있습니다. 현재 1등 후보만 저장하고 새 1등이 정상 저장된 뒤 이전 후보를 정리합니다.")
         potm_hint.setWordWrap(True); potm_hint.setStyleSheet("color:#94a3b8;")
-        potm.addWidget(potm_hint, 15, 0, 1, 4)
+        potm.addWidget(potm_hint, 16, 0, 1, 4)
         presentation = QGroupBox("Card layout / typography")
         pg = QGridLayout(presentation)
         pg.setHorizontalSpacing(12); pg.setVerticalSpacing(8)
@@ -8763,8 +9086,8 @@ class SettingsDialog(QDialog):
         ag.addWidget(QLabel("Script"), 1, 0); ag.addWidget(self.le_potm_announce, 1, 1, 1, 3)
         ag.addWidget(QLabel("{name} is replaced with the selected player's nickname."), 2, 0, 1, 4)
         ag.addWidget(self.chk_potm_obs_bgm_mute, 3, 0, 1, 2); ag.addWidget(QLabel("OBS music source"), 3, 2); ag.addWidget(self.le_potm_obs_bgm_source, 3, 3)
-        potm.addWidget(presentation, 16, 0, 1, 4)
-        potm.addWidget(announcement, 17, 0, 1, 4)
+        potm.addWidget(presentation, 17, 0, 1, 4)
+        potm.addWidget(announcement, 18, 0, 1, 4)
         potm.setColumnStretch(1, 1); potm.setColumnStretch(3, 1)
         potm_outer = QVBoxLayout(self.tab_potm)
         potm_outer.setContentsMargins(8, 8, 8, 8)
@@ -8789,6 +9112,47 @@ class SettingsDialog(QDialog):
         self.chk_obs_auto_replay_kd.setChecked(bool(getattr(self.cfg, "obs_auto_replay_kd", True)))
         self.chk_obs_auto_replay_tko = QCheckBox("TKO 재생")
         self.chk_obs_auto_replay_tko.setChecked(bool(getattr(self.cfg, "obs_auto_replay_tko", True)))
+        self.cmb_obs_auto_replay_source = QComboBox()
+        self.cmb_obs_auto_replay_source.addItem("기존 OBS 리플레이 버퍼", "replay_buffer")
+        self.cmb_obs_auto_replay_source.addItem("게임 전용 Source Record", "source_record")
+        replay_source_index = self.cmb_obs_auto_replay_source.findData(
+            str(getattr(self.cfg, "obs_auto_replay_source", "replay_buffer") or "replay_buffer")
+        )
+        self.cmb_obs_auto_replay_source.setCurrentIndex(max(0, replay_source_index))
+        self.chk_obs_auto_replay_source_fallback = QCheckBox(
+            "Source Record 실패 시 기존 리플레이 사용 (중복 저장)"
+        )
+        self.chk_obs_auto_replay_source_fallback.setChecked(
+            bool(getattr(self.cfg, "obs_auto_replay_source_fallback", False))
+        )
+        self.chk_obs_auto_replay_source_fallback.setToolTip(
+            "체크하면 실패 대체용으로 OBS 리플레이 버퍼 영상도 함께 저장합니다.\n"
+            "중복 파일을 원하지 않으면 체크하지 마세요."
+        )
+        self.sp_obs_auto_replay_pre_event = QDoubleSpinBox()
+        self.sp_obs_auto_replay_pre_event.setRange(0.5, 15.0)
+        self.sp_obs_auto_replay_pre_event.setDecimals(1)
+        self.sp_obs_auto_replay_pre_event.setSingleStep(0.5)
+        self.sp_obs_auto_replay_pre_event.setSuffix(" 초")
+        self.sp_obs_auto_replay_pre_event.setValue(
+            float(getattr(self.cfg, "obs_auto_replay_pre_event_sec", 3.0) or 3.0)
+        )
+        self.sp_obs_auto_replay_post_event = QDoubleSpinBox()
+        self.sp_obs_auto_replay_post_event.setRange(0.0, 5.0)
+        self.sp_obs_auto_replay_post_event.setDecimals(1)
+        self.sp_obs_auto_replay_post_event.setSingleStep(0.5)
+        self.sp_obs_auto_replay_post_event.setSuffix(" 초")
+        self.sp_obs_auto_replay_post_event.setValue(
+            float(getattr(self.cfg, "obs_auto_replay_post_event_sec", 1.0) or 0.0)
+        )
+        self.sp_obs_auto_replay_source_wait = QDoubleSpinBox()
+        self.sp_obs_auto_replay_source_wait.setRange(1.0, 20.0)
+        self.sp_obs_auto_replay_source_wait.setDecimals(1)
+        self.sp_obs_auto_replay_source_wait.setSingleStep(0.5)
+        self.sp_obs_auto_replay_source_wait.setSuffix(" 초")
+        self.sp_obs_auto_replay_source_wait.setValue(
+            float(getattr(self.cfg, "obs_auto_replay_source_wait_sec", 5.0) or 5.0)
+        )
         self.sp_obs_auto_replay_capture_delay = QDoubleSpinBox()
         self.sp_obs_auto_replay_capture_delay.setRange(0.0, 15.0)
         self.sp_obs_auto_replay_capture_delay.setDecimals(1)
@@ -8898,12 +9262,21 @@ class SettingsDialog(QDialog):
         auto_replay.addWidget(self.sp_replay_label_x, 10, 1)
         auto_replay.addWidget(QLabel("리플레이 문구 Y (위쪽 +)"), 10, 2)
         auto_replay.addWidget(self.sp_replay_label_y, 10, 3)
+        auto_replay.addWidget(QLabel("KD/TKO 리플레이 원본"), 11, 0)
+        auto_replay.addWidget(self.cmb_obs_auto_replay_source, 11, 1)
+        auto_replay.addWidget(self.chk_obs_auto_replay_source_fallback, 11, 2, 1, 2)
+        auto_replay.addWidget(QLabel("이벤트 직전"), 12, 0)
+        auto_replay.addWidget(self.sp_obs_auto_replay_pre_event, 12, 1)
+        auto_replay.addWidget(QLabel("이벤트 이후"), 12, 2)
+        auto_replay.addWidget(self.sp_obs_auto_replay_post_event, 12, 3)
+        auto_replay.addWidget(QLabel("Source Record 대기 제한"), 13, 0)
+        auto_replay.addWidget(self.sp_obs_auto_replay_source_wait, 13, 1)
         auto_replay_hint = QLabel(
             "저장 전 대기 동안 KO 장면까지 버퍼에 담습니다. 감지 후 재생 목표가 저장 전 대기보다 작으면 저장 완료 직후 재생됩니다."
         )
         auto_replay_hint.setWordWrap(True)
         auto_replay_hint.setStyleSheet("color:#94a3b8;")
-        auto_replay.addWidget(auto_replay_hint, 10, 0, 1, 4)
+        auto_replay.addWidget(auto_replay_hint, 14, 0, 1, 4)
         auto_replay.setColumnStretch(1, 1)
         auto_replay.setColumnStretch(3, 1)
         outer.addWidget(auto_replay_group)
@@ -8937,6 +9310,18 @@ class SettingsDialog(QDialog):
         self.sp_idle_highlight_fade.setRange(0, 3000)
         self.sp_idle_highlight_fade.setSuffix(" ms")
         self.sp_idle_highlight_fade.setValue(int(getattr(self.cfg, "idle_highlight_fade_ms", 350) or 350))
+        self.chk_idle_highlight_cinematic = QCheckBox("대기 영상 시네마 룩 적용")
+        self.chk_idle_highlight_cinematic.setChecked(bool(getattr(self.cfg, "idle_highlight_cinematic_enabled", False)))
+        self.chk_idle_highlight_cinematic.setToolTip("대기 영상에 영화풍 색보정·선명도·비네팅·그레인을 적용합니다. 아래 체크로 KD/TKO와 POTM에도 따로 적용할 수 있습니다.")
+        self.chk_idle_cinematic_kd_tko = QCheckBox("KD/TKO 리플레이에도 적용")
+        self.chk_idle_cinematic_kd_tko.setChecked(bool(getattr(self.cfg, "idle_highlight_cinematic_kd_tko_enabled", False)))
+        self.chk_idle_cinematic_kd_tko.setToolTip("KD·TKO 리플레이 영상에 같은 시네마 룩을 적용합니다. 스팅어 전환 영상에는 적용되지 않습니다.")
+        self.chk_idle_cinematic_potm = QCheckBox("POTM 영상에도 적용")
+        self.chk_idle_cinematic_potm.setChecked(bool(getattr(self.cfg, "idle_highlight_cinematic_potm_enabled", False)))
+        self.chk_idle_cinematic_potm.setToolTip("PLAY OF THE MATCH 본편 영상에 같은 시네마 룩을 적용합니다. POTM 카드·브금·전환에는 적용되지 않습니다.")
+        self.sp_idle_cinematic_contrast = QSpinBox(); self.sp_idle_cinematic_contrast.setRange(0, 60); self.sp_idle_cinematic_contrast.setPrefix("+"); self.sp_idle_cinematic_contrast.setValue(int(getattr(self.cfg, "idle_highlight_cinematic_contrast", 32) or 0))
+        self.sp_idle_cinematic_sharpen = QSpinBox(); self.sp_idle_cinematic_sharpen.setRange(0, 60); self.sp_idle_cinematic_sharpen.setPrefix("+"); self.sp_idle_cinematic_sharpen.setValue(int(getattr(self.cfg, "idle_highlight_cinematic_sharpen", 35) or 0))
+        self.sp_idle_cinematic_vignette = QSpinBox(); self.sp_idle_cinematic_vignette.setRange(0, 60); self.sp_idle_cinematic_vignette.setPrefix("+"); self.sp_idle_cinematic_vignette.setValue(int(getattr(self.cfg, "idle_highlight_cinematic_vignette", 24) or 0))
         idle.addWidget(self.chk_idle_highlight, 0, 0, 1, 4)
         idle.addWidget(QLabel("영상 경로"), 1, 0)
         idle.addWidget(self.le_idle_highlight_path, 1, 1)
@@ -8950,6 +9335,15 @@ class SettingsDialog(QDialog):
         idle.addWidget(self.cmb_idle_highlight_fit, 3, 1)
         idle.addWidget(QLabel("전환 시간"), 3, 2)
         idle.addWidget(self.sp_idle_highlight_fade, 3, 3)
+        idle.addWidget(self.chk_idle_highlight_cinematic, 4, 0, 1, 4)
+        idle.addWidget(self.chk_idle_cinematic_kd_tko, 5, 0, 1, 2)
+        idle.addWidget(self.chk_idle_cinematic_potm, 5, 2, 1, 2)
+        idle.addWidget(QLabel("시네마 대비"), 6, 0)
+        idle.addWidget(self.sp_idle_cinematic_contrast, 6, 1)
+        idle.addWidget(QLabel("시네마 선명도"), 6, 2)
+        idle.addWidget(self.sp_idle_cinematic_sharpen, 6, 3)
+        idle.addWidget(QLabel("시네마 비네팅"), 7, 0)
+        idle.addWidget(self.sp_idle_cinematic_vignette, 7, 1)
         idle.setColumnStretch(1, 1)
         idle.setColumnStretch(3, 1)
         outer.addWidget(idle_group)
@@ -9011,6 +9405,461 @@ class SettingsDialog(QDialog):
         if path:
             edit.setText(path)
             self._schedule_apply()
+
+    def _start_obs_source_record_wizard(self) -> None:
+        """Find an existing Source Record filter and remove manual name entry."""
+        self.apply_only(silent=True)
+        if not self.chk_obs_enabled.isChecked():
+            QMessageBox.warning(self, "OBS 간편 설정", "먼저 ‘OBS 연동 사용’을 켜고 OBS WebSocket 연결을 설정하세요.")
+            return
+        if "연결됨" not in str(self._obs_status_getter() if callable(self._obs_status_getter) else ""):
+            QMessageBox.information(
+                self,
+                "OBS 간편 설정",
+                "OBS 연결을 먼저 확인합니다. OBS를 켜 둔 뒤 잠시 후 이 버튼을 다시 눌러주세요.",
+            )
+            if callable(self._obs_test_connection):
+                self._obs_test_connection()
+            return
+        if not callable(self._obs_source_record_diagnose):
+            QMessageBox.warning(self, "OBS 간편 설정", "Source Record 자동 진단 기능을 찾지 못했습니다.")
+            return
+        self.btn_obs_source_record_wizard.setEnabled(False)
+        self.btn_obs_source_record_wizard.setText("OBS에서 Source Record 찾는 중...")
+        self._obs_source_record_diag_started_at = time.time()
+        self._obs_source_record_diagnose()
+        QTimer.singleShot(250, self._poll_obs_source_record_wizard)
+
+    def _show_obs_source_record_guide(self) -> None:
+        """Beginner-first, six-step explanation before touching OBS."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("OBS 소스 리플레이 처음 설정")
+        dialog.setMinimumSize(720, 570)
+        dialog.resize(780, 640)
+        layout = QVBoxLayout(dialog)
+        progress = QLabel()
+        progress.setStyleSheet("font-size:14px; font-weight:700; color:#60a5fa; padding:4px 2px;")
+        layout.addWidget(progress)
+        stack = QStackedWidget()
+        layout.addWidget(stack, 1)
+
+        pages = [
+            (
+                "1. 이 기능으로 무엇을 하나요?",
+                """
+                <h2>게임 화면만 자동으로 저장합니다</h2>
+                <p>경기 중 KD, TKO, 강한 공격, POTM 후보가 나오면 OBS의 <b>Source Record</b>가 최근 장면을 영상으로 저장합니다.</p>
+                <div style='background:#172033;padding:14px;border-radius:8px;'>
+                <b>방송 화면 전체를 저장하는 기능이 아닙니다.</b><br>
+                게임 전용 장면을 선택하면 브라우저 오버레이, 방송 BGM, 타이머 해설을 빼고<br>
+                <b>게임 영상 + 게임 소리</b>만 하이라이트로 남길 수 있습니다.
+                </div>
+                <h3>안전하게 작동합니다</h3>
+                <ul><li>기존 방송 장면을 삭제하지 않습니다.</li><li>기존 영상도 삭제하지 않습니다.</li>
+                <li>선택한 장면의 Source Record 필터만 만들거나 권장값으로 맞춥니다.</li></ul>
+                """,
+            ),
+            (
+                "2. OBS와 타이머를 연결합니다",
+                """
+                <h2>OBS WebSocket 연결</h2>
+                <p>타이머가 OBS에 “리플레이를 저장해”라고 명령하려면 WebSocket 연결이 필요합니다.</p>
+                <ol><li>OBS를 실행합니다.</li><li>OBS 상단 메뉴에서 <b>도구 → WebSocket 서버 설정</b>을 엽니다.</li>
+                <li><b>WebSocket 서버 활성화</b>를 체크합니다.</li><li>포트는 기본값 <b>4455</b>를 권장합니다.</li>
+                <li>비밀번호가 있다면 타이머 설정에도 똑같이 입력합니다.</li></ol>
+                <p><b>정상 기준:</b> 타이머의 OBS 상태에 <span style='color:#22c55e;'>OBS 연결됨</span>이라고 표시됩니다.</p>
+                <p style='color:#fbbf24;'>OBS를 나중에 켜도 괜찮습니다. 타이머가 자동으로 재연결합니다.</p>
+                """,
+            ),
+            (
+                "3. Source Record 플러그인을 준비합니다",
+                """
+                <h2>Source Record는 OBS용 무료 플러그인입니다</h2>
+                <p>마법사가 설치 여부를 자동 검사합니다. 설치되어 있지 않으면 공식 Windows 설치 파일을 바로 안내합니다.</p>
+                <ol><li><b>OBS를 완전히 종료</b>합니다.</li><li>안내되는 <b>windows-installer.exe</b>를 실행합니다.</li>
+                <li>설치를 마친 뒤 OBS를 다시 실행합니다.</li><li>타이머에서 마법사를 다시 시작합니다.</li></ol>
+                <div style='background:#3a2412;padding:12px;border-radius:8px;'>
+                OBS가 켜진 채로 설치하면 플러그인이 바로 나타나지 않을 수 있습니다.<br>
+                반드시 OBS를 재시작하세요.
+                </div>
+                """,
+            ),
+            (
+                "4. 게임 전용 장면을 고릅니다",
+                """
+                <h2>가장 중요한 단계입니다</h2>
+                <p>선택 목록에서 <b>게임 화면과 게임 소리만 들어 있는 장면</b>을 고르세요.</p>
+                <h3>들어가야 하는 것</h3><ul><li>게임 캡처 또는 관전툴 게임 화면</li><li>게임 소리</li></ul>
+                <h3>들어가면 안 되는 것</h3><ul><li>타이머 브라우저 오버레이</li><li>방송 BGM</li><li>타이머 해설·TTS</li><li>채팅창과 알림창</li></ul>
+                <p><b>전용 장면이 없다면:</b> OBS 장면 목록의 <b>＋</b>를 눌러 “스오파 - Source Record” 장면을 만들고,
+                소스 목록에 게임 화면과 게임 오디오만 추가하세요. 이 장면을 방송 화면에 띄울 필요는 없습니다.</p>
+                <p style='color:#fbbf24;'>방송용 종합 장면을 선택하면 오버레이와 BGM까지 영상에 들어갑니다.</p>
+                """,
+            ),
+            (
+                "5. 두 저장 폴더를 선택합니다",
+                """
+                <h2>폴더 두 개는 역할이 다릅니다</h2>
+                <h3>① 새 영상 수신 폴더 (_incoming)</h3>
+                <p>OBS가 방금 만든 원본이 잠깐 들어오는 임시 폴더입니다. 방송 종료 후 자동 정리할 수 있습니다.</p>
+                <h3>② 닉네임별 정리 폴더</h3>
+                <p>타이머가 발동 선수의 닉네임과 이벤트 종류에 따라 영상을 옮겨 보관하는 영구 폴더입니다.</p>
+                <ul><li>두 폴더는 서로 다르게 선택하세요.</li><li>외장·네트워크·클라우드 동기화 폴더보다 로컬 SSD를 권장합니다.</li>
+                <li>마법사는 보관 한도를 <b>50GB</b>로 설정합니다.</li><li>_merged 결과와 POTM 후보는 일반 정리 대상과 구분됩니다.</li></ul>
+                """,
+            ),
+            (
+                "6. 실제 영상으로 합격 확인합니다",
+                """
+                <h2>설정 후 반드시 실제 저장 테스트를 하세요</h2>
+                <ol><li>OBS의 게임 화면을 10초 이상 움직입니다.</li><li>타이머에서 <b>실제 저장 테스트</b>를 누릅니다.</li>
+                <li>최대 20초 동안 새 파일을 기다립니다.</li></ol>
+                <h3>모두 초록 체크면 완료</h3>
+                <ul><li>✅ 파일 생성</li><li>✅ 영상 트랙</li><li>✅ 오디오 트랙</li><li>✅ 재생 가능</li><li>✅ 영상 길이 약 7~13초</li></ul>
+                <h3>실패했을 때</h3>
+                <ul><li><b>오디오 ❌:</b> 선택한 장면에 게임 오디오 소스를 추가합니다.</li>
+                <li><b>영상 ❌:</b> 게임 캡처가 실제로 보이는 장면인지 확인합니다.</li>
+                <li><b>파일 없음:</b> OBS 연결, 플러그인 설치, 저장 폴더를 확인합니다.</li></ul>
+                <p><b>테스트에 합격하면</b> POTM, KD·KO/TKO 자동 리플레이, 이벤트 저장과 리플레이 소리를
+                Source Record 기준으로 자동 활성화합니다. 다른 설정을 다시 찾을 필요가 없습니다.</p>
+                """,
+            ),
+        ]
+        for title, html in pages:
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            body = QTextEdit()
+            body.setReadOnly(True)
+            body.setHtml(
+                "<style>body{font-family:'Malgun Gothic';font-size:15px;color:#e5e7eb;}"
+                "h2{color:#ffffff;}h3{color:#93c5fd;margin-top:16px;}li{margin:6px 0;}p{line-height:1.5;}</style>"
+                + html
+            )
+            page_layout.addWidget(body)
+            stack.addWidget(page)
+
+        buttons = QHBoxLayout()
+        btn_cancel = QPushButton("나중에")
+        btn_back = QPushButton("이전")
+        btn_next = QPushButton("다음")
+        buttons.addWidget(btn_cancel)
+        buttons.addStretch(1)
+        buttons.addWidget(btn_back)
+        buttons.addWidget(btn_next)
+        layout.addLayout(buttons)
+
+        def refresh() -> None:
+            index = stack.currentIndex()
+            progress.setText(f"{index + 1} / {len(pages)}   {pages[index][0]}")
+            btn_back.setEnabled(index > 0)
+            btn_next.setText("자동 검사 시작" if index == len(pages) - 1 else "다음")
+
+        def go_next() -> None:
+            index = stack.currentIndex()
+            if index < len(pages) - 1:
+                stack.setCurrentIndex(index + 1)
+                refresh()
+            else:
+                dialog.accept()
+
+        btn_cancel.clicked.connect(dialog.reject)
+        btn_back.clicked.connect(lambda: (stack.setCurrentIndex(max(0, stack.currentIndex() - 1)), refresh()))
+        btn_next.clicked.connect(go_next)
+        refresh()
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._start_obs_source_record_wizard()
+
+    def _poll_obs_source_record_wizard(self) -> None:
+        result: Dict[str, Any] = {}
+        if callable(self._obs_source_record_diagnostic_getter):
+            try:
+                result = dict(self._obs_source_record_diagnostic_getter() or {})
+            except Exception:
+                result = {}
+        started = float(self._obs_source_record_diag_started_at or 0.0)
+        if result and float(result.get("received_at") or 0.0) >= started:
+            self.btn_obs_source_record_wizard.setEnabled(True)
+            self.btn_obs_source_record_wizard.setText("처음 설정 마법사 (설명 포함)")
+            targets = list(result.get("targets") or [])
+            candidates = list(result.get("candidates") or [])
+            # An existing Source Record filter is definitive even if an older
+            # obs-websocket build cannot answer GetSourceFilterKindList.
+            plugin_installed = bool(result.get("plugin_installed", False)) or bool(targets)
+            if not plugin_installed:
+                answer = QMessageBox.question(
+                    self,
+                    "Source Record 플러그인 필요",
+                    "OBS Source Record 플러그인이 설치되지 않았습니다.\n\n"
+                    "OBS를 종료한 뒤 공식 Windows 설치 파일을 받아 설치해야 합니다. 공식 다운로드 페이지를 열까요?",
+                )
+                if answer == QMessageBox.StandardButton.Yes:
+                    QDesktopServices.openUrl(QUrl(
+                        "https://github.com/exeldro/obs-source-record/releases/download/0.4.8/"
+                        "source-record-0.4.8-windows-installer.exe"
+                    ))
+                return
+            create_filter = not bool(targets)
+            choices = targets if targets else candidates
+            if not choices:
+                QMessageBox.warning(self, "OBS 간편 설정", "OBS에서 선택할 장면이나 소스를 찾지 못했습니다.")
+                return
+            labels = []
+            for item in choices:
+                source = str(item.get("source") or "")
+                if create_filter:
+                    kind = "장면" if bool(item.get("scene", False)) else str(item.get("kind") or "소스")
+                    labels.append(f"{source}  [{kind}]")
+                else:
+                    labels.append(f"{source}  [{'켜짐' if bool(item.get('enabled', False)) else '꺼짐'}]")
+            current = str(self.le_obs_source_record_context.text() or "").strip()
+            default_index = next((i for i, item in enumerate(choices) if str(item.get("source") or "") == current), 0)
+            selected, ok = QInputDialog.getItem(
+                self,
+                "Source Record 대상 선택",
+                "게임 화면과 게임 소리만 들어 있는 장면/소스를 고르세요.\n브라우저 오버레이·방송 BGM·해설이 들어간 장면은 선택하지 마세요.",
+                labels, default_index, False,
+            )
+            if not ok:
+                return
+            index = labels.index(selected)
+            source = str(choices[index].get("source") or "").strip()
+            self.le_obs_source_record_context.setText(source)
+            self.chk_obs_source_record.setChecked(True)
+            self.chk_obs_source_record_auto_enable.setChecked(True)
+            self.chk_obs_source_record_stop_with_timer.setChecked(True)
+            self.sp_obs_source_record_archive_limit.setValue(50)
+            if not str(self.le_obs_source_record_incoming.text() or "").strip():
+                self._pick_obs_source_record_folder(self.le_obs_source_record_incoming, "OBS Source Record에 설정한 저장 폴더 선택")
+            if not str(self.le_obs_source_record_archive.text() or "").strip():
+                self._pick_obs_source_record_folder(self.le_obs_source_record_archive, "닉네임별 하이라이트 정리 폴더 선택")
+            incoming = normalize_app_path(str(self.le_obs_source_record_incoming.text() or ""))
+            archive = normalize_app_path(str(self.le_obs_source_record_archive.text() or ""))
+            if not incoming or not archive:
+                QMessageBox.warning(self, "OBS 간편 설정", "수신 폴더와 닉네임별 정리 폴더를 모두 선택해야 합니다.")
+                return
+            try:
+                os.makedirs(incoming, exist_ok=True)
+                os.makedirs(archive, exist_ok=True)
+            except OSError as exc:
+                QMessageBox.warning(self, "OBS 간편 설정", f"저장 폴더를 만들 수 없습니다.\n\n{exc}")
+                return
+            self.apply_only(silent=True)
+            if callable(self._obs_source_record_configure):
+                self._obs_source_record_configure(source, incoming, create_filter)
+            QMessageBox.information(
+                self,
+                "간편 설정 완료",
+                f"대상: {source}\n모드: Replay Buffer 10초\n저장 폴더: {incoming}\n\n"
+                + ("Source Record 필터 생성 요청까지 완료했습니다. " if create_filter else "기존 Source Record 설정을 권장값으로 맞췄습니다. ")
+                + "자동 켜기와 자동 저장을 활성화했습니다. "
+                "OBS 화면을 10초 이상 움직인 뒤 ‘실제 저장 테스트’를 눌러 영상과 소리를 확인하세요.",
+            )
+            return
+        if started and time.time() - started < 10.0:
+            QTimer.singleShot(250, self._poll_obs_source_record_wizard)
+            return
+        self.btn_obs_source_record_wizard.setEnabled(True)
+        self.btn_obs_source_record_wizard.setText("처음 설정 마법사 (설명 포함)")
+        QMessageBox.warning(self, "OBS 간편 설정", "OBS 응답이 없습니다. WebSocket 연결 상태를 확인하세요.")
+
+    def _test_obs_source_record_from_settings(self) -> None:
+        target = str(self.le_obs_source_record_context.text() or "").strip()
+        if not target:
+            QMessageBox.warning(self, "실제 저장 테스트", "먼저 간편 설정으로 Source Record 대상을 선택하세요.")
+            return
+        incoming = normalize_app_path(str(self.le_obs_source_record_incoming.text() or ""))
+        if not incoming or not os.path.isdir(incoming):
+            QMessageBox.warning(self, "실제 저장 테스트", "Source Record가 실제로 저장하는 ‘새 영상 수신 폴더’를 선택하세요.")
+            return
+        self.apply_only(silent=True)
+        if callable(self._obs_source_record_test):
+            extensions = ("*.mp4", "*.mov", "*.mkv", "*.webm", "*.m4v", "*.flv")
+            self._obs_source_record_test_before = {
+                os.path.normcase(os.path.abspath(path))
+                for pattern in extensions
+                for path in glob.glob(os.path.join(incoming, pattern))
+            }
+            self._obs_source_record_test_sizes = {}
+            self._obs_source_record_test_started_at = time.time()
+            self.btn_obs_source_record_test.setEnabled(False)
+            self.btn_obs_source_record_test.setText("새 영상 기다리는 중...")
+            self._obs_source_record_test(target)
+            QTimer.singleShot(500, lambda: self._poll_obs_source_record_file_test(incoming))
+        else:
+            QMessageBox.warning(self, "실제 저장 테스트", "저장 테스트 기능을 찾지 못했습니다.")
+
+    def _poll_obs_source_record_file_test(self, incoming: str) -> None:
+        extensions = ("*.mp4", "*.mov", "*.mkv", "*.webm", "*.m4v", "*.flv")
+        files = sorted(
+            {
+                os.path.normcase(os.path.abspath(path))
+                for pattern in extensions
+                for path in glob.glob(os.path.join(incoming, pattern))
+            } - self._obs_source_record_test_before,
+            key=lambda path: os.path.getmtime(path) if os.path.exists(path) else 0.0,
+            reverse=True,
+        )
+        ready = ""
+        for path in files:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            previous = self._obs_source_record_test_sizes.get(path)
+            self._obs_source_record_test_sizes[path] = size
+            if size > 0 and previous == size:
+                ready = path
+                break
+        if ready:
+            result = self._inspect_source_record_test_file(ready)
+            self.btn_obs_source_record_test.setEnabled(True)
+            self.btn_obs_source_record_test.setText("실제 저장 테스트")
+            marks = {
+                True: "✅",
+                False: "❌",
+                None: "⚠️",
+            }
+            duration = result.get("duration")
+            duration_text = f"{float(duration):.1f}초" if isinstance(duration, (int, float)) else "확인 불가"
+            message = (
+                f"파일 생성  ✅  {os.path.basename(ready)}\n"
+                f"영상 트랙  {marks[result.get('video')]}\n"
+                f"오디오 트랙  {marks[result.get('audio')]}\n"
+                f"재생 가능  {marks[result.get('playable')]}\n"
+                f"영상 길이  {marks[result.get('duration_ok')]}  {duration_text}\n\n"
+            )
+            if all(result.get(key) is True for key in ("video", "audio", "playable", "duration_ok")):
+                self._enable_source_record_replay_package()
+                QMessageBox.information(
+                    self,
+                    "Source Record 테스트 합격",
+                    message
+                    + "게임 영상과 게임 소리가 정상 저장됩니다.\n\n"
+                    + "✅ KD·KO/TKO 자동 리플레이\n"
+                    + "✅ PLAY OF THE MATCH\n"
+                    + "✅ Source Record 이벤트 저장\n"
+                    + "✅ 리플레이 소리 100%\n\n"
+                    + "위 기능을 모두 자동으로 활성화했습니다.",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Source Record 테스트 확인 필요",
+                    message + "오디오가 실패하면 선택한 장면에 게임 오디오 소스를 넣고 다시 테스트하세요.",
+                )
+            return
+        if time.time() - float(self._obs_source_record_test_started_at or 0.0) < 20.0:
+            QTimer.singleShot(500, lambda: self._poll_obs_source_record_file_test(incoming))
+            return
+        self.btn_obs_source_record_test.setEnabled(True)
+        self.btn_obs_source_record_test.setText("실제 저장 테스트")
+        QMessageBox.warning(
+            self,
+            "Source Record 테스트 실패",
+            "20초 안에 새 영상 파일이 생성되지 않았습니다.\n\n"
+            "OBS 연결, Source Record 필터, Replay Buffer 모드와 수신 폴더를 확인하세요.",
+        )
+
+    def _enable_source_record_replay_package(self) -> None:
+        """Enable the complete beginner preset only after a real clip passes."""
+        self.chk_obs_source_record.setChecked(True)
+        self.chk_obs_source_record_auto_enable.setChecked(True)
+        self.chk_obs_highlight_kd.setChecked(True)
+        self.chk_obs_highlight_tko.setChecked(True)
+        self.chk_potm_enabled.setChecked(True)
+        potm_source_index = self.cmb_potm_source.findData("source_record")
+        if potm_source_index >= 0:
+            self.cmb_potm_source.setCurrentIndex(potm_source_index)
+        self.chk_obs_auto_replay.setChecked(True)
+        self.chk_obs_auto_replay_kd.setChecked(True)
+        self.chk_obs_auto_replay_tko.setChecked(True)
+        replay_source_index = self.cmb_obs_auto_replay_source.findData("source_record")
+        if replay_source_index >= 0:
+            self.cmb_obs_auto_replay_source.setCurrentIndex(replay_source_index)
+        # Source Record is the single source of truth; leave the regular OBS
+        # replay buffer off as a fallback to avoid duplicate saved videos.
+        self.chk_obs_auto_replay_source_fallback.setChecked(False)
+        self.chk_obs_auto_replay_muted.setChecked(False)
+        self.sp_obs_auto_replay_volume.setValue(100)
+        self.sp_obs_auto_replay_post_event.setValue(1.0)
+        self.sp_obs_auto_replay_capture_delay.setValue(1.0)
+        self.sp_obs_auto_replay_source_wait.setValue(5.0)
+        self.apply_only(silent=True)
+        logging.info(
+            "OBS_SOURCE_RECORD_FULL_PRESET_ENABLED target=%s potm=source_record auto_replay=source_record",
+            str(self.le_obs_source_record_context.text() or ""),
+        )
+
+    def _inspect_source_record_test_file(self, path: str) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"video": False, "audio": None, "playable": False, "duration": None, "duration_ok": False}
+        # Source Record commonly writes Hybrid MP4.  Distributors should not
+        # need a separate ffprobe install just to verify audio, so recognize
+        # standard MP4/MOV and Matroska track markers as a safe fallback.
+        try:
+            markers = bytearray()
+            with open(path, "rb") as handle:
+                while len(markers) < 8 * 1024 * 1024:
+                    chunk = handle.read(min(1024 * 1024, 8 * 1024 * 1024 - len(markers)))
+                    if not chunk:
+                        break
+                    markers.extend(chunk)
+                try:
+                    handle.seek(0, os.SEEK_END)
+                    total_size = handle.tell()
+                    if total_size > 8 * 1024 * 1024:
+                        handle.seek(max(0, total_size - 8 * 1024 * 1024), os.SEEK_SET)
+                        markers.extend(handle.read(8 * 1024 * 1024))
+                except OSError:
+                    pass
+            marker_bytes = bytes(markers)
+            if any(token in marker_bytes for token in (b"soun", b"mp4a", b"Opus", b"A_AAC", b"A_OPUS")):
+                result["audio"] = True
+            if any(token in marker_bytes for token in (b"vide", b"avc1", b"hvc1", b"hev1", b"V_MPEG")):
+                result["video"] = True
+        except OSError:
+            pass
+        ffmpeg = self._highlight_merge_ffmpeg_path(str(self.le_obs_highlight_ffmpeg.text() or ""))
+        ffprobe = ""
+        if ffmpeg:
+            candidate = os.path.join(os.path.dirname(ffmpeg), "ffprobe.exe")
+            if os.path.isfile(candidate):
+                ffprobe = candidate
+        if not ffprobe:
+            ffprobe = shutil.which("ffprobe") or ""
+        if ffprobe:
+            try:
+                proc = subprocess.run(
+                    [ffprobe, "-v", "error", "-show_entries", "format=duration", "-show_streams", "-of", "json", path],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                payload = json.loads(proc.stdout or "{}") if proc.returncode == 0 else {}
+                streams = list(payload.get("streams") or [])
+                result["video"] = any(str(item.get("codec_type") or "") == "video" for item in streams)
+                result["audio"] = any(str(item.get("codec_type") or "") == "audio" for item in streams)
+                try:
+                    result["duration"] = float(dict(payload.get("format") or {}).get("duration"))
+                except (TypeError, ValueError):
+                    pass
+                result["playable"] = proc.returncode == 0 and bool(result["video"])
+            except Exception:
+                logging.exception("OBS_SOURCE_RECORD_TEST_FFPROBE_FAIL path=%s", path)
+        if not result["playable"]:
+            capture = cv2.VideoCapture(path)
+            try:
+                ok, _frame = capture.read()
+                result["video"] = bool(ok)
+                result["playable"] = bool(ok)
+                fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+                frames = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+                if fps > 0.0 and frames > 0.0:
+                    result["duration"] = frames / fps
+            finally:
+                capture.release()
+        duration = result.get("duration")
+        result["duration_ok"] = isinstance(duration, (int, float)) and 7.0 <= float(duration) <= 13.0
+        logging.info("OBS_SOURCE_RECORD_FILE_TEST path=%s result=%s", path, result)
+        return result
 
     def _pick_highlight_ffmpeg(self) -> None:
         start = normalize_app_path(str(self.le_obs_highlight_ffmpeg.text() or ""))
@@ -9083,7 +9932,126 @@ class SettingsDialog(QDialog):
             )
         )
 
+    def _run_central_engine_full_test(self) -> None:
+        """Validate every canonical verdict, show it, then run POTM.
+
+        This is intentionally non-destructive: it only uses deterministic
+        in-memory rehearsal rows and the already existing POTM presentation
+        rehearsal. It never writes Source Record clips or changes OBS inputs.
+        """
+        try:
+            self.apply_only(silent=True)
+            runner = self._central_engine_test
+            if not callable(runner):
+                QMessageBox.warning(self, "중앙엔진 테스트", "중앙엔진 테스트 함수를 찾지 못했습니다.")
+                return
+            result = dict(runner() or {})
+            lines = list(result.get("lines") or [])
+            failed = list(result.get("failed") or [])
+            self.txt_rehearsal_log.appendPlainText("\n".join(lines))
+            if not result.get("ok", False) or failed:
+                self.txt_rehearsal_log.appendPlainText("[실패] " + ", ".join(failed))
+                QMessageBox.warning(self, "중앙엔진 테스트", "판정 테스트 실패: " + ", ".join(failed))
+                return
+            self.txt_rehearsal_log.appendPlainText("[통과] 중앙 판정 전체 통과 → 브라우저 오버레이 시각 테스트 시작")
+            self._play_central_engine_visual_test(result)
+        except Exception:
+            logging.exception("CENTRAL_ENGINE_FULL_TEST_FAIL")
+            QMessageBox.warning(self, "중앙엔진 테스트", "통합 테스트 중 오류가 발생했습니다.")
+
+    def _play_central_engine_visual_test(self, result: Dict[str, Any]) -> None:
+        steps = [dict(item or {}) for item in list(result.get("visual_steps") or [])]
+        if not steps:
+            QMessageBox.warning(self, "중앙엔진 테스트", "표시할 중앙엔진 판정 결과가 없습니다.")
+            return
+        token = object()
+        self._central_engine_test_token = token
+        interval_ms = 2300
+
+        def active() -> bool:
+            return getattr(self, "_central_engine_test_token", None) is token
+
+        def show_step(index: int, step: Dict[str, Any]) -> None:
+            if not active():
+                return
+            event = dict(step.get("event") or {})
+            label = str(step.get("label") or event.get("event_primary") or "event")
+            attacker = "red" if str(event.get("attacker_side") or "").lower() == "red" else "blue"
+            receiver = "blue" if attacker == "red" else "red"
+            damage = float(event.get("damage", 0.0) or 0.0)
+            combo_hits = int(event.get("combo_hits", 0) or 0)
+            combo_damage = float(event.get("combo_damage", damage) or damage)
+            is_counter = bool(event.get("is_counter", False))
+            effect_kind = str(event.get("effect_kind") or "").lower().strip()
+            event.update({
+                "_test_event": True,
+                "side": receiver,
+                "attacker_side": attacker,
+                "receiver_side": receiver,
+                "screen_x": 0.5,
+                "screen_y": 0.5,
+                "coord_source": "central_engine_test",
+                "hitfx_key": "central-test-%d-%d" % (index, int(time.time() * 1000)),
+                "event_time": time.time(),
+                "punch": str(event.get("punch") or "TEST"),
+            })
+            combo_text = ""
+            if is_counter:
+                combo_text = "COUNTER\nHIT %d" % combo_hits if combo_hits >= 2 else "COUNTER"
+            elif combo_hits >= 2:
+                combo_text = "%d HIT COMBO" % combo_hits
+            info = {
+                "blue_combo_hit_text": combo_text if attacker == "blue" else "",
+                "blue_combo_damage_text": ("%d DAMAGE" % int(round(combo_damage))) if combo_text and attacker == "blue" else "",
+                "red_combo_hit_text": combo_text if attacker == "red" else "",
+                "red_combo_damage_text": ("%d DAMAGE" % int(round(combo_damage))) if combo_text and attacker == "red" else "",
+                "blue_recent_hit_text": ("%s %d" % (event["punch"], int(round(damage)))) if attacker == "blue" else "",
+                "red_recent_hit_text": ("%s %d" % (event["punch"], int(round(damage)))) if attacker == "red" else "",
+            }
+            payload: Dict[str, Any] = {
+                "spectator_log_info": info,
+                "spectator_hit_effect_events": [event],
+            }
+            if effect_kind in ("stun", "knockdown", "down", "tko"):
+                payload["spectator_effect_events"] = [{"side": receiver, "kind": effect_kind}]
+            self._emit_spectator_test_update(payload)
+            if is_counter:
+                self._push_browser_overlay_event(
+                    "counter",
+                    side=attacker,
+                    damage=damage,
+                    reason=str(event.get("counter_reason") or ""),
+                    test=True,
+                )
+            self.txt_rehearsal_log.appendPlainText(
+                "[표시 %d/%d] %s | %s"
+                % (index + 1, len(steps), label, ", ".join(event.get("event_tags") or []))
+            )
+            if bool(self.chk_rehearsal_tts.isChecked()):
+                self._speak_tts_test_qt("%s 테스트입니다." % label, role="analyst")
+
+        for index, step in enumerate(steps):
+            QTimer.singleShot(index * interval_ms, lambda i=index, s=step: show_step(i, s))
+
+        def finish_visuals() -> None:
+            if not active():
+                return
+            self._central_engine_test_token = None
+            self._test_set_spectator_info({
+                "blue_combo_hit_text": "",
+                "blue_combo_damage_text": "",
+                "red_combo_hit_text": "",
+                "red_combo_damage_text": "",
+                "blue_recent_hit_text": "",
+                "red_recent_hit_text": "",
+            }, {"spectator_match_stats_reset": True})
+            self.txt_rehearsal_log.appendPlainText("[시각 테스트 통과] POTM 전체 리허설 시작")
+            self._run_broadcast_rehearsal_from_settings()
+
+        QTimer.singleShot(len(steps) * interval_ms + 500, finish_visuals)
+
     def _stop_broadcast_rehearsal_from_settings(self) -> None:
+        self._central_engine_test_token = None
         stopper = self._broadcast_rehearsal_stop
         if callable(stopper):
             stopper()
@@ -9289,17 +10257,21 @@ class SettingsDialog(QDialog):
     def _archive_merged_source_clips(videos: List[str], player_dir: str) -> Tuple[int, List[str]]:
         """Move only the clips used for this successful compilation aside."""
         used_dir = os.path.join(player_dir, "_used")
-        os.makedirs(used_dir, exist_ok=True)
         moved = 0
         failures: List[str] = []
         for source in videos:
             try:
                 filename = os.path.basename(source)
                 stem, ext = os.path.splitext(filename)
-                target = os.path.join(used_dir, filename)
+                relative_parent = os.path.dirname(os.path.relpath(source, player_dir))
+                if relative_parent in ("", ".") or relative_parent.startswith(".."):
+                    relative_parent = ""
+                target_dir = os.path.join(used_dir, relative_parent)
+                os.makedirs(target_dir, exist_ok=True)
+                target = os.path.join(target_dir, filename)
                 index = 2
                 while os.path.exists(target):
-                    target = os.path.join(used_dir, f"{stem}_{index:02d}{ext}")
+                    target = os.path.join(target_dir, f"{stem}_{index:02d}{ext}")
                     index += 1
                 shutil.move(source, target)
                 moved += 1
@@ -9325,11 +10297,16 @@ class SettingsDialog(QDialog):
             return
         player_dir = os.path.abspath(player_dir)
         allowed = {".mp4", ".mkv", ".mov", ".m4v", ".webm"}
-        videos = sorted(
-            [os.path.join(player_dir, name) for name in os.listdir(player_dir)
-             if os.path.splitext(name)[1].lower() in allowed and os.path.isfile(os.path.join(player_dir, name))],
-            key=lambda path: (os.path.getmtime(path), os.path.basename(path).lower()),
-        )
+        videos = []
+        for root, dirs, names in os.walk(player_dir):
+            dirs[:] = [name for name in dirs if not name.startswith("_")]
+            videos.extend(
+                os.path.join(root, name)
+                for name in names
+                if os.path.splitext(name)[1].lower() in allowed
+                and os.path.isfile(os.path.join(root, name))
+            )
+        videos.sort(key=lambda path: (os.path.getmtime(path), os.path.basename(path).lower()))
         if len(videos) < 2:
             QMessageBox.information(self, "영상 합치기", "선택한 선수 폴더에 영상이 2개 이상 있어야 합니다.")
             return
@@ -9420,6 +10397,7 @@ class SettingsDialog(QDialog):
         transition_ms = int(self.sp_obs_highlight_merge_transition.value())
         transition_image_path = str(self.le_obs_highlight_merge_transition_image.text() or "").strip()
         transition_image_ms = int(self.sp_obs_highlight_merge_transition_image.value())
+        aspect_mode = str(self.cmb_obs_highlight_merge_aspect.currentData() or "landscape")
         shorts_top_text = str(self.te_obs_highlight_shorts_top.toPlainText() or "")[:240]
         shorts_bottom_text = str(self.te_obs_highlight_shorts_bottom.toPlainText() or "")[:240]
 
@@ -9501,15 +10479,16 @@ class SettingsDialog(QDialog):
             (self.chk_obs_highlight_heavy, "obs_highlight_heavy"),
         ):
             widget.setChecked(bool(getattr(self.cfg, attr, True)))
-        self.sp_obs_combo_min.setValue(int(getattr(self.cfg, "obs_highlight_combo_min", 3) or 3))
-        self.sp_obs_damage_min.setValue(float(getattr(self.cfg, "obs_highlight_damage_min", 55.0) or 55.0))
-        self.sp_obs_counter_damage_min.setValue(float(getattr(self.cfg, "obs_highlight_counter_damage_min", 30.0) or 0.0))
         self.sp_obs_highlight_cooldown.setValue(float(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0) or 8.0))
-        self.chk_event_engine.setChecked(bool(getattr(self.cfg, "event_engine_enabled", True)))
-        self.chk_event_engine_shadow.setChecked(bool(getattr(self.cfg, "event_engine_shadow_mode", False)))
         self.sp_event_heavy_damage.setValue(float(getattr(self.cfg, "event_heavy_damage", 50.0) or 0.0))
         self.sp_event_signature_damage.setValue(float(getattr(self.cfg, "event_signature_damage", 60.0) or 0.0))
         self.sp_event_counter_damage.setValue(float(getattr(self.cfg, "event_counter_min_damage", 40.0) or 0.0))
+        self.sp_event_counter_window.setValue(float(getattr(self.cfg, "event_counter_window_sec", 0.7) or 0.7))
+        self.sp_event_counter_graze.setValue(float(getattr(self.cfg, "event_counter_graze_max_damage", 15.0) or 0.0))
+        self.sp_event_counter_response.setValue(max(25.0, float(getattr(self.cfg, "event_counter_response_min_damage", 30.0) or 0.0)))
+        self.sp_event_combo_min.setValue(float(getattr(self.cfg, "event_combo_min_damage", 15.0) or 0.0))
+        self.sp_event_combo_window.setValue(float(getattr(self.cfg, "event_combo_window_sec", 0.8) or 0.8))
+        self.sp_event_combo_break.setValue(float(getattr(self.cfg, "event_combo_break_damage", 20.0) or 0.0))
         self.sp_event_combo_emphasis.setValue(int(getattr(self.cfg, "event_combo_emphasis_hits", 5) or 5))
         self.chk_obs_source_record.setChecked(bool(getattr(self.cfg, "obs_source_record_enabled", False)))
         self.chk_obs_source_record_auto_enable.setChecked(bool(getattr(self.cfg, "obs_source_record_auto_enable", True)))
@@ -9534,6 +10513,7 @@ class SettingsDialog(QDialog):
         self.sp_potm_replay_speed.setValue(float(getattr(self.cfg, "potm_replay_speed", 0.85) or 0.85))
         self.le_potm_bgm.setText(str(getattr(self.cfg, "potm_bgm_path", "") or ""))
         self.sp_potm_bgm_volume.setValue(int(getattr(self.cfg, "potm_bgm_volume", 75) or 0))
+        self.cmb_potm_audio_output.setCurrentIndex(max(0, self.cmb_potm_audio_output.findData(str(getattr(self.cfg, "potm_audio_output_device", "") or ""))))
         self.le_potm_test_video.setText(str(getattr(self.cfg, "potm_test_video_path", "") or ""))
         self.le_potm_name_color.setText(str(getattr(self.cfg, "potm_name_color", "#FFC62B") or "#FFC62B"))
         self.le_potm_title.setText(str(getattr(self.cfg, "potm_title_text", "PLAY OF THE MATCH") or "PLAY OF THE MATCH"))
@@ -9561,6 +10541,24 @@ class SettingsDialog(QDialog):
         self.chk_obs_auto_replay.setChecked(bool(getattr(self.cfg, "obs_auto_replay_enabled", True)))
         self.chk_obs_auto_replay_kd.setChecked(bool(getattr(self.cfg, "obs_auto_replay_kd", True)))
         self.chk_obs_auto_replay_tko.setChecked(bool(getattr(self.cfg, "obs_auto_replay_tko", True)))
+        self.cmb_obs_auto_replay_source.setCurrentIndex(max(
+            0,
+            self.cmb_obs_auto_replay_source.findData(
+                str(getattr(self.cfg, "obs_auto_replay_source", "replay_buffer") or "replay_buffer")
+            ),
+        ))
+        self.chk_obs_auto_replay_source_fallback.setChecked(
+            bool(getattr(self.cfg, "obs_auto_replay_source_fallback", False))
+        )
+        self.sp_obs_auto_replay_source_wait.setValue(
+            float(getattr(self.cfg, "obs_auto_replay_source_wait_sec", 5.0) or 5.0)
+        )
+        self.sp_obs_auto_replay_pre_event.setValue(
+            float(getattr(self.cfg, "obs_auto_replay_pre_event_sec", 3.0) or 3.0)
+        )
+        self.sp_obs_auto_replay_post_event.setValue(
+            float(getattr(self.cfg, "obs_auto_replay_post_event_sec", 1.0) or 0.0)
+        )
         self.sp_obs_auto_replay_capture_delay.setValue(float(getattr(self.cfg, "obs_auto_replay_capture_delay_sec", 1.0) or 0.0))
         self.chk_obs_replay_transition.setChecked(bool(getattr(self.cfg, "obs_replay_transition_enabled", False)))
         self.le_obs_replay_transition_before.setText(str(getattr(self.cfg, "obs_replay_transition_before_path", "") or ""))
@@ -9587,6 +10585,12 @@ class SettingsDialog(QDialog):
         fit_index = self.cmb_idle_highlight_fit.findData(str(getattr(self.cfg, "idle_highlight_fit", "cover") or "cover"))
         self.cmb_idle_highlight_fit.setCurrentIndex(max(0, fit_index))
         self.sp_idle_highlight_fade.setValue(int(getattr(self.cfg, "idle_highlight_fade_ms", 350) or 350))
+        self.chk_idle_highlight_cinematic.setChecked(bool(getattr(self.cfg, "idle_highlight_cinematic_enabled", False)))
+        self.chk_idle_cinematic_kd_tko.setChecked(bool(getattr(self.cfg, "idle_highlight_cinematic_kd_tko_enabled", False)))
+        self.chk_idle_cinematic_potm.setChecked(bool(getattr(self.cfg, "idle_highlight_cinematic_potm_enabled", False)))
+        self.sp_idle_cinematic_contrast.setValue(int(getattr(self.cfg, "idle_highlight_cinematic_contrast", 32) or 0))
+        self.sp_idle_cinematic_sharpen.setValue(int(getattr(self.cfg, "idle_highlight_cinematic_sharpen", 35) or 0))
+        self.sp_idle_cinematic_vignette.setValue(int(getattr(self.cfg, "idle_highlight_cinematic_vignette", 24) or 0))
         self._refresh_obs_status_label()
 
     def _test_obs_replay_transition_from_settings(self):
@@ -9715,7 +10719,39 @@ class SettingsDialog(QDialog):
         QTimer.singleShot(2000, _capture)
 
     def _test_spectator_lobby_auto_start_click(self):
+        mode = str(
+            self.cmb_spectator_lobby_auto_start_mode.currentData() or "f5"
+        ).strip().lower()
+        # This installation deliberately uses the game's F5 command.  Old
+        # profiles can still contain ``click``; never let that stale value move
+        # the user's mouse during a test.
+        if mode == "click":
+            mode = "f5"
         title = str(self.le_spectator_lobby_auto_start_title.text() or "").strip()
+        if mode in ("f5", "f5_then_click"):
+            if not title:
+                QMessageBox.warning(self, "자동 시작 테스트", "관전툴 창 제목을 입력하세요.")
+                return
+            ok, detail = press_vk_for_window_title(
+                0x74,  # VK_F5
+                title,
+                activate=True,
+                restore_previous=True,
+                minimize_target_after=True,
+            )
+            logging.info("LOBBY_AUTO_START_F5_TEST ok=%s %s", ok, detail)
+            DIAG.record(
+                "lobby_auto_start_f5_test",
+                ok=bool(ok),
+                detail=str(detail or ""),
+                title=title,
+            )
+            self.lbl_spectator_lobby_auto_start_state.setText(
+                ("F5 입력 전송 성공: " if ok else "F5 입력 전송 실패: ") + str(detail or "")
+            )
+            if not ok:
+                QMessageBox.warning(self, "F5 자동 시작 테스트 실패", str(detail or ""))
+            return
         x = int(self.sp_spectator_lobby_auto_start_x.value())
         y = int(self.sp_spectator_lobby_auto_start_y.value())
         if not title:
@@ -11525,14 +12561,8 @@ class SettingsDialog(QDialog):
             "round_no": replay_round_no,
             "round_state": replay_round_state,
             "last_fight_seconds": None,
-            "combo": {
-                "attacker_side": "",
-                "receiver_side": "",
-                "last_time": None,
-                "count": 0,
-                "damage": 0.0,
-            },
-            "last_counter_event": None,
+            "event_engine": FightEventEngine(self.cfg),
+            "display_combo_side": "",
             "token": time.time(),
         }
         self._spectator_replay_token = replay_state["token"]
@@ -11638,90 +12668,29 @@ class SettingsDialog(QDialog):
             recent = helper._format_recent_hit_text(ev)
             try:
                 combo_info: Dict[str, str] = {}
-                combo_state = dict(replay_state.get("combo") or {})
-                combo_min_damage = 15.0
-                combo_break_damage = 20.0
-                combo_gap = 0.8
-                counter_prev_damage = COUNTER_PREV_DAMAGE_THRESHOLD
-                counter_damage = COUNTER_DEALT_DAMAGE_THRESHOLD
-                counter_window = COUNTER_WINDOW_SEC
-                ev_time = float(ev.get("time", 0.0) or 0.0)
-                last_counter_event = dict(replay_state.get("last_counter_event") or {})
-                counter_hit = False
-                try:
-                    prev_t = float(last_counter_event.get("time", -9999.0))
-                    prev_dmg = float(last_counter_event.get("damage", 0.0) or 0.0)
-                except Exception:
-                    prev_t = -9999.0
-                    prev_dmg = 0.0
-                if (
-                    str(last_counter_event.get("attacker_side") or "").lower() == receiver_side
-                    and str(last_counter_event.get("receiver_side") or "").lower() == attacker_side
-                    and prev_dmg >= counter_prev_damage
-                    and damage >= counter_damage
-                    and 0.0 <= (ev_time - prev_t) <= counter_window
-                ):
-                    counter_hit = True
-                active_attacker = str(combo_state.get("attacker_side") or "")
-                active_receiver = str(combo_state.get("receiver_side") or "")
-                if (
-                    active_attacker in ("blue", "red")
-                    and active_receiver in ("blue", "red")
-                    and attacker_side == active_receiver
-                    and receiver_side == active_attacker
-                    and damage < combo_break_damage
-                ):
-                    replay_state["last_counter_event"] = dict(ev)
-                else:
-                    if (
-                        active_attacker in ("blue", "red")
-                        and active_receiver in ("blue", "red")
-                        and attacker_side == active_receiver
-                        and receiver_side == active_attacker
-                        and damage >= combo_break_damage
-                    ):
-                        combo_info[f"{active_attacker}_combo_hit_text"] = ""
-                        combo_info[f"{active_attacker}_combo_damage_text"] = ""
-                        combo_state = {"attacker_side": "", "receiver_side": "", "last_time": None, "count": 0, "damage": 0.0}
-                    if damage >= combo_min_damage:
-                        last_time = combo_state.get("last_time", None)
-                        same_chain = (
-                            combo_state.get("attacker_side") == attacker_side
-                            and combo_state.get("receiver_side") == receiver_side
-                            and last_time is not None
-                            and abs(ev_time - float(last_time or 0.0)) <= combo_gap
-                        )
-                        if same_chain:
-                            prev_count = int(combo_state.get("count", 0) or 0)
-                            combo_count = int(combo_state.get("count", 0) or 0) + 1
-                            combo_damage = float(combo_state.get("damage", 0.0) or 0.0) + damage
-                        else:
-                            prev_count = 0
-                            old_attacker = str(combo_state.get("attacker_side") or "")
-                            if old_attacker in ("blue", "red") and int(combo_state.get("count", 0) or 0) >= 2:
-                                combo_info[f"{old_attacker}_combo_hit_text"] = ""
-                                combo_info[f"{old_attacker}_combo_damage_text"] = ""
-                            combo_count = 1
-                            combo_damage = damage
-                        combo_state = {
-                            "attacker_side": attacker_side,
-                            "receiver_side": receiver_side,
-                            "last_time": ev_time,
-                            "count": combo_count,
-                            "damage": combo_damage,
-                        }
-                        if combo_count >= 2:
-                            combo_info[f"{attacker_side}_combo_hit_text"] = f"{combo_count} HIT COMBO"
-                            combo_info[f"{attacker_side}_combo_damage_text"] = f"{int(round(combo_damage))} DAMAGE"
-                            if prev_count < 2:
-                                combo_info["_combo_commentary_text"] = "좋은 콤보가 적중합니다"
-                    if counter_hit:
-                        combo_info[f"{attacker_side}_combo_hit_text"] = (
-                            f"COUNTER\nHIT {combo_count}" if combo_count >= 2 else "COUNTER"
-                        )
-                        combo_info[f"{attacker_side}_combo_damage_text"] = f"{int(round(damage))} DAMAGE"
-                    replay_state["last_counter_event"] = dict(ev)
-                replay_state["combo"] = combo_state
+                central = replay_state["event_engine"].classify(dict(ev or {}))
+                combo_count = int(central.get("combo_hits", 0) or 0)
+                combo_damage = float(central.get("combo_damage", 0.0) or 0.0)
+                counter_hit = bool(central.get("counter", False))
+                old_side = str(replay_state.get("display_combo_side") or "")
+                if old_side in ("blue", "red") and old_side != attacker_side:
+                    combo_info[f"{old_side}_combo_hit_text"] = ""
+                    combo_info[f"{old_side}_combo_damage_text"] = ""
+                if combo_count >= 2:
+                    combo_info[f"{attacker_side}_combo_hit_text"] = f"{combo_count} HIT COMBO"
+                    combo_info[f"{attacker_side}_combo_damage_text"] = f"{int(round(combo_damage))} DAMAGE"
+                    if combo_count == 2:
+                        combo_info["_combo_commentary_text"] = "좋은 콤보가 적중합니다"
+                    replay_state["display_combo_side"] = attacker_side
+                elif old_side == attacker_side:
+                    combo_info[f"{attacker_side}_combo_hit_text"] = ""
+                    combo_info[f"{attacker_side}_combo_damage_text"] = ""
+                    replay_state["display_combo_side"] = ""
+                if counter_hit:
+                    combo_info[f"{attacker_side}_combo_hit_text"] = (
+                        f"COUNTER\nHIT {combo_count}" if combo_count >= 2 else "COUNTER"
+                    )
+                    combo_info[f"{attacker_side}_combo_damage_text"] = f"{int(round(damage))} DAMAGE"
                 log_info = {
                     "match_text": "",
                     "recent_hit_text": "",
@@ -11745,10 +12714,18 @@ class SettingsDialog(QDialog):
                         "side": receiver_side,
                         "attacker_side": attacker_side,
                         "punch": str(ev.get("punch") or "Hit"),
-                        "damage": damage,
-                        "weak_point": str(ev.get("weak_point") or ""),
-                        "effect_kind": kind,
-                    }],
+                         "damage": damage,
+                         "weak_point": str(ev.get("weak_point") or ""),
+                         "effect_kind": kind,
+                         "event_primary": str(central.get("primary") or "hit"),
+                         "event_tags": list(central.get("tags") or []),
+                         "combo_hits": combo_count,
+                         "combo_damage": combo_damage,
+                         "is_counter": counter_hit,
+                         "counter_reason": str(central.get("counter_reason") or ""),
+                         "official_counter": bool(central.get("official_counter", False)),
+                         "inferred_counter": bool(central.get("inferred_counter", False)),
+                     }],
                 }
                 if kind:
                     replay_payload["spectator_effect_events"] = [{"side": receiver_side, "kind": kind}]
@@ -11772,7 +12749,17 @@ class SettingsDialog(QDialog):
                 helper._recent_damage_events.append(ev_for_summary)
                 effect_events = [{"side": receiver_side, "kind": kind}] if kind else []
                 if counter_hit and bool(getattr(self.cfg, "spectator_commentary_enabled", False)):
-                    self._speak_tts_test_qt("카운터가 적중됩니다!", role="analyst")
+                    self._speak_tts_test_qt(
+                        helper._live_line(
+                            f"replay-counter:{attacker_side}:{central.get('counter_reason', '')}:{int(damage)}:{combo_count}",
+                            helper._counter_commentary_candidates(
+                                str(central.get("counter_reason") or ""),
+                                damage,
+                                combo_count,
+                            ),
+                        ),
+                        role="analyst",
+                    )
                 else_combo_text = str(combo_info.pop("_combo_commentary_text", "") or "").strip()
                 if not counter_hit and else_combo_text and bool(getattr(self.cfg, "spectator_commentary_enabled", False)):
                     self._speak_tts_test_qt(else_combo_text, role="analyst")
@@ -12399,7 +13386,7 @@ class SettingsDialog(QDialog):
             return widget.value() if widget is not None else default
 
         shake_widget = getattr(self, "chk_overlay_ko_screen_shake", None)
-        return {
+        payload = {
             "overlay_kd_image_path": _text(
                 "le_overlay_kd_image", str(getattr(self.cfg, "overlay_kd_image_path", "assets/images/overlays/KD.png") or "assets/images/overlays/KD.png")
             ),
@@ -16401,6 +17388,21 @@ class SettingsDialog(QDialog):
         self._pixel_stop()
 
     def _log_start(self):
+        # ``SpectatorLog 사용`` is the persisted desired state.  It used to be
+        # copied *after* apply_only(), so a stale unchecked box could first
+        # stop the watcher and only then request a start.  Because stopping the
+        # Windows directory watcher is asynchronous, that sequence made a
+        # perfectly valid click look as though it had been ignored.
+        #
+        # Make a Start click authoritative before applying the rest of the
+        # dialog values.  The controller will still validate the folder and
+        # report a real startup failure to the timer window.
+        if hasattr(self, "chk_spectatorlog_enabled"):
+            try:
+                self._suspend_apply = True
+                self.chk_spectatorlog_enabled.setChecked(True)
+            finally:
+                self._suspend_apply = False
         self.apply_only(silent=True)
         if callable(getattr(self, "_log_detection_start", None)):
             self._log_detection_start()
@@ -16409,6 +17411,14 @@ class SettingsDialog(QDialog):
         self._update_detect_button()
 
     def _log_stop(self):
+        # Keep the saved checkbox and the explicit Stop command in lockstep;
+        # otherwise a pending auto-apply can immediately restart the watcher.
+        if hasattr(self, "chk_spectatorlog_enabled"):
+            try:
+                self._suspend_apply = True
+                self.chk_spectatorlog_enabled.setChecked(False)
+            finally:
+                self._suspend_apply = False
         if callable(getattr(self, "_log_detection_stop", None)):
             self._log_detection_stop()
         elif callable(getattr(self, "_detection_stop", None)):
@@ -18193,15 +19203,18 @@ class SettingsDialog(QDialog):
             self.cfg.obs_highlight_counter = bool(self.chk_obs_highlight_counter.isChecked())
             self.cfg.obs_highlight_combo = bool(self.chk_obs_highlight_combo.isChecked())
             self.cfg.obs_highlight_heavy = bool(self.chk_obs_highlight_heavy.isChecked())
-            self.cfg.obs_highlight_combo_min = int(self.sp_obs_combo_min.value())
-            self.cfg.obs_highlight_damage_min = float(self.sp_obs_damage_min.value())
-            self.cfg.obs_highlight_counter_damage_min = float(self.sp_obs_counter_damage_min.value())
             self.cfg.obs_highlight_cooldown_sec = float(self.sp_obs_highlight_cooldown.value())
-            self.cfg.event_engine_enabled = bool(self.chk_event_engine.isChecked())
-            self.cfg.event_engine_shadow_mode = bool(self.chk_event_engine_shadow.isChecked())
+            self.cfg.event_engine_enabled = True
+            self.cfg.event_engine_shadow_mode = False
             self.cfg.event_heavy_damage = float(self.sp_event_heavy_damage.value())
             self.cfg.event_signature_damage = float(self.sp_event_signature_damage.value())
             self.cfg.event_counter_min_damage = float(self.sp_event_counter_damage.value())
+            self.cfg.event_counter_window_sec = float(self.sp_event_counter_window.value())
+            self.cfg.event_counter_graze_max_damage = float(self.sp_event_counter_graze.value())
+            self.cfg.event_counter_response_min_damage = float(self.sp_event_counter_response.value())
+            self.cfg.event_combo_min_damage = float(self.sp_event_combo_min.value())
+            self.cfg.event_combo_window_sec = float(self.sp_event_combo_window.value())
+            self.cfg.event_combo_break_damage = float(self.sp_event_combo_break.value())
             self.cfg.event_combo_emphasis_hits = int(self.sp_event_combo_emphasis.value())
             self.cfg.obs_source_record_enabled = bool(self.chk_obs_source_record.isChecked())
             self.cfg.obs_source_record_auto_enable = bool(self.chk_obs_source_record_auto_enable.isChecked())
@@ -18224,6 +19237,7 @@ class SettingsDialog(QDialog):
             self.cfg.potm_replay_speed = float(self.sp_potm_replay_speed.value())
             self.cfg.potm_bgm_path = str(self.le_potm_bgm.text() or "").strip()
             self.cfg.potm_bgm_volume = int(self.sp_potm_bgm_volume.value())
+            self.cfg.potm_audio_output_device = str(self.cmb_potm_audio_output.currentData() or "")
             self.cfg.potm_test_video_path = str(self.le_potm_test_video.text() or "").strip()
             self.cfg.potm_name_color = _normalize_hex_color(str(self.le_potm_name_color.text() or "#FFC62B").strip() or "#FFC62B")
             self.cfg.potm_title_text = str(self.le_potm_title.text() or "PLAY OF THE MATCH").strip()
@@ -18250,6 +19264,21 @@ class SettingsDialog(QDialog):
             self.cfg.obs_auto_replay_enabled = bool(self.chk_obs_auto_replay.isChecked())
             self.cfg.obs_auto_replay_kd = bool(self.chk_obs_auto_replay_kd.isChecked())
             self.cfg.obs_auto_replay_tko = bool(self.chk_obs_auto_replay_tko.isChecked())
+            self.cfg.obs_auto_replay_source = str(
+                self.cmb_obs_auto_replay_source.currentData() or "replay_buffer"
+            )
+            self.cfg.obs_auto_replay_source_fallback = bool(
+                self.chk_obs_auto_replay_source_fallback.isChecked()
+            )
+            self.cfg.obs_auto_replay_source_wait_sec = float(
+                self.sp_obs_auto_replay_source_wait.value()
+            )
+            self.cfg.obs_auto_replay_pre_event_sec = float(
+                self.sp_obs_auto_replay_pre_event.value()
+            )
+            self.cfg.obs_auto_replay_post_event_sec = float(
+                self.sp_obs_auto_replay_post_event.value()
+            )
             self.cfg.obs_replay_transition_enabled = bool(self.chk_obs_replay_transition.isChecked())
             self.cfg.obs_replay_transition_before_path = str(self.le_obs_replay_transition_before.text() or "").strip()
             self.cfg.obs_replay_transition_after_path = str(self.le_obs_replay_transition_after.text() or "").strip()
@@ -18272,6 +19301,12 @@ class SettingsDialog(QDialog):
             self.cfg.idle_highlight_volume = int(self.sp_idle_highlight_volume.value())
             self.cfg.idle_highlight_fit = str(self.cmb_idle_highlight_fit.currentData() or "cover")
             self.cfg.idle_highlight_fade_ms = int(self.sp_idle_highlight_fade.value())
+            self.cfg.idle_highlight_cinematic_enabled = bool(self.chk_idle_highlight_cinematic.isChecked())
+            self.cfg.idle_highlight_cinematic_contrast = int(self.sp_idle_cinematic_contrast.value())
+            self.cfg.idle_highlight_cinematic_sharpen = int(self.sp_idle_cinematic_sharpen.value())
+            self.cfg.idle_highlight_cinematic_vignette = int(self.sp_idle_cinematic_vignette.value())
+            self.cfg.idle_highlight_cinematic_kd_tko_enabled = bool(self.chk_idle_cinematic_kd_tko.isChecked())
+            self.cfg.idle_highlight_cinematic_potm_enabled = bool(self.chk_idle_cinematic_potm.isChecked())
         if hasattr(self, "chk_spectatorlog_enabled"):
             self.cfg.spectatorlog_enabled = bool(self.chk_spectatorlog_enabled.isChecked())
         if hasattr(self, "chk_spectatorlog_sync_players"):
@@ -18284,7 +19319,7 @@ class SettingsDialog(QDialog):
                 self.le_spectator_lobby_auto_start_title.text() or ""
             ).strip()
             self.cfg.spectator_lobby_auto_start_mode = str(
-                self.cmb_spectator_lobby_auto_start_mode.currentData() or "click"
+                self.cmb_spectator_lobby_auto_start_mode.currentData() or "f5"
             )
             self.cfg.spectator_lobby_auto_start_capture_hotkey = str(
                 self.edit_spectator_lobby_auto_start_capture_hotkey.keySequence().toString() or ""
@@ -18904,7 +19939,7 @@ class SettingsDialog(QDialog):
             )
             if hasattr(self, "cmb_spectator_lobby_auto_start_mode"):
                 idx = self.cmb_spectator_lobby_auto_start_mode.findData(
-                    str(getattr(self.cfg, "spectator_lobby_auto_start_mode", "click") or "click")
+                    str(getattr(self.cfg, "spectator_lobby_auto_start_mode", "f5") or "f5")
                 )
                 self.cmb_spectator_lobby_auto_start_mode.setCurrentIndex(max(0, idx))
             if hasattr(self, "edit_spectator_lobby_auto_start_capture_hotkey"):
@@ -19317,6 +20352,7 @@ class MainApp(QObject):
         self._lobby_auto_start_last_at = 0.0
         self._lobby_post_match_kick_lock = threading.Lock()
         self._lobby_post_match_kick_last_session_id = ""
+        self._lobby_restore_hwnd_by_session: Dict[str, int] = {}
 
         self.timer_win = QmlTimerWindow(self.cfg, self.cfg_path)
         try:
@@ -19341,6 +20377,9 @@ class MainApp(QObject):
         self._browser_sp_rest_start_seconds = None
         self._browser_sp_rest_start_ratio = {"blue": 1.0, "red": 1.0}
         self._browser_sp_last_update_at = time.monotonic()
+        self._browser_sp_archive_last_at = 0.0
+        self._browser_sp_archive_last_sig = tuple()
+        self._browser_sp_restored_session_id = ""
         self._browser_round_knockdowns = {"blue": 0, "red": 0}
         self._browser_knockdown_round_key = None
         self._browser_overlay_timer = QTimer()
@@ -19400,12 +20439,16 @@ class MainApp(QObject):
         self._current_red_valid = False
         self._chapter_fallback_anchor_epoch = time.time()
         self._chapter_events: List[dict] = []
+        self._chapter_result_signatures: Dict[str, str] = {}
         self._chapter_last_title = ""
         self._chapter_last_elapsed = -999999
         self._chapter_seen_keys = set()
         self._chapter_session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._chapter_jsonl_path = ""
         self._chapter_txt_path = ""
+        # OBS stream start is the chapter-session identity. The chapter anchor
+        # itself may be created later when TimerAuto starts during a broadcast.
+        self._chapter_obs_stream_start_epoch = 0.0
         self._chapter_autosave_timer = QTimer()
         self._chapter_autosave_timer.setInterval(5000)
         self._chapter_autosave_timer.timeout.connect(self._chapter_autosave_tick)
@@ -19423,6 +20466,13 @@ class MainApp(QObject):
         self._idle_highlight_scan_timer.setInterval(5000)
         self._idle_highlight_scan_timer.timeout.connect(self._refresh_idle_highlight_playlist)
         self._obs_stream_active: Optional[bool] = None
+        # OBS itself can disappear briefly while a live broadcast is being
+        # recovered.  Keep this distinct from a clean StreamStateChanged
+        # stop: closing the chapter journal on the former splits one VOD into
+        # two unrelated chapter files.
+        self._obs_unexpected_disconnect_at = 0.0
+        self._chapter_obs_interrupt_pending_until = 0.0
+        self._chapter_stream_stop_generation = 0
         self._source_record_incoming_clear_generation = 0
         self._obs_last_highlight_at = 0.0
         self._obs_highlight_event_keys = deque(maxlen=300)
@@ -19436,6 +20486,7 @@ class MainApp(QObject):
         self._source_record_round = int(getattr(self.cfg, "timer_current_round", 1) or 1)
         self._source_record_seconds_left = 0
         self._source_record_pending = deque()
+        self._source_record_auto_replays: Dict[str, Dict[str, Any]] = {}
         self._source_record_seen_dir = ""
         self._source_record_seen_files = set()
         self._source_record_file_sizes = {}
@@ -19448,6 +20499,8 @@ class MainApp(QObject):
         self._potm_events = deque(maxlen=120)
         self._potm_seen_event_ids = set()
         self._potm_best: Dict[str, Any] = {}
+        self._potm_archive_session_id = ""
+        self._potm_archive_dir = ""
         self._potm_terminal_pending = False
         # POTM starts after the decisive final-round report, before the full
         # match report.  The latter is retained and shown after the replay.
@@ -19462,6 +20515,7 @@ class MainApp(QObject):
         # terminal log state: SpectatorLog can still contain an old "cancel".
         self._idle_presentation_generation = 0
         self._obs_status_detail = ""
+        self._obs_source_record_diagnostic_result: Dict[str, Any] = {}
         self.obs_integration = ObsIntegration(self.cfg)
         self._obs_auto_replay = ObsAutoReplayController(
             lambda: self.cfg,
@@ -19482,6 +20536,11 @@ class MainApp(QObject):
         self._commentary_players: Dict[str, Any] = {}
         self._commentary_tts_files: Dict[str, List[str]] = {"analyst": [], "caster": []}
         self._commentary_tts_busy: Dict[str, bool] = {"analyst": False, "caster": False}
+        # 캐스터/해설자는 실제 출력 장치를 하나 공유한다. 재생 중 들어온 멘트를
+        # 버리면 다운·TKO 같은 핵심 상황도 조용히 지나가므로, 짧은 우선순위 큐에
+        # 보관했다가 현재 문장이 끝난 직후 이어서 재생한다.
+        self._commentary_tts_queue = deque()
+        self._commentary_tts_queue_draining = False
         self._commentary_hide_round_report_on_complete: Dict[str, bool] = {"analyst": False, "caster": False}
         self._commentary_release_idle_highlight_on_complete: Dict[str, bool] = {"analyst": False, "caster": False}
         self._commentary_followup_epoch: Dict[str, int] = {"analyst": 0, "caster": 0}
@@ -19508,12 +20567,23 @@ class MainApp(QObject):
         # Settings-dialog test buttons route browser-only events through the
         # controller.  Keep the live server reachable there as well.
         self.controller.browser_overlay = self.browser_overlay
-        self.watcher = ScreenWatcher(self.cfg)
+        self._screen_detect_target_title_cache = ""
+        self._screen_detect_target_hwnd_cache = 0
+        self._screen_detect_target_checked_at = 0.0
+        self.watcher = ScreenWatcher(
+            self.cfg,
+            foreground_guard=self._screen_detection_target_is_foreground,
+        )
         self.spectator_watcher = _make_spectator_log_watcher(self.cfg)
         self._log_detector_transition = False
         self._log_detector_stopping = False
         # Preserve a start click that arrives while the Windows file watcher is closing.
         self._log_detector_start_pending = False
+        # ReadDirectoryChangesW owns a native directory handle.  Once it has
+        # been stopped, do not reuse that watcher object for the next start:
+        # its old notifier thread may still be unwinding and can otherwise
+        # close the handle installed by the new run.
+        self._spectator_watcher_recreate_pending = False
         self.action_runner = ActionRunner(self.controller, self.timer_win, self.timer_win.set_status)
         QTimer.singleShot(1800, self._prewarm_commentary_tts_cache)
         try:
@@ -19844,6 +20914,90 @@ class MainApp(QObject):
 
         QTimer.singleShot(max(0, min(60000, int(delay_ms or 2400))), lambda: _attempt(max(0, int(retries or 0))))
 
+    @staticmethod
+    def _commentary_tts_priority(text: str, hide_round_report_on_complete: bool = False) -> int:
+        """Return a playback priority for a broadcast commentary sentence."""
+        value = str(text or "")
+        if bool(hide_round_report_on_complete) or re.search(r"TKO|KO|녹아웃|다운|쓰러|기권", value, re.IGNORECASE):
+            return 100
+        if re.search(r"라운드 종료|휴식|경기 종료|판정|승리", value, re.IGNORECASE):
+            return 80
+        if re.search(r"카운터|강타|스턴", value, re.IGNORECASE):
+            return 45
+        return 10
+
+    def _enqueue_commentary_tts(self, text: str, role: str, **kwargs) -> None:
+        """Queue a live line while the shared TTS channel is occupied.
+
+        Generic live calls have a short lifetime: a delayed jab/counter call is
+        worse than silence.  Terminal and report lines stay long enough to be
+        heard even after a long preceding sentence.
+        """
+        queue = getattr(self, "_commentary_tts_queue", None)
+        if queue is None:
+            queue = deque()
+            self._commentary_tts_queue = queue
+        priority = self._commentary_tts_priority(text, bool(kwargs.get("hide_round_report_on_complete", False)))
+        now = time.monotonic()
+        normalized = re.sub(r"\s+", " ", str(text or "").strip())
+        # Do not repeat the same sentence when the watcher applies a snapshot
+        # more than once while audio is playing.
+        if any(str(item.get("text", "")) == normalized for item in queue):
+            logging.info("COMMENTARY_TTS_QUEUE_DEDUP role=%s text=%s", role, normalized)
+            return
+        item = {
+            "text": normalized,
+            "role": role,
+            "kwargs": dict(kwargs),
+            "priority": priority,
+            "created_at": now,
+            "expires_at": now + (30.0 if priority >= 80 else 8.0),
+        }
+        # Keep urgent state changes ahead of ordinary punch-by-punch calls,
+        # while preserving order among calls with the same priority.
+        insert_at = len(queue)
+        for index, queued in enumerate(queue):
+            if int(queued.get("priority", 0) or 0) < priority:
+                insert_at = index
+                break
+        queue.insert(insert_at, item)
+        # A bounded queue prevents a noisy exchange from becoming commentary
+        # several minutes after the action. Drop the lowest-priority oldest item.
+        if len(queue) > 12:
+            lowest = min(range(len(queue)), key=lambda i: (int(queue[i].get("priority", 0) or 0), float(queue[i].get("created_at", 0.0) or 0.0)))
+            dropped = queue[lowest]
+            del queue[lowest]
+            logging.info("COMMENTARY_TTS_QUEUE_DROP_OVERFLOW role=%s text=%s", dropped.get("role"), dropped.get("text"))
+        logging.info("COMMENTARY_TTS_QUEUED role=%s priority=%s depth=%s text=%s", role, priority, len(queue), normalized)
+
+    def _drain_commentary_tts_queue(self) -> None:
+        if bool(getattr(self, "_commentary_tts_queue_draining", False)):
+            return
+        busy = getattr(self, "_commentary_tts_busy", {}) or {}
+        if any(bool(value) for value in busy.values()):
+            return
+        queue = getattr(self, "_commentary_tts_queue", None)
+        if not queue:
+            return
+        self._commentary_tts_queue_draining = True
+        try:
+            now = time.monotonic()
+            while queue:
+                item = queue.popleft()
+                if float(item.get("expires_at", 0.0) or 0.0) <= now:
+                    logging.info("COMMENTARY_TTS_QUEUE_DROP_EXPIRED role=%s text=%s", item.get("role"), item.get("text"))
+                    continue
+                logging.info("COMMENTARY_TTS_QUEUE_PLAY role=%s priority=%s depth=%s text=%s", item.get("role"), item.get("priority"), len(queue), item.get("text"))
+                self._speak_commentary_tts(
+                    str(item.get("text", "") or ""),
+                    str(item.get("role", "analyst") or "analyst"),
+                    _from_queue=True,
+                    **dict(item.get("kwargs", {}) or {}),
+                )
+                break
+        finally:
+            self._commentary_tts_queue_draining = False
+
     def _speak_commentary_tts(
         self,
         text: str,
@@ -19853,6 +21007,7 @@ class MainApp(QObject):
         allow_slow: bool = False,
         hide_round_report_on_complete: bool = False,
         allow_during_potm: bool = False,
+        _from_queue: bool = False,
     ):
         text = str(text or "").strip()
         if not text:
@@ -19862,8 +21017,30 @@ class MainApp(QObject):
             logging.info("COMMENTARY_TTS_SKIP_POTM_ACTIVE role=%s text=%s", role, text)
             return
         busy = getattr(self, "_commentary_tts_busy", {}) or {}
+        if not bool(_from_queue) and (any(bool(value) for value in busy.values()) or bool(getattr(self, "_commentary_tts_queue", None))):
+            self._enqueue_commentary_tts(
+                text,
+                role,
+                rate_override=rate_override,
+                pitch_override=pitch_override,
+                allow_slow=allow_slow,
+                hide_round_report_on_complete=hide_round_report_on_complete,
+                allow_during_potm=allow_during_potm,
+            )
+            self._drain_commentary_tts_queue()
+            return
         if any(bool(value) for value in busy.values()):
-            logging.info("COMMENTARY_TTS_SKIP_CHANNEL_BUSY role=%s text=%s", role, text)
+            # Can only happen if a queued item races a player state change.
+            # Put it back instead of silently losing it.
+            self._enqueue_commentary_tts(
+                text,
+                role,
+                rate_override=rate_override,
+                pitch_override=pitch_override,
+                allow_slow=allow_slow,
+                hide_round_report_on_complete=hide_round_report_on_complete,
+                allow_during_potm=allow_during_potm,
+            )
             return
         if str(role or "").lower() == "caster":
             voice = str(getattr(self.cfg, "spectator_caster_voice", "ko-KR-InJoonNeural") or "ko-KR-InJoonNeural")
@@ -20261,6 +21438,7 @@ class MainApp(QObject):
                 if bool(self._commentary_release_idle_highlight_on_complete.get(role, False)):
                     self._commentary_release_idle_highlight_on_complete[role] = False
                     self._release_idle_highlight_after_presentation(0, "post_potm_final_commentary_complete")
+                QTimer.singleShot(0, self._drain_commentary_tts_queue)
         except Exception:
             pass
 
@@ -20323,6 +21501,7 @@ class MainApp(QObject):
             if bool(self._commentary_release_idle_highlight_on_complete.get(role, False)):
                 self._commentary_release_idle_highlight_on_complete[role] = False
                 self._release_idle_highlight_after_presentation(0, "post_potm_final_commentary_clear")
+            QTimer.singleShot(0, self._drain_commentary_tts_queue)
         except Exception:
             pass
 
@@ -20359,16 +21538,307 @@ class MainApp(QObject):
     def _reset_chapter_session(self, clear_events: bool = True):
         if clear_events:
             self._chapter_events = []
+            self._chapter_result_signatures = {}
             self._chapter_last_title = ""
             self._chapter_last_elapsed = -999999
             self._chapter_seen_keys = set()
         self._chapter_session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._chapter_jsonl_path = ""
         self._chapter_txt_path = ""
+        self._chapter_obs_stream_start_epoch = 0.0
 
-    def _sync_chapter_anchor_now(self):
+    def _repair_briefly_split_chapter_journal(self, path: str, events: List[dict]) -> List[dict]:
+        """Join a journal that was split by a momentary OBS inactive signal.
+
+        Older builds closed the journal immediately.  Some OBS/YouTube
+        reconnects report inactive for only a few seconds even though the VOD
+        continues.  The closed marker and the next journal's first wall time
+        give us an unambiguous repair signal.
+        """
+        if not events:
+            return events
+        try:
+            current_start = min(
+                datetime.fromisoformat(str(event.get("wall_time") or "")).timestamp()
+                for event in events if str(event.get("wall_time") or "").strip()
+            )
+        except (TypeError, ValueError):
+            return events
+        output_dir = os.path.dirname(os.path.abspath(path))
+        candidates = []
+        for marker in glob.glob(os.path.join(output_dir, "chapters_*.jsonl.closed")):
+            try:
+                raw_closed = Path(marker).read_text(encoding="utf-8").strip()
+                closed_at = datetime.fromisoformat(raw_closed).timestamp() if raw_closed else os.path.getmtime(marker)
+            except (OSError, ValueError):
+                continue
+            gap = current_start - closed_at
+            if 0.0 <= gap <= 20.0:
+                candidates.append((closed_at, marker, gap))
+        if not candidates:
+            return events
+        _closed_at, marker, gap = max(candidates, key=lambda item: item[0])
+        prior_jsonl = marker[:-len(".closed")]
+        prior_txt = os.path.splitext(prior_jsonl)[0] + ".txt"
+        prior_events: List[dict] = []
+        prior_anchor = 0.0
+        obs_stream_start = float(events[0].get("obs_stream_start_epoch", 0.0) or 0.0)
+
+        if os.path.isfile(prior_jsonl):
+            try:
+                with open(prior_jsonl, "r", encoding="utf-8") as stream:
+                    prior_events = [
+                        item for item in (json.loads(line) for line in stream if line.strip())
+                        if isinstance(item, dict) and str(item.get("title") or "").strip()
+                    ]
+                if prior_events:
+                    prior_anchor = float(prior_events[0].get("anchor_epoch", 0.0) or 0.0)
+            except (OSError, ValueError, TypeError):
+                prior_events = []
+
+        # The JSONL may have been removed by an older cleanup build.  The TXT
+        # still contains every YouTube chapter, so reconstruct a lossless
+        # chapter timeline from it instead of abandoning the earlier matches.
+        if not prior_events and os.path.isfile(prior_txt):
+            try:
+                raw_lines = Path(prior_txt).read_text(encoding="utf-8").splitlines()
+                offset_sec = 0
+                for raw_line in raw_lines:
+                    line = str(raw_line or "").strip()
+                    if line.startswith("# 기준 시각:"):
+                        prior_anchor = datetime.strptime(
+                            line.split(":", 1)[1].strip(), "%Y-%m-%d %H:%M:%S"
+                        ).timestamp()
+                    elif line.startswith("# 보정(초):"):
+                        offset_sec = int(line.split(":", 1)[1].strip())
+                if prior_anchor > 0:
+                    for raw_line in raw_lines:
+                        match = re.match(r"^((?:\d+:)?\d{2}:\d{2})\s+(.+)$", str(raw_line or "").strip())
+                        if not match:
+                            continue
+                        stamp, title = match.groups()
+                        parts = [int(part) for part in stamp.split(":")]
+                        elapsed = parts[0] * 60 + parts[1] if len(parts) == 2 else parts[0] * 3600 + parts[1] * 60 + parts[2]
+                        if elapsed == 0 and title == "시작":
+                            continue
+                        wall_epoch = prior_anchor + max(0, elapsed - offset_sec)
+                        prior_events.append({
+                            "wall_time": datetime.fromtimestamp(wall_epoch).isoformat(timespec="seconds"),
+                            "anchor_epoch": prior_anchor,
+                            "obs_stream_start_epoch": obs_stream_start,
+                            "offset_sec": offset_sec,
+                            "elapsed_sec": elapsed,
+                            "title": title,
+                            "source": "chapter_txt_recovery",
+                            "dedupe_key": f"recovered:{int(prior_anchor)}:{elapsed}:{title}",
+                        })
+            except (OSError, ValueError, TypeError):
+                logging.exception("CHAPTER_SPLIT_TXT_RECOVERY_FAIL path=%s", prior_txt)
+                return events
+        if not prior_events or prior_anchor <= 0:
+            return events
+
+        normalized_current = []
+        for original in events:
+            event = dict(original)
+            try:
+                wall_epoch = datetime.fromisoformat(str(event.get("wall_time") or "")).timestamp()
+                offset_sec = int(event.get("offset_sec", getattr(self.cfg, "chapter_offset_sec", 0)) or 0)
+                event["elapsed_sec"] = max(0, int(round(wall_epoch - prior_anchor)) + offset_sec)
+            except (TypeError, ValueError):
+                pass
+            event["anchor_epoch"] = prior_anchor
+            normalized_current.append(event)
+        for event in prior_events:
+            event["anchor_epoch"] = prior_anchor
+            event["obs_stream_start_epoch"] = obs_stream_start
+        merged = prior_events + normalized_current
+        merged.sort(key=lambda event: (
+            int(event.get("elapsed_sec", 0) or 0),
+            str(event.get("wall_time") or ""),
+        ))
+        try:
+            repair_path = path + ".repair"
+            with open(repair_path, "w", encoding="utf-8") as stream:
+                for event in merged:
+                    stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+            os.replace(repair_path, path)
+            logging.warning(
+                "CHAPTER_SPLIT_REPAIRED prior=%s current=%s gap=%.1fs events=%s",
+                prior_txt if not os.path.isfile(prior_jsonl) else prior_jsonl,
+                path,
+                gap,
+                len(merged),
+            )
+        except OSError:
+            logging.exception("CHAPTER_SPLIT_REPAIR_WRITE_FAIL path=%s", path)
+            return events
+        return merged
+
+    def _resume_chapter_session(
+        self,
+        *,
+        max_age_sec: float = 21600.0,
+        expected_anchor_epoch: float = 0.0,
+        anchor_tolerance_sec: float = 180.0,
+    ) -> bool:
+        """Reattach chapter state only when it belongs to the current OBS stream."""
+        if self._chapter_events or self._chapter_jsonl_path:
+            return bool(self._chapter_events)
+        now = time.time()
+        candidates = []
+        try:
+            for path in glob.glob(os.path.join(self._chapter_log_dir(), "chapters_*.jsonl")):
+                if os.path.isfile(path + ".closed"):
+                    continue
+                if now - os.path.getmtime(path) <= max(60.0, float(max_age_sec or 0.0)):
+                    candidates.append(path)
+        except OSError:
+            return False
+        for path in sorted(candidates, key=os.path.getmtime, reverse=True):
+            events = []
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    for line in stream:
+                        item = json.loads(line)
+                        if isinstance(item, dict) and str(item.get("title") or "").strip():
+                            events.append(item)
+            except (OSError, ValueError):
+                continue
+            if not events:
+                continue
+            events = self._repair_briefly_split_chapter_journal(path, events)
+            try:
+                anchor = float(events[0].get("anchor_epoch", 0.0) or 0.0)
+            except Exception:
+                anchor = 0.0
+            if anchor <= 0 or anchor > now + 60 or now - anchor > max(60.0, float(max_age_sec or 0.0)):
+                continue
+            # On a cold app start OBS supplies its current stream duration.
+            # The duration-derived stream start is a reliable session identity:
+            # do not attach yesterday's/open previous chapter after OBS itself
+            # has been stopped and started again while TimerAuto was closed.
+            try:
+                saved_stream_start = float(events[0].get("obs_stream_start_epoch", 0.0) or 0.0)
+            except Exception:
+                saved_stream_start = 0.0
+            interrupted_marker = path + ".obs_interrupted"
+            interrupted_resume = False
+            try:
+                interrupted_resume = (
+                    os.path.isfile(interrupted_marker)
+                    and now - os.path.getmtime(interrupted_marker) <= 600.0
+                )
+            except OSError:
+                interrupted_resume = False
+            if expected_anchor_epoch > 0 and not interrupted_resume:
+                tolerance = max(5.0, float(anchor_tolerance_sec or 0.0))
+                identity = saved_stream_start if saved_stream_start > 0 else anchor
+                if abs(float(identity) - float(expected_anchor_epoch)) > tolerance:
+                    logging.info(
+                        "CHAPTER_SESSION_RESUME_SKIP reason=obs_stream_anchor_mismatch chapter=%.3f stream=%.3f obs=%.3f drift=%.1fs",
+                        anchor, saved_stream_start, expected_anchor_epoch, abs(float(identity) - float(expected_anchor_epoch)),
+                    )
+                    continue
+            self._chapter_events = events
+            # A repaired journal can deliberately use the original YouTube
+            # broadcast anchor while OBS's output identity reflects a later
+            # reconnect.  Future chapter timestamps must keep using the
+            # original anchor after this app restart.
+            self.cfg.chapter_anchor_epoch = anchor
+            try:
+                save_cfg = getattr(self.cfg, "to_json", None)
+                if callable(save_cfg):
+                    save_cfg(self.cfg_path)
+            except Exception:
+                logging.exception("CHAPTER_RESUME_ANCHOR_SAVE_FAIL")
+            self._chapter_result_signatures = {}
+            for saved_event in events:
+                if str(saved_event.get("source") or "") != "match_result_summary":
+                    continue
+                result_key = str(saved_event.get("match_session_id") or "").strip()
+                result_signature = str(saved_event.get("result_signature") or "").strip()
+                if result_key and result_signature:
+                    self._chapter_result_signatures[result_key] = result_signature
+            self._chapter_fallback_anchor_epoch = anchor
+            self._chapter_jsonl_path = path
+            self._chapter_txt_path = os.path.splitext(path)[0] + ".txt"
+            self._chapter_obs_stream_start_epoch = saved_stream_start
+            self._chapter_seen_keys = {
+                str(event.get("dedupe_key") or "").strip()
+                for event in events if str(event.get("dedupe_key") or "").strip()
+            }
+            latest = max(events, key=lambda event: int(event.get("elapsed_sec", 0) or 0))
+            self._chapter_last_title = str(latest.get("title") or "")
+            self._chapter_last_elapsed = int(latest.get("elapsed_sec", 0) or 0)
+            logging.info("CHAPTER_SESSION_RESUMED path=%s events=%s", path, len(events))
+            if interrupted_resume:
+                logging.info("CHAPTER_SESSION_RESUMED_AFTER_OBS_INTERRUPT path=%s", path)
+            self._export_chapter_txt()
+            return True
+        return False
+
+    def _mark_chapter_obs_interrupt(self) -> None:
+        """Persist a short-lived marker so an app restart can also recover it."""
+        path = str(getattr(self, "_chapter_jsonl_path", "") or "")
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path + ".obs_interrupted", "w", encoding="utf-8") as stream:
+                stream.write(datetime.now().isoformat(timespec="seconds"))
+            logging.info("CHAPTER_OBS_INTERRUPT_MARKED path=%s", path)
+        except OSError:
+            logging.exception("CHAPTER_OBS_INTERRUPT_MARK_FAIL path=%s", path)
+
+    def _clear_chapter_obs_interrupt(self) -> None:
+        path = str(getattr(self, "_chapter_jsonl_path", "") or "")
+        if not path:
+            return
+        try:
+            marker = path + ".obs_interrupted"
+            if os.path.isfile(marker):
+                os.remove(marker)
+                logging.info("CHAPTER_OBS_INTERRUPT_RECOVERED path=%s", path)
+        except OSError:
+            logging.exception("CHAPTER_OBS_INTERRUPT_CLEAR_FAIL path=%s", path)
+
+    def _close_chapter_session(self) -> None:
+        path = str(getattr(self, "_chapter_jsonl_path", "") or "")
+        if not path or not os.path.isfile(path):
+            return
+        self._clear_chapter_obs_interrupt()
+        try:
+            with open(path + ".closed", "w", encoding="utf-8") as stream:
+                stream.write(datetime.now().isoformat(timespec="seconds"))
+            logging.info("CHAPTER_SESSION_CLOSED path=%s", path)
+        except OSError:
+            logging.exception("CHAPTER_SESSION_CLOSE_FAIL path=%s", path)
+
+    def _confirm_chapter_stream_stopped(self, generation: int) -> None:
+        """Close a chapter only after OBS stayed inactive for the grace period."""
+        if int(generation) != int(getattr(self, "_chapter_stream_stop_generation", 0) or 0):
+            return
+        if getattr(self, "_obs_stream_active", None) is not False:
+            return
+        self._chapter_obs_interrupt_pending_until = 0.0
+        self._obs_unexpected_disconnect_at = 0.0
+        self._schedule_source_record_incoming_clear()
+        self._close_chapter_session()
+        if bool(getattr(self.cfg, "obs_chapter_export_on_stop", False)):
+            self._export_chapter_txt()
+        logging.info(
+            "CHAPTER_STREAM_STOP_CONFIRMED generation=%s path=%s",
+            generation,
+            self._chapter_jsonl_path,
+        )
+
+    def _sync_chapter_anchor_now(self, obs_stream_start_epoch: float = 0.0):
         self.cfg.chapter_anchor_epoch = float(time.time())
         self._reset_chapter_session(clear_events=True)
+        try:
+            self._chapter_obs_stream_start_epoch = max(0.0, float(obs_stream_start_epoch or 0.0))
+        except Exception:
+            self._chapter_obs_stream_start_epoch = 0.0
         try:
             self.cfg.to_json(self.cfg_path)
         except Exception:
@@ -20486,6 +21956,31 @@ class MainApp(QObject):
         if _pid:
             return _pid
         return _name
+
+    def _chapter_event_display_title(self, event: dict) -> str:
+        """Resolve a saved VS chapter against the *current* player registry.
+
+        A player can be registered after a broadcast has already started.  The
+        event keeps the original spectator-log ID for identity, but the chapter
+        TXT must not remain stuck with the old unregistered-ID-only label.
+        """
+        row = dict(event or {})
+        source = str(row.get("source") or "")
+        blue_id = str(row.get("blue_id") or "").upper().strip()
+        red_id = str(row.get("red_id") or "").upper().strip()
+        if not blue_id or not red_id or source not in ("spectatorlog_vs_intro", "match_archive_recovery"):
+            return str(row.get("title") or "").strip()
+
+        players = dict(getattr(self.cfg, "players", {}) or {})
+        blue_registered = blue_id in players
+        red_registered = red_id in players
+        blue_name = str(players.get(blue_id) or row.get("blue_name") or "").strip()
+        red_name = str(players.get(red_id) or row.get("red_name") or "").strip()
+        blue_text = self._chapter_competitor_text("blue", blue_name, blue_id, blue_registered)
+        red_text = self._chapter_competitor_text("red", red_name, red_id, red_registered)
+        if not blue_text or not red_text:
+            return str(row.get("title") or "").strip()
+        return f"{blue_text} VS {red_text}"
 
     def _sync_current_players_to_config(self):
         self.cfg.current_blue_id = str(self._current_blue_id or "").upper().strip()
@@ -20812,10 +22307,13 @@ class MainApp(QObject):
         event = {
             "wall_time": datetime.now().isoformat(timespec="seconds"),
             "anchor_epoch": float(self._chapter_anchor_epoch()),
+            "obs_stream_start_epoch": float(getattr(self, "_chapter_obs_stream_start_epoch", 0.0) or 0.0),
             "offset_sec": int(getattr(self.cfg, "chapter_offset_sec", 0)),
             "elapsed_sec": int(elapsed),
             "title": event_title,
         }
+        if key:
+            event["dedupe_key"] = key
         if isinstance(payload, dict):
             event.update(payload)
         self._chapter_events.append(event)
@@ -20828,6 +22326,131 @@ class MainApp(QObject):
         self._export_chapter_txt()
         return True
 
+    @staticmethod
+    def _chapter_result_method_text(method: str) -> str:
+        raw = str(method or "").strip()
+        token = raw.upper().replace(" ", "").replace("_", "")
+        if "TKO" in token:
+            return "TKO"
+        if token == "KO" or "KNOCKOUT" in token:
+            return "KO"
+        if any(word in token for word in ("DISQUAL", "DQ", "실격")):
+            return "실격"
+        if any(word in token for word in ("FORFEIT", "SURRENDER", "RESIGN", "QUIT", "기권")):
+            return "기권"
+        if any(word in token for word in ("DRAW", "무승부")):
+            return "무승부"
+        if not token or any(word in token for word in ("DECISION", "POINTS", "판정")):
+            return "판정"
+        return raw
+
+    def _record_chapter_match_result(self, report_payload: dict) -> bool:
+        """Persist a final match result without turning it into a timestamp chapter."""
+        report = dict(report_payload or {})
+        if not bool(report.get("isFinal", False)):
+            return False
+        scorecard = dict(report.get("officialScorecard") or report.get("scorecard") or {})
+        rounds = []
+        for raw_row in list(scorecard.get("rounds") or []):
+            row = dict(raw_row or {})
+            try:
+                round_no = int(row.get("round", 0) or 0)
+                blue_score = int(row.get("blue_score", row.get("blueScore", 0)) or 0)
+                red_score = int(row.get("red_score", row.get("redScore", 0)) or 0)
+            except (TypeError, ValueError):
+                continue
+            if round_no > 0:
+                rounds.append({
+                    "round": round_no,
+                    "blue_score": blue_score,
+                    "red_score": red_score,
+                })
+        rounds.sort(key=lambda row: int(row.get("round", 0) or 0))
+
+        blue = dict(report.get("blue") or {})
+        red = dict(report.get("red") or {})
+        blue_name = str(scorecard.get("blueName") or blue.get("name") or "BLUE").strip()
+        red_name = str(scorecard.get("redName") or red.get("name") or "RED").strip()
+        session_id = str(report.get("matchSessionId") or "").strip()
+        matching_vs = None
+        for event in reversed(list(getattr(self, "_chapter_events", []) or [])):
+            if str(event.get("source") or "") not in ("spectatorlog_vs_intro", "match_archive_recovery"):
+                continue
+            event_session = str(event.get("match_session_id") or "").strip()
+            if session_id and event_session and event_session != session_id:
+                continue
+            matching_vs = dict(event)
+            break
+        if matching_vs:
+            blue_name = str(matching_vs.get("blue_name") or blue_name).strip()
+            red_name = str(matching_vs.get("red_name") or red_name).strip()
+        if not session_id:
+            session_id = str((matching_vs or {}).get("match_session_id") or "").strip()
+        if not session_id:
+            session_id = f"{blue_name.upper()}:{red_name.upper()}:{int((matching_vs or {}).get('elapsed_sec', 0) or 0)}"
+
+        winner_side = str(report.get("winner") or scorecard.get("winner") or "").lower().strip()
+        winner_name = str(report.get("winnerName") or scorecard.get("winnerName") or "").strip()
+        if winner_side == "blue":
+            winner_name = blue_name
+        elif winner_side == "red":
+            winner_name = red_name
+        elif winner_side == "draw":
+            winner_name = "무승부"
+        result_data = dict(report.get("matchResult") or {})
+        method = self._chapter_result_method_text(
+            str(report.get("resultMethod") or result_data.get("method") or "")
+        )
+        try:
+            blue_total = int(scorecard.get("blueTotal"))
+            red_total = int(scorecard.get("redTotal"))
+        except (TypeError, ValueError):
+            blue_total = sum(int(row["blue_score"]) for row in rounds)
+            red_total = sum(int(row["red_score"]) for row in rounds)
+
+        result_data = {
+            "match_session_id": session_id,
+            "blue_name": blue_name,
+            "red_name": red_name,
+            "winner_side": winner_side,
+            "winner_name": winner_name,
+            "result_method": method,
+            "blue_total": blue_total,
+            "red_total": red_total,
+            "rounds": rounds,
+        }
+        signature = hashlib.sha1(
+            json.dumps(result_data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        signatures = getattr(self, "_chapter_result_signatures", None)
+        if not isinstance(signatures, dict):
+            self._chapter_result_signatures = {}
+            signatures = self._chapter_result_signatures
+        if signatures.get(session_id) == signature:
+            return False
+        signatures[session_id] = signature
+
+        event = {
+            "wall_time": datetime.now().isoformat(timespec="seconds"),
+            "anchor_epoch": float(self._chapter_anchor_epoch()),
+            "obs_stream_start_epoch": float(getattr(self, "_chapter_obs_stream_start_epoch", 0.0) or 0.0),
+            "offset_sec": int(getattr(self.cfg, "chapter_offset_sec", 0)),
+            "elapsed_sec": int((matching_vs or {}).get("elapsed_sec", 0) or 0),
+            "title": "MATCH_RESULT_SUMMARY",
+            "source": "match_result_summary",
+            "result_signature": signature,
+            **result_data,
+        }
+        self._chapter_events.append(event)
+        self._ensure_chapter_paths()
+        try:
+            with open(self._chapter_jsonl_path, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            logging.exception("Failed to append chapter match result")
+        self._export_chapter_txt()
+        return True
+
     def _export_chapter_txt(self) -> str:
         if not self._chapter_events:
             return ""
@@ -20835,25 +22458,73 @@ class MainApp(QObject):
         hide_time = bool(getattr(self.cfg, "chapter_hide_time", False))
         anchor = self._chapter_anchor_epoch()
         anchor_label = datetime.fromtimestamp(anchor).strftime("%Y-%m-%d %H:%M:%S")
-        end_sec = max(int(ev.get("elapsed_sec", 0)) for ev in self._chapter_events)
+        chapter_events = [
+            ev for ev in self._chapter_events
+            if str(ev.get("source") or "") != "match_result_summary"
+        ]
+        end_sec = max((int(ev.get("elapsed_sec", 0)) for ev in chapter_events), default=0)
         lines = [
             f"# 챕터 생성일: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"# 기준 시각: {anchor_label}",
             f"# 보정(초): {int(getattr(self.cfg, 'chapter_offset_sec', 0)):+d}",
-            f"# 챕터 수: {len(self._chapter_events)}",
+            f"# 챕터 수: {len(chapter_events)}",
             f"# 총 길이: {self._format_chapter_elapsed(end_sec)}",
             "",
         ]
         if not hide_time:
             lines.append("00:00 시작")
-        for ev in sorted(self._chapter_events, key=lambda x: int(x.get("elapsed_sec", 0))):
+        for ev in sorted(chapter_events, key=lambda x: int(x.get("elapsed_sec", 0))):
             ts = self._format_chapter_elapsed(int(ev.get("elapsed_sec", 0)))
-            title = str(ev.get("title") or "").strip()
+            title = self._chapter_event_display_title(dict(ev or {}))
             if title:
                 if hide_time:
                     lines.append(title)
                 else:
                     lines.append(f"{ts} {title}")
+
+        latest_results = {}
+        result_order = []
+        for event in self._chapter_events:
+            if str(event.get("source") or "") != "match_result_summary":
+                continue
+            key = str(event.get("match_session_id") or "").strip()
+            if not key:
+                continue
+            if key not in latest_results:
+                result_order.append(key)
+            latest_results[key] = dict(event)
+        if result_order:
+            lines.extend(["", "# 경기 결과 요약"])
+        for index, key in enumerate(result_order, start=1):
+            result = latest_results[key]
+            blue_name = str(result.get("blue_name") or "BLUE").strip()
+            red_name = str(result.get("red_name") or "RED").strip()
+            winner_name = str(result.get("winner_name") or "").strip()
+            if not winner_name:
+                winner_name = "확인 불가"
+            rounds = list(result.get("rounds") or [])
+            blue_total = int(result.get("blue_total", 0) or 0)
+            red_total = int(result.get("red_total", 0) or 0)
+            final_score = f"{blue_total} - {red_total}" if rounds or blue_total or red_total else "기록 없음"
+            lines.extend([
+                "",
+                f"[경기 {index}]",
+                f"대진: {blue_name} VS {red_name}",
+                f"승자: {winner_name}",
+                f"승리 방식: {str(result.get('result_method') or '판정')}",
+                f"점수 순서: {blue_name} - {red_name}",
+                f"최종 점수: {final_score}",
+                "라운드별 점수:",
+            ])
+            if rounds:
+                for row in rounds:
+                    lines.append(
+                        f"R{int((row or {}).get('round', 0) or 0)}: "
+                        f"{int((row or {}).get('blue_score', 0) or 0)} - "
+                        f"{int((row or {}).get('red_score', 0) or 0)}"
+                    )
+            else:
+                lines.append("기록 없음")
         try:
             with open(self._chapter_txt_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
@@ -21407,6 +23078,49 @@ class MainApp(QObject):
             except Exception:
                 pass
 
+    def _recreate_spectator_watcher(self) -> None:
+        """Create a clean live watcher after a manual stop.
+
+        This deliberately keeps the old object alive until its worker exits;
+        only the new object is used for subsequent UI updates.  Reusing a
+        stopped Windows directory watcher caused intermittent stop/start
+        failures when the old ReadDirectoryChangesW cleanup raced the restart.
+        """
+        watcher = _make_spectator_log_watcher(self.cfg)
+        watcher.ui_update.connect(self.apply_ui_update)
+        watcher.status_update.connect(self.timer_win.set_status)
+        self.spectator_watcher = watcher
+        self._spectator_watcher_recreate_pending = False
+        logging.info("SPECTATORLOG_WATCHER_RECREATED")
+
+    def _screen_detection_target_is_foreground(self) -> bool:
+        """Allow monitor-coordinate detection only while the spectator tool owns focus."""
+        if os.name != "nt":
+            return True
+        title = str(
+            getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or ""
+        ).strip()
+        if not title:
+            return False
+        try:
+            now = time.monotonic()
+            cached_title = str(getattr(self, "_screen_detect_target_title_cache", "") or "")
+            hwnd = int(getattr(self, "_screen_detect_target_hwnd_cache", 0) or 0)
+            checked_at = float(getattr(self, "_screen_detect_target_checked_at", 0.0) or 0.0)
+            valid_hwnd = bool(hwnd and ctypes.windll.user32.IsWindow(wintypes.HWND(hwnd)))
+            if title != cached_title or not valid_hwnd or (now - checked_at) >= 0.75:
+                hwnd = int(_find_window_by_title_contains(title) or 0)
+                self._screen_detect_target_title_cache = title
+                self._screen_detect_target_hwnd_cache = hwnd
+                self._screen_detect_target_checked_at = now
+            if not hwnd:
+                return False
+            active = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+            return active == hwnd
+        except Exception:
+            logging.debug("SCREEN_DETECT_FOREGROUND_CHECK_FAIL", exc_info=True)
+            return False
+
     def _start_spectator_watcher_if_enabled(self, *, force_enable: bool = False):
         if bool(getattr(self, "_log_detector_transition", False)):
             if force_enable:
@@ -21421,6 +23135,8 @@ class MainApp(QObject):
                 self._stop_log_detector()
             return
         if getattr(self, "spectator_watcher", None) and not self.spectator_watcher.is_running():
+            if bool(getattr(self, "_spectator_watcher_recreate_pending", False)):
+                self._recreate_spectator_watcher()
             try:
                 root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
             except Exception:
@@ -21474,6 +23190,13 @@ class MainApp(QObject):
         self._update_backend_detect_flags()
 
     def _start_log_detector(self):
+        try:
+            DIAG.record(
+                "spectator_log_start_request",
+                transition=bool(getattr(self, "_log_detector_transition", False)),
+            )
+        except Exception:
+            pass
         if bool(getattr(self, "_log_detector_transition", False)):
             # The stop worker owns the directory handle. Do not lose a start click
             # while it releases that handle; restart immediately after cleanup.
@@ -21497,6 +23220,12 @@ class MainApp(QObject):
         self._update_backend_detect_flags()
 
     def _finish_log_detector_stop(self):
+        # The normal path arrives through _log_stop_finished.  A Windows
+        # directory-handle shutdown must never leave the UI in a permanent
+        # "stopping" state, though: a queued restart click would otherwise
+        # appear to do nothing forever.
+        if not bool(getattr(self, "_log_detector_transition", False)):
+            return
         restart_requested = bool(getattr(self, "_log_detector_start_pending", False))
         self._log_detector_transition = False
         self._log_detector_stopping = False
@@ -21522,8 +23251,13 @@ class MainApp(QObject):
         watcher = getattr(self, "spectator_watcher", None)
         if bool(getattr(self, "_log_detector_transition", False)):
             return
+        try:
+            DIAG.record("spectator_log_stop_request")
+        except Exception:
+            pass
         self._log_detector_transition = True
         self._log_detector_stopping = True
+        self._spectator_watcher_recreate_pending = True
         # A deliberate stop cancels any earlier restart request.
         self._log_detector_start_pending = False
         logging.info("SPECTATORLOG_STOP_REQUEST")
@@ -21560,6 +23294,18 @@ class MainApp(QObject):
                     self._log_detector_stopping = False
 
         threading.Thread(target=_job, daemon=True).start()
+
+        # Fallback for the rare case where the Python worker finished but the
+        # queued Qt completion signal did not reach the GUI event loop.  The
+        # replacement watcher created on restart owns independent native
+        # handles, so releasing this state is safe.
+        QTimer.singleShot(1500, self._recover_log_detector_transition)
+
+    def _recover_log_detector_transition(self):
+        if not bool(getattr(self, "_log_detector_transition", False)):
+            return
+        logging.warning("SPECTATORLOG_STOP_RECOVERY timeout_ms=1500")
+        self._finish_log_detector_stop()
 
     def _start_detectors(self):
         if self.watcher:
@@ -21692,6 +23438,26 @@ class MainApp(QObject):
         self._sync_koth_streak_to_overlay()
 
     def on_pixel_rule(self, name: str):
+        # Old installations can still carry the pre-SpectatorLog lobby-return
+        # automation.  It clicks a fixed screen coordinate, waits, then sends
+        # K1/K2.  Running that rule beside the log-driven F5 start and lobby
+        # kick changes focus/clicks the spectator UI at exactly the wrong
+        # moment.  The log-driven workflow supersedes this legacy rule.
+        resolved_name = str(name or "")
+        for rule in self.cfg.pixel_rules or []:
+            rid = str(rule.get("id") or "")
+            if rid and rid == resolved_name:
+                resolved_name = str(rule.get("name") or resolved_name)
+                break
+        if (
+            bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False))
+            and resolved_name.strip() in {"로비복귀", "레드승리로비복귀"}
+        ):
+            logging.info(
+                "ACTION_SKIP key=pixel:%s reason=legacy_lobby_action_superseded",
+                resolved_name,
+            )
+            return
         actions = self.cfg.actions.get(f"pixel:{name}", [])
         key = f"pixel:{name}"
         if not actions:
@@ -21930,10 +23696,15 @@ class MainApp(QObject):
                 obs_test_connection=self._test_obs_connection,
                 obs_replay_transition_test=self._test_obs_replay_transition,
                 obs_status_getter=self._obs_status_label,
+                obs_source_record_diagnose=self._diagnose_obs_source_record,
+                obs_source_record_diagnostic_getter=self._obs_source_record_diagnostic_status,
+                obs_source_record_test=self._test_obs_source_record,
+                obs_source_record_configure=self._configure_obs_source_record,
                 idle_highlight_refresh=self._sync_idle_highlight_playlist,
                 potm_test=self._test_potm_presentation,
                 broadcast_rehearsal=self._run_broadcast_rehearsal,
                 broadcast_rehearsal_stop=self._stop_broadcast_rehearsal,
+                central_engine_test=self._run_central_engine_preflight,
             )
         except Exception as e:
             logging.exception("Failed to open settings dialog")
@@ -22101,6 +23872,12 @@ class MainApp(QObject):
             idleHighlightVolume=max(0, min(100, int(getattr(self.cfg, "idle_highlight_volume", 0) or 0))),
             idleHighlightFit=str(getattr(self.cfg, "idle_highlight_fit", "cover") or "cover"),
             idleHighlightFadeMs=max(0, min(3000, int(getattr(self.cfg, "idle_highlight_fade_ms", 350) or 350))),
+            idleHighlightCinematicEnabled=bool(getattr(self.cfg, "idle_highlight_cinematic_enabled", False)),
+            idleHighlightCinematicContrast=max(0, min(60, int(getattr(self.cfg, "idle_highlight_cinematic_contrast", 32) or 0))),
+            idleHighlightCinematicSharpen=max(0, min(60, int(getattr(self.cfg, "idle_highlight_cinematic_sharpen", 35) or 0))),
+            idleHighlightCinematicVignette=max(0, min(60, int(getattr(self.cfg, "idle_highlight_cinematic_vignette", 24) or 0))),
+            idleHighlightCinematicKdTkoEnabled=bool(getattr(self.cfg, "idle_highlight_cinematic_kd_tko_enabled", False)),
+            idleHighlightCinematicPotmEnabled=bool(getattr(self.cfg, "idle_highlight_cinematic_potm_enabled", False)),
             matchActive=bool(getattr(self, "_match_active", False)),
         )
         logging.info("IDLE_HIGHLIGHT_PLAYLIST enabled=%s count=%s", bool(getattr(self.cfg, "idle_highlight_enabled", False)), len(files))
@@ -22131,6 +23908,45 @@ class MainApp(QObject):
         self._obs_status_detail = "연결 확인 중"
         integration.reconfigure(self.cfg)
         integration.test_connection()
+
+    def _diagnose_obs_source_record(self) -> None:
+        integration = getattr(self, "obs_integration", None)
+        if integration is None:
+            self._obs_source_record_diagnostic_result = {
+                "ok": False, "message": "OBS 연동 기능이 없습니다.", "targets": [], "received_at": time.time(),
+            }
+            return
+        self._obs_source_record_diagnostic_result = {}
+        integration.reconfigure(self.cfg)
+        integration.diagnose_source_record()
+
+    def _obs_source_record_diagnostic_status(self) -> Dict[str, Any]:
+        return dict(getattr(self, "_obs_source_record_diagnostic_result", {}) or {})
+
+    def _test_obs_source_record(self, target: str) -> None:
+        integration = getattr(self, "obs_integration", None)
+        if integration is None:
+            return
+        integration.reconfigure(self.cfg)
+        integration.set_source_record_enabled(str(target or ""), True)
+        QTimer.singleShot(
+            700,
+            lambda: integration.save_source_record_replay(
+                str(target or ""), "manual_setup_test", context={"manual_setup_test": True},
+            ),
+        )
+
+    def _configure_obs_source_record(self, target: str, incoming: str, create: bool) -> None:
+        integration = getattr(self, "obs_integration", None)
+        if integration is None:
+            return
+        integration.reconfigure(self.cfg)
+        integration.configure_source_record(
+            str(target or ""),
+            str(incoming or ""),
+            replay_duration=10,
+            create=bool(create),
+        )
 
     def _test_obs_replay_transition(self) -> None:
         before = str(getattr(self.cfg, "obs_replay_transition_before_path", "") or "").strip()
@@ -22188,19 +24004,71 @@ class MainApp(QObject):
             if kind == "status":
                 self._obs_status_detail = str(event.get("detail") or "").strip()
                 logging.info("OBS_STATUS status=%s detail=%s", event.get("status"), self._obs_status_detail)
-                if str(event.get("status") or "") == "connected":
-                    integration.ensure_capture_outputs()
-                    logging.info("OBS_CAPTURE_OUTPUTS_AUTO_ENABLE_REQUEST")
+                obs_status = str(event.get("status") or "")
+                if obs_status == "disconnected" and getattr(self, "_obs_stream_active", None) is True:
+                    # A WebSocket disconnect while output was active is the
+                    # signature of an OBS crash/restart.  A subsequent false
+                    # stream state is therefore provisional, not a clean end.
+                    self._obs_unexpected_disconnect_at = time.time()
+                    logging.warning("CHAPTER_OBS_UNEXPECTED_DISCONNECT armed_at=%.3f", self._obs_unexpected_disconnect_at)
+                if obs_status == "connected":
+                    # ObsIntegration schedules capture setup itself after the
+                    # authenticated connection. Re-queueing it here shortened
+                    # the Source Record startup grace period and recreated the
+                    # OBS-not-ready race when OBS was launched second.
+                    logging.info("OBS_CAPTURE_OUTPUTS_AUTO_ENABLE_ARMED")
             elif kind == "stream_state":
                 active = bool(event.get("active", False))
                 previous = self._obs_stream_active
                 self._obs_stream_active = active
-                logging.info("OBS_STREAM_STATE active=%s previous=%s", active, previous)
+                try:
+                    duration_sec = max(0.0, float(event.get("duration_ms", 0) or 0) / 1000.0)
+                except Exception:
+                    duration_sec = 0.0
+                logging.info(
+                    "OBS_STREAM_STATE active=%s previous=%s duration=%.1fs",
+                    active, previous, duration_sec,
+                )
                 if active and previous is not True:
                     self._source_record_incoming_clear_generation += 1
                     if bool(getattr(self.cfg, "obs_auto_chapter_enabled", False)):
-                        self._sync_chapter_anchor_now()
-                        if bool(getattr(self.cfg, "obs_chapter_add_start_event", True)):
+                        now = time.time()
+                        recovering_interrupt = (
+                            now <= float(getattr(self, "_chapter_obs_interrupt_pending_until", 0.0) or 0.0)
+                        )
+                        # False -> True is an observed new broadcast, never a
+                        # resume, except after an explicitly observed OBS
+                        # process failure.  On cold app start resume only when
+                        # OBS's current duration points to the same start time
+                        # (or a fresh crash-recovery marker says otherwise).
+                        expected_anchor = 0.0
+                        if previous is None:
+                            # With a just-restarted OBS the duration can still
+                            # be zero.  Passing "now" deliberately rejects
+                            # ordinary old journals, while the short-lived
+                            # .obs_interrupted marker still permits the one
+                            # journal that was interrupted by that crash.
+                            expected_anchor = time.time() - duration_sec if duration_sec > 0.0 else time.time()
+                        resumed = (
+                            self._resume_chapter_session(expected_anchor_epoch=expected_anchor)
+                            if previous is None
+                            else False
+                        )
+                        if recovering_interrupt and self._chapter_jsonl_path:
+                            resumed = True
+                            self._chapter_stream_stop_generation += 1
+                            logging.info("CHAPTER_OBS_INTERRUPT_RESUMED_IN_PROCESS path=%s", self._chapter_jsonl_path)
+                        if resumed:
+                            self._chapter_obs_interrupt_pending_until = 0.0
+                            self._obs_unexpected_disconnect_at = 0.0
+                            self._clear_chapter_obs_interrupt()
+                        else:
+                            # Preserve OBS's real stream identity separately
+                            # from the TimerAuto chapter anchor.  This makes a
+                            # mid-broadcast app restart resume this same file.
+                            stream_start = time.time() - duration_sec if duration_sec > 0.0 else time.time()
+                            self._sync_chapter_anchor_now(obs_stream_start_epoch=stream_start)
+                        if not resumed and bool(getattr(self.cfg, "obs_chapter_add_start_event", True)):
                             self._append_chapter_event(
                                 "방송 시작",
                                 {"source": "obs_websocket"},
@@ -22208,9 +24076,36 @@ class MainApp(QObject):
                                 dedupe_key=f"obs-stream:{int(time.time())}",
                             )
                 elif (not active) and previous is True:
-                    self._schedule_source_record_incoming_clear()
-                    if bool(getattr(self.cfg, "obs_chapter_export_on_stop", False)):
-                        self._export_chapter_txt()
+                    disconnect_at = float(getattr(self, "_obs_unexpected_disconnect_at", 0.0) or 0.0)
+                    unexpected = disconnect_at > 0 and (time.time() - disconnect_at) <= 120.0
+                    if bool(getattr(self.cfg, "obs_auto_chapter_enabled", False)):
+                        # StreamStateChanged can briefly report inactive while
+                        # OBS reconnects the same YouTube live output.  Closing
+                        # immediately split one VOD into multiple chapter files.
+                        # Give a clean-looking stop a short grace period, and an
+                        # observed OBS disconnect/restart a longer one.
+                        grace_sec = 180.0 if unexpected else 15.0
+                        self._chapter_obs_interrupt_pending_until = time.time() + grace_sec
+                        self._chapter_stream_stop_generation += 1
+                        stop_generation = int(self._chapter_stream_stop_generation)
+                        self._mark_chapter_obs_interrupt()
+                        logging.warning(
+                            "CHAPTER_STREAM_STOP_PENDING grace=%.1fs unexpected=%s generation=%s until=%.3f path=%s",
+                            grace_sec,
+                            unexpected,
+                            stop_generation,
+                            self._chapter_obs_interrupt_pending_until,
+                            self._chapter_jsonl_path,
+                        )
+                        QTimer.singleShot(
+                            int(grace_sec * 1000.0),
+                            lambda generation=stop_generation: self._confirm_chapter_stream_stopped(generation),
+                        )
+                    else:
+                        self._schedule_source_record_incoming_clear()
+                        self._close_chapter_session()
+                        if bool(getattr(self.cfg, "obs_chapter_export_on_stop", False)):
+                            self._export_chapter_txt()
             elif kind == "test_result":
                 ok = bool(event.get("ok", False))
                 self._obs_status_detail = "연결 테스트 성공" if ok else (str(event.get("message") or "연결 테스트 실패"))
@@ -22241,10 +24136,34 @@ class MainApp(QObject):
             elif kind == "source_record_filter_enabled":
                 if bool(event.get("ok", False)):
                     logging.info("OBS_SOURCE_RECORD_AUTO_ENABLE_OK")
+                    if bool(event.get("watchdog", False)):
+                        self._obs_status_detail = "Source Record 자동 유지 정상"
                 else:
                     message = str(event.get("message") or "")
                     logging.warning("OBS_SOURCE_RECORD_AUTO_ENABLE_FAIL detail=%s", message)
-                    self._obs_status_detail = message or "Source Record 필터 이름/대상을 확인하세요"
+                    if bool(event.get("retrying", False)):
+                        self._obs_status_detail = "OBS 준비 대기 중 - Source Record 자동 재시도"
+                    else:
+                        self._obs_status_detail = message or "Source Record 필터 이름/대상을 확인하세요"
+            elif kind == "source_record_diagnostic":
+                self._obs_source_record_diagnostic_result = {
+                    **dict(event or {}),
+                    "received_at": time.time(),
+                }
+                logging.info(
+                    "OBS_SOURCE_RECORD_DIAGNOSTIC ok=%s targets=%s detail=%s",
+                    bool(event.get("ok", False)),
+                    len(list(event.get("targets") or [])),
+                    str(event.get("message") or ""),
+                )
+            elif kind == "source_record_configured":
+                if bool(event.get("ok", False)):
+                    self._obs_status_detail = "Source Record 권장 설정 완료"
+                    logging.info("OBS_SOURCE_RECORD_CONFIG_OK")
+                else:
+                    message = str(event.get("message") or "Source Record 설정 실패")
+                    self._obs_status_detail = message
+                    logging.warning("OBS_SOURCE_RECORD_CONFIG_FAIL detail=%s", message)
             elif kind == "replay_file_saved":
                 replay_path = str(event.get("path") or "").strip()
                 replay_reason = str(event.get("reason") or "").strip()
@@ -22255,7 +24174,7 @@ class MainApp(QObject):
                     replay_reason,
                     replay_context.get("auto_replay_kind", ""),
                 )
-                self._schedule_obs_auto_replay(replay_path, replay_reason, replay_context)
+                self._handle_program_auto_replay_file(replay_path, replay_reason, replay_context)
                 self._copy_program_replay_to_player_archive(replay_path, replay_reason, replay_context)
                 if replay_context.get("potm_candidate_id"):
                     self._register_potm_file(replay_path, str(replay_context.get("potm_candidate_id") or ""))
@@ -22324,6 +24243,110 @@ class MainApp(QObject):
         return self._obs_auto_replay.schedule(path, reason, context)
 
     @staticmethod
+    def _source_record_auto_replay_key(context: dict) -> str:
+        value = str((context or {}).get("event_key") or "").strip()
+        if value:
+            return value
+        kind = str((context or {}).get("auto_replay_kind") or "").strip()
+        triggered = float((context or {}).get("trigger_monotonic") or 0.0)
+        return f"{kind}:{triggered:.3f}" if kind and triggered else ""
+
+    def _handle_program_auto_replay_file(self, path: str, reason: str, context: dict) -> bool:
+        context = dict(context or {})
+        if str(context.get("auto_replay_source") or "") != "source_record":
+            return self._schedule_obs_auto_replay(path, reason, context)
+        if not bool(context.get("auto_replay_source_fallback", False)):
+            logging.info(
+                "OBS_AUTO_REPLAY_PROGRAM_IGNORED reason=source_record_selected path=%s",
+                path,
+            )
+            return False
+        key = self._source_record_auto_replay_key(context)
+        if not key:
+            return self._schedule_obs_auto_replay(path, reason, context)
+        state = self._source_record_auto_replays.setdefault(
+            key,
+            {
+                "resolved": "",
+                "deadline": time.monotonic()
+                + max(1.0, float(context.get("auto_replay_source_wait_sec") or 5.0)),
+            },
+        )
+        state["fallback_path"] = str(path or "")
+        state["fallback_reason"] = str(reason or "")
+        state["fallback_context"] = context
+        if state.get("resolved"):
+            logging.info(
+                "OBS_AUTO_REPLAY_FALLBACK_IGNORED key=%s resolved=%s",
+                key,
+                state.get("resolved"),
+            )
+            return False
+        remaining_ms = max(
+            0,
+            int(round((float(state.get("deadline") or 0.0) - time.monotonic()) * 1000.0)),
+        )
+        QTimer.singleShot(remaining_ms, lambda replay_key=key: self._run_source_record_fallback(replay_key))
+        logging.info(
+            "OBS_AUTO_REPLAY_FALLBACK_ARMED key=%s wait_ms=%s path=%s",
+            key,
+            remaining_ms,
+            path,
+        )
+        return True
+
+    def _run_source_record_fallback(self, key: str) -> bool:
+        state = self._source_record_auto_replays.get(str(key or ""))
+        if not state or state.get("resolved"):
+            return False
+        path = str(state.get("fallback_path") or "")
+        if not path or not os.path.isfile(path):
+            logging.warning("OBS_AUTO_REPLAY_FALLBACK_UNAVAILABLE key=%s", key)
+            return False
+        state["resolved"] = "replay_buffer"
+        logging.warning("OBS_AUTO_REPLAY_SOURCE_TIMEOUT_FALLBACK key=%s path=%s", key, path)
+        return self._schedule_obs_auto_replay(
+            path,
+            str(state.get("fallback_reason") or ""),
+            dict(state.get("fallback_context") or {}),
+        )
+
+    def _play_source_record_auto_replay(self, target: str, meta: dict) -> bool:
+        context = dict(meta.get("context") or {})
+        if str(context.get("auto_replay_source") or "") != "source_record":
+            return False
+        key = self._source_record_auto_replay_key(context)
+        if not key:
+            return False
+        state = self._source_record_auto_replays.setdefault(
+            key,
+            {"resolved": "", "deadline": time.monotonic()},
+        )
+        if state.get("resolved"):
+            logging.info(
+                "OBS_AUTO_REPLAY_SOURCE_IGNORED key=%s resolved=%s path=%s",
+                key,
+                state.get("resolved"),
+                target,
+            )
+            return False
+        capture_delay = max(0.0, float(context.get("replay_capture_delay_sec") or 0.0))
+        pre_event = max(0.5, float(context.get("replay_pre_event_sec") or 3.0))
+        post_event = max(0.0, float(context.get("replay_post_event_sec") or 0.0))
+        context["replay_start_from_end_sec"] = capture_delay + pre_event
+        context["replay_end_from_end_sec"] = max(0.0, capture_delay - post_event)
+        state["resolved"] = "source_record"
+        logging.info(
+            "OBS_AUTO_REPLAY_SOURCE_READY key=%s pre=%.2f post=%.2f capture_delay=%.2f path=%s",
+            key,
+            pre_event,
+            post_event,
+            capture_delay,
+            target,
+        )
+        return self._schedule_obs_auto_replay(target, str(meta.get("event") or ""), context)
+
+    @staticmethod
     def _source_record_safe_name(value: str, fallback: str = "UNKNOWN") -> str:
         clean = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", str(value or "").strip())
         clean = re.sub(r"\s+", " ", clean).strip(" ._")
@@ -22331,6 +24354,10 @@ class MainApp(QObject):
 
     def _queue_source_record_clip(self, reason: str, context: dict) -> None:
         """Remember metadata until Source Record finishes writing its separate file."""
+        now = time.monotonic()
+        for replay_key, replay_state in list(self._source_record_auto_replays.items()):
+            if now - float(replay_state.get("deadline") or now) > 60.0:
+                self._source_record_auto_replays.pop(replay_key, None)
         incoming = normalize_app_path(str(getattr(self.cfg, "obs_source_record_incoming_dir", "") or ""))
         archive = normalize_app_path(str(getattr(self.cfg, "obs_source_record_archive_dir", "") or ""))
         if not incoming or not archive:
@@ -22348,9 +24375,41 @@ class MainApp(QObject):
                 "round": max(0, int(context.get("round") or getattr(self, "_source_record_round", 0) or 0)),
                 "seconds_left": max(0, int(context.get("seconds_left") or getattr(self, "_source_record_seconds_left", 0) or 0)),
                 "potm_candidate_id": str(context.get("potm_candidate_id") or ""),
+                "context": dict(context or {}),
             }
         )
+        auto_key = self._source_record_auto_replay_key(context)
+        if auto_key and str(context.get("auto_replay_source") or "") == "source_record":
+            wait_sec = max(1.0, float(context.get("auto_replay_source_wait_sec") or 5.0))
+            self._source_record_auto_replays[auto_key] = {
+                "resolved": "",
+                "deadline": time.monotonic() + wait_sec,
+            }
         logging.info("SOURCE_RECORD_CLIP_QUEUED nick=%s event=%s", nickname or "UNKNOWN", event)
+
+    @staticmethod
+    def _source_record_clip_destination(archive: str, meta: dict) -> Tuple[str, bool]:
+        """Return the one canonical clip location and POTM ownership flag.
+
+        Decisive KD/KO/TKO clips belong to the player's KO_REPLAY folder even
+        when the same file is the current POTM candidate.  POTM then references
+        that archive file without owning/deleting it.
+        """
+        event = str((meta or {}).get("event") or "").strip().upper()
+        context = dict((meta or {}).get("context") or {})
+        auto_kind = str(context.get("auto_replay_kind") or "").strip().lower()
+        highlight_kind = str(context.get("highlight_kind") or "").strip().lower()
+        decisive = (
+            event in {"KD", "KO", "TKO", "KNOCKDOWN", "DOWN"}
+            or auto_kind in {"kd", "tko"}
+            or highlight_kind in {"kd", "ko", "tko", "knockdown", "down"}
+        )
+        nickname = str((meta or {}).get("nickname") or "UNKNOWN")
+        if decisive:
+            return os.path.join(archive, nickname, "KO_REPLAY"), False
+        if (meta or {}).get("potm_candidate_id"):
+            return os.path.join(archive, "_potm_candidates"), True
+        return os.path.join(archive, nickname), False
 
     def _prune_source_record_archive(self) -> None:
         """Keep ordinary per-player highlight clips under the configured limit."""
@@ -22365,6 +24424,10 @@ class MainApp(QObject):
             return
         with lock:
             clips = []
+            potm_file = str(dict(getattr(self, "_potm_best", {}) or {}).get("file") or "")
+            protected_potm = (
+                os.path.normcase(os.path.abspath(potm_file)) if potm_file else ""
+            )
             try:
                 player_dirs = [
                     os.path.join(archive, name)
@@ -22376,6 +24439,8 @@ class MainApp(QObject):
                         for name in names:
                             path = os.path.join(root, name)
                             if os.path.splitext(name)[1].lower() not in allowed:
+                                continue
+                            if protected_potm and os.path.normcase(os.path.abspath(path)) == protected_potm:
                                 continue
                             try:
                                 stat = os.stat(path)
@@ -22602,7 +24667,7 @@ class MainApp(QObject):
         effects = {str(value or "").lower().strip() for value in candidate.get("effects") or []}
         decisive = bool(effects & {"tko", "knockdown", "down", "ko", "stun"})
         technical = int(candidate.get("counters") or 0) > 0 or int(candidate.get("hits") or 0) >= 3
-        heavy_limit = max(1.0, float(getattr(self.cfg, "obs_highlight_damage_min", 65.0) or 65.0))
+        heavy_limit = max(1.0, float(getattr(self.cfg, "event_heavy_damage", 50.0) or 50.0))
         heavy = float(candidate.get("damage") or 0.0) >= heavy_limit
         threshold = int(getattr(self.cfg, "potm_min_score", 45) or 45)
         candidate["qualification"] = "scored" if int(candidate.get("score") or 0) >= threshold else (
@@ -22623,6 +24688,7 @@ class MainApp(QObject):
             return None
         previous = dict(self._potm_best or {})
         self._potm_best = candidate
+        self._persist_potm_candidate()
         logging.info(
             "POTM_CANDIDATE_SELECTED score=%s qualification=%s label=%s",
             candidate.get("score"), candidate.get("qualification"), candidate.get("label"),
@@ -22691,8 +24757,59 @@ class MainApp(QObject):
             return
         self._potm_best["file"] = path
         self._potm_best["managed"] = bool(managed)
+        self._persist_potm_candidate()
         logging.info("POTM_CANDIDATE_FILE_READY score=%s path=%s", self._potm_best.get("score"), path)
         self._maybe_play_potm()
+
+    def _persist_potm_candidate(self) -> None:
+        """Store the current winner in its active MatchLogArchive session."""
+        candidate = dict(getattr(self, "_potm_best", {}) or {})
+        archive_dir = str(getattr(self, "_potm_archive_dir", "") or "").strip()
+        if not candidate or not archive_dir:
+            return
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+            target = os.path.join(archive_dir, "potm_candidate.json")
+            temp = target + ".tmp"
+            with open(temp, "w", encoding="utf-8") as stream:
+                json.dump(candidate, stream, ensure_ascii=False, indent=2)
+            os.replace(temp, target)
+            logging.info("POTM_CANDIDATE_PERSISTED score=%s path=%s", candidate.get("score"), candidate.get("file") or "")
+        except Exception:
+            logging.exception("POTM_CANDIDATE_PERSIST_FAIL")
+
+    def _bind_potm_match_archive(self, payload: Dict[str, Any]) -> None:
+        """Bind and restore POTM state for a newly attached match session."""
+        data = dict(payload or {})
+        session_id = str(data.get("id") or "").strip()
+        archive_dir = str(data.get("archiveDir") or "").strip()
+        if not session_id or not archive_dir:
+            return
+        if session_id == str(getattr(self, "_potm_archive_session_id", "") or "") and archive_dir == str(getattr(self, "_potm_archive_dir", "") or ""):
+            return
+        self._potm_archive_session_id = session_id
+        self._potm_archive_dir = archive_dir
+        # A brand-new session starts empty; a resumed session can continue
+        # with the candidate and already-organized Source Record clip.
+        self._potm_best = {}
+        try:
+            with open(os.path.join(archive_dir, "potm_candidate.json"), "r", encoding="utf-8") as stream:
+                candidate = json.load(stream)
+            if not isinstance(candidate, dict):
+                return
+            path = str(candidate.get("file") or "").strip()
+            if path and os.path.isfile(path):
+                self._potm_best = candidate
+                logging.info("POTM_CANDIDATE_RESUMED score=%s path=%s", candidate.get("score"), path)
+            elif candidate:
+                # The delayed Source Record organizer can still attach the
+                # clip after restart when its candidate id is retained.
+                self._potm_best = candidate
+                logging.info("POTM_CANDIDATE_RESUMED_WAITING_FOR_FILE score=%s", candidate.get("score"))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logging.exception("POTM_CANDIDATE_RESUME_FAIL")
 
     def _maybe_play_potm(self) -> None:
         if self._potm_played or not self._potm_terminal_pending:
@@ -22841,12 +24958,18 @@ class MainApp(QObject):
             "post_potm_final_report_safety_timeout",
         )
 
-    def _resume_potm_final_commentary(self, delay_ms: int = 750) -> None:
+    def _resume_potm_final_commentary(self, delay_ms: int = 750, missing_retries: int = 3) -> None:
         """Play the final-match analysis only after the POTM hand-off."""
         item = dict(getattr(self, "_potm_final_commentary", {}) or {})
         self._potm_final_commentary = {}
         text = str(item.get("text") or "").strip()
         if not text:
+            if int(missing_retries or 0) > 0:
+                # The final payload occasionally follows the replay-end UI
+                # event by one tick. Retry before ending the presentation.
+                logging.info("POTM_FINAL_COMMENTARY_WAITING retries=%s", missing_retries)
+                QTimer.singleShot(800, lambda r=int(missing_retries) - 1: self._resume_potm_final_commentary(0, r))
+                return
             logging.warning("POTM_FINAL_COMMENTARY_MISSING")
             self._release_idle_highlight_after_presentation(0, "post_potm_final_report_no_commentary")
             return
@@ -22875,6 +24998,54 @@ class MainApp(QObject):
         self._potm_obs_bgm_source_active = ""
         self._potm_obs_bgm_restore_muted = None
 
+    def _potm_bgm_media_path(self, source_path: str) -> str:
+        """Return a Qt-safe POTM music file, converting incompatible media once.
+
+        Some otherwise playable MP3 downloads use a stream layout that the Qt
+        Media Foundation backend rejects with ``Could not open file``.  ffmpeg
+        is already an optional project dependency for highlight merging, so a
+        cached PCM WAV is the reliable local playback fallback.
+        """
+        source = normalize_app_path(str(source_path or ""))
+        if not source or not os.path.isfile(source):
+            return source
+        ffmpeg = SettingsDialog._highlight_merge_ffmpeg_path(
+            str(getattr(self.cfg, "obs_highlight_ffmpeg_path", "") or "")
+        )
+        if not ffmpeg:
+            return source
+        try:
+            stat = os.stat(source)
+            token = hashlib.sha1(f"{source}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8", "replace")).hexdigest()[:20]
+            cache_dir = os.path.join(tempfile.gettempdir(), "timerauto_potm_audio")
+            os.makedirs(cache_dir, exist_ok=True)
+            target = os.path.join(cache_dir, f"potm_{token}.wav")
+            if os.path.isfile(target) and os.path.getsize(target) > 44:
+                return target
+            temp_target = target + ".tmp.wav"
+            try:
+                if os.path.exists(temp_target):
+                    os.remove(temp_target)
+            except OSError:
+                pass
+            result = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", source, "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", temp_target],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0),
+                timeout=30,
+            )
+            if result.returncode == 0 and os.path.isfile(temp_target) and os.path.getsize(temp_target) > 44:
+                os.replace(temp_target, target)
+                logging.info("POTM_BGM_TRANSCODED source=%s target=%s", source, target)
+                return target
+            logging.warning("POTM_BGM_TRANSCODE_FAIL source=%s detail=%s", source, str(result.stderr or "").strip()[:300])
+        except Exception:
+            logging.exception("POTM_BGM_TRANSCODE_EXCEPTION source=%s", source)
+        return source
+
     def _play_potm_bgm(self) -> None:
         path = normalize_app_path(str(getattr(self.cfg, "potm_bgm_path", "") or ""))
         self._potm_bgm_active = False
@@ -22886,8 +25057,10 @@ class MainApp(QObject):
                 self._potm_bgm_audio_out = QAudioOutput(); self._potm_bgm_player = QMediaPlayer(); self._potm_bgm_player.setAudioOutput(self._potm_bgm_audio_out)
                 self._potm_bgm_player.mediaStatusChanged.connect(self._on_potm_bgm_media_status)
             self._potm_bgm_audio_out.setVolume(max(0.0, min(1.0, float(getattr(self.cfg, "potm_bgm_volume", 75) or 0) / 100.0)))
-            self._potm_bgm_player.setSource(QUrl.fromLocalFile(path)); self._potm_bgm_active = True; self._potm_bgm_player.play()
-            logging.info("POTM_BGM_PLAY path=%s volume=%s", path, int(getattr(self.cfg, "potm_bgm_volume", 75) or 0))
+            output_name = _set_media_audio_device(self._potm_bgm_player, str(getattr(self.cfg, "potm_audio_output_device", "") or ""))
+            playable_path = self._potm_bgm_media_path(path)
+            self._potm_bgm_player.setSource(QUrl.fromLocalFile(playable_path)); self._potm_bgm_active = True; self._potm_bgm_player.play()
+            logging.info("POTM_BGM_PLAY path=%s playable=%s volume=%s output=%s", path, playable_path, int(getattr(self.cfg, "potm_bgm_volume", 75) or 0), output_name or "default")
         except Exception: logging.exception("POTM_BGM_PLAY_FAIL")
 
     def _play_potm_replay_audio(self, path: str) -> None:
@@ -22903,10 +25076,11 @@ class MainApp(QObject):
                 self._potm_replay_audio_player = QMediaPlayer()
                 self._potm_replay_audio_player.setAudioOutput(self._potm_replay_audio_out)
             self._potm_replay_audio_out.setVolume(1.0)
+            output_name = _set_media_audio_device(self._potm_replay_audio_player, str(getattr(self.cfg, "potm_audio_output_device", "") or ""))
             self._potm_replay_audio_player.setSource(QUrl.fromLocalFile(media_path))
             self._potm_replay_audio_player.setPlaybackRate(max(0.25, min(2.0, float(getattr(self.cfg, "potm_replay_speed", 0.85) or 0.85))))
             self._potm_replay_audio_player.play()
-            logging.info("POTM_REPLAY_AUDIO_PLAY path=%s", media_path)
+            logging.info("POTM_REPLAY_AUDIO_PLAY path=%s output=%s", media_path, output_name or "default")
         except Exception:
             logging.exception("POTM_REPLAY_AUDIO_PLAY_FAIL")
 
@@ -22941,29 +25115,151 @@ class MainApp(QObject):
                 QTimer.singleShot(110, _reveal)
             QTimer.singleShot(max(500, int(float(getattr(self.cfg, "potm_intro_hold_sec", 2.1) or 2.1) * 1000)), _start)
 
+    def _run_central_engine_preflight(self) -> Dict[str, Any]:
+        """Exercise canonical verdicts using the live configuration."""
+        if getattr(self, "_obs_stream_active", None) is True:
+            return {
+                "ok": False,
+                "failed": ["OBS 방송 중"],
+                "lines": ["[중앙엔진] 방송 중에는 시각 테스트를 실행하지 않습니다."],
+                "visual_steps": [],
+            }
+        checks = (
+            ("counter_down", "counter_whiff", "decisive"),
+            ("graze_counter", "counter_graze", "counter_strong"),
+            ("counter_tko", "counter", "decisive"),
+            ("clean_combo", "combo_emphasis", "decisive"),
+            ("heavy", "heavy", "stun"),
+        )
+        lines = ["[중앙엔진] 통합 판정 테스트 시작"]
+        failed: List[str] = []
+        scenario_rows: Dict[str, List[Dict[str, Any]]] = {}
+        for scenario, required_tag, required_result in checks:
+            rows = self._rehearsal_events("blue", scenario)
+            scenario_rows[scenario] = rows
+            tags = {
+                str(tag or "").lower().strip()
+                for row in rows
+                for tag in list(row.get("event_tags") or [])
+            }
+            ok = required_tag in tags and required_result in tags
+            lines.append(
+                "  %s: %s (tag=%s, result=%s)"
+                % (scenario, "PASS" if ok else "FAIL", required_tag, required_result)
+            )
+            if not ok:
+                failed.append(scenario)
+
+        weak_engine = FightEventEngine(self.cfg)
+        weak = weak_engine.classify({
+            "event_id": "central-test-weak",
+            "time": 10.0,
+            "attacker_side": "blue",
+            "receiver_side": "red",
+            "damage": 18.0,
+            "weak_point": "EyeLeft",
+        })
+        weak_ok = "weak_point" in set(weak.get("tags") or [])
+        lines.append("  weak_point: %s (EyeLeft)" % ("PASS" if weak_ok else "FAIL"))
+        if not weak_ok:
+            failed.append("weak_point")
+
+        def _last_matching(scenario: str, *required: str) -> Dict[str, Any]:
+            for row in reversed(scenario_rows.get(scenario) or []):
+                tags = {str(tag or "").lower().strip() for tag in list(row.get("event_tags") or [])}
+                if all(tag in tags for tag in required):
+                    return dict(row)
+            return {}
+
+        visual_steps = [
+            {"label": "헛침 카운터", "event": _last_matching("counter_down", "counter_whiff")},
+            {"label": "스침 카운터", "event": _last_matching("graze_counter", "counter_graze")},
+            {"label": "강조 콤보", "event": _last_matching("clean_combo", "combo_emphasis")},
+            {"label": "강타·약점·스턴", "event": _last_matching("heavy", "heavy", "weak_point", "stun")},
+            {"label": "다운", "event": _last_matching("counter_down", "knockdown")},
+            {"label": "TKO", "event": _last_matching("counter_tko", "tko")},
+        ]
+        missing_visuals = [str(item.get("label") or "") for item in visual_steps if not item.get("event")]
+        if missing_visuals:
+            failed.extend(missing_visuals)
+            lines.append("  visual_steps: FAIL (" + ", ".join(missing_visuals) + ")")
+        else:
+            lines.append("  visual_steps: PASS (%d단계)" % len(visual_steps))
+        return {
+            "ok": not failed,
+            "failed": failed,
+            "lines": lines,
+            "visual_steps": visual_steps,
+        }
+
     def _rehearsal_events(self, winner: str, scenario: str) -> List[Dict[str, Any]]:
-        """Build deterministic fake hits, then score them through the live engine."""
+        """Build deterministic raw hits and classify them through the live engine."""
         winner = "red" if str(winner).lower() == "red" else "blue"
         scenario = str(scenario or "counter_down")
+        opponent = "red" if winner == "blue" else "blue"
+        combo_damage = max(16.0, float(getattr(self.cfg, "event_combo_min_damage", 15.0) or 0.0) + 1.0)
+        combo_hits = max(5, int(getattr(self.cfg, "event_combo_emphasis_hits", 5) or 5))
+        heavy_damage = max(
+            63.0,
+            float(getattr(self.cfg, "event_heavy_damage", 50.0) or 0.0) + 5.0,
+        )
         if scenario == "counter_tko":
-            spec = [(34, True, ""), (24, False, ""), (21, False, ""), (30, False, "tko")]
+            spec = [(0, False, "", opponent), (25, False, "", winner)]
+            spec.extend((combo_damage, False, "", winner) for _ in range(max(1, combo_hits - 2)))
+            spec.append((combo_damage, False, "tko", winner))
+        elif scenario == "graze_counter":
+            graze_damage = max(0.1, min(
+                10.0,
+                float(getattr(self.cfg, "event_counter_graze_max_damage", 15.0) or 0.0),
+            ))
+            response_damage = max(
+                30.0,
+                float(getattr(self.cfg, "event_counter_response_min_damage", 30.0) or 0.0),
+                float(getattr(self.cfg, "event_counter_min_damage", 40.0) or 0.0) + 1.0,
+            )
+            spec = [(graze_damage, False, "", opponent), (response_damage, False, "", winner)]
         elif scenario == "clean_combo":
-            spec = [(19, False, ""), (17, False, ""), (16, False, ""), (22, False, ""), (28, False, "knockdown")]
+            spec = [(combo_damage, False, "", winner) for _ in range(max(1, combo_hits - 1))]
+            spec.append((combo_damage, False, "knockdown", winner))
         elif scenario == "heavy":
-            spec = [(63, False, "stun")]
+            spec = [(heavy_damage, False, "stun", winner)]
         else:
-            spec = [(31, True, "whiff"), (19, False, ""), (17, False, ""), (25, False, "knockdown")]
+            spec = [(0, False, "", opponent), (25, False, "", winner)]
+            spec.extend((combo_damage, False, "", winner) for _ in range(max(1, combo_hits - 2)))
+            spec.append((combo_damage, False, "knockdown", winner))
         now = time.monotonic()
-        items = []
-        for index, (damage, counter, marker) in enumerate(spec):
-            items.append({
+        event_gap = max(0.01, min(
+            0.5,
+            float(getattr(self.cfg, "event_combo_window_sec", 0.8) or 0.8) * 0.5,
+            float(getattr(self.cfg, "event_counter_window_sec", 0.7) or 0.7) * 0.5,
+        ))
+        raw_items = []
+        for index, (damage, _counter, marker, attacker) in enumerate(spec):
+            raw_items.append({
                 "event_id": "rehearsal-%s-%d" % (uuid.uuid4().hex, index),
-                "attacker_side": winner, "side": winner, "damage": damage,
-                "is_counter": counter, "counter_reason": marker if marker == "whiff" else "",
+                "attacker_side": attacker, "receiver_side": opponent if attacker == winner else winner,
+                "side": attacker, "damage": damage,
                 "effect_kind": "" if marker == "whiff" else marker,
+                "punch": "REHEARSAL",
+                "weak_point": "EyeLeft" if attacker == winner and scenario == "heavy" else "",
+                "time": 100.0 - index * event_gap,
                 "seen_at": now - (len(spec) - index) * 0.08,
             })
-        return items
+        engine = FightEventEngine(self.cfg)
+        classified = engine.classify_many(raw_items)
+        for event, verdict in zip(raw_items, classified):
+            event.update({
+                "_central_event": dict(verdict),
+                "event_primary": str(verdict.get("primary") or "hit"),
+                "event_tags": list(verdict.get("tags") or []),
+                "combo_hits": int(verdict.get("combo_hits", 0) or 0),
+                "combo_damage": float(verdict.get("combo_damage", 0.0) or 0.0),
+                "is_counter": bool(verdict.get("counter", False)),
+                "counter_reason": str(verdict.get("counter_reason") or ""),
+                "official_counter": bool(verdict.get("official_counter", False)),
+                "inferred_counter": bool(verdict.get("inferred_counter", False)),
+            })
+        return raw_items
 
     @staticmethod
     def _rehearsal_report_payload(blue_name: str, red_name: str, winner: str, candidate: Dict[str, Any]) -> Dict[str, Any]:
@@ -22972,7 +25268,7 @@ class MainApp(QObject):
         loser_name = blue_name if winner == "red" else red_name
         damage = max(1, int(round(float(candidate.get("damage") or 0))))
         receiver = "blue" if winner == "red" else "red"
-        return {
+        payload = {
             "isFinal": True, "round": 3, "leader": winner, "leaderName": winner_name,
             "roundTag": "MATCH COMPLETE",
             "summaryLine": "%s wins the rehearsal match with %s." % (winner_name, str(candidate.get("label") or "MATCH HIGHLIGHT")),
@@ -22982,6 +25278,14 @@ class MainApp(QObject):
             "blue": {"name": blue_name, "landed": 16 if winner == "blue" else 9, "damage": damage if winner == "blue" else max(1, damage // 2), "bigHits": 2 if winner == "blue" else 0, "knockdowns": 1 if winner == "blue" else 0, "tkos": 0},
             "red": {"name": red_name, "landed": 16 if winner == "red" else 9, "damage": damage if winner == "red" else max(1, damage // 2), "bigHits": 2 if winner == "red" else 0, "knockdowns": 1 if winner == "red" else 0, "tkos": 0},
         }
+        # Keep the rehearsal's hand-off identical to an actual final report:
+        # visual-only success must not conceal a missing end-report narration.
+        payload["_potmFinalCommentary"] = {
+            "text": "%s 선수의 결정적인 장면입니다. 이 테스트 매치의 흐름을 완전히 가져갔습니다." % winner_name,
+            "role": "analyst",
+            "hide_round_report_on_complete": True,
+        }
+        return payload
 
     def _run_broadcast_rehearsal(self, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Rehearse the complete POTM presentation without OBS side effects."""
@@ -23107,7 +25411,7 @@ class MainApp(QObject):
                 continue
             meta = self._source_record_pending[0]
             try:
-                target_dir = os.path.join(archive, "_potm_candidates") if meta.get("potm_candidate_id") else os.path.join(archive, meta["nickname"])
+                target_dir, potm_managed = self._source_record_clip_destination(archive, meta)
                 os.makedirs(target_dir, exist_ok=True)
                 stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
                 round_text = f"R{meta['round']}" if meta["round"] else "R?"
@@ -23123,8 +25427,13 @@ class MainApp(QObject):
                 shutil.move(path, target)
                 self._source_record_pending.popleft()
                 logging.info("SOURCE_RECORD_CLIP_ORGANIZED source=%s target=%s", path, target)
+                self._play_source_record_auto_replay(target, meta)
                 if meta.get("potm_candidate_id"):
-                    self._register_potm_file(target, str(meta.get("potm_candidate_id") or ""), managed=True)
+                    self._register_potm_file(
+                        target,
+                        str(meta.get("potm_candidate_id") or ""),
+                        managed=potm_managed,
+                    )
                 else:
                     self._prune_source_record_archive()
             except Exception:
@@ -23231,17 +25540,22 @@ class MainApp(QObject):
         elif normalized == "stun":
             enabled = bool(getattr(self.cfg, "obs_highlight_stun", True))
         elif normalized == "counter":
-            enabled = (
-                bool(getattr(self.cfg, "obs_highlight_counter", True))
-                and float(damage or 0.0) >= float(getattr(self.cfg, "obs_highlight_counter_damage_min", 30.0) or 0.0)
-            )
+            # Counter/strong-counter classification is owned by the central
+            # engine. This output toggle is intentionally not another damage
+            # threshold.
+            enabled = bool(getattr(self.cfg, "obs_highlight_counter", True))
             reason = f"counter-{float(damage or 0.0):.1f}"
         elif normalized == "combo":
-            enabled = bool(getattr(self.cfg, "obs_highlight_combo", True)) and int(combo_hits or 0) >= int(getattr(self.cfg, "obs_highlight_combo_min", 3) or 3)
+            enabled = bool(getattr(self.cfg, "obs_highlight_combo", True)) and int(combo_hits or 0) >= int(getattr(self.cfg, "event_combo_emphasis_hits", 5) or 5)
             reason = f"combo-{int(combo_hits or 0)}"
-        elif normalized in ("heavy", "hit"):
-            enabled = bool(getattr(self.cfg, "obs_highlight_heavy", True)) and float(damage or 0.0) >= float(getattr(self.cfg, "obs_highlight_damage_min", 55.0) or 55.0)
+        elif normalized == "heavy":
+            enabled = bool(getattr(self.cfg, "obs_highlight_heavy", True))
             reason = f"heavy-{float(damage or 0.0):.1f}"
+        elif normalized == "hit":
+            # Ordinary hits no longer become highlights from a second hidden
+            # damage threshold. Central tags decide whether a hit is heavy.
+            enabled = False
+            reason = f"hit-{float(damage or 0.0):.1f}"
         normal_highlight_enabled = bool(enabled)
         potm_candidate = dict(potm_candidate or {})
         potm_candidate_id = str(potm_candidate.get("id") or "").strip()
@@ -23261,7 +25575,13 @@ class MainApp(QObject):
         auto_replay_requested = normal_highlight_enabled and bool(getattr(self.cfg, "obs_auto_replay_enabled", True)) and (
             (auto_replay_kind == "kd" and bool(getattr(self.cfg, "obs_auto_replay_kd", True)))
             or (auto_replay_kind == "tko" and bool(getattr(self.cfg, "obs_auto_replay_tko", True)))
-        ) and program_replay_enabled
+        )
+        auto_replay_source = str(
+            getattr(self.cfg, "obs_auto_replay_source", "replay_buffer") or "replay_buffer"
+        ).strip().lower()
+        if auto_replay_source not in ("replay_buffer", "source_record"):
+            auto_replay_source = "replay_buffer"
+        source_fallback = bool(getattr(self.cfg, "obs_auto_replay_source_fallback", False))
         if not auto_replay_requested and now - float(self._obs_last_highlight_at or 0.0) < cooldown:
             return False
         self._obs_last_highlight_at = now
@@ -23273,6 +25593,20 @@ class MainApp(QObject):
             "highlight_kind": normalized,
             "round": int(getattr(self, "_source_record_round", 0) or getattr(self.cfg, "timer_current_round", 1) or 1),
             "seconds_left": int(getattr(self, "_source_record_seconds_left", 0) or 0),
+            "auto_replay_source": auto_replay_source,
+            "auto_replay_source_fallback": source_fallback,
+            "auto_replay_source_wait_sec": max(
+                1.0,
+                min(20.0, float(getattr(self.cfg, "obs_auto_replay_source_wait_sec", 5.0) or 5.0)),
+            ),
+            "replay_pre_event_sec": max(
+                0.5,
+                min(15.0, float(getattr(self.cfg, "obs_auto_replay_pre_event_sec", 3.0) or 3.0)),
+            ),
+            "replay_post_event_sec": max(
+                0.0,
+                min(5.0, float(getattr(self.cfg, "obs_auto_replay_post_event_sec", 1.0) or 0.0)),
+            ),
         }
         if potm_candidate_id:
             context.update({
@@ -23280,9 +25614,28 @@ class MainApp(QObject):
                 "potm_label": str(potm_candidate.get("label") or "MATCH HIGHLIGHT"),
                 "potm_qualification": str(potm_candidate.get("qualification") or ""),
             })
-        save_program_replay = program_replay_enabled and (normal_highlight_enabled or potm_requests_replay)
+        source_auto_replay = auto_replay_requested and auto_replay_source == "source_record"
+        save_program_replay = program_replay_enabled and (
+            potm_requests_replay
+            or (
+                normal_highlight_enabled
+                and (not source_auto_replay or source_fallback)
+            )
+        )
         save_source_record = source_record_enabled and (normal_highlight_enabled or potm_requests_source_record)
         capture_delay = max(0.0, min(15.0, float(getattr(self.cfg, "obs_auto_replay_capture_delay_sec", 1.0) or 0.0)))
+        if source_auto_replay:
+            capture_delay = max(capture_delay, float(context["replay_post_event_sec"]))
+        context["replay_capture_delay_sec"] = capture_delay
+        if not save_program_replay and not save_source_record:
+            logging.warning(
+                "OBS_HIGHLIGHT_SAVE_SKIPPED kind=%s auto_source=%s source_record_ready=%s fallback=%s",
+                normalized,
+                auto_replay_source,
+                source_record_enabled,
+                source_fallback,
+            )
+            return False
         if capture_delay > 0.0:
             self._save_obs_highlight_after_capture_delay(
                 integration,
@@ -23387,6 +25740,126 @@ class MainApp(QObject):
         self._browser_sp_last_rest_seconds = None
         self._browser_sp_rest_start_seconds = None
         self._browser_sp_rest_start_ratio = {"blue": 1.0, "red": 1.0}
+
+    def _restore_live_sp_from_match_archive(self, payload: Dict[str, Any]) -> bool:
+        """Restore TimerAuto-owned actual health when reattaching mid-match."""
+        data = dict(payload or {})
+        session_id = str(data.get("id") or "").strip()
+        archive_dir = str(data.get("archiveDir") or "").strip()
+        if not session_id or not archive_dir:
+            return False
+        if session_id == str(getattr(self, "_browser_sp_restored_session_id", "") or ""):
+            return False
+        values: Dict[str, Any] = {}
+        live_round = 0
+        try:
+            live_path = os.path.join(archive_dir, "vitals_live.json")
+            with open(live_path, "r", encoding="utf-8") as stream:
+                live_payload = json.load(stream)
+            if isinstance(live_payload, dict):
+                live_round = max(0, int(live_payload.get("round") or 0))
+                values = dict(live_payload.get("values") or {})
+        except (OSError, TypeError, ValueError):
+            values = {}
+
+        exact = all(
+            dict(values.get(side) or {}).get("staminaPct") is not None
+            for side in ("blue", "red")
+        )
+        if not exact:
+            # Compatibility fallback for archives created before live SP was
+            # persisted: use the newest frozen round value, applying one full
+            # configured break recovery when the live round has advanced.
+            for round_no in range(max(1, live_round), 0, -1):
+                try:
+                    with open(
+                        os.path.join(archive_dir, f"vitals_round_{round_no:02d}.json"),
+                        "r",
+                        encoding="utf-8",
+                    ) as stream:
+                        frozen = json.load(stream)
+                except (OSError, TypeError, ValueError):
+                    continue
+                if not isinstance(frozen, dict) or not all(
+                    dict(frozen.get(side) or {}).get("staminaPct") is not None
+                    for side in ("blue", "red")
+                ):
+                    continue
+                values = dict(frozen)
+                if live_round > round_no:
+                    recovery = max(
+                        0.0,
+                        min(
+                            1.0,
+                            float(getattr(self.cfg, "spectator_sp_break_recovery_pct", 30.0) or 0.0)
+                            / 100.0,
+                        ),
+                    )
+                    for side in ("blue", "red"):
+                        previous = max(
+                            0.0,
+                            min(1.0, float(dict(values.get(side) or {}).get("staminaPct", 100) or 0.0) / 100.0),
+                        )
+                        values.setdefault(side, {})["staminaPct"] = int(
+                            round((previous + (1.0 - previous) * recovery) * 100.0)
+                        )
+                break
+
+        if not all(
+            dict(values.get(side) or {}).get("staminaPct") is not None
+            for side in ("blue", "red")
+        ):
+            return False
+        self._browser_sp_ratio = {
+            side: max(
+                0.0,
+                min(1.0, float(dict(values.get(side) or {}).get("staminaPct", 100) or 0.0) / 100.0),
+            )
+            for side in ("blue", "red")
+        }
+        self._browser_sp_rest_start_ratio = dict(self._browser_sp_ratio)
+        self._browser_sp_restored_session_id = session_id
+        self._browser_sp_archive_last_at = 0.0
+        self._browser_sp_archive_last_sig = tuple()
+        logging.info(
+            "SPECTATORLOG_ACTUAL_HEALTH_RESUMED session=%s source=%s blue=%d red=%d",
+            session_id,
+            "live" if exact else "round_fallback",
+            int(round(self._browser_sp_ratio["blue"] * 100.0)),
+            int(round(self._browser_sp_ratio["red"] * 100.0)),
+        )
+        return True
+
+    def _archive_live_sp_ratios(self, round_no: int) -> None:
+        """Persist actual health once per second into the active match archive."""
+        archive = getattr(getattr(self, "spectator_watcher", None), "_match_archive", None)
+        if archive is None or not archive.active():
+            return
+        ratios = dict(getattr(self, "_browser_sp_ratio", {}) or {})
+        values = {
+            side: {
+                "staminaPct": int(
+                    round(max(0.0, min(1.0, float(ratios.get(side, 1.0) or 0.0))) * 100.0)
+                )
+            }
+            for side in ("blue", "red")
+        }
+        sig = (
+            values["blue"]["staminaPct"],
+            values["red"]["staminaPct"],
+            max(1, int(round_no or 1)),
+        )
+        now = time.time()
+        if sig == tuple(getattr(self, "_browser_sp_archive_last_sig", tuple()) or tuple()) and (
+            now - float(getattr(self, "_browser_sp_archive_last_at", 0.0) or 0.0) < 1.0
+        ):
+            return
+        try:
+            archive.merge_live_vitals(max(1, int(round_no or 1)), values)
+            self._browser_sp_archive_last_sig = sig
+            self._browser_sp_archive_last_at = now
+        except Exception:
+            logging.exception("SPECTATORLOG_ACTUAL_HEALTH_ARCHIVE_FAIL")
 
     def _browser_overlay_sp_update(self, d: dict, state: dict) -> Dict[str, float]:
         ratios = dict(getattr(self, "_browser_sp_ratio", {}) or {})
@@ -24295,10 +26768,15 @@ class MainApp(QObject):
                 obs_reconfigure=self._reconfigure_obs_integration,
                 obs_test_connection=self._test_obs_connection,
                 obs_status_getter=self._obs_status_label,
+                obs_source_record_diagnose=self._diagnose_obs_source_record,
+                obs_source_record_diagnostic_getter=self._obs_source_record_diagnostic_status,
+                obs_source_record_test=self._test_obs_source_record,
+                obs_source_record_configure=self._configure_obs_source_record,
                 idle_highlight_refresh=self._sync_idle_highlight_playlist,
                 potm_test=self._test_potm_presentation,
                 broadcast_rehearsal=self._run_broadcast_rehearsal,
                 broadcast_rehearsal_stop=self._stop_broadcast_rehearsal,
+                central_engine_test=self._run_central_engine_preflight,
             )
             self.settings_dlg.finished.connect(self.on_settings_closed)
         dlg = PixelActionDialog(None, self.settings_dlg, gx, gy, bgr)
@@ -24860,6 +27338,96 @@ class MainApp(QObject):
                     side = str(ev.get("side") or "")
                     damage = _num(ev.get("damage", 0.0), 0.0)
                     effect_kind = str(ev.get("effect_kind") or "").lower()
+                    attacker_side = str(ev.get("attacker_side") or "").lower()
+                    event_tags = [
+                        str(tag or "").lower()
+                        for tag in list(ev.get("event_tags") or ev.get("eventTags") or [])
+                        if str(tag or "").strip()
+                    ]
+                    event_primary = str(ev.get("event_primary") or ev.get("eventPrimary") or "").lower()
+                    event_time = _num(ev.get("event_time", ev.get("eventTime")), 0.0)
+                    combo_hits = _int(ev.get("combo_hits", ev.get("comboHits", 0)), 0)
+                    decisive_effect = effect_kind in (
+                        "knockdown",
+                        "down",
+                        "ko",
+                        "knockout",
+                        "tko",
+                    )
+                    combat_display_worthy = (
+                        decisive_effect
+                        or (
+                            bool(ev.get("is_counter") or ev.get("isCounter"))
+                            or combo_hits >= 2
+                            or ("heavy" in event_tags and damage >= 60.0)
+                            or any(
+                                tag in event_tags
+                                for tag in (
+                                    "signature",
+                                    "combo_emphasis",
+                                    "answer_back",
+                                    "momentum",
+                                    "target_lock",
+                                )
+                            )
+                        )
+                    )
+                    semantic_key = str(
+                        ev.get("hitfx_key")
+                        or ev.get("hitfxKey")
+                        or ev.get("event_id")
+                        or "%s|%s|%.2f|%.3f|%s" % (
+                            attacker_side,
+                            side,
+                            damage,
+                            event_time,
+                            str(ev.get("punch") or ""),
+                        )
+                    )
+
+                    # The impact renderer deliberately filters small hits, but
+                    # the combat-event director needs every classified row to
+                    # build counter/combo/momentum/target-lock sequences.  Keep
+                    # a separate dedupe map so the watcher's fast and full
+                    # passes cannot enqueue the same semantic event twice.
+                    try:
+                        now_perf_ms = time.perf_counter() * 1000.0
+                        combat_seen = getattr(self, "_browser_combat_event_seen", None)
+                        if not isinstance(combat_seen, dict):
+                            combat_seen = {}
+                            self._browser_combat_event_seen = combat_seen
+                        for _k, _at in list(combat_seen.items()):
+                            try:
+                                if now_perf_ms - float(_at) > 12000.0:
+                                    combat_seen.pop(_k, None)
+                            except Exception:
+                                combat_seen.pop(_k, None)
+                        if combat_display_worthy and semantic_key not in combat_seen:
+                            combat_seen[semantic_key] = now_perf_ms
+                            overlay.push_event(
+                                "combat_event",
+                                side=side,
+                                attackerSide=attacker_side,
+                                damage=damage,
+                                effectKind=effect_kind,
+                                punch=str(ev.get("punch") or ""),
+                                weakPoint=str(ev.get("weak_point") or ""),
+                                isCounter=bool(ev.get("is_counter") or ev.get("isCounter")),
+                                counterReason=str(ev.get("counter_reason") or ev.get("counterReason") or ""),
+                                officialCounter=bool(ev.get("official_counter") or ev.get("officialCounter")),
+                                inferredCounter=bool(ev.get("inferred_counter") or ev.get("inferredCounter")),
+                                comboHits=combo_hits,
+                                comboDamage=_num(ev.get("combo_damage", ev.get("comboDamage", 0.0)), 0.0),
+                                round=_int(ev.get("round", d.get("round_current", 0)), 0),
+                                eventPrimary=event_primary,
+                                eventTags=event_tags,
+                                eventTime=event_time,
+                                semanticKey=semantic_key,
+                                pushPerfMs=now_perf_ms,
+                            )
+                    except Exception:
+                        logging.exception("COMBAT_EVENT_OVERLAY_PUSH_FAIL")
+
                     threshold = max(0.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0))
                     if effect_kind not in ("stun", "tko", "knockdown", "down") and damage < threshold:
                         continue
@@ -24918,16 +27486,23 @@ class MainApp(QObject):
                         side=side,
                         damage=damage,
                         effectKind=effect_kind,
-                        attackerSide=str(ev.get("attacker_side") or ""),
+                        attackerSide=attacker_side,
                         punch=str(ev.get("punch") or ""),
                         weakPoint=str(ev.get("weak_point") or ""),
                         counterMult=_num(ev.get("counter_mult", ev.get("counterMult", 1.0)), 1.0),
                         isCounter=bool(ev.get("is_counter") or ev.get("isCounter")),
+                        counterReason=str(ev.get("counter_reason") or ev.get("counterReason") or ""),
+                        officialCounter=bool(ev.get("official_counter") or ev.get("officialCounter")),
+                        inferredCounter=bool(ev.get("inferred_counter") or ev.get("inferredCounter")),
+                        comboHits=_int(ev.get("combo_hits", ev.get("comboHits", 0)), 0),
+                        comboDamage=_num(ev.get("combo_damage", ev.get("comboDamage", 0.0)), 0.0),
+                        eventPrimary=event_primary,
+                        eventTags=event_tags,
                         coordSource=str(ev.get("coord_source") or ""),
                         gloveHand=str(ev.get("glove_hand") or ""),
                         screenX=sx,
                         screenY=sy,
-                        eventTime=_num(ev.get("event_time", ev.get("eventTime")), 0.0),
+                        eventTime=event_time,
                         hitfxKey=hitfx_key,
                         pushPerfMs=now_perf_ms,
                     )
@@ -25069,6 +27644,21 @@ class MainApp(QObject):
                     or bool(d.get("spectator_sp_reset", False))
                     or bool(d.get("spectator_match_stats_reset", False))):
                 update.update(self._browser_overlay_sp_update(d, state))
+                if not bool(d.get("spectator_sp_reset", False)) and not bool(
+                    d.get("spectator_match_stats_reset", False)
+                ):
+                    try:
+                        self._archive_live_sp_ratios(
+                            _int(
+                                d.get(
+                                    "round_current",
+                                    d.get("timer_current_round", getattr(self.cfg, "timer_current_round", 1)),
+                                ),
+                                1,
+                            )
+                        )
+                    except Exception:
+                        logging.exception("SPECTATORLOG_ACTUAL_HEALTH_ARCHIVE_UPDATE_FAIL")
 
             # Reports must show the final in-fight gauges, not the values after
             # break recovery or a result/new-match reset.  The browser SP state is
@@ -25355,8 +27945,17 @@ class MainApp(QObject):
                             hp_ratio = punishment.get("hp_ratio")
                             stored_vital = dict(last_fight_vitals.get(side) or {}) if use_fight_snapshot else {}
                             sp_ratio = float(browser_sp.get(side, 1.0) or 0.0)
+                            archived_stamina = punishment.get("staminaPct")
                             snapshot[side] = {
-                                "staminaPct": int(stored_vital.get("staminaPct", round(max(0.0, min(1.0, sp_ratio)) * 100.0)) or 0),
+                                "staminaPct": int(
+                                    archived_stamina
+                                    if archived_stamina is not None
+                                    else stored_vital.get(
+                                        "staminaPct",
+                                        round(max(0.0, min(1.0, sp_ratio)) * 100.0),
+                                    )
+                                    or 0
+                                ),
                                 # PUN long from the frozen archive is the
                                 # health authority. Browser state is fallback.
                                 "healthPct": (
@@ -25378,6 +27977,21 @@ class MainApp(QObject):
                             snapshot["red"].get("healthPct"),
                         )
                         cache[round_key] = snapshot
+                        try:
+                            archive = getattr(self.spectator_watcher, "_match_archive", None)
+                            if archive is not None and report_session_id == str(
+                                getattr(archive, "session_id", "") or ""
+                            ):
+                                archive.merge_vitals(
+                                    int(report_payload.get("round", 0) or 1),
+                                    {
+                                        side: {"staminaPct": int(snapshot[side]["staminaPct"])}
+                                        for side in ("blue", "red")
+                                    },
+                                    final=bool(report_payload.get("isFinal", False)),
+                                )
+                        except Exception:
+                            logging.exception("SPECTATORLOG_REPORT_STAMINA_ARCHIVE_FAIL")
                     for side in ("blue", "red"):
                         side_payload = dict(report_payload.get(side) or {})
                         vital = dict(snapshot.get(side) or {})
@@ -25385,6 +27999,54 @@ class MainApp(QObject):
                         if vital.get("healthPct") is not None:
                             side_payload["healthPct"] = int(vital["healthPct"])
                         report_payload[side] = side_payload
+                    if (
+                        bool(report_payload.get("isFinal", False))
+                        and bool(getattr(self.cfg, "spectator_fight_style_enabled", True))
+                    ):
+                        # The watcher owns game-log facts, but the browser SP
+                        # calculator owns actual health. Recompute only after
+                        # the frozen SP values have been attached so the style
+                        # operation medal never mistakes yellow game health
+                        # for blue actual health.
+                        min_attempts = max(
+                            1,
+                            min(
+                                500,
+                                int(getattr(self.cfg, "spectator_fight_style_min_attempts", 20) or 20),
+                            ),
+                        )
+                        min_landed = max(
+                            1,
+                            min(
+                                500,
+                                int(getattr(self.cfg, "spectator_fight_style_min_landed", 10) or 10),
+                            ),
+                        )
+                        blue_style_payload = dict(report_payload.get("blue") or {})
+                        red_style_payload = dict(report_payload.get("red") or {})
+                        blue_style_payload["fightStyle"] = analyze_fight_style(
+                            blue_style_payload,
+                            red_style_payload,
+                            min_attempts=min_attempts,
+                            min_landed=min_landed,
+                        )
+                        red_style_payload["fightStyle"] = analyze_fight_style(
+                            red_style_payload,
+                            blue_style_payload,
+                            min_attempts=min_attempts,
+                            min_landed=min_landed,
+                        )
+                        report_payload["blue"] = blue_style_payload
+                        report_payload["red"] = red_style_payload
+                        logging.info(
+                            "SPECTATORLOG_FINAL_STYLE_ACTUAL_HEALTH blue_sp=%s blue=%s/L%s red_sp=%s red=%s/L%s",
+                            blue_style_payload.get("staminaPct"),
+                            dict(blue_style_payload.get("fightStyle") or {}).get("label"),
+                            dict(blue_style_payload.get("fightStyle") or {}).get("level"),
+                            red_style_payload.get("staminaPct"),
+                            dict(red_style_payload.get("fightStyle") or {}).get("label"),
+                            dict(red_style_payload.get("fightStyle") or {}).get("level"),
+                        )
                     fallback_report_delay_ms = max(
                         fallback_report_delay_ms,
                         report_delay_ms + max(0, int(report_payload.get("displayMs", 0) or 0)),
@@ -25392,6 +28054,12 @@ class MainApp(QObject):
                     report_payload["showDelayMs"] = 0
                     if bool(report_payload.get("isFinal", False)):
                         self._potm_final_report_payload = dict(report_payload)
+                        try:
+                            self._record_chapter_match_result(report_payload)
+                        except Exception:
+                            # Chapter export must never interrupt the final
+                            # report/POTM presentation path.
+                            logging.exception("CHAPTER_MATCH_RESULT_APPEND_FAIL")
                         # This is the authoritative start of an end-of-match
                         # presentation.  Holding here covers the configured
                         # report delay without treating a stale terminal.txt as
@@ -25482,9 +28150,14 @@ class MainApp(QObject):
         if not bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)):
             return
         title = str(getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or "").strip()
-        mode = str(getattr(self.cfg, "spectator_lobby_auto_start_mode", "click") or "click").strip().lower()
+        mode = str(getattr(self.cfg, "spectator_lobby_auto_start_mode", "f5") or "f5").strip().lower()
+        # A previous UI version persisted ``click`` even after the operator
+        # switched the workflow to F5.  Treat that stale value as F5-only so
+        # automatic start can never move the mouse unexpectedly.
+        if mode == "click":
+            mode = "f5"
         if mode not in ("click", "f5", "f5_then_click"):
-            mode = "click"
+            mode = "f5"
         x = int(getattr(self.cfg, "spectator_lobby_auto_start_client_x", 0) or 0)
         y = int(getattr(self.cfg, "spectator_lobby_auto_start_client_y", 0) or 0)
         reference_width = int(getattr(self.cfg, "spectator_lobby_auto_start_reference_width", 0) or 0)
@@ -25525,34 +28198,132 @@ class MainApp(QObject):
             y,
             players,
         )
+        DIAG.record(
+            "lobby_auto_start_scheduled",
+            mode=mode,
+            delay_ms=delay_ms,
+            title=title,
+            players=players,
+        )
 
         def _worker():
+            f5_cleanup_pending = False
+            f5_previous_hwnd = 0
+            f5_target_hwnd = 0
+
+            def _finish_f5_window() -> None:
+                nonlocal f5_cleanup_pending
+                if not f5_cleanup_pending or os.name != "nt":
+                    return
+                f5_cleanup_pending = False
+                user32 = ctypes.windll.user32
+                if minimize_target and f5_target_hwnd:
+                    try:
+                        user32.ShowWindow(wintypes.HWND(f5_target_hwnd), 6)  # SW_MINIMIZE
+                    except Exception:
+                        pass
+                if (
+                    restore_focus
+                    and f5_previous_hwnd
+                    and f5_previous_hwnd != f5_target_hwnd
+                ):
+                    try:
+                        _activate_window_reliably(f5_previous_hwnd, restore=True)
+                    except Exception:
+                        pass
+
             try:
                 if delay_ms > 0:
                     time.sleep(delay_ms / 1000.0)
                 if mode in ("f5", "f5_then_click"):
+                    if os.name == "nt":
+                        try:
+                            f5_previous_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+                        except Exception:
+                            f5_previous_hwnd = 0
+                        f5_target_hwnd = int(_find_window_by_title_contains(title) or 0)
+                        f5_cleanup_pending = True
                     before_active = bool(getattr(self, "_match_active", False))
-                    f5_ok, f5_detail = press_vk_for_window_title(
-                        0x74,  # VK_F5
-                        title,
-                        activate=True,
-                        restore_previous=True,
-                    )
-                    logging.info("LOBBY_AUTO_START_F5_SENT ok=%s %s", f5_ok, f5_detail)
-                    if f5_ok:
-                        deadline = time.monotonic() + 1.8
-                        while time.monotonic() < deadline:
-                            if not before_active and bool(getattr(self, "_match_active", False)):
-                                detail = f"F5 confirmed: {f5_detail}"
-                                logging.info("LOBBY_AUTO_START_F5_OK %s", detail)
-                                self._lobby_auto_start_result.emit(True, detail)
-                                return
-                            time.sleep(0.08)
+                    f5_ok, f5_detail = False, ""
+                    # The spectator executable has been observed accepting a
+                    # scan-code SendInput call at the Win32 API boundary while
+                    # ignoring the actual F5 command.  Try distinct keyboard
+                    # representations and confirm each one against the live
+                    # match state instead of treating API acceptance as start.
+                    f5_methods = ("scan_code", "virtual_key", "keybd_event")
+                    for attempt, input_method in enumerate(f5_methods, start=1):
+                        if bool(getattr(self, "_match_active", False)):
+                            detail = f"match active before F5 retry attempt={attempt}"
+                            logging.info("LOBBY_AUTO_START_F5_OK %s", detail)
+                            DIAG.record("lobby_auto_start_f5_confirmed", detail=detail, title=title)
+                            _finish_f5_window()
+                            self._lobby_auto_start_result.emit(True, detail)
+                            return
+                        f5_ok, f5_detail = press_vk_for_window_title(
+                            0x74,  # VK_F5
+                            title,
+                            activate=True,
+                            # Keep the spectator window active until the live
+                            # log confirms start.  Restoring/minimizing 160 ms
+                            # after key-down allowed Unity to miss the command.
+                            restore_previous=False,
+                            minimize_target_after=False,
+                            input_method=input_method,
+                        )
+                        logging.info(
+                            "LOBBY_AUTO_START_F5_SENT attempt=%s method=%s ok=%s %s",
+                            attempt,
+                            input_method,
+                            f5_ok,
+                            f5_detail,
+                        )
+                        DIAG.record(
+                            "lobby_auto_start_f5_sent",
+                            attempt=attempt,
+                            method=input_method,
+                            ok=bool(f5_ok),
+                            detail=str(f5_detail or ""),
+                            title=title,
+                        )
+                        if f5_ok:
+                            deadline = time.monotonic() + 3.0
+                            while time.monotonic() < deadline:
+                                if not before_active and bool(getattr(self, "_match_active", False)):
+                                    detail = (
+                                        f"F5 confirmed attempt={attempt} "
+                                        f"method={input_method}: {f5_detail}"
+                                    )
+                                    logging.info("LOBBY_AUTO_START_F5_OK %s", detail)
+                                    DIAG.record(
+                                        "lobby_auto_start_f5_confirmed",
+                                        attempt=attempt,
+                                        detail=detail,
+                                        title=title,
+                                    )
+                                    _finish_f5_window()
+                                    self._lobby_auto_start_result.emit(True, detail)
+                                    return
+                                time.sleep(0.08)
+                        if attempt < len(f5_methods):
+                            logging.warning(
+                                "LOBBY_AUTO_START_F5_RETRY attempt=%s method=%s ok=%s detail=%s",
+                                attempt,
+                                input_method,
+                                f5_ok,
+                                f5_detail,
+                            )
+                            time.sleep(0.35)
                     if mode == "f5":
-                        detail = f"F5 start was not confirmed: {f5_detail}"
+                        detail = (
+                            f"F5 start was not confirmed after {len(f5_methods)} "
+                            f"input methods: {f5_detail}"
+                        )
                         logging.error("LOBBY_AUTO_START_F5_FAIL %s", detail)
+                        DIAG.record("lobby_auto_start_f5_not_confirmed", detail=detail, title=title)
+                        _finish_f5_window()
                         self._lobby_auto_start_result.emit(False, detail)
                         return
+                    _finish_f5_window()
                     logging.warning("LOBBY_AUTO_START_F5_FALLBACK_TO_CLICK %s", f5_detail)
                 ok, detail = True, ""
                 original_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0) if os.name == "nt" else 0
@@ -25584,6 +28355,7 @@ class MainApp(QObject):
             except Exception:
                 logging.exception("LOBBY_AUTO_START_CLICK_ERROR")
             finally:
+                _finish_f5_window()
                 try:
                     lock.release()
                 except Exception:
@@ -25606,40 +28378,57 @@ class MainApp(QObject):
         except Exception:
             pass
 
-    def _restore_spectator_window_after_match(self, payload: Optional[dict] = None) -> None:
-        """Restore and foreground the configured spectator/game window at match end."""
-        title = str(getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or "").strip()
-        if not title:
-            logging.warning("MATCH_END_SPECTATOR_WINDOW_RESTORE_SKIP reason=empty_window_title")
+    def _remember_window_before_lobby_kick(self, payload: Optional[dict] = None) -> None:
+        """Bring the spectator tool forward at match end and leave it visible."""
+        if not bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False)):
             return
-
-        def _worker():
-            try:
-                hwnd = _find_window_by_title_contains(title)
-                if not hwnd:
-                    logging.warning("MATCH_END_SPECTATOR_WINDOW_RESTORE_FAIL reason=window_not_found title=%r", title)
-                    return
-                ok, detail = _activate_window_reliably(hwnd)
-                level = logging.info if ok else logging.warning
-                level(
-                    "MATCH_END_SPECTATOR_WINDOW_RESTORE ok=%s session=%s detail=%s",
-                    ok,
-                    str(dict(payload or {}).get("matchSessionId") or ""),
-                    detail,
-                )
-            except Exception:
-                logging.exception("MATCH_END_SPECTATOR_WINDOW_RESTORE_FAIL")
-
-        threading.Thread(target=_worker, daemon=True, name="match-end-spectator-window").start()
+        title = str(getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or "").strip()
+        session_id = str(dict(payload or {}).get("matchSessionId") or "")
+        if not title or not session_id:
+            logging.warning(
+                "MATCH_END_LOBBY_FOCUS_CAPTURE_SKIP title=%r session=%r",
+                title,
+                session_id,
+            )
+            return
+        try:
+            target_hwnd = _find_window_by_title_contains(title)
+            previous_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0) if os.name == "nt" else 0
+            if previous_hwnd and previous_hwnd != target_hwnd:
+                self._lobby_restore_hwnd_by_session[session_id] = previous_hwnd
+            activated = False
+            activation_detail = ""
+            if target_hwnd:
+                activated, activation_detail = _activate_window_reliably(target_hwnd, restore=True)
+            logging.info(
+                "MATCH_END_LOBBY_WINDOW_OPEN session=%s target=%s previous=%s activated=%s detail=%s",
+                session_id,
+                target_hwnd,
+                previous_hwnd,
+                activated,
+                activation_detail,
+            )
+            DIAG.record(
+                "lobby_post_match_window_opened",
+                session=session_id,
+                target=int(target_hwnd or 0),
+                previous=int(previous_hwnd or 0),
+                activated=bool(activated),
+                detail=str(activation_detail or ""),
+            )
+        except Exception:
+            logging.exception("MATCH_END_LOBBY_WINDOW_OPEN_FAIL")
 
     def _schedule_lobby_post_match_kick(self, payload: Optional[dict] = None) -> None:
         """Kick the prior bout's occupied lobby slots exactly once per match."""
         if not bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False)):
             logging.info("LOBBY_POST_MATCH_KICK_SKIP reason=disabled")
+            DIAG.record("lobby_post_match_kick_skip", reason="disabled")
             return
         title = str(getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or "").strip()
         if not title:
             logging.warning("LOBBY_POST_MATCH_KICK_SKIP reason=empty_window_title")
+            DIAG.record("lobby_post_match_kick_skip", reason="empty_window_title")
             return
         session_id = str(dict(payload or {}).get("matchSessionId") or "")
         if session_id and session_id == str(
@@ -25649,10 +28438,12 @@ class MainApp(QObject):
                 "LOBBY_POST_MATCH_KICK_SKIP reason=already_handled session=%s",
                 session_id,
             )
+            DIAG.record("lobby_post_match_kick_skip", reason="already_handled", session=session_id)
             return
         lock = getattr(self, "_lobby_post_match_kick_lock", None)
         if lock is None or not lock.acquire(blocking=False):
             logging.info("LOBBY_POST_MATCH_KICK_SKIP reason=busy")
+            DIAG.record("lobby_post_match_kick_skip", reason="busy", session=session_id)
             return
         if session_id:
             # The watcher already emits one lobby-return edge per match. Keep a
@@ -25660,31 +28451,49 @@ class MainApp(QObject):
             # can never send another kick wave for the same bout.
             self._lobby_post_match_kick_last_session_id = session_id
 
-        def _occupied_targets(lobby: dict) -> Tuple[List[int], Dict[int, str]]:
-            targets: List[int] = []
-            names: Dict[int, str] = {}
+        returned_lobby = dict(payload or {})
+
+        def _occupied_player_slots(lobby: dict) -> List[int]:
+            found: List[int] = []
             for raw_slot in list(dict(lobby or {}).get("slots") or []):
+                item = dict(raw_slot or {})
                 try:
-                    slot = int(dict(raw_slot or {}).get("slot", -1))
+                    slot = int(item.get("slot", -1))
                 except Exception:
                     continue
-                if slot not in (0, 1, 2) or not bool(dict(raw_slot or {}).get("occupied", False)):
-                    continue
-                name = str(dict(raw_slot or {}).get("name") or "").strip()
-                targets.append(slot)
-                names[slot] = name
-            return targets, names
+                if slot in (1, 2) and bool(item.get("occupied", False)):
+                    found.append(slot)
+            return sorted(set(found))
 
         def _read_current_lobby() -> dict:
             try:
-                root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
+                root = resolve_spectatorlog_path(
+                    str(getattr(self.cfg, "spectatorlog_path", "") or "")
+                )
                 watcher = getattr(self, "spectator_watcher", None)
-                if watcher is None or not root:
-                    return {}
-                return dict(watcher._read_lobby_info(root) or {})
+                return dict(watcher._read_lobby_info(root) or {}) if watcher and root else {}
             except Exception:
                 logging.exception("LOBBY_POST_MATCH_KICK_READ_FAIL")
                 return {}
+
+        def _wait_for_removed(targets: List[int], timeout_sec: float) -> Tuple[bool, List[int], str]:
+            attempts = max(1, int(round(max(0.5, float(timeout_sec or 0.5)) / 0.20)))
+            last_slots: List[int] = []
+            observed = False
+            for attempt in range(attempts):
+                lobby = _read_current_lobby()
+                if lobby and isinstance(lobby.get("slots"), list):
+                    observed = True
+                    last_slots = _occupied_player_slots(lobby)
+                    remaining = [slot for slot in targets if slot in last_slots]
+                    if not remaining:
+                        return True, [], f"confirmed occupied={last_slots}"
+                if attempt + 1 < attempts:
+                    time.sleep(0.20)
+            remaining = [slot for slot in targets if slot in last_slots]
+            if not observed:
+                return False, list(targets), "lobby verification unavailable"
+            return False, remaining, f"still occupied={last_slots}"
 
         def _same_match_session() -> bool:
             if not session_id:
@@ -25705,22 +28514,121 @@ class MainApp(QObject):
                     0.0,
                     min(30.0, float(getattr(self.cfg, "spectator_lobby_post_match_kick_delay_sec", 5.0) or 0.0)),
                 )
+                # Lobby-return is a second authoritative edge after the match
+                # terminal event.  Reassert the spectator foreground here
+                # immediately; the report/POTM presentation or another desktop
+                # app may have taken focus during the return animation.
+                target_hwnd = int(_find_window_by_title_contains(title) or 0)
+                if target_hwnd:
+                    opened, open_detail = _activate_window_reliably(target_hwnd, restore=True)
+                    logging.info(
+                        "LOBBY_POST_MATCH_WINDOW_REOPEN activated=%s detail=%s",
+                        opened,
+                        open_detail,
+                    )
                 time.sleep(delay_sec)
                 if not _same_match_session():
                     logging.info("LOBBY_POST_MATCH_KICK_SKIP reason=new_match_session")
+                    DIAG.record("lobby_post_match_kick_skip", reason="new_match_session", session=session_id)
                     return
-                first_slots, first_names = _occupied_targets(_read_current_lobby())
-                if not first_slots:
-                    logging.info("LOBBY_POST_MATCH_KICK_SKIP reason=no_occupied_slots_0_1_2")
+                current_lobby = _read_current_lobby()
+                target_slots = (
+                    _occupied_player_slots(current_lobby)
+                    or _occupied_player_slots(returned_lobby)
+                )
+                if not target_slots:
+                    logging.info("LOBBY_POST_MATCH_KICK_SKIP reason=no_occupied_player_slots")
+                    DIAG.record(
+                        "lobby_post_match_kick_skip",
+                        reason="no_occupied_player_slots",
+                        session=session_id,
+                    )
                     return
-                ok, detail = kick_lobby_slots_for_window_title(first_slots, title)
+
+                input_ok, input_detail = kick_lobby_slots_for_window_title(
+                    target_slots,
+                    title,
+                    restore_previous=False,
+                    minimize_target_after=False,
+                )
+                confirmed, remaining, verify_detail = _wait_for_removed(target_slots, 3.0)
+                retry_detail = ""
+                if not confirmed and remaining and _same_match_session():
+                    retry_ok, retry_input_detail = kick_lobby_slots_for_window_title(
+                        remaining,
+                        title,
+                        restore_previous=False,
+                        minimize_target_after=False,
+                    )
+                    retry_confirmed, remaining, retry_verify_detail = _wait_for_removed(remaining, 3.0)
+                    confirmed = bool(retry_ok and retry_confirmed)
+                    retry_detail = (
+                        f" retry_input=({retry_input_detail}) "
+                        f"retry_verify=({retry_verify_detail})"
+                    )
+                ok = bool(confirmed)
+                detail = (
+                    f"input=({input_detail}) verify=({verify_detail})"
+                    f"{retry_detail} remaining={remaining}"
+                )
                 logging.info(
-                    "LOBBY_POST_MATCH_KICK_ONCE ok=%s delay=%.1fs slots=%s names=%s detail=%s",
-                    ok, delay_sec, first_slots, first_names, detail,
+                    "LOBBY_POST_MATCH_KICK_ONCE ok=%s delay=%.1fs slots=%s detail=%s",
+                    ok, delay_sec, target_slots, detail,
+                )
+                DIAG.record(
+                    "lobby_post_match_kick_result",
+                    ok=bool(ok),
+                    delay=delay_sec,
+                    slots=target_slots,
+                    detail=str(detail or ""),
+                    session=session_id,
                 )
             except Exception:
                 logging.exception("LOBBY_POST_MATCH_KICK_FAIL")
             finally:
+                # Keep the spectator tool open after the bout.  Moving it away
+                # during the lobby settle/verification window made K+slot
+                # shortcuts intermittent on slower returns.
+                try:
+                    hwnd = int(_find_window_by_title_contains(title) or 0)
+                    final_ok, final_detail = (
+                        _activate_window_reliably(hwnd, restore=True)
+                        if hwnd
+                        else (False, "window not found")
+                    )
+                    # Some applications restore their own foreground window
+                    # shortly after our worker finishes.  Verify after that
+                    # delayed handoff and take the spectator foreground back
+                    # once if necessary.
+                    time.sleep(1.0)
+                    active = (
+                        int(ctypes.windll.user32.GetForegroundWindow() or 0)
+                        if os.name == "nt"
+                        else hwnd
+                    )
+                    reasserted = False
+                    reassert_detail = ""
+                    if hwnd and active != hwnd:
+                        reasserted, reassert_detail = _activate_window_reliably(hwnd, restore=True)
+                    logging.info(
+                        "LOBBY_POST_MATCH_WINDOW_LEFT_OPEN session=%s target=%s "
+                        "active_before_reassert=%s final_ok=%s detail=%s "
+                        "reasserted=%s reassert_detail=%s",
+                        session_id,
+                        hwnd,
+                        active,
+                        final_ok,
+                        final_detail,
+                        reasserted,
+                        reassert_detail,
+                    )
+                except Exception:
+                    logging.exception("LOBBY_POST_MATCH_WINDOW_FINAL_ACTIVATE_FAIL")
+                try:
+                    if session_id:
+                        self._lobby_restore_hwnd_by_session.pop(session_id, None)
+                except Exception:
+                    pass
                 try:
                     lock.release()
                 except Exception:
@@ -25730,6 +28638,12 @@ class MainApp(QObject):
             "LOBBY_POST_MATCH_KICK_SCHEDULE session=%s delay=%.1fs",
             session_id or "<unknown>",
             max(0.0, min(30.0, float(getattr(self.cfg, "spectator_lobby_post_match_kick_delay_sec", 5.0) or 0.0))),
+        )
+        DIAG.record(
+            "lobby_post_match_kick_scheduled",
+            session=session_id,
+            delay=max(0.0, min(30.0, float(getattr(self.cfg, "spectator_lobby_post_match_kick_delay_sec", 5.0) or 0.0))),
+            title=title,
         )
         threading.Thread(target=_worker, daemon=True, name="LobbyPostMatchKick").start()
 
@@ -25769,8 +28683,12 @@ class MainApp(QObject):
             self._cancel_obs_auto_replay("round_or_match_start")
         if "vs_intro_event" in d:
             self._reset_potm_match()
+        if isinstance(d.get("spectator_match_session"), dict):
+            match_session = dict(d.get("spectator_match_session") or {})
+            self._bind_potm_match_archive(match_session)
+            self._restore_live_sp_from_match_archive(match_session)
         if isinstance(d.get("spectator_match_terminal"), dict):
-            self._restore_spectator_window_after_match(d.get("spectator_match_terminal"))
+            self._remember_window_before_lobby_kick(d.get("spectator_match_terminal"))
         if isinstance(d.get("spectator_lobby_returned"), dict):
             self._schedule_lobby_post_match_kick(d.get("spectator_lobby_returned"))
         if str(d.get("spectator_round_state", "") or "").strip().lower() in {"results", "end", "knockout", "disqualified", "cancel"}:
@@ -25824,7 +28742,11 @@ class MainApp(QObject):
         try:
             real_hit_events = [
                 dict(item or {}) for item in list(d.get("spectator_hit_effect_events") or [])
-                if isinstance(item, dict) and str((item or {}).get("event_id") or "").strip()
+                if (
+                    isinstance(item, dict)
+                    and str((item or {}).get("event_id") or "").strip()
+                    and not bool((item or {}).get("_test_event", False))
+                )
             ]
             central_combo_available = False
             for event in real_hit_events:
@@ -25840,10 +28762,12 @@ class MainApp(QObject):
                     highlight_kind = "knockdown"
                 elif effect_kind == "stun":
                     highlight_kind = "stun"
-                elif "counter" in event_tags or bool(event.get("is_counter", False)):
+                elif "counter_strong" in event_tags:
                     highlight_kind = "counter"
-                else:
+                elif "heavy" in event_tags or "signature" in event_tags:
                     highlight_kind = "heavy"
+                else:
+                    highlight_kind = "hit"
                 self._maybe_save_obs_highlight(
                     highlight_kind,
                     event_key="hit:" + str(event.get("event_id") or ""),
@@ -25852,7 +28776,7 @@ class MainApp(QObject):
                     potm_candidate=potm_candidate,
                 )
                 combo_hits = int(event.get("combo_hits", 0) or 0)
-                if central_live and combo_hits >= 2:
+                if central_live and "combo_emphasis" in event_tags:
                     self._maybe_save_obs_highlight(
                         "combo",
                         event_key=f"combo:{str(event.get('attacker_side') or '')}:{str(event.get('event_id') or '')}:{combo_hits}",
@@ -26076,6 +29000,64 @@ class MainApp(QObject):
                         )
             except Exception:
                 pass
+        # This is deliberately a QML timer-window aid, not a browser-overlay
+        # element: it lets the operator confirm lobby automation at a glance
+        # without putting any control UI on stream.
+        if "spectator_lobby_status" in d:
+            try:
+                lobby = dict(d.get("spectator_lobby_status") or {})
+                slots = list(lobby.get("slots") or [])
+                occupied = [s for s in slots if bool((s or {}).get("occupied"))]
+                ready = [s for s in occupied if bool((s or {}).get("ready"))]
+
+                def _lobby_seconds(value: object) -> str:
+                    try:
+                        total = max(0, int(round(float(value))))
+                    except Exception:
+                        return "-"
+                    return f"{total // 60}:{total % 60:02d}"
+
+                lines = ["● 로그 연결  LIVE"]
+                venue = str(lobby.get("venueId") or "").strip()
+                if venue:
+                    lines.append("경기장  ID " + venue)
+                rounds = str(lobby.get("rounds") or "").strip()
+                round_time = _lobby_seconds(lobby.get("roundDuration"))
+                break_time = _lobby_seconds(lobby.get("breakDuration"))
+                if rounds or round_time != "-" or break_time != "-":
+                    lines.append("경기 규칙  {}R · {} / 휴식 {}".format(rounds or "-", round_time, break_time))
+                lines.append("게임 시작 가능  {}".format("YES" if lobby.get("rawReadyToStart") else "NO"))
+                if slots:
+                    lines.append("슬롯  {}/{} 레디".format(len(ready), len(occupied)))
+                    for slot in slots[:4]:
+                        item = dict(slot or {})
+                        number = item.get("slot", "-")
+                        name = str(item.get("name") or "").strip()
+                        if not name:
+                            name = "비어 있음" if not item.get("occupied") else str(item.get("type") or "참가자")
+                        state = "READY" if item.get("ready") else ("대기" if item.get("occupied") else "-")
+                        lines.append("  {}번  {}  · {}".format(number, name, state))
+                else:
+                    lines.append("슬롯 정보를 기다리는 중")
+
+                if lobby.get("autoStartEnabled"):
+                    next_action = "시작 요청 중" if lobby.get("fightersReady") else "양쪽 선수 레디 대기"
+                    lines.append("자동 시작  " + next_action)
+                else:
+                    lines.append("자동 시작  꺼짐")
+                if lobby.get("kickEnabled"):
+                    lines.append("자동 강퇴  종료 후 {}초".format(int(round(float(lobby.get("kickDelaySec") or 0)))))
+                else:
+                    lines.append("자동 강퇴  꺼짐")
+                self.timer_win.set_lobby_control_text("\n".join(lines))
+            except Exception:
+                logging.exception("LOBBY_CONTROL_TOWER_UPDATE_FAIL")
+        elif bool(d.get("spectator_lobby_hide")):
+            try:
+                self.timer_win.set_lobby_control_text("")
+            except Exception:
+                pass
+
         if "spectator_log_info" in d:
             try:
                 if qml_visuals:
@@ -26118,10 +29100,20 @@ class MainApp(QObject):
                 if blue_text and red_text and blue_text.upper() != unknown and red_text.upper() != unknown:
                     blue_key = str(self._current_blue_id or blue_name or blue_text).upper().strip()
                     red_key = str(self._current_red_id or red_name or red_text).upper().strip()
+                    vs_event = dict(d.get("vs_intro_event") or {}) if isinstance(d.get("vs_intro_event"), dict) else {}
+                    match_session_id = str(vs_event.get("matchSessionId") or "").strip()
+                    # A player-pair key alone used to suppress every rematch
+                    # in one stream. Keep duplicate protection within a match,
+                    # but give every newly created match session its own key.
+                    chapter_key = (
+                        f"vs:{match_session_id}:{blue_key}:{red_key}"
+                        if match_session_id else f"vs:{blue_key}:{red_key}"
+                    )
                     self._append_chapter_event(
                         f"{blue_text} VS {red_text}",
                         {
                             "source": "spectatorlog_vs_intro",
+                            "match_session_id": match_session_id,
                             "blue_name": blue_name,
                             "red_name": red_name,
                             "blue_id": str(self._current_blue_id or ""),
@@ -26129,7 +29121,7 @@ class MainApp(QObject):
                             "blue_registered": bool(self._current_blue_registered),
                             "red_registered": bool(self._current_red_registered),
                         },
-                        dedupe_key=f"vs:{blue_key}:{red_key}",
+                        dedupe_key=chapter_key,
                     )
             except Exception:
                 logging.exception("CHAPTER_VS_INTRO_APPEND_FAIL")

@@ -660,6 +660,9 @@ class AppConfig:
     event_heavy_damage: float = 50.0
     event_signature_damage: float = 60.0
     event_counter_min_damage: float = 40.0
+    event_counter_window_sec: float = 0.7
+    event_counter_graze_max_damage: float = 15.0
+    event_counter_response_min_damage: float = 30.0
     event_combo_min_damage: float = 15.0
     event_combo_window_sec: float = 0.8
     event_combo_break_damage: float = 20.0
@@ -692,6 +695,9 @@ class AppConfig:
     potm_replay_speed: float = 0.85
     potm_bgm_path: str = ""
     potm_bgm_volume: int = 75
+    # Empty means the current Windows default output.  A selected device such
+    # as "CABLE Input" lets POTM audio reach OBS without local speakers.
+    potm_audio_output_device: str = ""
     potm_test_video_path: str = ""
     potm_name_color: str = "#FFC62B"
     potm_title_text: str = "PLAY OF THE MATCH"
@@ -741,6 +747,13 @@ class AppConfig:
     obs_auto_replay_enabled: bool = True
     obs_auto_replay_kd: bool = True
     obs_auto_replay_tko: bool = True
+    # KD/TKO browser replay source. Source Record avoids saving a duplicate
+    # Program-output replay unless the optional fallback is enabled.
+    obs_auto_replay_source: str = "replay_buffer"  # replay_buffer | source_record
+    obs_auto_replay_source_fallback: bool = False
+    obs_auto_replay_source_wait_sec: float = 5.0
+    obs_auto_replay_pre_event_sec: float = 3.0
+    obs_auto_replay_post_event_sec: float = 1.0
     # Wait briefly after every highlight trigger so the decisive moment is
     # present in OBS Replay Buffer before it is saved.
     obs_auto_replay_capture_delay_sec: float = 1.0
@@ -768,6 +781,15 @@ class AppConfig:
     idle_highlight_volume: int = 0
     idle_highlight_fit: str = "cover"
     idle_highlight_fade_ms: int = 350
+    # Browser-only cinematic color grade for idle/highlight playback.
+    idle_highlight_cinematic_enabled: bool = False
+    idle_highlight_cinematic_contrast: int = 32
+    idle_highlight_cinematic_sharpen: int = 35
+    idle_highlight_cinematic_vignette: int = 24
+    # Optional reuse of the idle-video grade on replay presentation.  Keep
+    # these opt-in: KD/TKO and POTM normally need their original game colors.
+    idle_highlight_cinematic_kd_tko_enabled: bool = False
+    idle_highlight_cinematic_potm_enabled: bool = False
     # Release first-run default: ON, because public builds do not ship SWa's
     # config.json.  If the user presses log detection, it should work immediately
     # with auto SpectatorLog path discovery instead of silently staying OFF.
@@ -794,7 +816,7 @@ class AppConfig:
     spectatorlog_sync_players: bool = True
     spectator_lobby_auto_start_enabled: bool = False
     spectator_lobby_auto_start_target_title: str = "The Thrill of the Fight 2"
-    spectator_lobby_auto_start_mode: str = "click"  # click / f5 / f5_then_click
+    spectator_lobby_auto_start_mode: str = "f5"  # click / f5 / f5_then_click
     spectator_lobby_auto_start_capture_hotkey: str = "F12"
     spectator_lobby_auto_start_client_x: int = 0
     spectator_lobby_auto_start_client_y: int = 0
@@ -1046,11 +1068,18 @@ class AppConfig:
         cfg.obs_highlight_combo_min = max(2, min(20, int(raw.get("obs_highlight_combo_min", 3) or 3)))
         cfg.obs_highlight_damage_min = max(0.0, min(300.0, float(raw.get("obs_highlight_damage_min", 55.0) or 55.0)))
         cfg.obs_highlight_cooldown_sec = max(0.0, min(120.0, float(raw.get("obs_highlight_cooldown_sec", 8.0) or 8.0)))
-        cfg.event_engine_enabled = bool(raw.get("event_engine_enabled", True))
-        cfg.event_engine_shadow_mode = bool(raw.get("event_engine_shadow_mode", False))
+        # The central event engine is now the sole production path.  Keep
+        # reading these legacy keys only for old config-file compatibility;
+        # they are no longer user-controllable and can never disable or shadow
+        # the canonical verdict.
+        cfg.event_engine_enabled = True
+        cfg.event_engine_shadow_mode = False
         cfg.event_heavy_damage = max(0.0, min(300.0, float(raw.get("event_heavy_damage", 50.0) or 0.0)))
         cfg.event_signature_damage = max(0.0, min(300.0, float(raw.get("event_signature_damage", 60.0) or 0.0)))
         cfg.event_counter_min_damage = max(0.0, min(300.0, float(raw.get("event_counter_min_damage", 40.0) or 0.0)))
+        cfg.event_counter_window_sec = max(0.05, min(5.0, float(raw.get("event_counter_window_sec", 0.7) or 0.7)))
+        cfg.event_counter_graze_max_damage = max(0.0, min(300.0, float(raw.get("event_counter_graze_max_damage", 15.0) or 0.0)))
+        cfg.event_counter_response_min_damage = max(25.0, min(300.0, float(raw.get("event_counter_response_min_damage", 30.0) or 25.0)))
         cfg.event_combo_min_damage = max(0.0, min(300.0, float(raw.get("event_combo_min_damage", 15.0) or 0.0)))
         cfg.event_combo_window_sec = max(0.1, min(5.0, float(raw.get("event_combo_window_sec", 0.8) or 0.8)))
         cfg.event_combo_break_damage = max(0.0, min(300.0, float(raw.get("event_combo_break_damage", 20.0) or 0.0)))
@@ -1078,6 +1107,7 @@ class AppConfig:
         cfg.potm_replay_speed = max(0.5, min(2.0, float(raw.get("potm_replay_speed", 0.85) or 0.85)))
         cfg.potm_bgm_path = str(raw.get("potm_bgm_path", "") or "").strip()
         cfg.potm_bgm_volume = max(0, min(100, int(raw.get("potm_bgm_volume", 75) or 0)))
+        cfg.potm_audio_output_device = str(raw.get("potm_audio_output_device", "") or "").strip()
         cfg.potm_test_video_path = str(raw.get("potm_test_video_path", "") or "").strip()
         cfg.potm_name_color = _normalize_hex_color(raw.get("potm_name_color", "#FFC62B"))
         cfg.potm_title_text = str(raw.get("potm_title_text", "PLAY OF THE MATCH") or "PLAY OF THE MATCH").strip()[:80]
@@ -1111,6 +1141,14 @@ class AppConfig:
         cfg.obs_auto_replay_enabled = bool(raw.get("obs_auto_replay_enabled", True))
         cfg.obs_auto_replay_kd = bool(raw.get("obs_auto_replay_kd", True))
         cfg.obs_auto_replay_tko = bool(raw.get("obs_auto_replay_tko", True))
+        replay_source_default = "source_record" if cfg.obs_source_record_enabled else "replay_buffer"
+        cfg.obs_auto_replay_source = str(raw.get("obs_auto_replay_source", replay_source_default) or replay_source_default).strip().lower()
+        if cfg.obs_auto_replay_source not in ("replay_buffer", "source_record"):
+            cfg.obs_auto_replay_source = replay_source_default
+        cfg.obs_auto_replay_source_fallback = bool(raw.get("obs_auto_replay_source_fallback", False))
+        cfg.obs_auto_replay_source_wait_sec = max(1.0, min(20.0, float(raw.get("obs_auto_replay_source_wait_sec", 5.0) or 5.0)))
+        cfg.obs_auto_replay_pre_event_sec = max(0.5, min(15.0, float(raw.get("obs_auto_replay_pre_event_sec", 3.0) or 3.0)))
+        cfg.obs_auto_replay_post_event_sec = max(0.0, min(5.0, float(raw.get("obs_auto_replay_post_event_sec", 1.0) or 0.0)))
         cfg.obs_auto_replay_capture_delay_sec = max(0.0, min(15.0, float(raw.get("obs_auto_replay_capture_delay_sec", 1.0) or 0.0)))
         cfg.obs_auto_replay_delay_sec = max(0.0, min(15.0, float(raw.get("obs_auto_replay_delay_sec", 2.0) or 0.0)))
         cfg.obs_auto_replay_muted = bool(raw.get("obs_auto_replay_muted", True))
@@ -1139,6 +1177,12 @@ class AppConfig:
         if cfg.idle_highlight_fit not in ("cover", "contain"):
             cfg.idle_highlight_fit = "cover"
         cfg.idle_highlight_fade_ms = max(0, min(3000, int(raw.get("idle_highlight_fade_ms", 350) or 350)))
+        cfg.idle_highlight_cinematic_enabled = bool(raw.get("idle_highlight_cinematic_enabled", False))
+        cfg.idle_highlight_cinematic_contrast = max(0, min(60, int(raw.get("idle_highlight_cinematic_contrast", 32) or 0)))
+        cfg.idle_highlight_cinematic_sharpen = max(0, min(60, int(raw.get("idle_highlight_cinematic_sharpen", 35) or 0)))
+        cfg.idle_highlight_cinematic_vignette = max(0, min(60, int(raw.get("idle_highlight_cinematic_vignette", 24) or 0)))
+        cfg.idle_highlight_cinematic_kd_tko_enabled = bool(raw.get("idle_highlight_cinematic_kd_tko_enabled", False))
+        cfg.idle_highlight_cinematic_potm_enabled = bool(raw.get("idle_highlight_cinematic_potm_enabled", False))
         cfg.spectatorlog_enabled = bool(raw.get("spectatorlog_enabled", True))
         cfg.spectatorlog_path = str(raw.get("spectatorlog_path", "") or "")
         cfg.spectatorlog_sync_timer = bool(raw.get("spectatorlog_sync_timer", True))
@@ -1149,10 +1193,10 @@ class AppConfig:
             or "The Thrill of the Fight 2"
         )
         cfg.spectator_lobby_auto_start_mode = str(
-            raw.get("spectator_lobby_auto_start_mode", "click") or "click"
+            raw.get("spectator_lobby_auto_start_mode", "f5") or "f5"
         ).strip().lower()
         if cfg.spectator_lobby_auto_start_mode not in ("click", "f5", "f5_then_click"):
-            cfg.spectator_lobby_auto_start_mode = "click"
+            cfg.spectator_lobby_auto_start_mode = "f5"
         cfg.spectator_lobby_auto_start_capture_hotkey = str(
             raw.get("spectator_lobby_auto_start_capture_hotkey", "F12") or ""
         ).strip()
@@ -1751,11 +1795,14 @@ class AppConfig:
             "obs_highlight_combo_min": int(max(2, min(20, self.obs_highlight_combo_min))),
             "obs_highlight_damage_min": float(max(0.0, min(300.0, self.obs_highlight_damage_min))),
             "obs_highlight_cooldown_sec": float(max(0.0, min(120.0, self.obs_highlight_cooldown_sec))),
-            "event_engine_enabled": bool(self.event_engine_enabled),
-            "event_engine_shadow_mode": bool(self.event_engine_shadow_mode),
+            "event_engine_enabled": True,
+            "event_engine_shadow_mode": False,
             "event_heavy_damage": float(max(0.0, min(300.0, self.event_heavy_damage))),
             "event_signature_damage": float(max(0.0, min(300.0, self.event_signature_damage))),
             "event_counter_min_damage": float(max(0.0, min(300.0, self.event_counter_min_damage))),
+            "event_counter_window_sec": float(max(0.05, min(5.0, self.event_counter_window_sec))),
+            "event_counter_graze_max_damage": float(max(0.0, min(300.0, self.event_counter_graze_max_damage))),
+            "event_counter_response_min_damage": float(max(25.0, min(300.0, self.event_counter_response_min_damage))),
             "event_combo_min_damage": float(max(0.0, min(300.0, self.event_combo_min_damage))),
             "event_combo_window_sec": float(max(0.1, min(5.0, self.event_combo_window_sec))),
             "event_combo_break_damage": float(max(0.0, min(300.0, self.event_combo_break_damage))),
@@ -1781,6 +1828,7 @@ class AppConfig:
             "potm_replay_speed": float(max(0.5, min(2.0, self.potm_replay_speed))),
             "potm_bgm_path": to_app_rel(str(self.potm_bgm_path or "")),
             "potm_bgm_volume": int(max(0, min(100, self.potm_bgm_volume))),
+            "potm_audio_output_device": str(self.potm_audio_output_device or ""),
             "potm_test_video_path": to_app_rel(str(self.potm_test_video_path or "")),
             "potm_name_color": _normalize_hex_color(self.potm_name_color),
             "potm_title_text": str(self.potm_title_text or "PLAY OF THE MATCH")[:80],
@@ -1822,6 +1870,11 @@ class AppConfig:
             "obs_auto_replay_enabled": bool(self.obs_auto_replay_enabled),
             "obs_auto_replay_kd": bool(self.obs_auto_replay_kd),
             "obs_auto_replay_tko": bool(self.obs_auto_replay_tko),
+            "obs_auto_replay_source": str(self.obs_auto_replay_source or "replay_buffer"),
+            "obs_auto_replay_source_fallback": bool(self.obs_auto_replay_source_fallback),
+            "obs_auto_replay_source_wait_sec": float(max(1.0, min(20.0, self.obs_auto_replay_source_wait_sec))),
+            "obs_auto_replay_pre_event_sec": float(max(0.5, min(15.0, self.obs_auto_replay_pre_event_sec))),
+            "obs_auto_replay_post_event_sec": float(max(0.0, min(5.0, self.obs_auto_replay_post_event_sec))),
             "obs_auto_replay_capture_delay_sec": float(max(0.0, min(15.0, self.obs_auto_replay_capture_delay_sec))),
             "obs_auto_replay_delay_sec": float(max(0.0, min(15.0, self.obs_auto_replay_delay_sec))),
             "obs_auto_replay_muted": bool(self.obs_auto_replay_muted),
@@ -1846,6 +1899,12 @@ class AppConfig:
             "idle_highlight_volume": int(max(0, min(100, self.idle_highlight_volume))),
             "idle_highlight_fit": str(self.idle_highlight_fit or "cover"),
             "idle_highlight_fade_ms": int(max(0, min(3000, self.idle_highlight_fade_ms))),
+            "idle_highlight_cinematic_enabled": bool(self.idle_highlight_cinematic_enabled),
+            "idle_highlight_cinematic_contrast": int(max(0, min(60, self.idle_highlight_cinematic_contrast))),
+            "idle_highlight_cinematic_sharpen": int(max(0, min(60, self.idle_highlight_cinematic_sharpen))),
+            "idle_highlight_cinematic_vignette": int(max(0, min(60, self.idle_highlight_cinematic_vignette))),
+            "idle_highlight_cinematic_kd_tko_enabled": bool(self.idle_highlight_cinematic_kd_tko_enabled),
+            "idle_highlight_cinematic_potm_enabled": bool(self.idle_highlight_cinematic_potm_enabled),
             "spectatorlog_enabled": bool(self.spectatorlog_enabled),
             "spectatorlog_path": to_app_rel(str(self.spectatorlog_path or "")),
             "spectatorlog_poll_ms": int(self.spectatorlog_poll_ms or 250),
@@ -1870,7 +1929,7 @@ class AppConfig:
             "spectator_lobby_auto_start_mode": str(
                 self.spectator_lobby_auto_start_mode
                 if self.spectator_lobby_auto_start_mode in ("click", "f5", "f5_then_click")
-                else "click"
+                else "f5"
             ),
             "spectator_lobby_auto_start_capture_hotkey": str(
                 self.spectator_lobby_auto_start_capture_hotkey or ""

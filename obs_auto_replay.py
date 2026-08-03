@@ -60,7 +60,7 @@ class ObsAutoReplayController:
         generation = self._generation
         self._schedule_once(
             remaining_ms,
-            lambda: self._start(generation, replay_path, kind),
+            lambda: self._start(generation, replay_path, kind, context),
         )
         logging.info(
             "OBS_AUTO_REPLAY_SCHEDULE kind=%s delay_ms=%s path=%s",
@@ -70,8 +70,9 @@ class ObsAutoReplayController:
         )
         return True
 
-    def _start(self, generation: int, path: str, kind: str) -> bool:
+    def _start(self, generation: int, path: str, kind: str, context: Optional[Dict[str, Any]] = None) -> bool:
         cfg = self._config_getter()
+        context = dict(context or {})
         if generation != self._generation or not self._kind_enabled(cfg, kind):
             return False
         if not os.path.isfile(path):
@@ -98,6 +99,8 @@ class ObsAutoReplayController:
                 transition_before_ms=int(getattr(cfg, "obs_replay_transition_before_ms", 500) or 0),
                 transition_after_ms=int(getattr(cfg, "obs_replay_transition_after_ms", 400) or 0),
                 transition_speed=float(getattr(cfg, "obs_replay_transition_speed", 1.0) or 1.0),
+                start_from_end_sec=float(context.get("replay_start_from_end_sec", 0.0) or 0.0),
+                end_from_end_sec=float(context.get("replay_end_from_end_sec", 0.0) or 0.0),
             )
         except Exception:
             logging.exception("OBS_AUTO_REPLAY_START_FAIL kind=%s path=%s", kind, path)

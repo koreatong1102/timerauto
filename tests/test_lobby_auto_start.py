@@ -138,6 +138,7 @@ class LobbyAutoStartTests(unittest.TestCase):
             loaded = AppConfig.from_json(path)
 
         self.assertTrue(loaded.spectator_lobby_auto_start_enabled)
+        self.assertEqual(loaded.spectator_lobby_auto_start_mode, "f5")
         self.assertEqual(loaded.spectator_lobby_auto_start_target_title, "Spectator")
         self.assertEqual(loaded.spectator_lobby_auto_start_client_x, 641)
         self.assertEqual(loaded.spectator_lobby_auto_start_client_y, 392)

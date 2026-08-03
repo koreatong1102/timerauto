@@ -109,6 +109,12 @@ class ObsIntegration:
         self._pending_replay_requests = deque()
         self._pending_input_mute_requests: Dict[str, Dict[str, Any]] = {}
         self._pending_input_settings_requests: Dict[str, str] = {}
+        self._source_record_diagnostic: Dict[str, Any] = {}
+        self._source_record_watch_target = ""
+        self._source_record_watch_attempt = 0
+        self._source_record_watch_next_at = 0.0
+        self._source_record_watch_request_id = ""
+        self._pending_source_record_config: Dict[str, str] = {}
 
     @property
     def status(self) -> str:
@@ -158,6 +164,36 @@ class ObsIntegration:
         if not self._thread or not self._thread.is_alive():
             self.start()
 
+    def diagnose_source_record(self) -> None:
+        """Discover OBS sources/scenes that already own a Source Record filter."""
+        if not self._settings.enabled:
+            self._events.put({"type": "source_record_diagnostic", "ok": False, "message": "OBS 연동이 꺼져 있습니다.", "targets": []})
+            return
+        self._commands.put({"type": "source_record_diagnostic"})
+        if not self._thread or not self._thread.is_alive():
+            self.start()
+
+    def configure_source_record(
+        self,
+        target_name: str,
+        incoming_dir: str,
+        *,
+        replay_duration: int = 10,
+        create: bool = False,
+    ) -> None:
+        """Create or normalize a Source Record replay-buffer filter."""
+        target = source_record_source_name(target_name)
+        path = str(incoming_dir or "").strip().replace("\\", "/")
+        if not self._settings.enabled or not target or not path:
+            return
+        self._commands.put({
+            "type": "source_record_configure",
+            "target": target,
+            "path": path,
+            "replay_duration": max(1, min(120, int(replay_duration or 10))),
+            "create": bool(create),
+        })
+
     def save_replay(self, reason: str = "", *, context: Optional[Dict[str, Any]] = None) -> None:
         if not self._settings.enabled:
             return
@@ -201,6 +237,9 @@ class ObsIntegration:
         source_name = source_record_source_name(target_name)
         if not self._settings.enabled or not source_name:
             return
+        if not enabled:
+            # Timer shutdown must win over the keep-alive watchdog.
+            self._commands.put({"type": "source_record_watch_stop"})
         self._commands.put(
             {
                 "type": "request",
@@ -231,7 +270,10 @@ class ObsIntegration:
                 and bool(getattr(self._cfg, "obs_source_record_auto_enable", True))):
             target = str(getattr(self._cfg, "obs_source_record_context", "") or "").strip()
             if target:
-                self.set_source_record_enabled(target, True)
+                self._commands.put({
+                    "type": "source_record_watch_start",
+                    "target": source_record_source_name(target),
+                })
         # With OBS's browser-source audio control disabled, Chromium sends the
         # sound to the Windows playback device: the operator hears it, but OBS
         # may not.  Discover our one loopback overlay source and route it into
@@ -325,6 +367,7 @@ class ObsIntegration:
                     raise RuntimeError("OBS authentication rejected")
                 self._pending_replay_requests.clear()
                 self._pending_input_settings_requests.clear()
+                self._source_record_watch_request_id = ""
                 self._set_status("connected")
                 # Do this in the websocket worker as well as from the UI. It
                 # removes any dependency on Qt's event-poll timing at startup.
@@ -378,6 +421,71 @@ class ObsIntegration:
                     request_id = await self._send_request(ws, "GetInputMute", request_data={"inputName": input_name})
                     if request_id:
                         self._pending_input_mute_requests[request_id] = {"inputName": input_name, "context": dict(command.get("context") or {})}
+                elif kind == "source_record_diagnostic":
+                    token = uuid.uuid4().hex
+                    self._source_record_diagnostic = {
+                        "token": token,
+                        "base_pending": {
+                            f"source-record-scenes-{token}",
+                            f"source-record-inputs-{token}",
+                            f"source-record-kinds-{token}",
+                        },
+                        "names": set(),
+                        "candidates": {},
+                        "plugin_installed": False,
+                        "filter_pending": {},
+                        "targets": [],
+                    }
+                    await self._send_request(ws, "GetSceneList", request_id=f"source-record-scenes-{token}")
+                    await self._send_request(ws, "GetInputList", request_id=f"source-record-inputs-{token}")
+                    await self._send_request(ws, "GetSourceFilterKindList", request_id=f"source-record-kinds-{token}")
+                elif kind == "source_record_configure":
+                    target = str(command.get("target") or "").strip()
+                    settings = {
+                        "replay_buffer": True,
+                        "stream_mode": 0,
+                        "record_mode": 1,
+                        "different_audio": True,
+                        "audio_track": 6,
+                        "audio_source": target,
+                        "path": str(command.get("path") or "").strip(),
+                        "keyint_sec": 2,
+                        "rate_control": "CBR",
+                        "replay_duration": int(command.get("replay_duration") or 10),
+                        "scale_type": 3,
+                    }
+                    request_type = "CreateSourceFilter" if bool(command.get("create", False)) else "SetSourceFilterSettings"
+                    request_data = {
+                        "sourceName": target,
+                        "filterName": "Source Record",
+                        "filterSettings": settings,
+                    }
+                    if request_type == "CreateSourceFilter":
+                        request_data["filterKind"] = "source_record_filter"
+                    config_request_id = f"source-record-config-{uuid.uuid4().hex}"
+                    self._pending_source_record_config[config_request_id] = target
+                    await self._send_request(
+                        ws,
+                        request_type,
+                        request_id=config_request_id,
+                        request_data=request_data,
+                    )
+                elif kind == "source_record_watch_start":
+                    target = str(command.get("target") or "").strip()
+                    if target:
+                        changed = target != self._source_record_watch_target
+                        self._source_record_watch_target = target
+                        self._source_record_watch_attempt = 0
+                        self._source_record_watch_request_id = ""
+                        # OBS can accept WebSocket authentication before scenes
+                        # and third-party filters finish loading.
+                        self._source_record_watch_next_at = time.monotonic() + (2.0 if changed else 0.5)
+                elif kind == "source_record_watch_stop":
+                    self._source_record_watch_target = ""
+                    self._source_record_watch_attempt = 0
+                    self._source_record_watch_next_at = 0.0
+                    self._source_record_watch_request_id = ""
+            await self._service_source_record_watch(ws)
 
     async def _send_request(
         self,
@@ -407,7 +515,11 @@ class ObsIntegration:
             event_data = data.get("eventData") or {}
             if event_type == "StreamStateChanged":
                 active = bool(event_data.get("outputActive", False))
-                self._events.put({"type": "stream_state", "active": active})
+                self._events.put({
+                    "type": "stream_state",
+                    "active": active,
+                    "duration_ms": int(event_data.get("outputDuration", 0) or 0),
+                })
             elif event_type == "ReplayBufferSaved":
                 pending = self._pending_replay_requests.popleft() if self._pending_replay_requests else {}
                 self._events.put(
@@ -420,11 +532,32 @@ class ObsIntegration:
                 )
         elif op == 7:
             request_type = str(data.get("requestType") or "")
+            request_id = str(data.get("requestId") or "")
             status = data.get("requestStatus") or {}
             ok = bool(status.get("result", False))
+            if request_id.startswith("source-record-config-"):
+                configured_target = str(self._pending_source_record_config.pop(request_id, "") or "")
+                self._events.put({
+                    "type": "source_record_configured",
+                    "ok": ok,
+                    "message": str(status.get("comment") or ""),
+                })
+                if ok and configured_target:
+                    self._commands.put({"type": "source_record_watch_start", "target": configured_target})
+                return
+            if request_id.startswith("source-record-watch-"):
+                self._handle_source_record_watch_response(request_id, ok, str(status.get("comment") or ""))
+                return
+            if request_id.startswith("source-record-"):
+                await self._handle_source_record_diagnostic_response(ws, request_type, request_id, ok, data)
+                return
             if request_type == "GetStreamStatus" and ok:
                 response = data.get("responseData") or {}
-                self._events.put({"type": "stream_state", "active": bool(response.get("outputActive", False))})
+                self._events.put({
+                    "type": "stream_state",
+                    "active": bool(response.get("outputActive", False)),
+                    "duration_ms": int(response.get("outputDuration", 0) or 0),
+                })
             elif request_type == "GetVersion":
                 self._events.put({"type": "test_result", "ok": ok, "message": str(status.get("comment") or "")})
             elif request_type == "GetReplayBufferStatus":
@@ -518,3 +651,141 @@ class ObsIntegration:
                         "ok": True,
                         "inputName": input_name,
                     })
+
+    async def _handle_source_record_diagnostic_response(
+        self,
+        ws: Any,
+        request_type: str,
+        request_id: str,
+        ok: bool,
+        data: Dict[str, Any],
+    ) -> None:
+        state = self._source_record_diagnostic
+        if not state or str(state.get("token") or "") not in request_id:
+            return
+        response = dict(data.get("responseData") or {})
+        base_pending = state.get("base_pending")
+        if request_type in {"GetSceneList", "GetInputList", "GetSourceFilterKindList"} and isinstance(base_pending, set):
+            base_pending.discard(request_id)
+            if ok and request_type == "GetSceneList":
+                for item in list(response.get("scenes") or []):
+                    name = str(dict(item or {}).get("sceneName") or "").strip()
+                    if name:
+                        state["names"].add(name)
+                        state["candidates"].setdefault(name, {"source": name, "kind": "scene", "scene": True})
+            elif ok and request_type == "GetInputList":
+                for item in list(response.get("inputs") or []):
+                    info = dict(item or {})
+                    name = str(info.get("inputName") or "").strip()
+                    if name:
+                        state["names"].add(name)
+                        state["candidates"].setdefault(name, {
+                            "source": name,
+                            "kind": str(info.get("unversionedInputKind") or info.get("inputKind") or "input"),
+                            "scene": False,
+                        })
+            elif ok and request_type == "GetSourceFilterKindList":
+                kinds = [str(value or "") for value in list(response.get("sourceFilterKinds") or [])]
+                state["plugin_installed"] = "source_record_filter" in kinds
+            if base_pending:
+                return
+            names = sorted(state.get("names") or [], key=str.casefold)
+            if not names:
+                self._events.put({
+                    "type": "source_record_diagnostic", "ok": False,
+                    "message": "OBS에서 장면/소스 목록을 읽지 못했습니다.", "targets": [],
+                    "candidates": [], "plugin_installed": bool(state.get("plugin_installed", False)),
+                })
+                self._source_record_diagnostic = {}
+                return
+            token = str(state.get("token") or "")
+            for index, name in enumerate(names):
+                rid = f"source-record-filter-{token}-{index}"
+                state["filter_pending"][rid] = name
+                await self._send_request(
+                    ws,
+                    "GetSourceFilterList",
+                    request_id=rid,
+                    request_data={"sourceName": name},
+                )
+            return
+
+        if request_type != "GetSourceFilterList":
+            return
+        pending = state.get("filter_pending") or {}
+        source_name = str(pending.pop(request_id, "") or "")
+        if ok and source_name:
+            for item in list(response.get("filters") or []):
+                filter_info = dict(item or {})
+                filter_name = str(filter_info.get("filterName") or "").strip()
+                if filter_name.casefold() == "source record":
+                    state["targets"].append({
+                        "source": source_name,
+                        "filter": filter_name,
+                        "enabled": bool(filter_info.get("filterEnabled", False)),
+                        "kind": str(filter_info.get("filterKind") or ""),
+                    })
+                    break
+        if pending:
+            return
+        targets = sorted(list(state.get("targets") or []), key=lambda item: str(item.get("source") or "").casefold())
+        self._events.put({
+            "type": "source_record_diagnostic",
+            "ok": bool(targets),
+            "message": "Source Record 대상을 찾았습니다." if targets else "'Source Record' 필터가 붙은 장면/소스를 찾지 못했습니다.",
+            "targets": targets,
+            "candidates": sorted(list((state.get("candidates") or {}).values()), key=lambda item: (not bool(item.get("scene", False)), str(item.get("source") or "").casefold())),
+            "plugin_installed": bool(state.get("plugin_installed", False)),
+        })
+        self._source_record_diagnostic = {}
+
+    async def _service_source_record_watch(self, ws: Any) -> None:
+        target = str(self._source_record_watch_target or "").strip()
+        if not target or self._source_record_watch_request_id:
+            return
+        if time.monotonic() < float(self._source_record_watch_next_at or 0.0):
+            return
+        request_id = f"source-record-watch-{uuid.uuid4().hex}"
+        self._source_record_watch_request_id = request_id
+        await self._send_request(
+            ws,
+            "SetSourceFilterEnabled",
+            request_id=request_id,
+            request_data={
+                "sourceName": target,
+                "filterName": "Source Record",
+                "filterEnabled": True,
+            },
+        )
+        logging.info(
+            "OBS_SOURCE_RECORD_WATCH_REQUEST target=%s attempt=%s",
+            target,
+            self._source_record_watch_attempt + 1,
+        )
+
+    def _handle_source_record_watch_response(self, request_id: str, ok: bool, message: str) -> None:
+        if request_id != self._source_record_watch_request_id:
+            return
+        self._source_record_watch_request_id = ""
+        if ok:
+            self._source_record_watch_attempt = 0
+            self._source_record_watch_next_at = time.monotonic() + 30.0
+            logging.info("OBS_SOURCE_RECORD_WATCH_OK target=%s", self._source_record_watch_target)
+        else:
+            self._source_record_watch_attempt += 1
+            delays = (2.0, 4.0, 8.0, 15.0, 30.0)
+            delay = delays[min(self._source_record_watch_attempt - 1, len(delays) - 1)]
+            self._source_record_watch_next_at = time.monotonic() + delay
+            logging.warning(
+                "OBS_SOURCE_RECORD_WATCH_RETRY target=%s delay=%.1fs detail=%s",
+                self._source_record_watch_target,
+                delay,
+                message,
+            )
+        self._events.put({
+            "type": "source_record_filter_enabled",
+            "ok": bool(ok),
+            "message": str(message or ""),
+            "watchdog": True,
+            "retrying": not bool(ok),
+        })

@@ -277,7 +277,10 @@ def _play_media_sfx(player, audio_out, path: str, playback_rate: float = 1.0) ->
             player.setPlaybackRate(max(0.25, min(4.0, float(playback_rate or 1.0))))
         except Exception:
             pass
-        player.setSource(url)
+        # Reusing an already loaded short effect avoids reopening/decoding the
+        # WAV or MP3 on every KD/TKO, which is noticeable on slower machines.
+        if player.source() != url:
+            player.setSource(url)
         _refresh_default_audio_device(player)
         player.play()
         return True
@@ -857,8 +860,12 @@ def _activate_window_reliably(hwnd: int, *, restore: bool = False) -> Tuple[bool
             if thread_id and current_tid and thread_id != current_tid and thread_id not in attached:
                 if user32.AttachThreadInput(current_tid, thread_id, True):
                     attached.append(thread_id)
-        if not restore:
-            user32.ShowWindow(wintypes.HWND(hwnd), 9)  # SW_RESTORE
+        # ``restore`` means this call is restoring a previously focused
+        # window, not that the target should remain minimized.  A minimized
+        # window can still become GetForegroundWindow(), which used to make
+        # the diagnostics report success while nothing appeared on screen.
+        # Always surface the requested window before activating it.
+        user32.ShowWindow(wintypes.HWND(hwnd), 9)  # SW_RESTORE
         user32.BringWindowToTop(wintypes.HWND(hwnd))
         user32.SetActiveWindow(wintypes.HWND(hwnd))
         user32.SetForegroundWindow(wintypes.HWND(hwnd))
@@ -8512,7 +8519,7 @@ class SettingsDialog(QDialog):
         self.sp_spectator_final_report_delay.setSuffix(" sec")
         self.sp_spectator_final_report_delay.setValue(float(getattr(self.cfg, "spectator_final_report_delay_sec", 10.0) or 0.0))
         auto_start_lay.addWidget(QLabel("시작 입력"), 2, 0)
-        fixed_f5 = QLabel("F5 단축키 (자동 실행 후 관전툴 최소화 · 이전 창 복귀)")
+        fixed_f5 = QLabel("F5 단축키 (관전툴 자체 전체화면 설정 사용)")
         fixed_f5.setStyleSheet("color:#93c5fd; font-weight:600;")
         auto_start_lay.addWidget(fixed_f5, 2, 1, 1, 4)
         auto_start_lay.addWidget(QLabel("F5 입력 전 대기"), 3, 0)
@@ -8816,6 +8823,7 @@ class SettingsDialog(QDialog):
         self.sp_event_heavy_damage = QDoubleSpinBox(); self.sp_event_heavy_damage.setRange(0.0, 300.0); self.sp_event_heavy_damage.setSuffix(" dmg"); self.sp_event_heavy_damage.setValue(float(getattr(self.cfg, "event_heavy_damage", 50.0) or 0.0))
         self.sp_event_signature_damage = QDoubleSpinBox(); self.sp_event_signature_damage.setRange(0.0, 300.0); self.sp_event_signature_damage.setSuffix(" dmg"); self.sp_event_signature_damage.setValue(float(getattr(self.cfg, "event_signature_damage", 60.0) or 0.0))
         self.sp_event_counter_damage = QDoubleSpinBox(); self.sp_event_counter_damage.setRange(0.0, 300.0); self.sp_event_counter_damage.setSuffix(" dmg"); self.sp_event_counter_damage.setValue(float(getattr(self.cfg, "event_counter_min_damage", 40.0) or 0.0))
+        self.sp_event_counter_official_mult = QDoubleSpinBox(); self.sp_event_counter_official_mult.setRange(1.0, 3.0); self.sp_event_counter_official_mult.setDecimals(2); self.sp_event_counter_official_mult.setSingleStep(0.01); self.sp_event_counter_official_mult.setSuffix(" x"); self.sp_event_counter_official_mult.setValue(float(getattr(self.cfg, "event_counter_official_min_mult", 1.02) or 1.02))
         self.sp_event_counter_window = QDoubleSpinBox(); self.sp_event_counter_window.setRange(0.05, 5.0); self.sp_event_counter_window.setDecimals(2); self.sp_event_counter_window.setSuffix(" 초"); self.sp_event_counter_window.setValue(float(getattr(self.cfg, "event_counter_window_sec", 0.7) or 0.7))
         self.sp_event_counter_graze = QDoubleSpinBox(); self.sp_event_counter_graze.setRange(0.0, 300.0); self.sp_event_counter_graze.setSuffix(" dmg"); self.sp_event_counter_graze.setValue(float(getattr(self.cfg, "event_counter_graze_max_damage", 15.0) or 0.0))
         self.sp_event_counter_response = QDoubleSpinBox(); self.sp_event_counter_response.setRange(25.0, 300.0); self.sp_event_counter_response.setSuffix(" dmg"); self.sp_event_counter_response.setValue(max(25.0, float(getattr(self.cfg, "event_counter_response_min_damage", 30.0) or 0.0)))
@@ -8834,9 +8842,10 @@ class SettingsDialog(QDialog):
         event_rules.addWidget(QLabel("콤보 인정 최소 피해"), 4, 2); event_rules.addWidget(self.sp_event_combo_min, 4, 3)
         event_rules.addWidget(QLabel("콤보 연결 시간"), 5, 0); event_rules.addWidget(self.sp_event_combo_window, 5, 1)
         event_rules.addWidget(QLabel("콤보 차단 반격 피해"), 5, 2); event_rules.addWidget(self.sp_event_combo_break, 5, 3)
+        event_rules.addWidget(QLabel("원본 카운터 최소 배율"), 6, 0); event_rules.addWidget(self.sp_event_counter_official_mult, 6, 1)
         event_rules_hint = QLabel("공식 로그 카운터와 방송용 규칙을 함께 사용하지만, 방송용 카운터는 항상 25 피해 이상만 인정합니다. 상대가 완전히 헛치면 설정 시간 안에 25 이상 적중해야 하고, 상대가 설정 피해 이하로 스쳤을 때는 설정된 반격 피해(최소 25) 이상이어야 합니다. 이 판정과 콤보 판정을 오버레이·해설·POTM·리포트·경기스타일이 함께 사용합니다.")
         event_rules_hint.setWordWrap(True); event_rules_hint.setStyleSheet("color:#94a3b8;")
-        event_rules.addWidget(event_rules_hint, 6, 0, 1, 4)
+        event_rules.addWidget(event_rules_hint, 7, 0, 1, 4)
         replay_hint = QLabel("OBS 출력 설정에서 리플레이 버퍼 사용을 허용해야 합니다. 자동 시작을 켜면 연결 후 버퍼를 시작하며, 브라우저 이펙트와 별도 스레드로 동작합니다.")
         replay_hint.setWordWrap(True)
         replay_hint.setStyleSheet("color:#94a3b8;")
@@ -10483,6 +10492,7 @@ class SettingsDialog(QDialog):
         self.sp_event_heavy_damage.setValue(float(getattr(self.cfg, "event_heavy_damage", 50.0) or 0.0))
         self.sp_event_signature_damage.setValue(float(getattr(self.cfg, "event_signature_damage", 60.0) or 0.0))
         self.sp_event_counter_damage.setValue(float(getattr(self.cfg, "event_counter_min_damage", 40.0) or 0.0))
+        self.sp_event_counter_official_mult.setValue(float(getattr(self.cfg, "event_counter_official_min_mult", 1.02) or 1.02))
         self.sp_event_counter_window.setValue(float(getattr(self.cfg, "event_counter_window_sec", 0.7) or 0.7))
         self.sp_event_counter_graze.setValue(float(getattr(self.cfg, "event_counter_graze_max_damage", 15.0) or 0.0))
         self.sp_event_counter_response.setValue(max(25.0, float(getattr(self.cfg, "event_counter_response_min_damage", 30.0) or 0.0)))
@@ -19209,6 +19219,7 @@ class SettingsDialog(QDialog):
             self.cfg.event_heavy_damage = float(self.sp_event_heavy_damage.value())
             self.cfg.event_signature_damage = float(self.sp_event_signature_damage.value())
             self.cfg.event_counter_min_damage = float(self.sp_event_counter_damage.value())
+            self.cfg.event_counter_official_min_mult = float(self.sp_event_counter_official_mult.value())
             self.cfg.event_counter_window_sec = float(self.sp_event_counter_window.value())
             self.cfg.event_counter_graze_max_damage = float(self.sp_event_counter_graze.value())
             self.cfg.event_counter_response_min_damage = float(self.sp_event_counter_response.value())
@@ -20353,6 +20364,22 @@ class MainApp(QObject):
         self._lobby_post_match_kick_lock = threading.Lock()
         self._lobby_post_match_kick_last_session_id = ""
         self._lobby_restore_hwnd_by_session: Dict[str, int] = {}
+        # Window restoration and slot cleanup are separate concerns.  Keep a
+        # one-shot latch so an empty post-match lobby still brings the
+        # spectator tool forward when lobby.txt actually returns.
+        self._lobby_window_restore_pending_session = ""
+        # Keep the spectator tool surfaced through slow result/main-menu
+        # recovery. Screen detection is intentionally foreground-only, so a
+        # single successful SetForegroundWindow at match end is insufficient
+        # when another application steals focus before the recovery image is
+        # shown.
+        self._lobby_focus_guard_session = ""
+        self._lobby_focus_guard_until = 0.0
+        self._lobby_focus_guard_lobby_seen = False
+        self._lobby_focus_guard_timer = QTimer()
+        self._lobby_focus_guard_timer.setInterval(750)
+        self._lobby_focus_guard_timer.timeout.connect(self._poll_lobby_focus_guard)
+        self._lobby_focus_guard_timer.start()
 
         self.timer_win = QmlTimerWindow(self.cfg, self.cfg_path)
         try:
@@ -27117,8 +27144,14 @@ class MainApp(QObject):
     def _log_portrait_path_for_side(self, side: str) -> str:
         try:
             root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
-            candidate = os.path.join(root, str(side or "").lower().strip(), "portrait.png")
-            return candidate if os.path.isfile(candidate) else ""
+            corner_dir = os.path.join(root, str(side or "").lower().strip())
+            candidate = os.path.join(corner_dir, "portrait.png")
+            name_path = os.path.join(corner_dir, "name.txt")
+            if not os.path.isfile(candidate):
+                return ""
+            if os.path.isfile(name_path) and os.path.getmtime(candidate) + 0.1 < os.path.getmtime(name_path):
+                return ""
+            return candidate
         except Exception:
             return ""
 
@@ -27132,7 +27165,8 @@ class MainApp(QObject):
 
     def _resolve_portrait_image(self, side: str, gid: str, log_img=_NO_UPDATE):
         """Return (image_or_none, source).
-        source is log/profile/empty/no_update. In log-priority mode profile image is not used as fallback.
+        source is log/profile/empty/no_update. A missing or stale game portrait
+        falls back to the current player's registered profile image.
         """
         mode = self._portrait_priority_mode()
         side = str(side or "").lower().strip()
@@ -27144,6 +27178,11 @@ class MainApp(QObject):
             except Exception:
                 return False
 
+        profile_path = self._profile_portrait_path_for_gid(gid)
+        profile_img = self._read_portrait_image_path(profile_path) if profile_path else None
+        if mode == "profile" and _valid_img(profile_img):
+            logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=profile path=%s", side, profile_path)
+            return profile_img, "profile"
         if _valid_img(log_img):
             logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=log payload=1", side)
             return log_img, "log"
@@ -27152,12 +27191,9 @@ class MainApp(QObject):
         if _valid_img(log_img2):
             logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=log path=%s", side, log_path)
             return log_img2, "log"
-        if mode == "profile":
-            profile_path = self._profile_portrait_path_for_gid(gid)
-            profile_img = self._read_portrait_image_path(profile_path) if profile_path else None
-            if _valid_img(profile_img):
-                logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=profile path=%s", side, profile_path)
-                return profile_img, "profile"
+        if _valid_img(profile_img):
+            logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=profile path=%s", side, profile_path)
+            return profile_img, "profile"
         logging.info("PLAYER_PORTRAIT_RESOLVE side=%s source=empty", side)
         return None, "empty"
 
@@ -27206,9 +27242,9 @@ class MainApp(QObject):
                 if display:
                     update["blueName" if side == "blue" else "redName"] = display
             for side, gid in ids.items():
-                if side == "blue" and "blue_player_img" in d:
+                if side == "blue" and d.get("blue_player_img") is not None:
                     continue
-                if side == "red" and "red_player_img" in d:
+                if side == "red" and d.get("red_player_img") is not None:
                     continue
                 id_key = "blue_player_id" if side == "blue" else "red_player_id"
                 name_key = "blue_name" if side == "blue" else "red_name"
@@ -27314,7 +27350,7 @@ class MainApp(QObject):
             logging.debug("BROWSER_OVERLAY_ASSET_SYNC_FAIL", exc_info=True)
         return update
 
-    def _apply_browser_overlay_direct_update(self, d: dict):
+    def _apply_browser_overlay_direct_update(self, d: dict, *, skip_effect_push: bool = False):
         try:
             overlay = getattr(self, "browser_overlay", None)
             if overlay is None:
@@ -28155,9 +28191,10 @@ class MainApp(QObject):
                 logging.debug("BROWSER_OVERLAY_WINNER_CARD_SUPPRESSED")
             for side in list(d.get("stun_flash_sides") or []):
                 overlay.push_event("stun", side=str(side or ""))
-            for ev in list(d.get("spectator_effect_events") or []):
-                ev = dict(ev or {})
-                overlay.push_event(str(ev.get("kind") or ""), side=str(ev.get("side") or ""))
+            if not skip_effect_push:
+                for ev in list(d.get("spectator_effect_events") or []):
+                    ev = dict(ev or {})
+                    overlay.push_event(str(ev.get("kind") or ""), side=str(ev.get("side") or ""))
             _push_hit_impacts_fast()
         except Exception:
             logging.exception("BROWSER_OVERLAY_DIRECT_UPDATE_FAIL")
@@ -28201,9 +28238,7 @@ class MainApp(QObject):
         activate = bool(getattr(self.cfg, "spectator_lobby_auto_start_activate", True))
         restore_focus = bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_focus", True))
         restore_cursor = bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_cursor", True))
-        minimize_target = bool(
-            getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False)
-        )
+        minimize_target = bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False))
         players = list((payload or {}).get("players") or [])
         logging.info(
             "LOBBY_AUTO_START_SCHEDULE mode=%s delay_ms=%s title=%s client=(%s,%s) players=%s",
@@ -28232,12 +28267,9 @@ class MainApp(QObject):
                 if not f5_cleanup_pending or os.name != "nt":
                     return
                 f5_cleanup_pending = False
-                user32 = ctypes.windll.user32
-                if minimize_target and f5_target_hwnd:
-                    try:
-                        user32.ShowWindow(wintypes.HWND(f5_target_hwnd), 6)  # SW_MINIMIZE
-                    except Exception:
-                        pass
+                # The spectator tool now owns its fullscreen transition.
+                # Never minimize it immediately after F5, even if an old
+                # click-mode setting still has "minimize target" enabled.
                 if (
                     restore_focus
                     and f5_previous_hwnd
@@ -28407,6 +28439,10 @@ class MainApp(QObject):
                 session_id,
             )
             return
+        self._lobby_window_restore_pending_session = session_id
+        self._lobby_focus_guard_session = session_id
+        self._lobby_focus_guard_until = time.monotonic() + 150.0
+        self._lobby_focus_guard_lobby_seen = False
         try:
             target_hwnd = _find_window_by_title_contains(title)
             previous_hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0) if os.name == "nt" else 0
@@ -28434,6 +28470,101 @@ class MainApp(QObject):
             )
         except Exception:
             logging.exception("MATCH_END_LOBBY_WINDOW_OPEN_FAIL")
+
+    def _poll_lobby_focus_guard(self) -> None:
+        """Keep post-match recovery observable until the lobby has settled."""
+        session_id = str(getattr(self, "_lobby_focus_guard_session", "") or "")
+        if not session_id:
+            return
+        now = time.monotonic()
+        if now >= float(getattr(self, "_lobby_focus_guard_until", 0.0) or 0.0):
+            logging.info("LOBBY_FOCUS_GUARD_END session=%s reason=deadline", session_id)
+            self._lobby_focus_guard_session = ""
+            return
+        if not bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False)):
+            self._lobby_focus_guard_session = ""
+            return
+        title = str(getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or "").strip()
+        if not title or os.name != "nt":
+            return
+        try:
+            hwnd = int(_find_window_by_title_contains(title) or 0)
+            active = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+            if not hwnd or active == hwnd:
+                return
+            activated, detail = _activate_window_reliably(hwnd)
+            logging.info(
+                "LOBBY_FOCUS_GUARD_REASSERT session=%s target=%s active_before=%s "
+                "active_before_title=%r activated=%s detail=%s",
+                session_id,
+                hwnd,
+                active,
+                _window_title(active),
+                activated,
+                detail,
+            )
+            DIAG.record(
+                "lobby_focus_guard_reassert",
+                session=session_id,
+                target=hwnd,
+                active_before=active,
+                active_before_title=_window_title(active),
+                activated=bool(activated),
+                detail=str(detail or ""),
+            )
+        except Exception:
+            logging.exception("LOBBY_FOCUS_GUARD_REASSERT_FAIL")
+
+    def _restore_spectator_window_on_lobby_observed(self) -> None:
+        """Reassert foreground on the first real lobby update after a match.
+
+        The old path did this only from the automatic-kick worker.  That worker
+        is intentionally not emitted for a host-only lobby, so a normal clean
+        return could leave screen detection paused after another app took
+        focus during the results presentation.
+        """
+        session_id = str(getattr(self, "_lobby_window_restore_pending_session", "") or "")
+        if not session_id:
+            return
+        if not bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False)):
+            self._lobby_window_restore_pending_session = ""
+            return
+        title = str(getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or "").strip()
+        if not title:
+            return
+        try:
+            hwnd = int(_find_window_by_title_contains(title) or 0)
+            activated, detail = (
+                _activate_window_reliably(hwnd, restore=True)
+                if hwnd
+                else (False, "window not found")
+            )
+            logging.info(
+                "LOBBY_POST_MATCH_WINDOW_ON_LOBBY session=%s target=%s activated=%s detail=%s",
+                session_id,
+                hwnd,
+                activated,
+                detail,
+            )
+            DIAG.record(
+                "lobby_post_match_window_on_lobby",
+                session=session_id,
+                target=hwnd,
+                activated=bool(activated),
+                detail=str(detail or ""),
+            )
+            if activated:
+                self._lobby_window_restore_pending_session = ""
+                # Continue guarding briefly after lobby.txt returns. This
+                # covers the delayed K+1/K+2 cleanup and prevents a focus
+                # thief from pausing screen detection during that window.
+                self._lobby_focus_guard_lobby_seen = True
+                self._lobby_focus_guard_until = min(
+                    float(getattr(self, "_lobby_focus_guard_until", 0.0) or 0.0),
+                    time.monotonic() + 15.0,
+                )
+        except Exception:
+            logging.exception("LOBBY_POST_MATCH_WINDOW_ON_LOBBY_FAIL")
 
     def _schedule_lobby_post_match_kick(self, payload: Optional[dict] = None) -> None:
         """Kick the prior bout's occupied lobby slots exactly once per match."""
@@ -28663,6 +28794,33 @@ class MainApp(QObject):
         )
         threading.Thread(target=_worker, daemon=True, name="LobbyPostMatchKick").start()
 
+    def _emit_urgent_spectator_effects(self, d: dict) -> tuple[set, bool]:
+        """Publish KO/KD feedback before optional main-thread work."""
+        played_sfx = set()
+        early_browser_effects = False
+        browser_output_only = bool(getattr(self.cfg, "browser_overlay_output_only", True))
+        for ev in list((d or {}).get("spectator_effect_events") or []):
+            kind = str((ev or {}).get("kind") or "").lower().strip()
+            side = str((ev or {}).get("side") or "").lower().strip()
+            if kind not in ("stun", "knockdown", "tko") or side not in ("blue", "red"):
+                continue
+            if browser_output_only:
+                try:
+                    self.browser_overlay.push_event(kind, side=side)
+                    early_browser_effects = True
+                except Exception:
+                    logging.exception("BROWSER_EARLY_EFFECT_PUSH_FAIL kind=%s side=%s", kind, side)
+            sfx_key = (kind, side)
+            if sfx_key not in played_sfx:
+                played_sfx.add(sfx_key)
+                try:
+                    self._play_spectator_sfx(kind)
+                except Exception:
+                    logging.exception("SPECTATOR_EARLY_SFX_FAIL kind=%s side=%s", kind, side)
+        if played_sfx:
+            DIAG.record("spectator_urgent_effect_feedback", count=len(played_sfx), browser=early_browser_effects)
+        return played_sfx, early_browser_effects
+
     def apply_ui_update(self, d: dict):
         try:
             DIAG.record(
@@ -28678,6 +28836,10 @@ class MainApp(QObject):
             )
         except Exception:
             pass
+        # KO/KD feedback must precede POTM scoring, highlight scheduling and
+        # all other main-thread bookkeeping below. The full browser state still
+        # updates later; only its duplicate effect-event push is suppressed.
+        played_sfx, early_browser_effects = self._emit_urgent_spectator_effects(d)
         # Preserve the live player/time state for Source Record's filename.
         # Player fields are intentionally cached because SpectatorLog only
         # emits them on a new match or a player-pair change.
@@ -28699,12 +28861,16 @@ class MainApp(QObject):
             self._cancel_obs_auto_replay("round_or_match_start")
         if "vs_intro_event" in d:
             self._reset_potm_match()
+            self._lobby_window_restore_pending_session = ""
+            self._lobby_focus_guard_session = ""
         if isinstance(d.get("spectator_match_session"), dict):
             match_session = dict(d.get("spectator_match_session") or {})
             self._bind_potm_match_archive(match_session)
             self._restore_live_sp_from_match_archive(match_session)
         if isinstance(d.get("spectator_match_terminal"), dict):
             self._remember_window_before_lobby_kick(d.get("spectator_match_terminal"))
+        if isinstance(d.get("spectator_lobby_status"), dict):
+            self._restore_spectator_window_on_lobby_observed()
         if isinstance(d.get("spectator_lobby_returned"), dict):
             self._schedule_lobby_post_match_kick(d.get("spectator_lobby_returned"))
         if str(d.get("spectator_round_state", "") or "").strip().lower() in {"results", "end", "knockout", "disqualified", "cancel"}:
@@ -28835,13 +29001,12 @@ class MainApp(QObject):
             or bool(d.get("spectator_match_stats_reset", False))
         )
         if browser_output_only:
-            self._apply_browser_overlay_direct_update(d)
+            self._apply_browser_overlay_direct_update(d, skip_effect_push=early_browser_effects)
         elif sp_authority_update:
             # Even when QML effects are enabled, keep the browser/log calculator
             # authoritative and feed its result back to both renderers.
             sp_update = self._browser_overlay_sp_update(d, self.browser_overlay.snapshot())
             self.browser_overlay.update(**sp_update)
-        played_sfx = set()
         clear_match_overlay = bool(d.get("spectator_match_clear", False))
         reset_match_stats = bool(d.get("spectator_match_stats_reset", False))
         if ("blue_player_id" in d or "red_player_id" in d

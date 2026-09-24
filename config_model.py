@@ -660,6 +660,7 @@ class AppConfig:
     event_heavy_damage: float = 50.0
     event_signature_damage: float = 60.0
     event_counter_min_damage: float = 40.0
+    event_counter_official_min_mult: float = 1.02
     event_counter_window_sec: float = 0.7
     event_counter_graze_max_damage: float = 15.0
     event_counter_response_min_damage: float = 30.0
@@ -1077,6 +1078,7 @@ class AppConfig:
         cfg.event_heavy_damage = max(0.0, min(300.0, float(raw.get("event_heavy_damage", 50.0) or 0.0)))
         cfg.event_signature_damage = max(0.0, min(300.0, float(raw.get("event_signature_damage", 60.0) or 0.0)))
         cfg.event_counter_min_damage = max(0.0, min(300.0, float(raw.get("event_counter_min_damage", 40.0) or 0.0)))
+        cfg.event_counter_official_min_mult = max(1.0, min(3.0, float(raw.get("event_counter_official_min_mult", 1.02) or 1.02)))
         cfg.event_counter_window_sec = max(0.05, min(5.0, float(raw.get("event_counter_window_sec", 0.7) or 0.7)))
         cfg.event_counter_graze_max_damage = max(0.0, min(300.0, float(raw.get("event_counter_graze_max_damage", 15.0) or 0.0)))
         cfg.event_counter_response_min_damage = max(25.0, min(300.0, float(raw.get("event_counter_response_min_damage", 30.0) or 25.0)))
@@ -1800,6 +1802,7 @@ class AppConfig:
             "event_heavy_damage": float(max(0.0, min(300.0, self.event_heavy_damage))),
             "event_signature_damage": float(max(0.0, min(300.0, self.event_signature_damage))),
             "event_counter_min_damage": float(max(0.0, min(300.0, self.event_counter_min_damage))),
+            "event_counter_official_min_mult": float(max(1.0, min(3.0, self.event_counter_official_min_mult))),
             "event_counter_window_sec": float(max(0.05, min(5.0, self.event_counter_window_sec))),
             "event_counter_graze_max_damage": float(max(0.0, min(300.0, self.event_counter_graze_max_damage))),
             "event_counter_response_min_damage": float(max(25.0, min(300.0, self.event_counter_response_min_damage))),

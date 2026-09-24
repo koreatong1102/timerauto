@@ -140,6 +140,7 @@ class LobbyAutoStartTests(unittest.TestCase):
         self.assertTrue(loaded.spectator_lobby_auto_start_enabled)
         self.assertEqual(loaded.spectator_lobby_auto_start_mode, "f5")
         self.assertEqual(loaded.spectator_lobby_auto_start_target_title, "Spectator")
+        self.assertFalse(hasattr(loaded, "spectator_match_auto_fullscreen_enabled"))
         self.assertEqual(loaded.spectator_lobby_auto_start_client_x, 641)
         self.assertEqual(loaded.spectator_lobby_auto_start_client_y, 392)
         self.assertEqual(loaded.spectator_lobby_auto_start_delay_ms, 450)

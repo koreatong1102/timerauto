@@ -29,7 +29,9 @@ DERIVED_FIELDS = {
     "combo_damage",
     "counter_reason",
     "official_counter",
+    "official_counter_raw",
     "inferred_counter",
+    "counter_opportunity_id",
 }
 
 

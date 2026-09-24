@@ -27,6 +27,10 @@ class LobbyPostMatchKickTests(unittest.TestCase):
         app._lobby_post_match_kick_lock = threading.Lock()
         app._lobby_post_match_kick_last_session_id = ""
         app._lobby_restore_hwnd_by_session = {}
+        app._lobby_window_restore_pending_session = ""
+        app._lobby_focus_guard_session = ""
+        app._lobby_focus_guard_until = 0.0
+        app._lobby_focus_guard_lobby_seen = False
         app.spectator_watcher = SimpleNamespace(
             _match_session_id="match-1",
             _read_lobby_info=lambda _root: {
@@ -188,6 +192,70 @@ class LobbyPostMatchKickTests(unittest.TestCase):
 
         activate.assert_called_once_with(700, restore=True)
         self.assertEqual(app._lobby_restore_hwnd_by_session["match-1"], 800)
+        self.assertEqual(app._lobby_window_restore_pending_session, "match-1")
+
+    def test_empty_lobby_reasserts_window_without_waiting_for_kickable_player(self):
+        app = self._app()
+        app._lobby_window_restore_pending_session = "match-1"
+        activate = Mock(return_value=(True, "ok"))
+
+        with (
+            patch.object(timerauto, "_find_window_by_title_contains", return_value=700),
+            patch.object(timerauto, "_activate_window_reliably", activate),
+        ):
+            app._restore_spectator_window_on_lobby_observed()
+
+        activate.assert_called_once_with(700, restore=True)
+        self.assertEqual(app._lobby_window_restore_pending_session, "")
+
+    def test_failed_lobby_window_reassert_remains_pending_for_retry(self):
+        app = self._app()
+        app._lobby_window_restore_pending_session = "match-1"
+
+        with (
+            patch.object(timerauto, "_find_window_by_title_contains", return_value=700),
+            patch.object(timerauto, "_activate_window_reliably", return_value=(False, "blocked")),
+        ):
+            app._restore_spectator_window_on_lobby_observed()
+
+        self.assertEqual(app._lobby_window_restore_pending_session, "match-1")
+
+    def test_focus_guard_reasserts_when_another_window_steals_focus(self):
+        app = self._app()
+        app._lobby_focus_guard_session = "match-1"
+        app._lobby_focus_guard_until = 999.0
+        activate = Mock(return_value=(True, "ok"))
+        fake_user32 = SimpleNamespace(GetForegroundWindow=lambda: 800)
+
+        with (
+            patch.object(timerauto.time, "monotonic", return_value=100.0),
+            patch.object(timerauto.os, "name", "nt"),
+            patch.object(timerauto, "_find_window_by_title_contains", return_value=700),
+            patch.object(timerauto, "_activate_window_reliably", activate),
+            patch.object(timerauto, "_window_title", return_value="Other Window"),
+            patch.object(timerauto.ctypes, "windll", SimpleNamespace(user32=fake_user32)),
+        ):
+            app._poll_lobby_focus_guard()
+
+        activate.assert_called_once_with(700)
+
+    def test_focus_guard_does_not_reactivate_when_spectator_is_foreground(self):
+        app = self._app()
+        app._lobby_focus_guard_session = "match-1"
+        app._lobby_focus_guard_until = 999.0
+        activate = Mock(return_value=(True, "ok"))
+        fake_user32 = SimpleNamespace(GetForegroundWindow=lambda: 700)
+
+        with (
+            patch.object(timerauto.time, "monotonic", return_value=100.0),
+            patch.object(timerauto.os, "name", "nt"),
+            patch.object(timerauto, "_find_window_by_title_contains", return_value=700),
+            patch.object(timerauto, "_activate_window_reliably", activate),
+            patch.object(timerauto.ctypes, "windll", SimpleNamespace(user32=fake_user32)),
+        ):
+            app._poll_lobby_focus_guard()
+
+        activate.assert_not_called()
 
 
 class LobbyWindowInputSafetyTests(unittest.TestCase):

@@ -16,8 +16,20 @@ from typing import Any, Dict, Iterable, List
 SPECIAL_KINDS = {"stun", "knockdown", "down", "ko", "tko"}
 
 
+def counter_opportunity_id(row: dict) -> str:
+    """Stable identity for one opponent damage event used as a counter chance."""
+    raw = dict(row or {})
+    fields = (
+        "time", "attacker_side", "receiver_side", "damage", "counter_mult",
+        "hand", "punch", "damage_type", "weak_point", "raw_line",
+    )
+    identity = {key: raw.get(key) for key in fields if key in raw}
+    encoded = json.dumps(identity, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return "damage:" + hashlib.sha1(encoded.encode("ascii", "ignore")).hexdigest()
+
+
 class FightEventEngine:
-    RULE_SCHEMA_VERSION = 7
+    RULE_SCHEMA_VERSION = 8
     COUNTER_MIN_DAMAGE = 25.0
 
     def __init__(self, cfg: Any):
@@ -33,6 +45,7 @@ class FightEventEngine:
             "blue": {},
             "red": {},
         }
+        self._consumed_counter_opportunities = set()
         self._momentum: Dict[str, List[Dict[str, Any]]] = {
             "blue": [],
             "red": [],
@@ -55,7 +68,11 @@ class FightEventEngine:
             "counter_window": self._number(getattr(self.cfg, "event_counter_window_sec", 0.7), 0.7),
             "counter_graze_max": self._number(getattr(self.cfg, "event_counter_graze_max_damage", 15.0), 15.0),
             "counter_response_min": self._number(getattr(self.cfg, "event_counter_response_min_damage", 30.0), 30.0),
+            "counter_official_min_mult": self._number(
+                getattr(self.cfg, "event_counter_official_min_mult", 1.02), 1.02
+            ),
             "counter_min_damage": self.COUNTER_MIN_DAMAGE,
+            "counter_opportunity_policy": "consume_once",
             # Throw-only whiff inference is applied by the watcher before the
             # row reaches this engine. Keep its causal policy in the shared
             # ruleset identity so archived reports are rebuilt after a change.
@@ -102,10 +119,15 @@ class FightEventEngine:
             raw_counter_reason = "graze"
         counter_mult = self._number(raw.get("counter_mult"), 1.0)
         inferred_reasons = {"whiff", "graze"}
-        official_counter = (
+        official_counter_raw = (
             raw_counter_reason == "official"
             or (counter_mult > 1.0001 and raw_counter_reason not in inferred_reasons)
         )
+        official_min_mult = max(
+            1.0,
+            self._number(getattr(self.cfg, "event_counter_official_min_mult", 1.02), 1.02),
+        )
+        official_counter = bool(official_counter_raw and counter_mult + 1e-9 >= official_min_mult)
         inferred_counter = raw_counter_reason in inferred_reasons
 
         # Keep the game's official counter metadata, and additionally recognize
@@ -121,10 +143,13 @@ class FightEventEngine:
         )
         elapsed_from_previous = abs(event_time - self._number(previous_attack.get("time"), -9999.0))
         previous_damage = self._number(previous_attack.get("damage"), 0.0)
+        previous_is_opportunity = (
+            str(previous_attack.get("receiver") or "") == side
+            and elapsed_from_previous <= counter_window
+        )
         if (
             not inferred_counter
-            and str(previous_attack.get("receiver") or "") == side
-            and elapsed_from_previous <= counter_window
+            and previous_is_opportunity
             and (
                 (previous_damage <= 0.0 and damage >= self.COUNTER_MIN_DAMAGE)
                 or (previous_damage <= graze_max and damage >= response_min)
@@ -136,7 +161,23 @@ class FightEventEngine:
         counter_eligible = damage >= self.COUNTER_MIN_DAMAGE
         if not counter_eligible:
             inferred_counter = False
-        counter = bool(counter_eligible and (official_counter or inferred_counter or raw.get("is_counter", False)))
+        # A single opponent attack can produce only one counter success. The
+        # first qualifying reply consumes that opportunity; later punches are
+        # combo follow-ups, not additional counters.
+        opportunity_id = str(raw.get("counter_opportunity_id") or "").strip()
+        if not opportunity_id and previous_is_opportunity:
+            opportunity_id = str(previous_attack.get("opportunity_id") or "")
+        opportunity_consumed = bool(
+            opportunity_id and opportunity_id in self._consumed_counter_opportunities
+        )
+        declared_counter = bool(raw.get("is_counter", False)) and counter_mult <= 1.0001
+        counter = bool(
+            counter_eligible
+            and not opportunity_consumed
+            and (official_counter or inferred_counter or declared_counter)
+        )
+        if counter and opportunity_id:
+            self._consumed_counter_opportunities.add(opportunity_id)
         counter_reason = (
             "official"
             if counter and official_counter
@@ -169,7 +210,12 @@ class FightEventEngine:
                 combo_hits = int(previous.get("hits", 0) or 0) + 1 if same_chain else 1
                 combo_damage = self._number(previous.get("damage"), 0.0) + damage if same_chain else damage
                 self._combo[side] = {"receiver": receiver, "time": event_time, "hits": combo_hits, "damage": combo_damage}
-            self._last_attack[side] = {"receiver": receiver, "time": event_time, "damage": damage}
+            self._last_attack[side] = {
+                "receiver": receiver,
+                "time": event_time,
+                "damage": damage,
+                "opportunity_id": counter_opportunity_id(raw),
+            }
 
         heavy_min = max(0.0, self._number(getattr(self.cfg, "event_heavy_damage", 50.0), 50.0))
         signature_min = max(heavy_min, self._number(getattr(self.cfg, "event_signature_damage", 60.0), 60.0))
@@ -253,7 +299,9 @@ class FightEventEngine:
             "counter_eligible": counter_eligible,
             "counter_reason": counter_reason,
             "official_counter": bool(official_counter),
+            "official_counter_raw": bool(official_counter_raw),
             "inferred_counter": bool(inferred_counter),
+            "counter_opportunity_id": opportunity_id,
             "effect_kind": effect_kind,
             "weak_point": weak_point,
             "combo_hits": combo_hits,

@@ -722,6 +722,112 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertEqual(parsed["punch"], "RearHook")
         self.assertTrue(parsed["is_counter"])
 
+    def test_new_cumulative_damage_layout_preserves_round_and_region(self):
+        parsed = self.watcher._parse_damage_event_parts([
+            "2", "91.25", "38.5", "1.00", "blue", "right",
+            "0.46", "0.51", "1.0", "2.0", "3.0", "Cross", "Hit", "Head",
+        ])
+        self.assertEqual(parsed["round"], 2)
+        self.assertEqual(parsed["attacker_side"], "red")
+        self.assertEqual(parsed["damage"], 38.5)
+        self.assertEqual(parsed["screen_x"], 0.46)
+        self.assertEqual(parsed["hit_location"], "Head")
+        self.assertEqual(parsed["weak_point"], "")
+        self.assertEqual(
+            self.watcher._parse_damage_event_parts([
+                "2", "90.9", "44", "1.15", "red", "left", ".4", ".5",
+                "1", "2", "3", "LeadHook", "Hit", "Chin",
+            ])["weak_point"], "Chin",
+        )
+
+    def test_new_cumulative_throws_keep_rounds(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "punches_thrown.txt")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("1\t100.00\tblue\tleft\tJab\n")
+                stream.write("2\t99.80\tred\tright\tCross\n")
+            throws = self.watcher._read_punches_thrown_file(path)
+        self.assertEqual([(row["round"], row["side"]) for row in throws], [(1, "blue"), (2, "red")])
+        self.assertEqual([len(rows) for rows in self.watcher._events_by_source_round(throws, 2).values()], [1, 1])
+
+    def test_new_damage_file_updates_round_damage_and_hit_effect(self):
+        with tempfile.TemporaryDirectory() as root:
+            match_dir = os.path.join(root, "match")
+            os.mkdir(match_dir)
+            path = os.path.join(match_dir, "damage_events.txt")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("1\t100.0\t20\t1.0\tred\tleft\t.4\t.5\t1\t2\t3\tJab\tHit\tHead\n")
+            self.watcher._last_fight_round_no = 2
+            self.watcher._read_damage_update(path)
+            with open(path, "a", encoding="utf-8") as stream:
+                stream.write("2\t99.0\t40\t1.0\tblue\tright\t.6\t.5\t1\t2\t3\tCross\tHit\tChin\n")
+            update = self.watcher._read_damage_update(path)
+        self.assertEqual(update["blue_damage_dealt"], 20)
+        self.assertEqual(update["red_damage_dealt"], 40)
+        self.assertEqual(update["blue_round_damage_dealt"], 0)
+        self.assertEqual(update["red_round_damage_dealt"], 40)
+        self.assertTrue(update.get("spectator_hit_effect_events"))
+
+    def test_round_damage_resets_when_round_changes_without_new_hit(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "damage_events.txt")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("1\t100\t35\t1.0\tred\tleft\t.4\t.5\t1\t2\t3\tJab\tHit\tChin\n")
+            self.watcher._last_fight_round_no = 1
+            first = self.watcher._read_damage_update(path)
+            self.watcher._last_fight_round_no = 2
+            second = self.watcher._read_damage_update(path)
+        self.assertEqual(first["blue_round_damage_dealt"], 35)
+        self.assertEqual(second["blue_round_damage_dealt"], 0)
+        self.assertEqual(second["blue_damage_dealt"], 35)
+
+    def test_new_round_report_excludes_prior_round_hits(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "damage_events.txt")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("1\t100\t70\t1.0\tred\tleft\t.4\t.5\t1\t2\t3\tJab\tHit\tChin\n")
+                stream.write("2\t100\t35\t1.0\tred\tleft\t.4\t.5\t1\t2\t3\tJab\tHit\tChin\n")
+            with open(os.path.join(root, "punches_thrown.txt"), "w", encoding="utf-8") as stream:
+                stream.write("1\t100\tblue\tleft\tJab\n")
+                stream.write("2\t100\tblue\tleft\tJab\n")
+            self.watcher._last_round_state = "break"
+            report = self.watcher._build_round_report_payload(path, 2, ("BLUE", "RED"))
+        self.assertEqual(report["blue"]["maxPunch"]["damage"], 35)
+
+    def test_old_portrait_is_not_reused_for_new_player(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "portrait.png")
+            name_path = os.path.join(root, "name.txt")
+            with open(path, "wb") as stream:
+                stream.write(b"placeholder")
+            with open(name_path, "w", encoding="utf-8") as stream:
+                stream.write("NEW_PLAYER")
+            os.utime(path, (100, 100))
+            os.utime(name_path, (200, 200))
+            with patch("spectator_log_watcher._safe_cv2_imread") as read_image:
+                self.assertEqual(self.watcher._read_image_if_changed("blue", path), (False, None))
+                read_image.assert_not_called()
+                os.utime(path, (201, 201))
+                read_image.return_value = SimpleNamespace(size=1)
+                changed, image = self.watcher._read_image_if_changed("blue", path)
+                self.assertTrue(changed)
+                self.assertEqual(image.size, 1)
+
+    def test_cumulative_log_over_600_rows_does_not_replay_old_hit_effects(self):
+        with tempfile.TemporaryDirectory() as root:
+            match_dir = os.path.join(root, "match")
+            os.mkdir(match_dir)
+            path = os.path.join(match_dir, "damage_events.txt")
+            with open(path, "w", encoding="utf-8") as stream:
+                for i in range(601):
+                    stream.write(f"1\t{i / 100:.2f}\t30\t1.0\tred\tleft\t.4\t.5\t1\t2\t3\tJab\tHit\tHead\n")
+            self.watcher._last_fight_round_no = 1
+            self.watcher._read_damage_update(path)
+            with open(path, "a", encoding="utf-8") as stream:
+                stream.write("1\t10.00\t35\t1.0\tred\tright\t.4\t.5\t1\t2\t3\tCross\tHit\tChin\n")
+            update = self.watcher._read_damage_update(path)
+        self.assertEqual(len(update.get("spectator_hit_effect_events") or []), 1)
+
     def test_report_exposes_score_power55_and_max_combo(self):
         with tempfile.TemporaryDirectory() as root:
             damage_path = os.path.join(root, "damage_events.txt")

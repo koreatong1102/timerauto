@@ -14,6 +14,7 @@ def config():
         event_heavy_damage=50.0,
         event_signature_damage=60.0,
         event_counter_min_damage=40.0,
+        event_counter_official_min_mult=1.02,
         event_combo_emphasis_hits=5,
     )
 
@@ -125,6 +126,91 @@ class FightEventEngineTests(unittest.TestCase):
         self.assertTrue(inferred["inferred_counter"])
         self.assertEqual(inferred["counter_reason"], "graze")
 
+    def test_tiny_official_multiplier_is_audited_but_not_broadcast(self):
+        engine = FightEventEngine(config())
+        tiny = engine.classify({
+            "time": 100.0, "attacker_side": "blue", "receiver_side": "red",
+            "damage": 35.0, "counter_mult": 1.01, "is_counter": True,
+        })
+        accepted = engine.classify({
+            "time": 90.0, "attacker_side": "red", "receiver_side": "blue",
+            "damage": 35.0, "counter_mult": 1.02, "is_counter": True,
+        })
+        self.assertTrue(tiny["official_counter_raw"])
+        self.assertFalse(tiny["official_counter"])
+        self.assertFalse(tiny["counter"])
+        self.assertTrue(accepted["official_counter"])
+        self.assertTrue(accepted["counter"])
+
+    def test_one_opponent_attack_can_create_only_one_counter(self):
+        engine = FightEventEngine(config())
+        engine.classify({
+            "event_id": "opponent-graze",
+            "time": 100.0, "attacker_side": "red", "receiver_side": "blue",
+            "damage": 10.0,
+        })
+        first = engine.classify({
+            "time": 99.6, "attacker_side": "blue", "receiver_side": "red",
+            "damage": 31.0,
+        })
+        followup = engine.classify({
+            "time": 99.4, "attacker_side": "blue", "receiver_side": "red",
+            "damage": 42.0,
+        })
+        self.assertTrue(first["counter"])
+        self.assertEqual(first["counter_reason"], "graze")
+        self.assertFalse(followup["counter"])
+        self.assertEqual(followup["combo_hits"], 2)
+
+    def test_official_counter_also_consumes_the_shared_opportunity(self):
+        engine = FightEventEngine(config())
+        engine.classify({
+            "time": 100.0, "attacker_side": "red", "receiver_side": "blue",
+            "damage": 10.0,
+        })
+        official = engine.classify({
+            "time": 99.6, "attacker_side": "blue", "receiver_side": "red",
+            "damage": 31.0, "counter_mult": 1.02, "is_counter": True,
+        })
+        followup = engine.classify({
+            "time": 99.4, "attacker_side": "blue", "receiver_side": "red",
+            "damage": 42.0,
+        })
+        self.assertTrue(official["counter"])
+        self.assertEqual(official["counter_reason"], "official")
+        self.assertFalse(followup["counter"])
+
+    def test_one_whiff_throw_opportunity_can_create_only_one_counter(self):
+        engine = FightEventEngine(config())
+        first = engine.classify({
+            "time": 99.6, "attacker_side": "blue", "receiver_side": "red",
+            "damage": 31.0, "is_counter": True, "counter_reason": "whiff",
+            "counter_opportunity_id": "throw:red:100.0:right:Jab",
+        })
+        followup = engine.classify({
+            "time": 99.4, "attacker_side": "blue", "receiver_side": "red",
+            "damage": 42.0, "is_counter": True, "counter_reason": "whiff",
+            "counter_opportunity_id": "throw:red:100.0:right:Jab",
+        })
+        self.assertTrue(first["counter"])
+        self.assertFalse(followup["counter"])
+        self.assertEqual(followup["combo_hits"], 2)
+
+    def test_whiff_throw_is_consumed_once_during_annotation(self):
+        watcher = SpectatorLogWatcher.__new__(SpectatorLogWatcher)
+        watcher.cfg = config()
+        replies = [
+            {"time": 99.6, "attacker_side": "blue", "receiver_side": "red", "damage": 31.0},
+            {"time": 99.4, "attacker_side": "blue", "receiver_side": "red", "damage": 42.0},
+        ]
+        annotated = watcher._annotate_whiff_counters_from_throws(
+            replies,
+            [{"time": 100.0, "side": "red", "hand": "right", "punch": "Jab"}],
+            replies,
+        )
+        self.assertTrue(annotated[0].get("is_counter"))
+        self.assertFalse(annotated[1].get("is_counter", False))
+
     def test_central_false_counter_verdict_overrides_legacy_multiplier(self):
         cfg = config()
         cfg.event_engine_shadow_mode = False
@@ -145,7 +231,7 @@ class FightEventEngineTests(unittest.TestCase):
         cfg.event_engine_shadow_mode = False
         watcher = SpectatorLogWatcher.__new__(SpectatorLogWatcher)
         watcher.cfg = cfg
-        self.assertTrue(watcher._is_counter_event({"counter_mult": 1.2}))
+        self.assertTrue(watcher._is_counter_event({"counter_mult": 1.2, "damage": 30.0}))
         self.assertTrue(watcher._is_counter_event({
             "counter_mult": 1.0,
             "_central_event": {"counter": True, "tags": ["hit", "counter"]},

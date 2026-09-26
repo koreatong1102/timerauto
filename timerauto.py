@@ -7769,6 +7769,10 @@ class SettingsDialog(QDialog):
         self.btn_spectatorlog_test_red_stun= QPushButton("레드 스턴 테스트")
         self.btn_spectatorlog_test_blue_kd= QPushButton("블루 KD 테스트")
         self.btn_spectatorlog_test_red_kd= QPushButton("레드 KD 테스트")
+        self.btn_ko_latency_probe = QPushButton("KO 화면·소리 지연 진단")
+        self.btn_ko_latency_probe.setToolTip("실제 로그를 건드리지 않고 브라우저 오버레이 수신 시간과 KD 효과음을 확인합니다. 방송 중에는 누르지 마세요.")
+        self.lbl_ko_latency_probe = QLabel("OBS 브라우저 오버레이를 켜고 방송 전 테스트하세요. 인터넷/송출 지연은 별도입니다.")
+        self.lbl_ko_latency_probe.setWordWrap(True)
         self.btn_spectatorlog_test_blue_tko= QPushButton("블루 TKO 테스트")
         self.btn_spectatorlog_test_red_tko= QPushButton("레드 TKO 테스트")
         self.btn_spectatorlog_test_damage= QPushButton("데미지 표시 테스트")
@@ -7883,6 +7887,7 @@ class SettingsDialog(QDialog):
             [
                 [self.btn_spectatorlog_test_blue_stun, self.btn_spectatorlog_test_red_stun],
                 [self.btn_spectatorlog_test_blue_kd, self.btn_spectatorlog_test_red_kd],
+                [self.btn_ko_latency_probe, self.lbl_ko_latency_probe],
                 [self.btn_spectatorlog_test_blue_tko, self.btn_spectatorlog_test_red_tko],
                 [self.btn_spectatorlog_test_blue_combo, self.btn_spectatorlog_test_red_combo],
                 [self.btn_spectatorlog_test_counter],
@@ -8279,6 +8284,7 @@ class SettingsDialog(QDialog):
         self.btn_spectatorlog_test_red_stun.clicked.connect(lambda: self._test_spectator_stun("red"))
         self.btn_spectatorlog_test_blue_kd.clicked.connect(lambda: self._test_spectator_effect("blue", "knockdown"))
         self.btn_spectatorlog_test_red_kd.clicked.connect(lambda: self._test_spectator_effect("red", "knockdown"))
+        self.btn_ko_latency_probe.clicked.connect(self._test_ko_latency_probe)
         self.btn_spectatorlog_test_blue_tko.clicked.connect(lambda: self._test_spectator_effect("blue", "tko"))
         self.btn_spectatorlog_test_red_tko.clicked.connect(lambda: self._test_spectator_effect("red", "tko"))
         self.btn_spectatorlog_test_damage.clicked.connect(self._test_spectator_damage)
@@ -11059,6 +11065,44 @@ class SettingsDialog(QDialog):
             })
         except Exception as e:
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
+
+    def _test_ko_latency_probe(self):
+        overlay = getattr(self.controller, "browser_overlay", None) if self.controller else None
+        if overlay is None or getattr(overlay, "_server", None) is None:
+            self.lbl_ko_latency_probe.setText("오버레이 서버가 꺼져 있습니다. 타이머와 OBS 브라우저 소스를 먼저 켜세요.")
+            return
+        key = "ko-probe-%d" % time.time_ns()
+        sent_ms = int(time.time() * 1000)
+        self.lbl_ko_latency_probe.setText("KO 신호 전송 중… 화면과 효과음이 동시에 나오는지도 확인하세요.")
+        try:
+            overlay.push_event("ko", side="blue", latencyProbeKey=key, pushEpochMs=sent_ms)
+            if hasattr(self.controller, "_play_spectator_sfx"):
+                self.controller._play_spectator_sfx("knockdown")
+            logging.info("KO_LATENCY_PROBE_SENT key=%s epoch_ms=%s", key, sent_ms)
+        except Exception:
+            logging.exception("KO_LATENCY_PROBE_FAIL")
+            self.lbl_ko_latency_probe.setText("진단 신호 전송 실패. 진단 ZIP의 로그를 확인하세요.")
+            return
+
+        def show_result():
+            beacon = overlay.latency_beacon(key)
+            if beacon:
+                try:
+                    browser_ms = float(beacon["browser_ms"])
+                    render_ms = max(0.0, browser_ms - sent_ms)
+                except (TypeError, ValueError, KeyError):
+                    render_ms = -1.0
+                result = ("브라우저 KO 표시: 전송 후 약 %.0fms. " % render_ms) if render_ms >= 0 else "브라우저 KO 표시 확인됨. "
+                result += "효과음은 직접 들리는지 확인하세요. 이 수치는 OBS 송출·인터넷·시청자 지연은 포함하지 않습니다."
+                self.lbl_ko_latency_probe.setText(result)
+                logging.info("KO_LATENCY_PROBE_RESULT key=%s render_ms=%.1f", key, render_ms)
+            else:
+                self.lbl_ko_latency_probe.setText(
+                    "2초 내 브라우저 응답 없음. OBS 브라우저 소스가 실제로 열려 있는지, 표시 설정이 켜졌는지 확인하세요."
+                )
+                logging.warning("KO_LATENCY_PROBE_TIMEOUT key=%s", key)
+
+        QTimer.singleShot(2000, show_result)
 
     def _load_spectatorlog_players_for_test(self, tw) -> bool:
         root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
@@ -27350,6 +27394,31 @@ class MainApp(QObject):
             logging.debug("BROWSER_OVERLAY_ASSET_SYNC_FAIL", exc_info=True)
         return update
 
+    @staticmethod
+    def _browser_vs_gate_action(has_blue: bool, has_red: bool, waited: float, round_state: str) -> str:
+        state = str(round_state or "").lower()
+        if state in ("fight", "break", "results", "end", "knockout", "disqualified"):
+            return "skip"
+        if (has_blue and has_red) or waited >= 12.0:
+            return "show"
+        return "wait"
+
+    def _expire_pending_browser_vs_intro(self, started: float) -> None:
+        if getattr(self, "_browser_vs_pending_since", None) != started:
+            return
+        overlay = getattr(self, "browser_overlay", None)
+        if overlay is None:
+            return
+        state = str(overlay.snapshot().get("roundState") or "")
+        if self._browser_vs_gate_action(False, False, 12.0, state) == "show":
+            blue = bool(overlay.image_path("blue"))
+            red = bool(overlay.image_path("red"))
+            overlay.push_event("vs")
+            logging.info("BROWSER_VS_SHOW blue_portrait=%s red_portrait=%s waited=12.00s fallback=1", blue, red)
+        else:
+            logging.warning("BROWSER_VS_SKIP_PORTRAITS_NOT_READY state=%s waited=12.00s", state)
+        self._browser_vs_pending_since = None
+
     def _apply_browser_overlay_direct_update(self, d: dict, *, skip_effect_push: bool = False):
         try:
             overlay = getattr(self, "browser_overlay", None)
@@ -27571,13 +27640,13 @@ class MainApp(QObject):
             if "arena_name" in d:
                 update["arenaName"] = str(d.get("arena_name") or "")
             if "blue_damage_dealt" in d:
-                update["blueTotalDamageText"] = str(_int(d.get("blue_damage_dealt"), 0))
+                update["blueTotalDamageText"] = str(int(round(_num(d.get("blue_damage_dealt"), 0))))
             if "red_damage_dealt" in d:
-                update["redTotalDamageText"] = str(_int(d.get("red_damage_dealt"), 0))
-            if "blue_round_damage_dealt" in d:
-                update["blueDamageText"] = "DMG %d" % _int(d.get("blue_round_damage_dealt"), 0)
-            if "red_round_damage_dealt" in d:
-                update["redDamageText"] = "DMG %d" % _int(d.get("red_round_damage_dealt"), 0)
+                update["redTotalDamageText"] = str(int(round(_num(d.get("red_damage_dealt"), 0))))
+            if "blue_round_damage_dealt" in d or "blue_round_damage_display" in d:
+                update["blueDamageText"] = "DMG %d" % int(round(_num(d.get("blue_round_damage_display", d.get("blue_round_damage_dealt")), 0)))
+            if "red_round_damage_dealt" in d or "red_round_damage_display" in d:
+                update["redDamageText"] = "DMG %d" % int(round(_num(d.get("red_round_damage_display", d.get("red_round_damage_dealt")), 0)))
             if "spectator_recent_text_size" in d:
                 update["spectatorRecentTextSize"] = _int(d.get("spectator_recent_text_size"), 23)
 
@@ -27933,7 +28002,39 @@ class MainApp(QObject):
                 ev = dict(d.get("round_intro_event") or {})
                 overlay.push_event("round_intro", round=ev.get("round", ""))
             if "vs_intro_event" in d:
-                overlay.push_event("vs")
+                # The game writes name.txt at MatchIntro, but portrait.png can
+                # arrive several seconds later.  Keep the chapter/voice event
+                # immediate while waiting to show the visual VS card with faces.
+                vs_source = d.get("vs_intro_event")
+                self._browser_vs_pending_since = (
+                    time.monotonic() - 12.0
+                    if isinstance(vs_source, dict) and vs_source.get("source") == "settings_test"
+                    else time.monotonic()
+                )
+                if not (isinstance(vs_source, dict) and vs_source.get("source") == "settings_test"):
+                    started = self._browser_vs_pending_since
+                    QTimer.singleShot(12000, lambda s=started: self._expire_pending_browser_vs_intro(s))
+            vs_pending_since = getattr(self, "_browser_vs_pending_since", None)
+            if vs_pending_since is not None:
+                has_blue = bool(overlay.image_path("blue"))
+                has_red = bool(overlay.image_path("red"))
+                waited = max(0.0, time.monotonic() - vs_pending_since)
+                round_state = str(d.get("spectator_round_state") or "").lower()
+                action = self._browser_vs_gate_action(has_blue, has_red, waited, round_state)
+                if action == "show":
+                    overlay.push_event("vs")
+                    self._browser_vs_pending_since = None
+                    logging.info(
+                        "BROWSER_VS_SHOW blue_portrait=%s red_portrait=%s waited=%.2fs",
+                        has_blue, has_red, waited,
+                    )
+                elif action == "skip":
+                    # Never cover live boxing with a late full-screen intro.
+                    self._browser_vs_pending_since = None
+                    logging.warning(
+                        "BROWSER_VS_SKIP_PORTRAITS_NOT_READY state=%s waited=%.2fs",
+                        round_state, waited,
+                    )
             if bool(d.get("spectator_round_report_hide")):
                 try:
                     overlay.push_event("round_report_hide")

@@ -10,6 +10,13 @@ class BrowserOverlayResponsiveTests(unittest.TestCase):
     def setUpClass(cls):
         cls.html = BrowserOverlayServer()._html()
 
+    def test_ko_latency_probe_beacon_is_available_to_settings(self):
+        server = BrowserOverlayServer()
+        self.assertIsNone(server.latency_beacon("probe"))
+        server.record_latency_beacon("ko_probe_show", "probe", "1234", "1200")
+        self.assertEqual(server.latency_beacon("probe")["browser_ms"], "1234")
+        self.assertIn("overlayBeacon('ko_probe_show'", self.html)
+
     def test_overlay_uses_single_logical_stage(self):
         self.assertIn("OVERLAY_BASE_WIDTH=1920", self.html)
         self.assertIn("OVERLAY_BASE_HEIGHT=1080", self.html)

@@ -113,6 +113,13 @@ class SpectatorLogWatcher(QObject):
         }
         self._damage_initialized = False
         self._total_damage_dealt: Dict[str, float] = {"blue": 0.0, "red": 0.0}
+        self._hud_official_damage_key: Tuple[Any, ...] = tuple()
+        self._hud_official_damage_base: Dict[str, float] = {"blue": 0.0, "red": 0.0}
+        self._hud_raw_damage_anchor: Dict[str, float] = {"blue": 0.0, "red": 0.0}
+        self._hud_last_round_damage: Dict[str, float] = {"blue": 0.0, "red": 0.0}
+        self._hud_official_rows_sig: Tuple[int, int] = (0, 0)
+        self._hud_official_rows: List[dict] = []
+        self._hud_last_projection_sig: Tuple[Any, ...] = tuple()
         self._damage_total_offset: Dict[str, float] = {"blue": 0.0, "red": 0.0}
         self._damage_file_last_dealt: Dict[str, float] = {"blue": 0.0, "red": 0.0}
         self._last_damage_update_sig: Tuple[int, int] = (0, 0)
@@ -1236,6 +1243,23 @@ class SpectatorLogWatcher(QObject):
         damage_update = self._read_damage_update(dmg_path)
         if damage_update:
             out.update(damage_update)
+        elif scores_sig != (0, 0) or self._hud_official_damage_key:
+            # A score row often lands after the last punch.  Reconcile the HUD
+            # even when damage_events.txt itself has not changed.
+            hud_damage = self._project_hud_damage(
+                scores_path,
+                int(caster_round_no or round_no or self._last_fight_round_no or 1),
+                self._hud_last_round_damage,
+            )
+            official_round = self._hud_official_round_damage(int(caster_round_no or round_no or 1))
+            projection_sig = self._hud_projection_signature(hud_damage, official_round)
+            if projection_sig != self._hud_last_projection_sig:
+                self._hud_last_projection_sig = projection_sig
+                out["blue_damage_dealt"] = round(hud_damage["blue"], 2)
+                out["red_damage_dealt"] = round(hud_damage["red"], 2)
+                if official_round:
+                    out["blue_round_damage_display"] = round(official_round["blue"], 2)
+                    out["red_round_damage_display"] = round(official_round["red"], 2)
 
         # Suppress pure duplicate state churn from round_time/camera rewrites.
         # Damage/event outputs remain immediate because dmg_sig and damage_update change.
@@ -1253,7 +1277,10 @@ class SpectatorLogWatcher(QObject):
         state_changed_for_ui = state_emit_sig != self._last_state_emit_sig
         if state_changed_for_ui:
             self._last_state_emit_sig = state_emit_sig
-        elif not damage_update and not player_payload_due and "commentary_tts_text" not in out and "round_intro_event" not in out and "vs_intro_event" not in out:
+        elif (not damage_update and not player_payload_due
+              and "blue_player_img" not in out and "red_player_img" not in out
+              and "commentary_tts_text" not in out
+              and "round_intro_event" not in out and "vs_intro_event" not in out):
             # Nothing meaningful changed for the overlay/UI.  Still allow a low-rate
             # pass for punishment/HP values so the HUD does not feel stale.
             try:
@@ -1629,6 +1656,13 @@ class SpectatorLogWatcher(QObject):
         self._event_engine_round = 0
         self._event_engine_ruleset_version = self._event_ruleset_version()
         self._total_damage_dealt = {"blue": 0.0, "red": 0.0}
+        self._hud_official_damage_key = tuple()
+        self._hud_official_damage_base = {"blue": 0.0, "red": 0.0}
+        self._hud_raw_damage_anchor = {"blue": 0.0, "red": 0.0}
+        self._hud_last_round_damage = {"blue": 0.0, "red": 0.0}
+        self._hud_official_rows_sig = (0, 0)
+        self._hud_official_rows = []
+        self._hud_last_projection_sig = tuple()
         self._damage_total_offset = {"blue": 0.0, "red": 0.0}
         self._damage_file_last_dealt = {"blue": 0.0, "red": 0.0}
         self._last_damage_update_sig = (0, 0)
@@ -2289,6 +2323,84 @@ class SpectatorLogWatcher(QObject):
             rows.append(row)
         rows.sort(key=lambda x: int(x.get("round", 0) or 0))
         return rows
+
+    def _project_hud_damage(self, scores_path: str, round_no: int, round_dealt: Dict[str, float]) -> Dict[str, float]:
+        """Official completed rounds plus the unscored live-round delta.
+
+        scores.csv does not finalize the active round until its score row is
+        written.  A raw cumulative damage total alone therefore drifts from
+        the game's official result, while official totals alone would freeze
+        the HUD during a fight.
+        """
+        sig = self._file_sig(scores_path)
+        if sig != self._hud_official_rows_sig:
+            self._hud_official_rows = self._read_official_scores(scores_path) if sig != (0, 0) else []
+            self._hud_official_rows_sig = sig
+        raw_total = dict(self._total_damage_dealt or {})
+        state = str(self._last_round_state or "fight").lower()
+        completed = self._filter_completed_score_rows(
+            self._hud_official_rows, state=state, round_no=round_no,
+        )
+        official = [
+            row for row in completed
+            if row.get("blue_damage_taken") is not None and row.get("red_damage_taken") is not None
+            and not (
+                int(row.get("blue_score", 0) or 0) == 10
+                and int(row.get("red_score", 0) or 0) == 10
+                and float(row.get("blue_damage_taken", 0.0) or 0.0) == 0.0
+                and float(row.get("red_damage_taken", 0.0) or 0.0) == 0.0
+                and int(row.get("blue_kds", 0) or 0) == 0
+                and int(row.get("red_kds", 0) or 0) == 0
+            )
+        ]
+        # A partial CSV rewrite must never erase already confirmed rounds.
+        if official and all(
+            row.get("blue_damage_taken") is not None and row.get("red_damage_taken") is not None
+            for row in completed
+        ):
+            key = tuple(
+                (int(row["round"]), float(row["blue_damage_taken"]), float(row["red_damage_taken"]))
+                for row in official
+            )
+            if key != self._hud_official_damage_key:
+                self._hud_official_damage_key = key
+                self._hud_official_damage_base = {
+                    "blue": sum(float(row["red_damage_taken"]) for row in official),
+                    "red": sum(float(row["blue_damage_taken"]) for row in official),
+                }
+                included_current = any(int(row["round"]) == int(round_no or 0) for row in official)
+                self._hud_raw_damage_anchor = {
+                    side: float(raw_total.get(side, 0.0) or 0.0)
+                    - (0.0 if included_current else float(round_dealt.get(side, 0.0) or 0.0))
+                    for side in ("blue", "red")
+                }
+        if not self._hud_official_damage_key:
+            return {side: float(raw_total.get(side, 0.0) or 0.0) for side in ("blue", "red")}
+        if state in ("results", "end", "knockout", "disqualified") and any(
+            int(item[0]) == int(round_no or 0) for item in self._hud_official_damage_key
+        ):
+            return dict(self._hud_official_damage_base)
+        return {
+            side: max(0.0, float(self._hud_official_damage_base.get(side, 0.0) or 0.0)
+                      + max(0.0, float(raw_total.get(side, 0.0) or 0.0)
+                            - float(self._hud_raw_damage_anchor.get(side, 0.0) or 0.0)))
+            for side in ("blue", "red")
+        }
+
+    def _hud_official_round_damage(self, round_no: int) -> Dict[str, float]:
+        for recorded_round, blue_taken, red_taken in self._hud_official_damage_key:
+            if int(recorded_round) == int(round_no or 0):
+                return {"blue": float(red_taken), "red": float(blue_taken)}
+        return {}
+
+    @staticmethod
+    def _hud_projection_signature(total: Dict[str, float], official_round: Dict[str, float]) -> Tuple[Any, ...]:
+        return (
+            round(float(total.get("blue", 0.0) or 0.0), 2),
+            round(float(total.get("red", 0.0) or 0.0), 2),
+            round(float(official_round.get("blue", 0.0) or 0.0), 2) if official_round else None,
+            round(float(official_round.get("red", 0.0) or 0.0), 2) if official_round else None,
+        )
 
     def _filter_completed_score_rows(self, rows: List[dict], *, state: Optional[str] = None, round_no: Optional[int] = None, winner_present: bool = False) -> List[dict]:
         """Hide current-round placeholder score rows from live scorecards.
@@ -7479,7 +7591,14 @@ class SpectatorLogWatcher(QObject):
         self._last_stun_counts = {side: int(effect_counts.get(side, {}).get("stun", 0) or 0) for side in ("blue", "red")}
         self._damage_initialized = True
         if effect_events:
-            out["spectator_effect_events"] = effect_events
+            # Do not make fullscreen KD/stun feedback wait for the slower
+            # classification, archive and commentary pass.  The fast pass
+            # still hands these events to the full pass for its bookkeeping.
+            if not self._safe_emit_update({
+                "spectator_effect_events": list(effect_events),
+                "_spectator_urgent_fast_emit": True,
+            }):
+                out["spectator_effect_events"] = effect_events
         new_events: List[dict] = []
         if parsed_events:
             # Mark official and fast-punish counters before selecting new rows,
@@ -7587,6 +7706,18 @@ class SpectatorLogWatcher(QObject):
             attacker = str(event.get("attacker_side") or "").lower()
             if attacker in round_dealt:
                 round_dealt[attacker] += float(event.get("damage", 0.0) or 0.0)
+        self._hud_last_round_damage = dict(round_dealt)
+        hud_damage = self._project_hud_damage(
+            os.path.join(os.path.dirname(path), "scores.csv"),
+            int(active_round_no or 1), round_dealt,
+        )
+        out["blue_damage_dealt"] = round(hud_damage["blue"], 2)
+        out["red_damage_dealt"] = round(hud_damage["red"], 2)
+        official_round = self._hud_official_round_damage(int(active_round_no or 1))
+        self._hud_last_projection_sig = self._hud_projection_signature(hud_damage, official_round)
+        if official_round:
+            out["blue_round_damage_display"] = round(official_round["blue"], 2)
+            out["red_round_damage_display"] = round(official_round["red"], 2)
         out["blue_round_damage_dealt"] = round(round_dealt["blue"], 2)
         out["red_round_damage_dealt"] = round(round_dealt["red"], 2)
         hit_effect_events = []

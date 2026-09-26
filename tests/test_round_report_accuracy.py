@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -464,6 +465,33 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertIsNone(update.get("blue_player_img"))
         self.assertEqual(update.get("blue_name"), "NEXT_BLUE")
         self.assertFalse(self.watcher._portrait_locked["blue"])
+
+    def test_late_intro_portraits_are_emitted_even_without_other_log_changes(self):
+        self.watcher.cfg.players = {}
+        self.watcher._runtime_baseline_ready = True
+        with tempfile.TemporaryDirectory() as root:
+            self.watcher.cfg.spectator_match_archive_dir = os.path.join(root, "archive")
+            for folder in ("blue", "red", "match"):
+                os.makedirs(os.path.join(root, folder), exist_ok=True)
+            for path, value in (
+                (os.path.join(root, "blue", "name.txt"), "BLUE"),
+                (os.path.join(root, "red", "name.txt"), "RED"),
+                (os.path.join(root, "match", "round_number.txt"), "1"),
+                (os.path.join(root, "match", "round_total.txt"), "3"),
+                (os.path.join(root, "match", "round_state.txt"), "MatchIntro"),
+            ):
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(value)
+            with patch.object(self.watcher, "_read_image_if_changed", return_value=(False, None)):
+                first = self.watcher._read_update(root)
+            self.assertIn("vs_intro_event", first)
+            self.watcher._portrait_retry_due = {"blue": 0.0, "red": 0.0}
+            self.watcher._last_log_info_emit_at = time.time()
+            portrait = SimpleNamespace(size=1)
+            with patch.object(self.watcher, "_read_image_if_changed", return_value=(True, portrait)):
+                late = self.watcher._read_update(root)
+            self.assertIs(late.get("blue_player_img"), portrait)
+            self.assertIs(late.get("red_player_img"), portrait)
 
     def test_starting_at_completed_cancel_still_arms_one_lobby_kick(self):
         """Launching TimerAuto on the result screen must not lose the next lobby edge."""

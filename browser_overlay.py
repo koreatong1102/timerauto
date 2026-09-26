@@ -35,6 +35,7 @@ class BrowserOverlayServer:
         self._studio_store = OverlayStudioStore(studio_path)
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
+        self._latency_beacons: Dict[str, Dict[str, Any]] = {}
         self._state: Dict[str, Any] = {
             "seq": 0,
             "timeText": "3:00",
@@ -290,6 +291,8 @@ class BrowserOverlayServer:
                                 DIAG.record("browser_overlay_beacon", event=event, key=key, seq=seq, browserMs=browser_ms, pushMs=push_ms)
                             except Exception:
                                 pass
+                            if event == "ko_probe_show" and key:
+                                outer.record_latency_beacon(event, key, browser_ms, push_ms)
                             logging.info("BROWSER_OVERLAY_BEACON event=%s key=%s seq=%s browserMs=%s pushMs=%s", event, key, seq, browser_ms, push_ms)
                         except Exception:
                             logging.debug("BROWSER_OVERLAY_BEACON_FAIL", exc_info=True)
@@ -681,6 +684,21 @@ class BrowserOverlayServer:
     def image_path(self, side: str) -> str:
         with self._lock:
             return str(self._image_paths.get(str(side or "").lower(), "") or "")
+
+    def record_latency_beacon(self, event: str, key: str, browser_ms: str, push_ms: str) -> None:
+        with self._lock:
+            self._latency_beacons[str(key)] = {
+                "event": str(event), "received_at": time.time(),
+                "browser_ms": str(browser_ms), "push_ms": str(push_ms),
+            }
+            if len(self._latency_beacons) > 64:
+                oldest = next(iter(self._latency_beacons))
+                self._latency_beacons.pop(oldest, None)
+
+    def latency_beacon(self, key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            item = self._latency_beacons.get(str(key))
+            return dict(item) if item else None
 
     def set_asset_path(self, name: str, path: Any):
         key = str(name or "").strip().lower()
@@ -3504,6 +3522,7 @@ function koAnimate(el,frames,options){
   if(!el||typeof el.animate!=='function')return null;
   try{let animation=el.animate(frames,options);koAnimations.push(animation);return animation}catch(e){return null}
 }
+const koProbeSeen=new Set();
 function showKO(mode,s){
   mode=mode==='tko'?'tko':'kd';
   console.info('[KO_IMAGE_SHOW]',mode,'seq='+String((s&&s.seq)||0));
@@ -3526,6 +3545,14 @@ function showKO(mode,s){
   position.style.setProperty('--ko-art-width',(baseWidth*scale)+'px');
   position.style.setProperty('--ko-art-height',(baseWidth*ratio*scale)+'px');
   el.classList.toggle('tko',mode==='tko');el.classList.add('show');el.setAttribute('aria-hidden','false');
+  for(const ev of (s&&s.events)||[]){
+    const probe=String(ev&&ev.latencyProbeKey||'');
+    if(probe&&!koProbeSeen.has(probe)){
+      koProbeSeen.add(probe);
+      overlayBeacon('ko_probe_show',{key:probe,browserMs:Date.now(),pushMs:ev.pushEpochMs||0});
+      if(koProbeSeen.size>64)koProbeSeen.delete(koProbeSeen.values().next().value);
+    }
+  }
   let url=koAssetUrl(mode,s),fallbackText=mode==='tko'?'T.K.O.':'K.O.';
   fallback.textContent=fallbackText;fallback.classList.toggle('show',!url);
   for(const img of [far,near,main]){

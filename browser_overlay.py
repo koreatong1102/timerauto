@@ -3800,6 +3800,13 @@ function rrV4Rows(blue,red){
   html+=row(rrV4Num(blue.knockdowns??blue.kd),'\uB2E4\uC6B4 \uD68D\uB4DD',rrV4Num(red.knockdowns??red.kd));
   return html;
 }
+function rrVisibleWeakHits(data,s){
+  const items=data.weakHitAll||data.weakHitTop||[];
+  const selected=s&&s.reportWeakPointParts;
+  if(!Array.isArray(selected))return items.slice(0,4);
+  const known=['턱','코','왼쪽 관자놀이','오른쪽 관자놀이','관자놀이','왼쪽 눈','오른쪽 눈','이마','간','명치'];
+  return items.filter(item=>{const label=String(item.label||'');return selected.includes(label)||(!known.includes(label)&&selected.includes('기타'));}).slice(0,4);
+}
 function rrV4Fighter(side,data,opp,s,winner,leader,isFinal,showResult){
   const red=side==='red';
   const name=rrV4Name(side,data,s);
@@ -3842,8 +3849,10 @@ function rrV4Fighter(side,data,opp,s,winner,leader,isFinal,showResult){
   ];
   const head=red?(meta+photo):(photo+meta);
   const highlight='<div class="rrHighlight"><div class="rrHighlightCard"><span class="rrHighlightLabel">\uCD5C\uACE0 \uB370\uBBF8\uC9C0 \uD380\uCE58</span><b class="rrHighlightValue">'+escapeHtml(rrV4TopPunch(data))+'</b></div><div class="rrHighlightCard rrHighlightDamage"><span class="rrHighlightLabel">'+(isFinal?'\uACBD\uAE30 \uB370\uBBF8\uC9C0':'\uB77C\uC6B4\uB4DC \uB370\uBBF8\uC9C0')+'</span><b class="rrHighlightValue">'+rrV4Num(data.damage)+'</b></div></div>';
-  const weak=(data.weakHitAll||data.weakHitTop||[]).slice(0,4);
-  return '<section class="rrFighter '+side+(styleVisible?'':' noFightStyle')+'"><div class="rrHead">'+head+'</div>'+styleHtml+'<div class="rrAccent"></div>'+highlight+'<div class="rrSideStack"><div class="rrSection"><div class="rrSectionTitle">\uC8FC\uC694 \uB54C\uB9B0 \uAE09\uC18C \uBD80\uC704</div><div class="rrInfoGrid">'+rrV4InfoCards(weak,'weak')+'</div></div><div class="rrSection"><div class="rrSectionTitle">'+(isFinal?'\uACBD\uAE30 \uC218\uCE58':'\uB77C\uC6B4\uB4DC \uC218\uCE58')+'</div><div class="rrInfoGrid">'+rrV4InfoCards(roundItems,'metric')+'</div></div></div><div class="rrVitalsBox"><div class="rrVitals">'+rrV4Vitals(stamina,health,red)+'</div></div></section>';
+  const weak=rrVisibleWeakHits(data,s);
+  const weakEnabled=!Array.isArray(s.reportWeakPointParts)||s.reportWeakPointParts.length>0;
+  const weakSection=weakEnabled?'<div class="rrSection"><div class="rrSectionTitle">\uC8FC\uC694 \uB54C\uB9B0 \uAE09\uC18C \uBD80\uC704</div><div class="rrInfoGrid">'+rrV4InfoCards(weak,'weak')+'</div></div>':'';
+  return '<section class="rrFighter '+side+(styleVisible?'':' noFightStyle')+'"><div class="rrHead">'+head+'</div>'+styleHtml+'<div class="rrAccent"></div>'+highlight+'<div class="rrSideStack"'+(weakEnabled?'':' style="grid-template-rows:1fr!important"')+'>'+weakSection+'<div class="rrSection"><div class="rrSectionTitle">'+(isFinal?'\uACBD\uAE30 \uC218\uCE58':'\uB77C\uC6B4\uB4DC \uC218\uCE58')+'</div><div class="rrInfoGrid">'+rrV4InfoCards(roundItems,'metric')+'</div></div></div><div class="rrVitalsBox"><div class="rrVitals">'+rrV4Vitals(stamina,health,red)+'</div></div></section>';
 }
 function rrV4Vitals(stamina,health,red){
   const staminaRow='<div class="rrVital rrStamina"><span class="rrVitalLabel">\uC2E4\uC81C\uCCB4\uB825</span><div class="rrBar"><div class="rrBarFill" style="--w:'+stamina+'%"></div></div><b>'+stamina+'%</b></div>';

@@ -159,6 +159,7 @@ class BrowserOverlaySync:
                 overlayRoundFontSize=int(getattr(self.cfg, "overlay_round_font_size", 11) or 11),
                 roundIntroSpeed=float(getattr(self.cfg, "overlay_round_intro_speed", 1.0) or 1.0),
                 roundIntroOutlinePx=int(getattr(self.cfg, "overlay_round_intro_outline_px", 3) or 0),
+                reportWeakPointParts=getattr(self.cfg, "report_weak_point_parts", None),
                 roundIntroGlowColor=str(getattr(self.cfg, "overlay_round_intro_glow_color", "#38BDF8") or "#38BDF8"),
                 overlayRoundX=int(getattr(self.cfg, "overlay_round_x", 0) or 0),
                 overlayRoundY=int(getattr(self.cfg, "overlay_round_y", 0) or 0),

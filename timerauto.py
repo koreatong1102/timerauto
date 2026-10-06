@@ -160,6 +160,7 @@ from app_paths import (
     resolve_player_image_path,
 )
 from config_model import (
+    REPORT_WEAK_POINT_PARTS,
     Rect,
     TriggerConfig,
     PaletteConfig,
@@ -7528,6 +7529,7 @@ class SettingsDialog(QDialog):
         self.sp_chapter_offset = QSpinBox()
         self.sp_chapter_offset.setRange(-36000, 36000)
         self.sp_chapter_offset.setValue(int(getattr(self.cfg, "chapter_offset_sec", 0)))
+        self.sp_chapter_offset.setToolTip("양수는 챕터 시간을 뒤로, 음수는 앞으로 이동합니다. 기존 기록에도 TXT 저장 시 적용됩니다.")
         chapter_lay.addWidget(self.sp_chapter_offset, 1, 1)
         chapter_lay.addWidget(QLabel("중복 무시(초)"), 1, 2)
         self.sp_chapter_dedupe = QSpinBox()
@@ -7635,6 +7637,25 @@ class SettingsDialog(QDialog):
         report_analysis_hint.setWordWrap(True)
         report_analysis_hint.setStyleSheet("color:#9ca3af;")
         report_analysis_lay.addWidget(report_analysis_hint, 2, 0, 1, 4)
+        report_analysis_lay.addWidget(QLabel("리포트에 표시할 급소 부위"), 3, 0, 1, 2)
+        self.report_weak_point_checks = {}
+        btn_weak_all = QPushButton("전체 선택")
+        btn_weak_none = QPushButton("전체 해제")
+        btn_weak_all.clicked.connect(lambda: [checkbox.setChecked(True) for checkbox in self.report_weak_point_checks.values()])
+        btn_weak_none.clicked.connect(lambda: [checkbox.setChecked(False) for checkbox in self.report_weak_point_checks.values()])
+        report_analysis_lay.addWidget(btn_weak_all, 3, 2)
+        report_analysis_lay.addWidget(btn_weak_none, 3, 3)
+        selected_parts = getattr(self.cfg, "report_weak_point_parts", REPORT_WEAK_POINT_PARTS)
+        for index, part in enumerate(REPORT_WEAK_POINT_PARTS):
+            checkbox = QCheckBox(part)
+            checkbox.setChecked(part in selected_parts)
+            checkbox.setToolTip("라운드·경기 종료 리포트의 급소 표시만 변경합니다. 통계와 경기스타일 계산은 유지됩니다.")
+            checkbox.stateChanged.connect(self._schedule_apply)
+            self.report_weak_point_checks[part] = checkbox
+            report_analysis_lay.addWidget(checkbox, 4 + index // 4, index % 4)
+        weak_hint = QLabel("체크한 부위 중 적중이 많은 최대 4개를 표시합니다. 모두 해제하면 급소 영역을 숨깁니다.")
+        weak_hint.setWordWrap(True)
+        report_analysis_lay.addWidget(weak_hint, 7, 0, 1, 4)
         report_analysis_lay.setColumnStretch(1, 1)
         report_analysis_lay.setColumnStretch(3, 1)
         record_lay.addWidget(report_analysis_group)
@@ -8896,7 +8917,7 @@ class SettingsDialog(QDialog):
         automation.addWidget(QLabel("새 영상 수신 폴더"), 8, 0)
         automation.addWidget(self.le_obs_source_record_incoming, 8, 1, 1, 2)
         automation.addWidget(self.btn_obs_source_record_incoming, 8, 3)
-        automation.addWidget(QLabel("닉네임별 정리 폴더"), 9, 0)
+        automation.addWidget(QLabel("닉네임별 정리 폴더 (공통)"), 9, 0)
         automation.addWidget(self.le_obs_source_record_archive, 9, 1, 1, 2)
         automation.addWidget(self.btn_obs_source_record_archive, 9, 3)
         self.sp_obs_source_record_archive_limit = QSpinBox()
@@ -8983,20 +9004,30 @@ class SettingsDialog(QDialog):
         automation.addWidget(self.sp_obs_highlight_merge_transition_image, 18, 1)
         automation.addWidget(self.btn_obs_highlight_merge_selected, 19, 0, 1, 4)
         automation.addWidget(self.lbl_obs_highlight_merge, 20, 0, 1, 4)
-        self.chk_obs_replay_buffer_archive = QCheckBox("OBS 기본 Replay Buffer도 닉네임 폴더에 복사")
+        self.chk_obs_replay_buffer_archive = QCheckBox("기본 리플레이 버퍼 영상도 선수별 폴더에 보관")
         self.chk_obs_replay_buffer_archive.setChecked(bool(getattr(self.cfg, "obs_replay_buffer_archive_enabled", False)))
         self.chk_obs_replay_buffer_archive.setToolTip(
             "OBS 기본 리플레이 버퍼 저장본을 같은 닉네임별 정리 폴더에 복사합니다.\n"
             "OBS 원본은 그대로 남겨 브라우저 KD/TKO 리플레이 재생이 끊기지 않습니다."
         )
-        automation.addWidget(self.chk_obs_replay_buffer_archive, 19, 0, 1, 4)
-        automation.addWidget(self.chk_obs_source_record_auto_enable, 20, 0, 1, 4)
-        automation.addWidget(self.chk_obs_source_record_stop_with_timer, 21, 0, 1, 4)
+        self.chk_obs_replay_buffer_archive_down_only = QCheckBox("선수 폴더에는 다운(KD / KO / TKO) 영상만 보관")
+        self.chk_obs_replay_buffer_archive_down_only.setChecked(bool(getattr(self.cfg, "obs_replay_buffer_archive_down_only", True)))
+        self.chk_obs_replay_buffer_archive_down_only.setToolTip("체크하면 다운시킨 선수의 KO_REPLAY 폴더에만 복사합니다. OBS 원본 저장과 POTM 후보 저장은 별도이며, 자동 저장 이벤트는 위 KD·TKO·스턴 등의 체크로 선택합니다.")
+        self.chk_obs_replay_buffer_archive_down_only.toggled.connect(self._schedule_apply)
+        def _enable_buffer_archive(checked):
+            if checked and not self.le_obs_source_record_archive.text().strip():
+                self.le_obs_source_record_archive.setText("Highlights")
+            self._schedule_apply()
+        self.chk_obs_replay_buffer_archive.toggled.connect(_enable_buffer_archive)
+        automation.addWidget(self.chk_obs_replay_buffer_archive, 21, 0, 1, 4)
+        automation.addWidget(self.chk_obs_replay_buffer_archive_down_only, 22, 0, 1, 4)
+        automation.addWidget(self.chk_obs_source_record_auto_enable, 23, 0, 1, 4)
+        automation.addWidget(self.chk_obs_source_record_stop_with_timer, 24, 0, 1, 4)
         source_record_tools = QHBoxLayout()
         source_record_tools.addWidget(self.btn_obs_source_record_wizard)
         source_record_tools.addWidget(self.btn_obs_source_record_test)
         source_record_tools.addStretch(1)
-        automation.addLayout(source_record_tools, 22, 0, 1, 4)
+        automation.addLayout(source_record_tools, 25, 0, 1, 4)
         automation.setColumnStretch(1, 1)
         automation.setColumnStretch(3, 1)
         outer.addWidget(automation_group)
@@ -10517,6 +10548,7 @@ class SettingsDialog(QDialog):
         self.sp_obs_source_record_archive_limit.setValue(int(getattr(self.cfg, "obs_source_record_archive_limit_gb", 5) or 5))
         self.chk_obs_source_record_clear_incoming.setChecked(bool(getattr(self.cfg, "obs_source_record_clear_incoming_on_stream_stop", True)))
         self.chk_obs_replay_buffer_archive.setChecked(bool(getattr(self.cfg, "obs_replay_buffer_archive_enabled", False)))
+        self.chk_obs_replay_buffer_archive_down_only.setChecked(bool(getattr(self.cfg, "obs_replay_buffer_archive_down_only", True)))
         self.chk_potm_enabled.setChecked(bool(getattr(self.cfg, "potm_enabled", False)))
         self.cmb_potm_source.setCurrentIndex(max(0, self.cmb_potm_source.findData(str(getattr(self.cfg, "potm_capture_source", "source_record") or "source_record"))))
         self.sp_potm_min_score.setValue(int(getattr(self.cfg, "potm_min_score", 45) or 45))
@@ -10644,6 +10676,15 @@ class SettingsDialog(QDialog):
         if not callable(self._chapter_export):
             QMessageBox.information(self, "챕터", "내보내기 기능이 연결되지 않았습니다.")
             return
+        # Export is a separate button from Apply: commit the value currently
+        # typed in the spinbox before invoking the application's exporter.
+        self.sp_chapter_offset.interpretText()
+        self.cfg.chapter_offset_sec = int(self.sp_chapter_offset.value())
+        if self._cfg_path:
+            try:
+                self.cfg.to_json(self._cfg_path)
+            except Exception:
+                logging.exception("CHAPTER_EXPORT_SETTINGS_SAVE_FAIL")
         path = ""
         try:
             path = str(self._chapter_export() or "")
@@ -19280,6 +19321,7 @@ class SettingsDialog(QDialog):
             self.cfg.obs_source_record_archive_limit_gb = int(self.sp_obs_source_record_archive_limit.value())
             self.cfg.obs_source_record_clear_incoming_on_stream_stop = bool(self.chk_obs_source_record_clear_incoming.isChecked())
             self.cfg.obs_replay_buffer_archive_enabled = bool(self.chk_obs_replay_buffer_archive.isChecked())
+            self.cfg.obs_replay_buffer_archive_down_only = bool(self.chk_obs_replay_buffer_archive_down_only.isChecked())
             self.cfg.potm_enabled = bool(self.chk_potm_enabled.isChecked())
             self.cfg.potm_capture_source = str(self.cmb_potm_source.currentData() or "source_record")
             self.cfg.potm_min_score = int(self.sp_potm_min_score.value())
@@ -19445,6 +19487,8 @@ class SettingsDialog(QDialog):
             self.cfg.spectatorlog_blackbox_mode = str(self.cmb_spectatorlog_blackbox_mode.currentData() or "smart")
         if hasattr(self, "chk_spectator_fight_style"):
             self.cfg.spectator_fight_style_enabled = bool(self.chk_spectator_fight_style.isChecked())
+        if hasattr(self, "report_weak_point_checks"):
+            self.cfg.report_weak_point_parts = [part for part, checkbox in self.report_weak_point_checks.items() if checkbox.isChecked()]
         if hasattr(self, "sp_spectator_fight_style_attempts"):
             self.cfg.spectator_fight_style_min_attempts = int(
                 self.sp_spectator_fight_style_attempts.value()
@@ -20082,6 +20126,10 @@ class SettingsDialog(QDialog):
             self.sp_spectator_fight_style_attempts.setValue(
                 int(getattr(self.cfg, "spectator_fight_style_min_attempts", 20) or 20)
             )
+        if hasattr(self, "report_weak_point_checks"):
+            selected_parts = getattr(self.cfg, "report_weak_point_parts", REPORT_WEAK_POINT_PARTS)
+            for part, checkbox in self.report_weak_point_checks.items():
+                checkbox.setChecked(part in selected_parts)
         if hasattr(self, "sp_spectator_fight_style_landed"):
             self.sp_spectator_fight_style_landed.setValue(
                 int(getattr(self.cfg, "spectator_fight_style_min_landed", 10) or 10)
@@ -21715,7 +21763,8 @@ class MainApp(QObject):
             try:
                 wall_epoch = datetime.fromisoformat(str(event.get("wall_time") or "")).timestamp()
                 offset_sec = int(event.get("offset_sec", getattr(self.cfg, "chapter_offset_sec", 0)) or 0)
-                event["elapsed_sec"] = max(0, int(round(wall_epoch - prior_anchor)) + offset_sec)
+                event["elapsed_raw_sec"] = int(round(wall_epoch - prior_anchor))
+                event["elapsed_sec"] = max(0, event["elapsed_raw_sec"] + offset_sec)
             except (TypeError, ValueError):
                 pass
             event["anchor_epoch"] = prior_anchor
@@ -22366,10 +22415,10 @@ class MainApp(QObject):
             self._chapter_seen_keys.add(key)
         now_epoch = time.time()
         if elapsed_sec is None:
-            elapsed = int(now_epoch - self._chapter_anchor_epoch() + int(getattr(self.cfg, "chapter_offset_sec", 0)))
+            raw_elapsed = int(now_epoch - self._chapter_anchor_epoch())
         else:
-            elapsed = int(elapsed_sec) + int(getattr(self.cfg, "chapter_offset_sec", 0))
-        elapsed = max(0, elapsed)
+            raw_elapsed = int(elapsed_sec)
+        elapsed = max(0, raw_elapsed + int(getattr(self.cfg, "chapter_offset_sec", 0)))
         dedupe = max(0, int(getattr(self.cfg, "chapter_dedupe_sec", 20)))
         if self._chapter_last_title == event_title and (elapsed - self._chapter_last_elapsed) <= dedupe:
             return False
@@ -22381,6 +22430,7 @@ class MainApp(QObject):
             "obs_stream_start_epoch": float(getattr(self, "_chapter_obs_stream_start_epoch", 0.0) or 0.0),
             "offset_sec": int(getattr(self.cfg, "chapter_offset_sec", 0)),
             "elapsed_sec": int(elapsed),
+            "elapsed_raw_sec": int(raw_elapsed),
             "title": event_title,
         }
         if key:
@@ -22522,6 +22572,13 @@ class MainApp(QObject):
         self._export_chapter_txt()
         return True
 
+    def _chapter_export_elapsed(self, event: dict) -> int:
+        raw_elapsed = event.get("elapsed_raw_sec")
+        if raw_elapsed is None:
+            # Older journals already include their record-time correction.
+            raw_elapsed = int(event.get("elapsed_sec", 0) or 0) - int(event.get("offset_sec", 0) or 0)
+        return max(0, int(raw_elapsed) + int(getattr(self.cfg, "chapter_offset_sec", 0) or 0))
+
     def _export_chapter_txt(self) -> str:
         if not self._chapter_events:
             return ""
@@ -22533,7 +22590,7 @@ class MainApp(QObject):
             ev for ev in self._chapter_events
             if str(ev.get("source") or "") != "match_result_summary"
         ]
-        end_sec = max((int(ev.get("elapsed_sec", 0)) for ev in chapter_events), default=0)
+        end_sec = max((self._chapter_export_elapsed(ev) for ev in chapter_events), default=0)
         lines = [
             f"# 챕터 생성일: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"# 기준 시각: {anchor_label}",
@@ -22544,8 +22601,8 @@ class MainApp(QObject):
         ]
         if not hide_time:
             lines.append("00:00 시작")
-        for ev in sorted(chapter_events, key=lambda x: int(x.get("elapsed_sec", 0))):
-            ts = self._format_chapter_elapsed(int(ev.get("elapsed_sec", 0)))
+        for ev in sorted(chapter_events, key=self._chapter_export_elapsed):
+            ts = self._format_chapter_elapsed(self._chapter_export_elapsed(ev))
             title = self._chapter_event_display_title(dict(ev or {}))
             if title:
                 if hide_time:
@@ -24575,17 +24632,24 @@ class MainApp(QObject):
             return
         side = str(context.get("attacker_side") or "").lower().strip()
         names = dict(getattr(self, "_source_record_names", {}) or {})
-        nickname = self._source_record_safe_name(str(names.get(side) or ""), "UNKNOWN")
+        nickname = self._source_record_safe_name(str(context.get("attacker_name") or names.get(side) or ""), "UNKNOWN")
         event = self._source_record_safe_name(
             str(reason or context.get("highlight_kind") or "highlight").upper().replace("KNOCKDOWN", "KD"),
             "HIGHLIGHT",
         )
+        target_dir, _managed = self._source_record_clip_destination(
+            archive, {"nickname": nickname, "event": event, "context": dict(context or {})},
+        )
+        if bool(getattr(self.cfg, "obs_replay_buffer_archive_down_only", True)) and target_dir != os.path.join(archive, nickname, "KO_REPLAY"):
+            return
+        if side not in ("blue", "red") and not context.get("attacker_name"):
+            logging.info("OBS_REPLAY_ARCHIVE_UNASSIGNED path=%s reason=%s", source, reason)
+            return
         round_no = max(0, int(context.get("round") or getattr(self, "_source_record_round", 0) or 0))
-        seconds = max(0, int(context.get("seconds_left") or getattr(self, "_source_record_seconds_left", 0) or 0))
+        seconds = max(0, int(context.get("seconds_left", getattr(self, "_source_record_seconds_left", 0)) or 0))
 
         def _copy() -> None:
             try:
-                target_dir = os.path.join(archive, nickname)
                 os.makedirs(target_dir, exist_ok=True)
                 stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
                 round_text = f"R{round_no}" if round_no else "R?"
@@ -25677,6 +25741,7 @@ class MainApp(QObject):
             "trigger_monotonic": now,
             "event_key": str(event_key or ""),
             "attacker_side": str(attacker_side or "").lower().strip(),
+            "attacker_name": str(dict(getattr(self, "_source_record_names", {}) or {}).get(str(attacker_side or "").lower().strip()) or ""),
             "highlight_kind": normalized,
             "round": int(getattr(self, "_source_record_round", 0) or getattr(self.cfg, "timer_current_round", 1) or 1),
             "seconds_left": int(getattr(self, "_source_record_seconds_left", 0) or 0),
@@ -27986,6 +28051,7 @@ class MainApp(QObject):
             update.setdefault("hitFxLatencyLog", bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)))
             update.setdefault("hitFxSpriteEnabled", bool(getattr(self.cfg, "spectator_hit_effect_sprite_enabled", True)))
             update.setdefault("hitFxRingEnabled", bool(getattr(self.cfg, "spectator_hit_effect_ring_enabled", False)))
+            update["reportWeakPointParts"] = list(getattr(self.cfg, "report_weak_point_parts", REPORT_WEAK_POINT_PARTS))
             try:
                 style_time = dict(getattr(self.cfg, "overlay_style_time", {}) or {})
                 style_round = dict(getattr(self.cfg, "overlay_style_round", {}) or {})

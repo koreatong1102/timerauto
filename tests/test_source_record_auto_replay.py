@@ -4,7 +4,7 @@ import time
 import unittest
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from timerauto import MainApp, SettingsDialog
 
@@ -24,6 +24,66 @@ class _FakeObsIntegration:
 
 
 class SourceRecordAutoReplayTests(unittest.TestCase):
+    def test_native_buffer_request_snapshots_the_attacker_name(self):
+        with tempfile.TemporaryDirectory() as root:
+            app = self._app(root, fallback=False)
+            app.cfg.obs_source_record_enabled = False
+            app.cfg.obs_auto_replay_source = "replay_buffer"
+            app._source_record_names["blue"] = "Original Nick"
+            self.assertTrue(app._maybe_save_obs_highlight("knockdown", attacker_side="blue", event_key="kd-name"))
+            app._source_record_names["blue"] = "Next Match"
+            self.assertEqual(app.obs_integration.program_saves[0][1]["attacker_name"], "Original Nick")
+
+    def test_native_buffer_down_clip_uses_saved_attacker_name_and_ko_subfolder(self):
+        with tempfile.TemporaryDirectory() as root:
+            app = self._app(root, fallback=False)
+            app.cfg.obs_replay_buffer_archive_enabled = True
+            app.cfg.obs_replay_buffer_archive_down_only = True
+            app._prune_source_record_archive = Mock()
+            app._source_record_names = {"blue": "NEXT MATCH", "red": "OTHER"}
+            source = os.path.join(root, "replay.mkv")
+            with open(source, "wb") as stream:
+                stream.write(b"saved replay")
+            context = {"attacker_side": "blue", "attacker_name": "Original Nick", "highlight_kind": "knockdown", "round": 2, "seconds_left": 0, "potm_candidate_id": "candidate"}
+            with patch("timerauto.threading.Thread", side_effect=lambda target, **kwargs: SimpleNamespace(start=target)):
+                app._copy_program_replay_to_player_archive(source, "knockdown", context)
+            player_dir = os.path.join(app.cfg.obs_source_record_archive_dir, "Original Nick", "KO_REPLAY")
+            files = os.listdir(player_dir)
+            self.assertEqual(len(files), 1)
+            with open(os.path.join(player_dir, files[0]), "rb") as stream:
+                self.assertEqual(stream.read(), b"saved replay")
+            self.assertTrue(os.path.isfile(source))
+            self.assertFalse(os.path.isdir(os.path.join(app.cfg.obs_source_record_archive_dir, "NEXT MATCH")))
+
+    def test_native_buffer_archive_down_only_does_not_copy_counter_or_manual_save(self):
+        with tempfile.TemporaryDirectory() as root:
+            app = self._app(root, fallback=False)
+            app.cfg.obs_replay_buffer_archive_enabled = True
+            app.cfg.obs_replay_buffer_archive_down_only = True
+            source = os.path.join(root, "replay.mp4")
+            with open(source, "wb") as stream:
+                stream.write(b"replay")
+            with patch("timerauto.threading.Thread") as thread:
+                app._copy_program_replay_to_player_archive(source, "counter-60", {"attacker_side": "blue", "highlight_kind": "counter"})
+                app._copy_program_replay_to_player_archive(source, "", {})
+                thread.assert_not_called()
+
+    def test_native_buffer_all_events_option_and_disabled_archive(self):
+        with tempfile.TemporaryDirectory() as root:
+            app = self._app(root, fallback=False)
+            app.cfg.obs_replay_buffer_archive_enabled = False
+            app.cfg.obs_replay_buffer_archive_down_only = False
+            app._prune_source_record_archive = Mock()
+            source = os.path.join(root, "replay.mp4")
+            with open(source, "wb") as stream:
+                stream.write(b"replay")
+            with patch("timerauto.threading.Thread", side_effect=lambda target, **kwargs: SimpleNamespace(start=target)):
+                app._copy_program_replay_to_player_archive(source, "counter-60", {"attacker_side": "blue"})
+                self.assertEqual(os.listdir(app.cfg.obs_source_record_archive_dir), [])
+                app.cfg.obs_replay_buffer_archive_enabled = True
+                app._copy_program_replay_to_player_archive(source, "counter-60", {"attacker_side": "blue"})
+            self.assertEqual(len(os.listdir(os.path.join(app.cfg.obs_source_record_archive_dir, "BLUE"))), 1)
+
     def _app(self, root, *, fallback):
         app = MainApp.__new__(MainApp)
         incoming = os.path.join(root, "incoming")

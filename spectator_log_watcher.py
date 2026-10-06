@@ -4020,7 +4020,7 @@ class SpectatorLogWatcher(QObject):
                 for item in punches.values()
             )
             weak_hit_top = self._round_report_top_items(opponent.get("weak_received") or {}, limit=3)
-            weak_hit_all = self._round_report_top_items(opponent.get("weak_received") or {}, limit=8)
+            weak_hit_all = self._round_report_top_items(opponent.get("weak_received") or {}, limit=32)
             return {
                 "name": str(st.get("name") or ("BLUE" if side == "blue" else "RED")),
                 "landed": landed,

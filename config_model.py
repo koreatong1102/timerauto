@@ -14,6 +14,8 @@ import os
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional
 
+REPORT_WEAK_POINT_PARTS = ["턱", "코", "왼쪽 관자놀이", "오른쪽 관자놀이", "관자놀이", "왼쪽 눈", "오른쪽 눈", "이마", "간", "명치", "기타"]
+
 from app_paths import app_path, normalize_app_path, normalize_builtin_asset_path, to_app_rel
 
 def migrate_action_keys(actions: Dict[str, List[dict]],
@@ -683,6 +685,7 @@ class AppConfig:
     # Copy native OBS Replay Buffer files into the same per-player archive.
     # They stay in OBS's own output folder for browser-overlay replay safety.
     obs_replay_buffer_archive_enabled: bool = False
+    obs_replay_buffer_archive_down_only: bool = True
     # Play of the Match (best technical moment across the entire bout).
     potm_enabled: bool = False
     potm_capture_source: str = "source_record"  # source_record | replay_buffer
@@ -864,6 +867,7 @@ class AppConfig:
     spectator_name_bar_y: int = 0
     browser_round_damage_width: int = 150
     spectator_fight_style_enabled: bool = True
+    report_weak_point_parts: List[str] = field(default_factory=lambda: list(REPORT_WEAK_POINT_PARTS))
     spectator_fight_style_min_attempts: int = 20
     spectator_fight_style_min_landed: int = 10
     spectator_commentary_enabled: bool = True
@@ -1095,6 +1099,7 @@ class AppConfig:
         cfg.obs_source_record_auto_enable = bool(raw.get("obs_source_record_auto_enable", True))
         cfg.obs_source_record_stop_with_timer = bool(raw.get("obs_source_record_stop_with_timer", True))
         cfg.obs_replay_buffer_archive_enabled = bool(raw.get("obs_replay_buffer_archive_enabled", False))
+        cfg.obs_replay_buffer_archive_down_only = bool(raw.get("obs_replay_buffer_archive_down_only", True))
         cfg.potm_enabled = bool(raw.get("potm_enabled", False))
         cfg.potm_capture_source = str(raw.get("potm_capture_source", "source_record") or "source_record").strip().lower()
         if cfg.potm_capture_source not in ("source_record", "replay_buffer"):
@@ -1280,6 +1285,8 @@ class AppConfig:
         except (TypeError, ValueError):
             cfg.browser_round_damage_width = 150
         cfg.spectator_fight_style_enabled = bool(raw.get("spectator_fight_style_enabled", True))
+        selected_parts = raw.get("report_weak_point_parts", REPORT_WEAK_POINT_PARTS)
+        cfg.report_weak_point_parts = [part for part in REPORT_WEAK_POINT_PARTS if part in selected_parts] if isinstance(selected_parts, list) else list(REPORT_WEAK_POINT_PARTS)
         try:
             cfg.spectator_fight_style_min_attempts = max(
                 1, min(500, int(raw.get("spectator_fight_style_min_attempts", 20) or 20))
@@ -1819,6 +1826,7 @@ class AppConfig:
             "obs_source_record_auto_enable": bool(self.obs_source_record_auto_enable),
             "obs_source_record_stop_with_timer": bool(self.obs_source_record_stop_with_timer),
             "obs_replay_buffer_archive_enabled": bool(self.obs_replay_buffer_archive_enabled),
+            "obs_replay_buffer_archive_down_only": bool(self.obs_replay_buffer_archive_down_only),
             "potm_enabled": bool(self.potm_enabled),
             "potm_capture_source": str(self.potm_capture_source or "source_record"),
             "potm_min_score": int(max(1, min(100, self.potm_min_score))),
@@ -1983,6 +1991,7 @@ class AppConfig:
             "spectator_name_bar_y": int(max(-100, min(100, self.spectator_name_bar_y))),
             "browser_round_damage_width": int(max(80, min(320, self.browser_round_damage_width))),
             "spectator_fight_style_enabled": bool(self.spectator_fight_style_enabled),
+            "report_weak_point_parts": list(self.report_weak_point_parts),
             "spectator_fight_style_min_attempts": int(
                 max(1, min(500, self.spectator_fight_style_min_attempts))
             ),

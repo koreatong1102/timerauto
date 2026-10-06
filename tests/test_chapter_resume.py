@@ -5,12 +5,50 @@ import time
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from timerauto import MainApp
+from timerauto import MainApp, SettingsDialog
 
 
 class ChapterResumeTests(unittest.TestCase):
+    def test_export_reapplies_current_offset_to_existing_journal_without_accumulating(self):
+        with tempfile.TemporaryDirectory() as root:
+            app = self._app(root)
+            app._chapter_events = [{"elapsed_sec": 67, "offset_sec": 7, "title": "BLUE VS RED"}]
+            original = dict(app._chapter_events[0])
+            for offset, stamp in ((0, "01:00"), (3, "01:03"), (-3, "00:57"), (3, "01:03")):
+                app.cfg.chapter_offset_sec = offset
+                with open(app._export_chapter_txt(), encoding="utf-8") as stream:
+                    text = stream.read()
+                self.assertIn(f"{stamp} BLUE VS RED", text)
+                self.assertEqual(app._chapter_events[0], original)
+
+    def test_new_event_keeps_raw_time_when_negative_offset_clamps_to_zero(self):
+        with tempfile.TemporaryDirectory() as root:
+            app = self._app(root)
+            app.cfg.chapter_offset_sec = -10
+            app._append_chapter_event("BLUE VS RED", elapsed_sec=5)
+            self.assertEqual(app._chapter_events[0]["elapsed_sec"], 0)
+            app.cfg.chapter_offset_sec = 0
+            with open(app._export_chapter_txt(), encoding="utf-8") as stream:
+                self.assertIn("00:05 BLUE VS RED", stream.read())
+
+    def test_settings_export_commits_typed_offset_before_export_callback(self):
+        cfg = SimpleNamespace(chapter_offset_sec=0, to_json=Mock())
+        spinner = Mock()
+        spinner.value.return_value = -3
+        def export():
+            spinner.interpretText.assert_called_once()
+            self.assertEqual(cfg.chapter_offset_sec, -3)
+            return "chapters.txt"
+        dialog = SimpleNamespace(
+            cfg=cfg, sp_chapter_offset=spinner, _cfg_path="config.json",
+            _chapter_export=export, _refresh_chapter_status_label=Mock(),
+        )
+        with patch("timerauto.QMessageBox.information"):
+            SettingsDialog._export_chapter_txt_from_settings(dialog)
+        cfg.to_json.assert_called_once_with("config.json")
+
     def _app(self, root):
         app = MainApp.__new__(MainApp)
         app.cfg = SimpleNamespace(chapter_output_dir=root, chapter_anchor_epoch=0.0, chapter_offset_sec=0, chapter_hide_time=False)
@@ -273,6 +311,7 @@ class ChapterResumeTests(unittest.TestCase):
                 stream.write(json.dumps(current_event, ensure_ascii=False) + "\n")
 
             app = self._app(root)
+            app.cfg.chapter_offset_sec = 3
             self.assertTrue(app._resume_chapter_session(
                 max_age_sec=10800,
                 expected_anchor_epoch=reconnect_at,

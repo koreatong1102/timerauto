@@ -24625,7 +24625,7 @@ class MainApp(QObject):
         """Copy native OBS Replay Buffer output without disrupting overlay playback."""
         if not bool(getattr(self.cfg, "obs_replay_buffer_archive_enabled", False)):
             return
-        archive = normalize_app_path(str(getattr(self.cfg, "obs_source_record_archive_dir", "") or ""))
+        archive = normalize_app_path(str(getattr(self.cfg, "obs_source_record_archive_dir", "") or "Highlights"))
         source = os.path.abspath(os.path.expanduser(str(source_path or "").strip()))
         if not archive or not os.path.isfile(source):
             logging.warning("OBS_REPLAY_ARCHIVE_COPY_SKIPPED source=%s archive=%s", source, archive)
@@ -25767,8 +25767,20 @@ class MainApp(QObject):
                 "potm_qualification": str(potm_candidate.get("qualification") or ""),
             })
         source_auto_replay = auto_replay_requested and auto_replay_source == "source_record"
+        # Archiving is an explicit output request, independent of the source
+        # selected for on-air playback. A stale Source Record playback setting
+        # must not suppress native-buffer player archives.
+        archive_requests_replay = (
+            normal_highlight_enabled
+            and bool(getattr(self.cfg, "obs_replay_buffer_archive_enabled", False))
+            and (
+                not bool(getattr(self.cfg, "obs_replay_buffer_archive_down_only", True))
+                or normalized in ("knockdown", "down", "kd", "ko", "tko")
+            )
+        )
         save_program_replay = program_replay_enabled and (
             potm_requests_replay
+            or archive_requests_replay
             or (
                 normal_highlight_enabled
                 and (not source_auto_replay or source_fallback)

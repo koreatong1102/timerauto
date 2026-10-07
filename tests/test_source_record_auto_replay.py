@@ -24,6 +24,50 @@ class _FakeObsIntegration:
 
 
 class SourceRecordAutoReplayTests(unittest.TestCase):
+    def test_native_archive_requests_buffer_even_with_source_playback_selected(self):
+        for source_enabled in (False, True):
+            with self.subTest(source_enabled=source_enabled), tempfile.TemporaryDirectory() as root:
+                app = self._app(root, fallback=False)
+                app.cfg.obs_source_record_enabled = source_enabled
+                app.cfg.obs_replay_buffer_archive_enabled = True
+                app.cfg.obs_replay_buffer_archive_down_only = True
+                with patch("timerauto.QTimer.singleShot", side_effect=lambda _ms, fn: fn()):
+                    self.assertTrue(app._maybe_save_obs_highlight("knockdown", attacker_side="blue", event_key="archive-kd"))
+                self.assertEqual(len(app.obs_integration.program_saves), 1)
+                self.assertEqual(app.obs_integration.program_saves[0][1]["attacker_name"], "BLUE")
+                source = os.path.join(root, "saved.mkv")
+                with open(source, "wb") as stream:
+                    stream.write(b"OBS replay")
+                app._prune_source_record_archive = Mock()
+                reason, context = app.obs_integration.program_saves[0]
+                with patch("timerauto.threading.Thread", side_effect=lambda target, **kwargs: SimpleNamespace(start=target)):
+                    app._copy_program_replay_to_player_archive(source, reason, context)
+                self.assertEqual(len(os.listdir(os.path.join(app.cfg.obs_source_record_archive_dir, "BLUE", "KO_REPLAY"))), 1)
+
+    def test_native_archive_blank_folder_defaults_to_highlights(self):
+        with tempfile.TemporaryDirectory() as root:
+            app = self._app(root, fallback=False)
+            app.cfg.obs_replay_buffer_archive_enabled = True
+            app.cfg.obs_source_record_archive_dir = ""
+            app._prune_source_record_archive = Mock()
+            source = os.path.join(root, "saved.mkv")
+            with open(source, "wb") as stream:
+                stream.write(b"OBS replay")
+            with patch("timerauto.normalize_app_path", side_effect=lambda path: os.path.join(root, path)), patch("timerauto.threading.Thread", side_effect=lambda target, **kwargs: SimpleNamespace(start=target)):
+                app._copy_program_replay_to_player_archive(source, "knockdown", {"attacker_side": "blue"})
+            self.assertEqual(len(os.listdir(os.path.join(root, "Highlights", "BLUE", "KO_REPLAY"))), 1)
+
+    def test_native_down_only_archive_does_not_force_non_down_buffer_capture(self):
+        with tempfile.TemporaryDirectory() as root:
+            app = self._app(root, fallback=False)
+            app.cfg.obs_replay_buffer_archive_enabled = True
+            app.cfg.obs_replay_buffer_archive_down_only = True
+            app.cfg.obs_highlight_counter = True
+            app.cfg.obs_auto_replay_enabled = False
+            app.cfg.obs_replay_buffer_enabled = False
+            self.assertTrue(app._maybe_save_obs_highlight("counter", attacker_side="blue", event_key="counter"))
+            self.assertEqual(app.obs_integration.program_saves, [])
+
     def test_native_buffer_request_snapshots_the_attacker_name(self):
         with tempfile.TemporaryDirectory() as root:
             app = self._app(root, fallback=False)

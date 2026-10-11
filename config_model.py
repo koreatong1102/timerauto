@@ -686,6 +686,8 @@ class AppConfig:
     # They stay in OBS's own output folder for browser-overlay replay safety.
     obs_replay_buffer_archive_enabled: bool = False
     obs_replay_buffer_archive_down_only: bool = True
+    # Keep only the final selected POTM in the winner's permanent player folder.
+    obs_potm_archive_enabled: bool = False
     # Play of the Match (best technical moment across the entire bout).
     potm_enabled: bool = False
     potm_capture_source: str = "source_record"  # source_record | replay_buffer
@@ -1100,6 +1102,7 @@ class AppConfig:
         cfg.obs_source_record_stop_with_timer = bool(raw.get("obs_source_record_stop_with_timer", True))
         cfg.obs_replay_buffer_archive_enabled = bool(raw.get("obs_replay_buffer_archive_enabled", False))
         cfg.obs_replay_buffer_archive_down_only = bool(raw.get("obs_replay_buffer_archive_down_only", True))
+        cfg.obs_potm_archive_enabled = bool(raw.get("obs_potm_archive_enabled", False))
         cfg.potm_enabled = bool(raw.get("potm_enabled", False))
         cfg.potm_capture_source = str(raw.get("potm_capture_source", "source_record") or "source_record").strip().lower()
         if cfg.potm_capture_source not in ("source_record", "replay_buffer"):
@@ -1827,6 +1830,7 @@ class AppConfig:
             "obs_source_record_stop_with_timer": bool(self.obs_source_record_stop_with_timer),
             "obs_replay_buffer_archive_enabled": bool(self.obs_replay_buffer_archive_enabled),
             "obs_replay_buffer_archive_down_only": bool(self.obs_replay_buffer_archive_down_only),
+            "obs_potm_archive_enabled": bool(self.obs_potm_archive_enabled),
             "potm_enabled": bool(self.potm_enabled),
             "potm_capture_source": str(self.potm_capture_source or "source_record"),
             "potm_min_score": int(max(1, min(100, self.potm_min_score))),

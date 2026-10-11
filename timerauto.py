@@ -6468,6 +6468,7 @@ class SettingsDialog(QDialog):
         obs_source_record_diagnose: Optional[Callable[[], None]] = None,
         obs_source_record_diagnostic_getter: Optional[Callable[[], Dict[str, Any]]] = None,
         obs_source_record_test: Optional[Callable[[str], None]] = None,
+        obs_replay_setup_test: Optional[Callable[[bool], Dict[str, Any]]] = None,
         obs_source_record_configure: Optional[Callable[[str, str, bool], None]] = None,
         idle_highlight_refresh: Optional[Callable[[], None]] = None,
         potm_test: Optional[Callable[[], None]] = None,
@@ -6526,6 +6527,7 @@ class SettingsDialog(QDialog):
         self._obs_source_record_diagnose = obs_source_record_diagnose
         self._obs_source_record_diagnostic_getter = obs_source_record_diagnostic_getter
         self._obs_source_record_test = obs_source_record_test
+        self._obs_replay_setup_test = obs_replay_setup_test
         self._obs_source_record_configure = obs_source_record_configure
         self._obs_source_record_diag_started_at = 0.0
         self._obs_source_record_test_started_at = 0.0
@@ -8528,7 +8530,7 @@ class SettingsDialog(QDialog):
         self.chk_spectator_lobby_auto_start_activate.setChecked(
             bool(getattr(self.cfg, "spectator_lobby_auto_start_activate", True))
         )
-        self.chk_spectator_lobby_auto_start_restore_focus = QCheckBox("클릭 후 이전 창 복원")
+        self.chk_spectator_lobby_auto_start_restore_focus = QCheckBox("시작 확인 후 이전 창으로 돌아가기")
         self.chk_spectator_lobby_auto_start_restore_focus.setChecked(
             bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_focus", True))
         )
@@ -8536,10 +8538,15 @@ class SettingsDialog(QDialog):
         self.chk_spectator_lobby_auto_start_restore_cursor.setChecked(
             bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_cursor", True))
         )
-        self.chk_spectator_lobby_auto_start_minimize_target = QCheckBox("클릭 후 관전툴 최소화")
+        self.chk_spectator_lobby_auto_start_minimize_target = QCheckBox("시작 확인 후 관전툴 최소화")
         self.chk_spectator_lobby_auto_start_minimize_target.setChecked(
             bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False))
         )
+        self.chk_spectator_lobby_auto_start_minimize_target.setToolTip(
+            "실제 경기 시작 로그를 확인한 뒤 최소화합니다. 관전툴의 자체 전체화면 설정과는 별개입니다."
+        )
+        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_minimize_target, 6, 0, 1, 2)
+        auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_restore_focus, 6, 2, 1, 3)
         self.sp_spectator_final_report_delay = QDoubleSpinBox()
         self.sp_spectator_final_report_delay.setRange(0.0, 30.0)
         self.sp_spectator_final_report_delay.setSingleStep(0.5)
@@ -9327,6 +9334,54 @@ class SettingsDialog(QDialog):
         auto_replay.setColumnStretch(3, 1)
         outer.addWidget(auto_replay_group)
 
+        simple_group = QGroupBox("리플레이 간편 설정 — 처음 사용하면 여기부터")
+        simple = QGridLayout(simple_group)
+        self.cmb_replay_simple_mode = QComboBox()
+        self.cmb_replay_simple_mode.addItem("방송 화면 그대로 — 타이머 / 오버레이 포함", "replay_buffer")
+        self.cmb_replay_simple_mode.addItem("게임 화면만 — Source Record", "source_record")
+        self.cmb_replay_simple_mode.setCurrentIndex(max(0, self.cmb_replay_simple_mode.findData(str(getattr(self.cfg, "obs_auto_replay_source", "replay_buffer")))))
+        simple.addWidget(QLabel("저장할 화면"), 0, 0)
+        simple.addWidget(self.cmb_replay_simple_mode, 0, 1, 1, 2)
+        # Share the existing archive folder instead of introducing two competing paths.
+        self.le_replay_simple_folder = QLineEdit(self.le_obs_source_record_archive.text())
+        self.le_replay_simple_folder.setPlaceholderText("선수별 영상을 모아둘 폴더를 선택하세요")
+        self.le_replay_simple_folder.textChanged.connect(self.le_obs_source_record_archive.setText)
+        self.le_obs_source_record_archive.textChanged.connect(self.le_replay_simple_folder.setText)
+        simple.addWidget(QLabel("선수별 저장 폴더"), 1, 0)
+        simple.addWidget(self.le_replay_simple_folder, 1, 1)
+        folder_button = QPushButton("폴더 선택")
+        folder_button.clicked.connect(lambda: self._pick_obs_source_record_folder(self.le_obs_source_record_archive, "선수별 영상 저장 폴더"))
+        simple.addWidget(folder_button, 1, 2)
+        self.chk_obs_potm_archive = QCheckBox("최종 선정 POTM도 선수의 POTM 폴더에 보관")
+        self.chk_obs_potm_archive.setChecked(bool(getattr(self.cfg, "obs_potm_archive_enabled", False)))
+        self.chk_obs_potm_archive.toggled.connect(self._schedule_apply)
+        simple.addWidget(self.chk_obs_potm_archive, 2, 0, 1, 3)
+        instructions = QLabel(
+            "① OBS에서 타이머·브라우저 오버레이가 보이는 방송 장면을 준비하세요.\n"
+            "② 화면 방식과 저장 폴더를 고른 뒤 ‘선택한 방식으로 설정’을 누르세요.\n"
+            "③ ‘저장 테스트’로 만든 파일을 직접 재생해서 타이머와 소리를 확인하세요.\n\n"
+            "방송 화면: OBS 기본 리플레이 버퍼를 사용합니다. Source Record 플러그인은 필요 없습니다.\n"
+            "게임 화면만: Source Record 마법사에서 게임 소스/장면과 수신 폴더를 준비해야 합니다.\n"
+            "KD·KO·TKO → 다운시킨 선수/KO_REPLAY, 최종 POTM → 선정 선수/POTM.\n"
+            "화면 방식은 저장 파일의 출처를 고르는 설정입니다. OBS 장면에 없는 타이머를 영상에 추가하지는 않습니다.\n"
+            "OBS가 다른 컴퓨터라면 저장 영상에 타이머가 보이도록 그 OBS에도 오버레이를 넣고, 저장 파일은 접근 가능한 공유 경로를 사용하세요."
+        )
+        instructions.setWordWrap(True)
+        simple.addWidget(instructions, 3, 0, 1, 3)
+        apply_button = QPushButton("선택한 방식으로 설정")
+        apply_button.clicked.connect(self._apply_replay_simple_setup)
+        self.btn_replay_simple_test = QPushButton("저장 테스트")
+        self.btn_replay_simple_test.clicked.connect(self._test_replay_simple_setup)
+        simple.addWidget(apply_button, 4, 0)
+        simple.addWidget(self.btn_replay_simple_test, 4, 1)
+        guide_button = QPushButton("게임 화면만: Source Record 마법사")
+        guide_button.clicked.connect(self._show_obs_source_record_guide)
+        simple.addWidget(guide_button, 5, 0, 1, 3)
+        self.lbl_replay_simple_status = QLabel("기존 설정은 버튼을 누르기 전까지 변경하지 않습니다.")
+        self.lbl_replay_simple_status.setWordWrap(True)
+        simple.addWidget(self.lbl_replay_simple_status, 6, 0, 1, 3)
+        outer.insertWidget(1, simple_group)
+
         idle_group = QGroupBox("경기 대기 중 하이라이트 영상")
         idle = QGridLayout(idle_group)
         idle.setHorizontalSpacing(10)
@@ -9707,6 +9762,81 @@ class SettingsDialog(QDialog):
         self.btn_obs_source_record_wizard.setEnabled(True)
         self.btn_obs_source_record_wizard.setText("처음 설정 마법사 (설명 포함)")
         QMessageBox.warning(self, "OBS 간편 설정", "OBS 응답이 없습니다. WebSocket 연결 상태를 확인하세요.")
+
+    @staticmethod
+    def _replay_simple_preset(source: str) -> dict:
+        if source not in ("replay_buffer", "source_record"):
+            raise ValueError("Unknown replay source")
+        buffer = source == "replay_buffer"
+        return {
+            "chk_obs_enabled": True, "chk_obs_replay_buffer": buffer,
+            "chk_obs_replay_buffer_auto_start": buffer,
+            "chk_obs_source_record": not buffer,
+            "chk_obs_source_record_auto_enable": not buffer,
+            "chk_obs_replay_buffer_archive": buffer,
+            "chk_obs_replay_buffer_archive_down_only": True,
+            "chk_obs_potm_archive": True, "chk_potm_enabled": True,
+            "chk_obs_auto_replay": True, "chk_obs_auto_replay_kd": True,
+            "chk_obs_auto_replay_tko": True, "chk_obs_auto_replay_source_fallback": False,
+            "chk_obs_highlight_kd": True, "chk_obs_highlight_tko": True,
+            "chk_obs_highlight_stun": False, "chk_obs_highlight_counter": False,
+            "chk_obs_highlight_combo": False, "chk_obs_highlight_heavy": False,
+        }
+
+    def _apply_replay_simple_setup(self) -> None:
+        source = str(self.cmb_replay_simple_mode.currentData())
+        if not self.le_obs_source_record_archive.text().strip():
+            QMessageBox.warning(self, "리플레이 간편 설정", "먼저 선수별 저장 폴더를 선택하세요.")
+            return
+        for name, value in self._replay_simple_preset(source).items():
+            getattr(self, name).setChecked(value)
+        for combo in (self.cmb_obs_auto_replay_source, self.cmb_potm_source):
+            combo.setCurrentIndex(combo.findData(source))
+        self.apply_only(silent=True)
+        text = ("방송 화면 저장 설정 완료. KD·POTM 모두 기본 버퍼를 사용합니다.\n"
+                "OBS 장면에 타이머가 보이는지 확인한 뒤 저장 테스트를 누르세요."
+                if source == "replay_buffer" else
+                "게임 화면 저장 설정 완료. KD·POTM 모두 Source Record를 사용합니다.\n"
+                "Source Record 마법사로 대상과 수신 폴더를 준비한 뒤 저장 테스트를 누르세요.")
+        self.lbl_replay_simple_status.setText(text)
+
+    def _test_replay_simple_setup(self) -> None:
+        source = str(self.cmb_replay_simple_mode.currentData())
+        if self.cmb_obs_auto_replay_source.currentData() != source or self.cmb_potm_source.currentData() != source:
+            QMessageBox.warning(self, "저장 테스트", "먼저 ‘선택한 방식으로 설정’을 눌러 KD와 POTM 방식을 맞춰주세요.")
+            return
+        self.apply_only(silent=True)
+        if source == "source_record":
+            self._test_obs_source_record_from_settings()
+            return
+        if not callable(self._obs_replay_setup_test):
+            QMessageBox.warning(self, "저장 테스트", "버퍼 저장 테스트 기능을 찾지 못했습니다.")
+            return
+        result = self._obs_replay_setup_test(True)
+        if result.get("error"):
+            QMessageBox.warning(self, "저장 테스트", str(result["error"]))
+            return
+        self.btn_replay_simple_test.setEnabled(False)
+        self._replay_simple_test_started = time.monotonic()
+        self.lbl_replay_simple_status.setText("버퍼를 준비하고 10초 후 저장합니다. OBS 화면을 움직이고 타이머를 보이게 해주세요.")
+        QTimer.singleShot(500, self._poll_replay_simple_test)
+
+    def _poll_replay_simple_test(self) -> None:
+        result = self._obs_replay_setup_test(False)
+        path = str(result.get("path") or "")
+        error = str(result.get("error") or "")
+        if path or error or time.monotonic() - self._replay_simple_test_started >= 45:
+            self.btn_replay_simple_test.setEnabled(True)
+            if path:
+                self.lbl_replay_simple_status.setText("테스트 저장 완료: " + path)
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                QMessageBox.information(self, "저장 테스트 완료", "저장한 영상을 열었습니다. 타이머·오버레이와 소리가 들어 있는지 확인하세요.\n없다면 OBS 녹화 장면의 소스 구성을 확인해야 합니다.\n\n" + path)
+            else:
+                error = error or "저장 응답이 없습니다. OBS 연결 및 출력 설정의 리플레이 버퍼 사용을 확인하세요."
+                self.lbl_replay_simple_status.setText(error)
+                QMessageBox.warning(self, "저장 테스트", error)
+            return
+        QTimer.singleShot(500, self._poll_replay_simple_test)
 
     def _test_obs_source_record_from_settings(self) -> None:
         target = str(self.le_obs_source_record_context.text() or "").strip()
@@ -10549,6 +10679,7 @@ class SettingsDialog(QDialog):
         self.chk_obs_source_record_clear_incoming.setChecked(bool(getattr(self.cfg, "obs_source_record_clear_incoming_on_stream_stop", True)))
         self.chk_obs_replay_buffer_archive.setChecked(bool(getattr(self.cfg, "obs_replay_buffer_archive_enabled", False)))
         self.chk_obs_replay_buffer_archive_down_only.setChecked(bool(getattr(self.cfg, "obs_replay_buffer_archive_down_only", True)))
+        self.chk_obs_potm_archive.setChecked(bool(getattr(self.cfg, "obs_potm_archive_enabled", False)))
         self.chk_potm_enabled.setChecked(bool(getattr(self.cfg, "potm_enabled", False)))
         self.cmb_potm_source.setCurrentIndex(max(0, self.cmb_potm_source.findData(str(getattr(self.cfg, "potm_capture_source", "source_record") or "source_record"))))
         self.sp_potm_min_score.setValue(int(getattr(self.cfg, "potm_min_score", 45) or 45))
@@ -10793,8 +10924,11 @@ class SettingsDialog(QDialog):
                 0x74,  # VK_F5
                 title,
                 activate=True,
-                restore_previous=True,
-                minimize_target_after=True,
+                # This button checks key transmission, not start confirmation.
+                # Do not pull focus away while the native tool consumes F5.
+                restore_previous=False,
+                minimize_target_after=False,
+                input_method="keybd_event",
             )
             logging.info("LOBBY_AUTO_START_F5_TEST ok=%s %s", ok, detail)
             DIAG.record(
@@ -19322,6 +19456,7 @@ class SettingsDialog(QDialog):
             self.cfg.obs_source_record_clear_incoming_on_stream_stop = bool(self.chk_obs_source_record_clear_incoming.isChecked())
             self.cfg.obs_replay_buffer_archive_enabled = bool(self.chk_obs_replay_buffer_archive.isChecked())
             self.cfg.obs_replay_buffer_archive_down_only = bool(self.chk_obs_replay_buffer_archive_down_only.isChecked())
+            self.cfg.obs_potm_archive_enabled = bool(self.chk_obs_potm_archive.isChecked())
             self.cfg.potm_enabled = bool(self.chk_potm_enabled.isChecked())
             self.cfg.potm_capture_source = str(self.cmb_potm_source.currentData() or "source_record")
             self.cfg.potm_min_score = int(self.sp_potm_min_score.value())
@@ -20453,6 +20588,9 @@ class MainApp(QObject):
         self._action_last_run: Dict[str, float] = {}
         self._lobby_auto_start_lock = threading.Lock()
         self._lobby_auto_start_last_at = 0.0
+        self._lobby_auto_start_input_method = "keybd_event"
+        self._lobby_auto_start_window_lock = threading.Lock()
+        self._lobby_auto_start_window_pending = None
         self._lobby_post_match_kick_lock = threading.Lock()
         self._lobby_post_match_kick_last_session_id = ""
         self._lobby_restore_hwnd_by_session: Dict[str, int] = {}
@@ -23843,6 +23981,7 @@ class MainApp(QObject):
                 obs_source_record_diagnose=self._diagnose_obs_source_record,
                 obs_source_record_diagnostic_getter=self._obs_source_record_diagnostic_status,
                 obs_source_record_test=self._test_obs_source_record,
+                obs_replay_setup_test=self._test_replay_buffer_setup,
                 obs_source_record_configure=self._configure_obs_source_record,
                 idle_highlight_refresh=self._sync_idle_highlight_playlist,
                 potm_test=self._test_potm_presentation,
@@ -24080,6 +24219,49 @@ class MainApp(QObject):
             ),
         )
 
+    def _test_replay_buffer_setup(self, start: bool = False) -> dict:
+        if not start:
+            return dict(getattr(self, "_replay_setup_test_result", {}) or {})
+        integration = getattr(self, "obs_integration", None)
+        if integration is None or integration.status != "connected":
+            return {"error": "먼저 OBS 연결 테스트로 ‘연결됨’을 확인하세요."}
+        if not bool(getattr(self.cfg, "obs_replay_buffer_enabled", False)):
+            return {"error": "먼저 ‘방송 화면 그대로’ 방식으로 설정하세요."}
+        test_id = uuid.uuid4().hex
+        self._replay_setup_test_result = {"id": test_id}
+        integration.reconfigure(self.cfg)
+        integration.ensure_replay_buffer()
+        def _save():
+            if (getattr(self, "_replay_setup_test_result", {}) or {}).get("id") != test_id:
+                return
+            if integration.status != "connected":
+                self._replay_setup_test_result = {"id": test_id, "error": "OBS 연결이 끊겨 테스트를 저장하지 못했습니다."}
+                return
+            integration.save_replay("manual_setup_test", context={"replay_setup_test_id": test_id})
+        QTimer.singleShot(10000, _save)
+        return dict(self._replay_setup_test_result)
+
+    def _receive_replay_setup_test(self, path: str, test_id: str) -> None:
+        if test_id != (getattr(self, "_replay_setup_test_result", {}) or {}).get("id"):
+            return
+        source = os.path.abspath(str(path or ""))
+        if not os.path.isfile(source):
+            self._replay_setup_test_result = {"id": test_id, "error": "OBS는 저장했지만 타이머에서 파일에 접근할 수 없습니다. OBS가 다른 컴퓨터라면 접근 가능한 공유 저장 경로를 설정하세요."}
+            return
+        archive = normalize_app_path(str(getattr(self.cfg, "obs_source_record_archive_dir", "") or "Highlights"))
+        def _copy():
+            try:
+                folder = os.path.join(archive, "_test")
+                os.makedirs(folder, exist_ok=True)
+                target = os.path.join(folder, "방송화면_저장테스트_" + test_id[:8] + os.path.splitext(source)[1])
+                shutil.copy2(source, target)
+                if test_id == (getattr(self, "_replay_setup_test_result", {}) or {}).get("id"):
+                    self._replay_setup_test_result = {"id": test_id, "path": target}
+            except Exception as exc:
+                logging.exception("REPLAY_SETUP_TEST_COPY_FAIL")
+                self._replay_setup_test_result = {"id": test_id, "error": "테스트 파일 복사 실패: " + str(exc)}
+        threading.Thread(target=_copy, daemon=True, name="ReplaySetupTestCopy").start()
+
     def _configure_obs_source_record(self, target: str, incoming: str, create: bool) -> None:
         integration = getattr(self, "obs_integration", None)
         if integration is None:
@@ -24312,6 +24494,9 @@ class MainApp(QObject):
                 replay_path = str(event.get("path") or "").strip()
                 replay_reason = str(event.get("reason") or "").strip()
                 replay_context = dict(event.get("context") or {})
+                if replay_context.get("replay_setup_test_id"):
+                    self._receive_replay_setup_test(replay_path, str(replay_context["replay_setup_test_id"]))
+                    continue
                 logging.info(
                     "OBS_REPLAY_FILE_SAVED path=%s reason=%s auto_kind=%s",
                     replay_path,
@@ -24321,7 +24506,7 @@ class MainApp(QObject):
                 self._handle_program_auto_replay_file(replay_path, replay_reason, replay_context)
                 self._copy_program_replay_to_player_archive(replay_path, replay_reason, replay_context)
                 if replay_context.get("potm_candidate_id"):
-                    self._register_potm_file(replay_path, str(replay_context.get("potm_candidate_id") or ""))
+                    self._register_potm_file(replay_path, str(replay_context.get("potm_candidate_id") or ""), capture_source="replay_buffer")
             elif kind == "replay_buffer_status":
                 if not bool(event.get("ok", False)):
                     self._obs_status_detail = str(event.get("message") or "리플레이 버퍼 상태 확인 실패")
@@ -24669,6 +24854,40 @@ class MainApp(QObject):
 
         threading.Thread(target=_copy, daemon=True, name="ObsReplayArchiveCopy").start()
 
+    def _archive_final_potm(self, candidate: dict) -> None:
+        if (not bool(getattr(self.cfg, "obs_potm_archive_enabled", False))
+                or bool(getattr(self, "_potm_rehearsal_active", False))):
+            return
+        source = str(candidate.get("file") or "")
+        if not source or not os.path.isfile(source) or not candidate.get("id"):
+            return
+        archive = normalize_app_path(str(getattr(self.cfg, "obs_source_record_archive_dir", "") or "Highlights"))
+        names = dict(getattr(self, "_source_record_names", {}) or {})
+        nickname = self._source_record_safe_name(str(candidate.get("nickname") or names.get(candidate.get("side")) or ""), "UNKNOWN")
+        candidate_id = self._source_record_safe_name(str(candidate["id"]), "POTM")
+        target_dir = os.path.join(archive, nickname, "POTM")
+        # A stable candidate ID makes repeated calls/resume idempotent.
+        target = os.path.join(target_dir, f"POTM_R{int(candidate.get('round') or 0)}_{candidate_id}" + os.path.splitext(source)[1])
+        def _copy():
+            temp = target + "." + uuid.uuid4().hex + ".tmp"
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                if os.path.isfile(target):
+                    return
+                shutil.copy2(source, temp)
+                os.replace(temp, target)
+                logging.info("POTM_FINAL_ARCHIVE_OK source=%s target=%s", source, target)
+                self._prune_source_record_archive()
+            except Exception:
+                logging.exception("POTM_FINAL_ARCHIVE_FAIL source=%s target=%s", source, target)
+            finally:
+                try:
+                    if os.path.isfile(temp):
+                        os.remove(temp)
+                except OSError:
+                    pass
+        threading.Thread(target=_copy, daemon=True, name="PotmFinalArchiveCopy").start()
+
     def _reset_potm_match(self) -> None:
         self._stop_potm_replay_audio()
         old = dict(getattr(self, "_potm_best", {}) or {})
@@ -24838,6 +25057,8 @@ class MainApp(QObject):
             )
             return None
         previous = dict(self._potm_best or {})
+        candidate["capture_source"] = str(getattr(self.cfg, "potm_capture_source", "source_record") or "source_record")
+        candidate["nickname"] = str(dict(getattr(self, "_source_record_names", {}) or {}).get(candidate.get("side")) or candidate.get("side") or "UNKNOWN")
         self._potm_best = candidate
         self._persist_potm_candidate()
         logging.info(
@@ -24900,13 +25121,17 @@ class MainApp(QObject):
                     except OSError: pass
         threading.Thread(target=_worker, daemon=True, name="PotmAnnouncementPrewarm").start()
 
-    def _register_potm_file(self, path: str, candidate_id: str, *, managed: bool = False) -> None:
-        if not path or candidate_id != str((self._potm_best or {}).get("id") or ""):
+    def _register_potm_file(self, path: str, candidate_id: str, *, managed: bool = False, capture_source: str) -> None:
+        expected = str((self._potm_best or {}).get("capture_source") or getattr(self.cfg, "potm_capture_source", "source_record"))
+        if not path or candidate_id != str((self._potm_best or {}).get("id") or "") or capture_source != expected:
             try:
                 if managed and path and os.path.isfile(path): os.remove(path)
             except OSError: pass
             return
+        if self._potm_played:
+            return  # Never swap the selected file after the presentation starts.
         self._potm_best["file"] = path
+        self._potm_best["file_source"] = capture_source
         self._potm_best["managed"] = bool(managed)
         self._persist_potm_candidate()
         logging.info("POTM_CANDIDATE_FILE_READY score=%s path=%s", self._potm_best.get("score"), path)
@@ -24974,6 +25199,7 @@ class MainApp(QObject):
         if not path or not os.path.isfile(path):
             return
         self._potm_played = True
+        self._archive_final_potm(dict(self._potm_best or {}))
         generation = self._potm_play_generation
         # Count the configured extra delay after the decisive round report has
         # visibly finished, never from the later full-match report event.
@@ -25584,6 +25810,7 @@ class MainApp(QObject):
                         target,
                         str(meta.get("potm_candidate_id") or ""),
                         managed=potm_managed,
+                        capture_source="source_record",
                     )
                 else:
                     self._prune_source_record_archive()
@@ -26935,6 +27162,7 @@ class MainApp(QObject):
                 obs_source_record_diagnose=self._diagnose_obs_source_record,
                 obs_source_record_diagnostic_getter=self._obs_source_record_diagnostic_status,
                 obs_source_record_test=self._test_obs_source_record,
+                obs_replay_setup_test=self._test_replay_buffer_setup,
                 obs_source_record_configure=self._configure_obs_source_record,
                 idle_highlight_refresh=self._sync_idle_highlight_playlist,
                 potm_test=self._test_potm_presentation,
@@ -27474,27 +27702,48 @@ class MainApp(QObject):
     @staticmethod
     def _browser_vs_gate_action(has_blue: bool, has_red: bool, waited: float, round_state: str) -> str:
         state = str(round_state or "").lower()
-        if state in ("fight", "break", "results", "end", "knockout", "disqualified"):
+        if state in ("fight", "break", "knockdown", "foul", "results", "end", "knockout", "disqualified", "cancel"):
             return "skip"
-        if (has_blue and has_red) or waited >= 12.0:
+        if state == "intro" and has_blue and has_red:
             return "show"
         return "wait"
 
-    def _expire_pending_browser_vs_intro(self, started: float) -> None:
-        if getattr(self, "_browser_vs_pending_since", None) != started:
-            return
+    def _update_pending_browser_vs_intro(self, d: dict) -> None:
         overlay = getattr(self, "browser_overlay", None)
         if overlay is None:
             return
-        state = str(overlay.snapshot().get("roundState") or "")
-        if self._browser_vs_gate_action(False, False, 12.0, state) == "show":
-            blue = bool(overlay.image_path("blue"))
-            red = bool(overlay.image_path("red"))
+        if "vs_intro_event" in d:
+            source = d.get("vs_intro_event")
+            if isinstance(source, dict) and source.get("source") == "settings_test":
+                # The manual layout test intentionally works without a live bout.
+                self._browser_vs_pending_since = None
+                overlay.push_event("vs")
+                return
+            self._browser_vs_pending_since = time.monotonic()
+        started = getattr(self, "_browser_vs_pending_since", None)
+        if started is None:
+            return
+        state = str(d.get("spectator_round_state") or overlay.snapshot().get("roundState") or "").lower()
+        watcher = getattr(self, "spectator_watcher", None)
+        locked = getattr(watcher, "_portrait_locked", {})
+        # Profile images or the prior match's browser images do not prove that
+        # the current official portraits have arrived. The watcher locks a side
+        # only after decoding its fresh PNG; the file-age guard rejects leftovers.
+        ready = {
+            side: bool(locked.get(side, False))
+            and bool(self._log_portrait_path_for_side(side))
+            and bool(overlay.image_path(side))
+            for side in ("blue", "red")
+        }
+        waited = max(0.0, time.monotonic() - started)
+        action = self._browser_vs_gate_action(ready["blue"], ready["red"], waited, state)
+        if action == "show":
+            self._browser_vs_pending_since = None
             overlay.push_event("vs")
-            logging.info("BROWSER_VS_SHOW blue_portrait=%s red_portrait=%s waited=12.00s fallback=1", blue, red)
-        else:
-            logging.warning("BROWSER_VS_SKIP_PORTRAITS_NOT_READY state=%s waited=12.00s", state)
-        self._browser_vs_pending_since = None
+            logging.info("BROWSER_VS_SHOW blue_portrait=True red_portrait=True waited=%.2fs", waited)
+        elif action == "skip":
+            self._browser_vs_pending_since = None
+            logging.info("BROWSER_VS_SKIP_AFTER_INTRO state=%s waited=%.2fs", state, waited)
 
     def _apply_browser_overlay_direct_update(self, d: dict, *, skip_effect_push: bool = False):
         try:
@@ -28079,40 +28328,7 @@ class MainApp(QObject):
             if "round_intro_event" in d and bool(getattr(self.cfg, "overlay_show_round", True)):
                 ev = dict(d.get("round_intro_event") or {})
                 overlay.push_event("round_intro", round=ev.get("round", ""))
-            if "vs_intro_event" in d:
-                # The game writes name.txt at MatchIntro, but portrait.png can
-                # arrive several seconds later.  Keep the chapter/voice event
-                # immediate while waiting to show the visual VS card with faces.
-                vs_source = d.get("vs_intro_event")
-                self._browser_vs_pending_since = (
-                    time.monotonic() - 12.0
-                    if isinstance(vs_source, dict) and vs_source.get("source") == "settings_test"
-                    else time.monotonic()
-                )
-                if not (isinstance(vs_source, dict) and vs_source.get("source") == "settings_test"):
-                    started = self._browser_vs_pending_since
-                    QTimer.singleShot(12000, lambda s=started: self._expire_pending_browser_vs_intro(s))
-            vs_pending_since = getattr(self, "_browser_vs_pending_since", None)
-            if vs_pending_since is not None:
-                has_blue = bool(overlay.image_path("blue"))
-                has_red = bool(overlay.image_path("red"))
-                waited = max(0.0, time.monotonic() - vs_pending_since)
-                round_state = str(d.get("spectator_round_state") or "").lower()
-                action = self._browser_vs_gate_action(has_blue, has_red, waited, round_state)
-                if action == "show":
-                    overlay.push_event("vs")
-                    self._browser_vs_pending_since = None
-                    logging.info(
-                        "BROWSER_VS_SHOW blue_portrait=%s red_portrait=%s waited=%.2fs",
-                        has_blue, has_red, waited,
-                    )
-                elif action == "skip":
-                    # Never cover live boxing with a late full-screen intro.
-                    self._browser_vs_pending_since = None
-                    logging.warning(
-                        "BROWSER_VS_SKIP_PORTRAITS_NOT_READY state=%s waited=%.2fs",
-                        round_state, waited,
-                    )
+            self._update_pending_browser_vs_intro(d)
             if bool(d.get("spectator_round_report_hide")):
                 try:
                     overlay.push_event("round_report_hide")
@@ -28378,15 +28594,113 @@ class MainApp(QObject):
         except Exception:
             logging.exception("BROWSER_OVERLAY_DIRECT_UPDATE_FAIL")
 
-    def _schedule_lobby_auto_start_click(self, payload: Optional[dict] = None) -> None:
+    def _lobby_auto_start_context(self, players: List[str]) -> str:
+        """Read actual game state, never the presentation/idle-video latch."""
+        watcher = getattr(self, "spectator_watcher", None)
+        if watcher is None or not hasattr(watcher, "_read_text"):
+            return "waiting"
+        root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
+        state = watcher._normalize_round_state(watcher._read_text(os.path.join(root, "match", "round_state.txt")))
+        if not state:
+            return "waiting"
+        if state in ("intro", "fight", "break", "knockdown", "foul"):
+            return "started"
         if not bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)):
+            return "cancelled"
+        lobby = watcher._read_lobby_info(root)
+        if not lobby:
+            # A non-atomic rewrite is neither a start confirmation nor permission to send F5.
+            return "waiting"
+        fighters = SpectatorLogWatcher._lobby_fighter_slots(lobby)
+        names = [str(slot.get("name") or "").casefold() for slot in fighters]
+        if players and names != [str(name).casefold() for name in players]:
+            return "cancelled"
+        if len(fighters) != 2 or not all(bool(slot.get("ready", False)) for slot in fighters):
+            return "cancelled"
+        return "ready"
+
+    def _complete_lobby_auto_start_window(self, request_id: str) -> None:
+        """One-shot window cleanup, including starts confirmed after F5 times out."""
+        lock = getattr(self, "_lobby_auto_start_window_lock", None)
+        if lock is None or not lock.acquire(blocking=False):
+            return
+        try:
+            pending = getattr(self, "_lobby_auto_start_window_pending", None)
+            if not pending or pending["request_id"] != request_id:
+                return
+            self._lobby_auto_start_window_pending = None
+            self._lobby_focus_guard_session = ""
+            self._lobby_window_restore_pending_session = ""
+            if os.name != "nt":
+                return
+            time.sleep(0.35)
+            if pending["minimize"] and bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False)):
+                try:
+                    minimized, hwnd = False, 0
+                    for _ in range(2):
+                        hwnd = int(_find_window_by_title_contains(pending["title"]) or pending["target"])
+                        if not hwnd:
+                            break
+                        ctypes.windll.user32.ShowWindow(wintypes.HWND(hwnd), 6)
+                        time.sleep(0.15)
+                        minimized = bool(ctypes.windll.user32.IsIconic(wintypes.HWND(hwnd)))
+                        if minimized:
+                            break
+                    logging.info("LOBBY_AUTO_START_WINDOW_MINIMIZE target=%s minimized=%s confirmed=True", hwnd, minimized)
+                    DIAG.record("lobby_auto_start_window_minimized", target=hwnd, minimized=minimized)
+                except Exception:
+                    logging.exception("LOBBY_AUTO_START_WINDOW_MINIMIZE_FAIL")
+            previous = pending["previous"]
+            if pending["restore"] and previous and previous != pending["target"]:
+                try:
+                    restored, detail = _activate_window_reliably(previous, restore=True)
+                    logging.info("LOBBY_AUTO_START_WINDOW_RESTORE target=%s restored=%s detail=%s", previous, restored, detail)
+                except Exception:
+                    logging.exception("LOBBY_AUTO_START_WINDOW_RESTORE_FAIL")
+        finally:
+            lock.release()
+
+    def _observe_lobby_auto_start_window(self, update: dict) -> None:
+        pending = getattr(self, "_lobby_auto_start_window_pending", None)
+        if not pending:
+            return
+        if time.monotonic() > pending["until"] or not bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)):
+            self._lobby_auto_start_window_pending = None
+            logging.info("LOBBY_AUTO_START_WINDOW_PENDING_CANCEL reason=expired_or_disabled")
+            return
+        if str(update.get("spectator_round_state") or "").lower() not in ("intro", "fight"):
+            return
+        watcher = getattr(self, "spectator_watcher", None)
+        names = [str(watcher._side_raw_name(side) or "").strip().casefold() for side in ("blue", "red")]
+        if not all(names):
+            return  # Player files may still be rewritten during MatchIntro.
+        if sorted(names) != sorted(str(name).strip().casefold() for name in pending["players"]):
+            self._lobby_auto_start_window_pending = None
+            logging.info("LOBBY_AUTO_START_WINDOW_PENDING_CANCEL reason=different_players")
+            return
+        logging.info("LOBBY_AUTO_START_WINDOW_LATE_CONFIRM request=%s", pending["request_id"])
+        threading.Thread(
+            target=lambda: self._complete_lobby_auto_start_window(pending["request_id"]),
+            daemon=True, name="lobby-start-window",
+        ).start()
+
+    def _schedule_lobby_auto_start_click(self, payload: Optional[dict] = None) -> None:
+        request_id = str((payload or {}).get("requestId") or "")
+        watcher = getattr(self, "spectator_watcher", None)
+
+        def _ack(ok: bool) -> None:
+            if watcher is not None and hasattr(watcher, "lobby_auto_start_finished"):
+                watcher.lobby_auto_start_finished(request_id, ok)
+
+        if not bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)):
+            _ack(False)
             return
         title = str(getattr(self.cfg, "spectator_lobby_auto_start_target_title", "") or "").strip()
         mode = str(getattr(self.cfg, "spectator_lobby_auto_start_mode", "f5") or "f5").strip().lower()
         # A previous UI version persisted ``click`` even after the operator
         # switched the workflow to F5.  Treat that stale value as F5-only so
         # automatic start can never move the mouse unexpectedly.
-        if mode == "click":
+        if mode in ("click", "f5_then_click"):
             mode = "f5"
         if mode not in ("click", "f5", "f5_then_click"):
             mode = "f5"
@@ -28396,17 +28710,21 @@ class MainApp(QObject):
         reference_height = int(getattr(self.cfg, "spectator_lobby_auto_start_reference_height", 0) or 0)
         if not title:
             logging.warning("LOBBY_AUTO_START_SKIP reason=empty_window_title")
+            _ack(False)
             return
         if mode in ("click", "f5_then_click") and x == 0 and y == 0:
             logging.warning("LOBBY_AUTO_START_SKIP reason=unset_client_point")
+            _ack(False)
             return
         now = time.monotonic()
         if now - float(getattr(self, "_lobby_auto_start_last_at", 0.0) or 0.0) < 2.0:
             logging.info("LOBBY_AUTO_START_SKIP reason=cooldown")
+            _ack(False)
             return
         lock = getattr(self, "_lobby_auto_start_lock", None)
         if lock is None or not lock.acquire(blocking=False):
             logging.info("LOBBY_AUTO_START_SKIP reason=busy")
+            _ack(False)
             return
         self._lobby_auto_start_last_at = now
         delay_ms = max(0, min(5000, int(getattr(self.cfg, "spectator_lobby_auto_start_delay_ms", 300) or 300)))
@@ -28419,6 +28737,8 @@ class MainApp(QObject):
         restore_cursor = bool(getattr(self.cfg, "spectator_lobby_auto_start_restore_cursor", True))
         minimize_target = bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False))
         players = list((payload or {}).get("players") or [])
+        if getattr(self, "_lobby_auto_start_window_lock", None) is None:
+            self._lobby_auto_start_window_lock = threading.Lock()
         logging.info(
             "LOBBY_AUTO_START_SCHEDULE mode=%s delay_ms=%s title=%s client=(%s,%s) players=%s",
             mode,
@@ -28437,6 +28757,7 @@ class MainApp(QObject):
         )
 
         def _worker():
+            confirmed = False
             f5_cleanup_pending = False
             f5_previous_hwnd = 0
             f5_target_hwnd = 0
@@ -28446,16 +28767,17 @@ class MainApp(QObject):
                 if not f5_cleanup_pending or os.name != "nt":
                     return
                 f5_cleanup_pending = False
-                # The spectator tool now owns its fullscreen transition.
-                # Never minimize it immediately after F5, even if an old
-                # click-mode setting still has "minimize target" enabled.
+                if confirmed:
+                    self._complete_lobby_auto_start_window(request_id)
+                    return
                 if (
                     restore_focus
                     and f5_previous_hwnd
                     and f5_previous_hwnd != f5_target_hwnd
                 ):
                     try:
-                        _activate_window_reliably(f5_previous_hwnd, restore=True)
+                        restored, detail = _activate_window_reliably(f5_previous_hwnd, restore=True)
+                        logging.info("LOBBY_AUTO_START_WINDOW_RESTORE target=%s restored=%s detail=%s", f5_previous_hwnd, restored, detail)
                     except Exception:
                         pass
 
@@ -28470,21 +28792,45 @@ class MainApp(QObject):
                             f5_previous_hwnd = 0
                         f5_target_hwnd = int(_find_window_by_title_contains(title) or 0)
                         f5_cleanup_pending = True
-                    before_active = bool(getattr(self, "_match_active", False))
+                        previous_pending = getattr(self, "_lobby_auto_start_window_pending", None)
+                        if (previous_pending and previous_pending["players"] == players
+                                and time.monotonic() <= previous_pending["until"]):
+                            f5_previous_hwnd = previous_pending["previous"]
+                        self._lobby_auto_start_window_pending = {
+                            "request_id": request_id, "players": players,
+                            "until": time.monotonic() + 45.0, "title": title,
+                            "target": f5_target_hwnd, "previous": f5_previous_hwnd,
+                            "minimize": minimize_target, "restore": restore_focus,
+                        }
                     f5_ok, f5_detail = False, ""
                     # The spectator executable has been observed accepting a
                     # scan-code SendInput call at the Win32 API boundary while
                     # ignoring the actual F5 command.  Try distinct keyboard
                     # representations and confirm each one against the live
                     # match state instead of treating API acceptance as start.
-                    f5_methods = ("scan_code", "virtual_key", "keybd_event")
+                    preferred = str(getattr(self, "_lobby_auto_start_input_method", "keybd_event") or "keybd_event")
+                    if preferred not in ("keybd_event", "scan_code", "virtual_key"):
+                        preferred = "keybd_event"
+                    f5_methods = tuple(dict.fromkeys((preferred, "keybd_event", "scan_code", "virtual_key")))
                     for attempt, input_method in enumerate(f5_methods, start=1):
-                        if bool(getattr(self, "_match_active", False)):
+                        context = self._lobby_auto_start_context(players)
+                        ready_deadline = time.monotonic() + 3.0
+                        while context == "waiting" and time.monotonic() < ready_deadline:
+                            time.sleep(0.08)
+                            context = self._lobby_auto_start_context(players)
+                        if context == "started":
+                            confirmed = True
                             detail = f"match active before F5 retry attempt={attempt}"
                             logging.info("LOBBY_AUTO_START_F5_OK %s", detail)
                             DIAG.record("lobby_auto_start_f5_confirmed", detail=detail, title=title)
                             _finish_f5_window()
                             self._lobby_auto_start_result.emit(True, detail)
+                            return
+                        if request_id and request_id != getattr(watcher, "_lobby_auto_start_request_id", ""):
+                            self._lobby_auto_start_result.emit(False, "준비 상태가 변경되어 이전 시작 요청을 중단했습니다.")
+                            return
+                        if context != "ready":
+                            self._lobby_auto_start_result.emit(False, "선수 변경·준비 해제 또는 로그 미확인으로 시작 입력을 중단했습니다.")
                             return
                         f5_ok, f5_detail = press_vk_for_window_title(
                             0x74,  # VK_F5
@@ -28515,7 +28861,10 @@ class MainApp(QObject):
                         if f5_ok:
                             deadline = time.monotonic() + 3.0
                             while time.monotonic() < deadline:
-                                if not before_active and bool(getattr(self, "_match_active", False)):
+                                context = self._lobby_auto_start_context(players)
+                                if context == "started":
+                                    confirmed = True
+                                    self._lobby_auto_start_input_method = input_method
                                     detail = (
                                         f"F5 confirmed attempt={attempt} "
                                         f"method={input_method}: {f5_detail}"
@@ -28529,6 +28878,9 @@ class MainApp(QObject):
                                     )
                                     _finish_f5_window()
                                     self._lobby_auto_start_result.emit(True, detail)
+                                    return
+                                if context == "cancelled":
+                                    self._lobby_auto_start_result.emit(False, "준비 상태가 변경되어 재시도를 중단했습니다.")
                                     return
                                 time.sleep(0.08)
                         if attempt < len(f5_methods):
@@ -28587,11 +28939,12 @@ class MainApp(QObject):
                     lock.release()
                 except Exception:
                     pass
+                _ack(confirmed)
 
         threading.Thread(target=_worker, daemon=True, name="LobbyAutoStartClick").start()
 
     def _handle_lobby_auto_start_result(self, ok: bool, detail: str) -> None:
-        message = ("자동 시작 클릭 성공" if ok else "자동 시작 클릭 실패") + (f": {detail}" if detail else "")
+        message = ("자동 시작 확인" if ok else "자동 시작 미확인") + (f": {detail}" if detail else "")
         try:
             self.timer_win.set_status(message)
         except Exception:
@@ -28655,6 +29008,10 @@ class MainApp(QObject):
         session_id = str(getattr(self, "_lobby_focus_guard_session", "") or "")
         if not session_id:
             return
+        if self._lobby_auto_start_context([]) == "started":
+            self._lobby_focus_guard_session = ""
+            self._lobby_window_restore_pending_session = ""
+            return
         now = time.monotonic()
         if now >= float(getattr(self, "_lobby_focus_guard_until", 0.0) or 0.0):
             logging.info("LOBBY_FOCUS_GUARD_END session=%s reason=deadline", session_id)
@@ -28704,6 +29061,10 @@ class MainApp(QObject):
         """
         session_id = str(getattr(self, "_lobby_window_restore_pending_session", "") or "")
         if not session_id:
+            return
+        if self._lobby_auto_start_context([]) == "started":
+            self._lobby_window_restore_pending_session = ""
+            self._lobby_focus_guard_session = ""
             return
         if not bool(getattr(self.cfg, "spectator_lobby_post_match_kick_enabled", False)):
             self._lobby_window_restore_pending_session = ""
@@ -28916,7 +29277,10 @@ class MainApp(QObject):
                 # during the lobby settle/verification window made K+slot
                 # shortcuts intermittent on slower returns.
                 try:
-                    hwnd = int(_find_window_by_title_contains(title) or 0)
+                    hwnd = (
+                        0 if self._lobby_auto_start_context([]) == "started"
+                        else int(_find_window_by_title_contains(title) or 0)
+                    )
                     final_ok, final_detail = (
                         _activate_window_reliably(hwnd, restore=True)
                         if hwnd
@@ -28934,7 +29298,7 @@ class MainApp(QObject):
                     )
                     reasserted = False
                     reassert_detail = ""
-                    if hwnd and active != hwnd:
+                    if hwnd and active != hwnd and self._lobby_auto_start_context([]) != "started":
                         reasserted, reassert_detail = _activate_window_reliably(hwnd, restore=True)
                     logging.info(
                         "LOBBY_POST_MATCH_WINDOW_LEFT_OPEN session=%s target=%s "
@@ -29019,6 +29383,9 @@ class MainApp(QObject):
         # all other main-thread bookkeeping below. The full browser state still
         # updates later; only its duplicate effect-event push is suppressed.
         played_sfx, early_browser_effects = self._emit_urgent_spectator_effects(d)
+        # F5 input confirmation has a short timeout, but Unity can write the
+        # actual start later. Window cleanup follows that real log independently.
+        self._observe_lobby_auto_start_window(d)
         # Preserve the live player/time state for Source Record's filename.
         # Player fields are intentionally cached because SpectatorLog only
         # emits them on a new match or a player-pair change.

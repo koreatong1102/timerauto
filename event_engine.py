@@ -29,7 +29,7 @@ def counter_opportunity_id(row: dict) -> str:
 
 
 class FightEventEngine:
-    RULE_SCHEMA_VERSION = 8
+    RULE_SCHEMA_VERSION = 9
     COUNTER_MIN_DAMAGE = 25.0
 
     def __init__(self, cfg: Any):
@@ -78,6 +78,7 @@ class FightEventEngine:
             # ruleset identity so archived reports are rebuilt after a change.
             "whiff_clock_direction": "countdown",
             "whiff_log_jitter_sec": 0.10,
+            "whiff_landed_match_policy": "same_hand_when_known",
             "combo_min": self._number(getattr(self.cfg, "event_combo_min_damage", 15.0), 15.0),
             "combo_window": self._number(getattr(self.cfg, "event_combo_window_sec", 0.8), 0.8),
             "combo_break": self._number(getattr(self.cfg, "event_combo_break_damage", 20.0), 20.0),
@@ -145,7 +146,7 @@ class FightEventEngine:
         previous_damage = self._number(previous_attack.get("damage"), 0.0)
         previous_is_opportunity = (
             str(previous_attack.get("receiver") or "") == side
-            and elapsed_from_previous <= counter_window
+            and elapsed_from_previous <= counter_window + 1e-9
         )
         if (
             not inferred_counter

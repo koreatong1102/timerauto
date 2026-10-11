@@ -100,6 +100,7 @@ class SpectatorLogWatcher(QObject):
         self._portrait_locked: Dict[str, bool] = {"blue": False, "red": False}
         self._portrait_lock_name: Dict[str, str] = {"blue": "", "red": ""}
         self._portrait_retry_due: Dict[str, float] = {"blue": 0.0, "red": 0.0}
+        self._portrait_result_check_at: float = 0.0
         # Realtime performance guard: player/name/portrait data is static for a bout.
         # Emit it only on a new pair or new MatchIntro, not on every round_time/camera write.
         self._last_player_payload_pair: Tuple[str, str] = ("", "")
@@ -157,6 +158,13 @@ class SpectatorLogWatcher(QObject):
         self._post_match_lobby_return_armed: bool = False
         self._post_match_lobby_return_session_id: str = ""
         self._lobby_ready_latched: bool = False
+        self._lobby_auto_start_state_lock = threading.RLock()
+        self._lobby_auto_start_ready_key = tuple()
+        self._lobby_auto_start_attempts = 0
+        self._lobby_auto_start_serial = 0
+        self._lobby_auto_start_request_id = ""
+        self._lobby_auto_start_retry_at = 0.0
+        self._lobby_auto_start_deadline = 0.0
         self._last_lobby_rounds: Optional[int] = None
         self._last_lobby_round_duration: Optional[int] = None
         self._last_lobby_break_duration: Optional[int] = None
@@ -274,6 +282,7 @@ class SpectatorLogWatcher(QObject):
         self._sp_head_burst_at: Dict[str, float] = {"blue": 0.0, "red": 0.0}
         self._sp_combo_count: Dict[str, int] = {"blue": 0, "red": 0}
         self._sp_combo_last_throw_at: Dict[str, float] = {"blue": -999.0, "red": -999.0}
+        self._sp_combo_last_round: Dict[str, int] = {"blue": 0, "red": 0}
 
     def start(self):
         if self.is_running():
@@ -548,6 +557,7 @@ class SpectatorLogWatcher(QObject):
         self._portrait_locked = {"blue": False, "red": False}
         self._portrait_lock_name = {"blue": "", "red": ""}
         self._portrait_retry_due = {"blue": 0.0, "red": 0.0}
+        self._portrait_result_check_at = 0.0
         self._image_mtimes.pop("blue", None)
         self._image_mtimes.pop("red", None)
         self._last_signature = tuple()
@@ -795,7 +805,17 @@ class SpectatorLogWatcher(QObject):
                 for side in ("blue", "red")
             )
         )
-        if sync_players and (player_payload_due or portrait_retry_due):
+        # The official tool replaces the intro portraits at winner announcement.
+        # Recheck file mtimes at a bounded rate, including delayed image writes;
+        # the image reader decodes only a changed file and never clears a valid face.
+        portrait_result_due = False
+        if sync_players and pair_ready and time.time() >= self._portrait_result_check_at:
+            if self._normalize_round_state(state_raw) in (
+                "results", "end", "knockout", "disqualified", "cancel",
+            ) and self._current_match_winner_result(winner_path):
+                portrait_result_due = True
+                self._portrait_result_check_at = time.time() + 0.5
+        if sync_players and (player_payload_due or portrait_retry_due or portrait_result_due):
             # portrait.png is reused by filename and can be written a little
             # after name.txt on a new match. Clear the old portrait immediately,
             # then retry only the still-unlocked side until the new file is valid.
@@ -807,9 +827,9 @@ class SpectatorLogWatcher(QObject):
             r_img_path = os.path.join(root, "red", "portrait.png")
             b_img_changed, b_img = (False, None)
             r_img_changed, r_img = (False, None)
-            if not self._portrait_locked.get("blue", False):
+            if not self._portrait_locked.get("blue", False) or portrait_result_due:
                 b_img_changed, b_img = self._read_image_if_changed("blue", b_img_path)
-            if not self._portrait_locked.get("red", False):
+            if not self._portrait_locked.get("red", False) or portrait_result_due:
                 r_img_changed, r_img = self._read_image_if_changed("red", r_img_path)
             if player_payload_due and blue_name_raw:
                 bid, bname, breg, bvalid = self._name_payload(blue_name_raw)
@@ -829,11 +849,11 @@ class SpectatorLogWatcher(QObject):
                     "red_player_valid": rvalid,
                 })
                 out["red_player_img"] = None
-            if b_img_changed and b_img is not None and not self._portrait_locked.get("blue", False):
+            if b_img_changed and b_img is not None:
                 out["blue_player_img"] = b_img
                 self._portrait_locked["blue"] = True
                 self._portrait_retry_due["blue"] = 0.0
-            if r_img_changed and r_img is not None and not self._portrait_locked.get("red", False):
+            if r_img_changed and r_img is not None:
                 out["red_player_img"] = r_img
                 self._portrait_locked["red"] = True
                 self._portrait_retry_due["red"] = 0.0
@@ -904,11 +924,9 @@ class SpectatorLogWatcher(QObject):
                 self._event_engine.reset()
             self._event_engine_round = 0
             self._sp_throw_path = os.path.join(match_dir, "punches_thrown.txt")
-            try:
-                self._sp_throw_offset = int(os.path.getsize(self._sp_throw_path))
-            except Exception:
-                self._sp_throw_offset = 0
-            self._sp_throw_initialized = True
+            self._sp_throw_offset = 0
+            self._sp_throw_initialized = False
+            self._read_new_punches_thrown(self._sp_throw_path)
         if self._is_match_intro_state(state_raw) and pair_ready and not baseline_read:
             if pair_key != self._last_active_match_pair and pair_key != self._last_vs_intro_pair:
                 # The UI only needs a truthy value, but the chapter logger
@@ -1186,7 +1204,7 @@ class SpectatorLogWatcher(QObject):
                         self._post_match_lobby_return_armed = False
                         self._post_match_lobby_return_session_id = ""
                         logging.info("SPECTATORLOG_LOBBY_RETURN_AFTER_MATCH slots=%s", slots)
-                self._apply_lobby_auto_start_edge(lobby_info, out)
+                self._apply_lobby_auto_start_edge(lobby_info, out, state=state)
                 lobby_key = (lobby_sig, tuple((int((x or {}).get("slot", 0) or 0), str((x or {}).get("name") or ""), bool((x or {}).get("ready", False)), bool((x or {}).get("occupied", False))) for x in list(lobby_info.get("slots") or [])))
                 if baseline_read:
                     self._last_lobby_sig = lobby_key
@@ -1927,7 +1945,7 @@ class SpectatorLogWatcher(QObject):
             0.05,
             float(getattr(self.cfg, "event_counter_window_sec", COUNTER_WINDOW_SEC) or COUNTER_WINDOW_SEC),
         )
-        if gap > counter_window:
+        if gap > counter_window + 1e-9:
             return ""
         try:
             dmg = max(0.0, float(ev.get("damage", 0.0) or 0.0))
@@ -2038,10 +2056,10 @@ class SpectatorLogWatcher(QObject):
                     causal_gap = throw_time - hit_time
                 except Exception:
                     continue
-                if -0.10 <= causal_gap <= counter_window:
+                if -0.10 - 1e-9 <= causal_gap <= counter_window + 1e-9:
                     attempt_id = "throw:" + "|".join(
                         str((thrown or {}).get(key, ""))
-                        for key in ("time", "side", "hand", "punch", "raw_line")
+                        for key in ("round", "time", "side", "hand", "punch", "raw_line")
                     )
                     if attempt_id not in consumed_attempts:
                         candidates.append((abs(causal_gap), causal_gap, attempt_id, thrown))
@@ -2054,6 +2072,10 @@ class SpectatorLogWatcher(QObject):
                 if str((previous or {}).get("attacker_side") or "").lower() != opponent:
                     continue
                 if ev.get("round") and previous.get("round") and int(ev["round"]) != int(previous["round"]):
+                    continue
+                attempt_hand = str(attempt.get("hand") or "").strip().lower()
+                impact_hand = str(previous.get("hand") or "").strip().lower()
+                if attempt_hand and impact_hand and attempt_hand != impact_hand:
                     continue
                 try:
                     if abs(float((previous or {}).get("time", 0.0) or 0.0) - attempt_time) <= 0.35:
@@ -2175,13 +2197,19 @@ class SpectatorLogWatcher(QObject):
             with open(path, "rb") as stream:
                 stream.seek(self._sp_throw_offset)
                 raw = stream.read()
-                self._sp_throw_offset = stream.tell()
+                end_offset = stream.tell()
         except Exception:
             return []
         if not self._sp_throw_initialized:
             # Attaching to a running match must not spend historical stamina.
+            # Baseline only complete rows: if the writer is midway through a
+            # row, leave that row for the next poll rather than losing its tail.
+            self._sp_throw_offset = end_offset - len(raw) + raw.rfind(b"\n") + 1
             self._sp_throw_initialized = True
             return []
+        complete_end = raw.rfind(b"\n") + 1
+        self._sp_throw_offset += complete_end
+        raw = raw[:complete_end]
         events: List[dict] = []
         for line in raw.decode("utf-8-sig", errors="ignore").splitlines():
             parts = str(line or "").strip().split("\t")
@@ -2196,6 +2224,7 @@ class SpectatorLogWatcher(QObject):
         self._sp_head_burst_at = {"blue": 0.0, "red": 0.0}
         self._sp_combo_count = {"blue": 0, "red": 0}
         self._sp_combo_last_throw_at = {"blue": -999.0, "red": -999.0}
+        self._sp_combo_last_round = {"blue": 0, "red": 0}
 
     def _update_live_sp_activity(self, match_dir: str, out: Dict[str, Any], state: str = "") -> None:
         costs = {
@@ -2207,14 +2236,18 @@ class SpectatorLogWatcher(QObject):
         changed = False
         for event in self._read_new_punches_thrown(os.path.join(match_dir, "punches_thrown.txt")):
             side = str(event.get("side") or "")
+            if side not in ("blue", "red"):
+                continue
             key, _label = self._punch_report_group(str(event.get("punch") or ""))
-            event_time = float(event.get("time", -999.0) or -999.0)
-            last_time = float(self._sp_combo_last_throw_at.get(side, -999.0) or -999.0)
-            if 0.0 <= event_time - last_time <= 0.85:
+            event_time = float(event.get("time", -999.0))
+            last_time = float(self._sp_combo_last_throw_at.get(side, -999.0))
+            event_round = int(event.get("round", 0) or 0)
+            if event_round == self._sp_combo_last_round.get(side, 0) and abs(event_time - last_time) <= 0.85:
                 self._sp_combo_count[side] = int(self._sp_combo_count.get(side, 0)) + 1
             else:
                 self._sp_combo_count[side] = 1
             self._sp_combo_last_throw_at[side] = event_time
+            self._sp_combo_last_round[side] = event_round
             extra = 0.0
             if int(self._sp_combo_count.get(side, 0)) >= 3:
                 extra = max(0.0, min(2.0, float(getattr(self.cfg, "spectator_sp_combo_extra_pct", 15.0) or 0.0) / 100.0))
@@ -2533,7 +2566,29 @@ class SpectatorLogWatcher(QObject):
             pass
         return info
 
-    def _apply_lobby_auto_start_edge(self, lobby_info: dict, out: Dict[str, Any]) -> bool:
+    @staticmethod
+    def _lobby_fighter_slots(lobby_info: dict) -> List[dict]:
+        return [
+            slot for slot in list((lobby_info or {}).get("slots") or [])
+            if bool((slot or {}).get("occupied", False))
+            and not any(token in str((slot or {}).get("type") or "").lower()
+                        for token in ("spectator", "observer", "camera", "host"))
+        ][:2]
+
+    def lobby_auto_start_finished(self, request_id: str, ok: bool) -> None:
+        """Acknowledge only the current ready request; permit one bounded retry."""
+        with self._lobby_auto_start_state_lock:
+            if not request_id or request_id != self._lobby_auto_start_request_id:
+                return
+            self._lobby_auto_start_deadline = 0.0
+            self._lobby_auto_start_retry_at = (
+                time.monotonic() + 2.0
+                if not ok and self._lobby_auto_start_attempts < 2 else 0.0
+            )
+            logging.info("SPECTATOR_LOBBY_AUTO_START_RESULT request=%s ok=%s attempts=%s retry=%s",
+                         request_id, ok, self._lobby_auto_start_attempts, bool(self._lobby_auto_start_retry_at))
+
+    def _apply_lobby_auto_start_edge(self, lobby_info: dict, out: Dict[str, Any], *, state: str = "") -> bool:
         occupied_slots = [
             slot
             for slot in list((lobby_info or {}).get("slots") or [])
@@ -2541,11 +2596,7 @@ class SpectatorLogWatcher(QObject):
         ]
         # Slot order is not the fighter order: slot 0 is commonly the host
         # spectator. Use PlayerType and exclude observer slots explicitly.
-        spectator_type_tokens = ("spectator", "observer", "camera", "host")
-        player_slots = [
-            slot for slot in occupied_slots
-            if not any(token in str((slot or {}).get("type") or "").strip().lower() for token in spectator_type_tokens)
-        ][:2]
+        player_slots = self._lobby_fighter_slots(lobby_info)
         slots_ready = bool(len(player_slots) == 2 and all(bool((slot or {}).get("ready", False)) for slot in player_slots))
         ready_to_start = slots_ready
         ready_signature = tuple(
@@ -2567,22 +2618,49 @@ class SpectatorLogWatcher(QObject):
                 bool((lobby_info or {}).get("ready_to_start", False)),
                 bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)),
             )
-        if ready_to_start and not self._lobby_ready_latched:
-            self._lobby_ready_latched = True
-            if bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)):
+        with self._lobby_auto_start_state_lock:
+            ready_key = tuple((slot.get("slot"), str(slot.get("name") or "").casefold()) for slot in player_slots)
+            if not ready_to_start or ready_key != self._lobby_auto_start_ready_key:
+                if self._lobby_ready_latched and not ready_to_start:
+                    logging.info("SPECTATOR_LOBBY_AUTO_START_REARM")
+                self._lobby_ready_latched = False
+                self._lobby_auto_start_ready_key = ready_key
+                self._lobby_auto_start_attempts = 0
+                self._lobby_auto_start_request_id = ""
+                self._lobby_auto_start_retry_at = 0.0
+                self._lobby_auto_start_deadline = 0.0
+            if state in ("intro", "fight", "break", "knockdown", "foul"):
+                # A lingering lobby file must never trigger input mid-bout.
+                self._lobby_ready_latched = True
+                self._lobby_auto_start_retry_at = 0.0
+                self._lobby_auto_start_deadline = 0.0
+                return False
+            if not ready_to_start or not bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)):
+                return False
+            now = time.monotonic()
+            retry_due = bool(
+                (self._lobby_auto_start_retry_at and now >= self._lobby_auto_start_retry_at)
+                or (self._lobby_auto_start_deadline and now >= self._lobby_auto_start_deadline)
+            )
+            if (not self._lobby_ready_latched or retry_due) and self._lobby_auto_start_attempts < 2:
+                self._lobby_ready_latched = True
+                self._lobby_auto_start_attempts += 1
+                self._lobby_auto_start_serial += 1
+                self._lobby_auto_start_request_id = f"lobby-start-{self._lobby_auto_start_serial}"
+                self._lobby_auto_start_retry_at = 0.0
+                # Recover a dropped/busy UI request too, without an endless loop.
+                self._lobby_auto_start_deadline = now + 30.0
                 out["spectator_lobby_auto_start"] = {
                     "ready_to_start": True,
                     "players": [str((slot or {}).get("name") or "") for slot in player_slots],
+                    "requestId": self._lobby_auto_start_request_id,
+                    "attempt": self._lobby_auto_start_attempts,
                 }
                 logging.info(
                     "SPECTATOR_LOBBY_AUTO_START_EDGE players=%s",
                     [str((slot or {}).get("name") or "") for slot in player_slots],
                 )
                 return True
-        elif not ready_to_start:
-            if self._lobby_ready_latched:
-                logging.info("SPECTATOR_LOBBY_AUTO_START_REARM")
-            self._lobby_ready_latched = False
         return False
 
     def _remember_lobby_settings(self, lobby: dict) -> None:
@@ -6539,7 +6617,8 @@ class SpectatorLogWatcher(QObject):
             "weak": {},
             "events": 0,
             # Numeric events remains the compatibility counter above.  Keep the
-            # actual matched rows separately for combo/impact metrics.
+            # combat rows separately for combo/impact metrics. Archive-backed
+            # reports include unmatched rows here; accuracy uses its own matches.
             "event_rows": [],
             "gauge_start": {},
             "gauge_end": {},
@@ -6567,7 +6646,7 @@ class SpectatorLogWatcher(QObject):
                 for key in (
                     "_central_event", "event_primary", "event_tags", "combo_hits",
                     "combo_damage", "counter_reason", "official_counter",
-                    "inferred_counter", "event_id",
+                    "inferred_counter", "counter_opportunity_id", "event_id",
                 ):
                     event.pop(key, None)
                 try:
@@ -6624,7 +6703,7 @@ class SpectatorLogWatcher(QObject):
                 for key in (
                     "_central_event", "event_primary", "event_tags", "combo_hits",
                     "combo_damage", "counter_reason", "official_counter",
-                    "inferred_counter",
+                    "inferred_counter", "counter_opportunity_id",
                 ):
                     event.pop(key, None)
                 try:
@@ -6726,31 +6805,23 @@ class SpectatorLogWatcher(QObject):
                 )
                 item["count"] += 1
 
-            for match in list(matched.get("matches") or []):
-                event = dict(match.get("event") or {})
+            # Throw matching is an accuracy constraint, not a filter for the
+            # durable combat facts. A missing/mistimed throw must not erase a
+            # central counter/combo verdict or a zero-damage punishment KD.
+            for event in damage_events:
                 attacker = str(event.get("attacker_side") or "").lower()
                 receiver = str(event.get("receiver_side") or "").lower()
                 punch = str(event.get("punch") or "").strip().lower()
-                if attacker not in ("blue", "red") or receiver not in ("blue", "red") or punch in ("pull", "other"):
+                if attacker not in ("blue", "red") or receiver not in ("blue", "red"):
                     continue
                 damage = max(0.0, float(event.get("damage", 0.0) or 0.0))
-                landed = damage >= REPORT_LANDED_MIN_DAMAGE
                 stats["events"] += 1
                 stats["event_rows"].append(event)
                 stats["dealt"][attacker] += damage
-                if not landed:
-                    continue
-                stats["landed"][attacker] += 1
-                stats["hits"][attacker] += 1
                 if damage >= 45.0:
                     stats["bigs"][attacker] += 1
                 key, label = self._punch_report_group(str(event.get("punch") or ""))
-                item = stats["punches"][attacker].setdefault(
-                    key, {"label": label, "count": 0, "damage": 0.0}
-                )
-                item["count"] += 1
-                item["damage"] += damage
-                if damage > float(dict(stats["max_punch"].get(attacker) or {}).get("damage", 0.0) or 0.0):
+                if punch not in ("pull", "other") and damage > float(dict(stats["max_punch"].get(attacker) or {}).get("damage", 0.0) or 0.0):
                     stats["max_punch"][attacker] = {"key": key, "label": label, "damage": damage}
                 if self._is_counter_event(event):
                     stats["counters_for"][attacker] += 1
@@ -6763,7 +6834,7 @@ class SpectatorLogWatcher(QObject):
                 elif effect == "tko":
                     stats["tkos_for"][attacker] += 1
                 weak = self._weak_point_ko(str(event.get("weak_point") or ""))
-                if weak:
+                if weak and punch not in ("pull", "other") and damage >= REPORT_LANDED_MIN_DAMAGE:
                     weak_key = f"{receiver}:{weak}"
                     weak_item = stats["weak"].setdefault(
                         weak_key, {"receiver": receiver, "weak": weak, "count": 0, "damage": 0.0}
@@ -6775,6 +6846,24 @@ class SpectatorLogWatcher(QObject):
                     )
                     received["count"] += 1
                     received["damage"] += damage
+            for match in list(matched.get("matches") or []):
+                event = dict(match.get("event") or {})
+                attacker = str(event.get("attacker_side") or "").lower()
+                receiver = str(event.get("receiver_side") or "").lower()
+                punch = str(event.get("punch") or "").strip().lower()
+                if attacker not in ("blue", "red") or receiver not in ("blue", "red") or punch in ("pull", "other"):
+                    continue
+                damage = max(0.0, float(event.get("damage", 0.0) or 0.0))
+                if damage < REPORT_LANDED_MIN_DAMAGE:
+                    continue
+                stats["landed"][attacker] += 1
+                stats["hits"][attacker] += 1
+                key, label = self._punch_report_group(str(event.get("punch") or ""))
+                item = stats["punches"][attacker].setdefault(
+                    key, {"label": label, "count": 0, "damage": 0.0}
+                )
+                item["count"] += 1
+                item["damage"] += damage
             rounds[round_no] = stats
         if rounds:
             logging.info("SPECTATORLOG_REPORT_ARCHIVE_SOURCE rounds=%s", sorted(rounds))

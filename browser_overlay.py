@@ -288,7 +288,8 @@ class BrowserOverlayServer:
                             browser_ms = str((qs.get("browserMs") or [""])[0] or "")[:40]
                             push_ms = str((qs.get("pushMs") or [""])[0] or "")[:40]
                             try:
-                                DIAG.record("browser_overlay_beacon", event=event, key=key, seq=seq, browserMs=browser_ms, pushMs=push_ms)
+                                details = {name: str((qs.get(name) or [""])[0])[:100] for name in ("position", "duration", "speed", "muted", "errorCode")}
+                                DIAG.record("browser_overlay_beacon", event=event, key=key, seq=seq, browserMs=browser_ms, pushMs=push_ms, **details)
                             except Exception:
                                 pass
                             if event == "ko_probe_show" and key:
@@ -419,6 +420,7 @@ class BrowserOverlayServer:
                         self._send(204, b"", "text/plain")
                         return
                     if path == "/api/obs-replay/ended":
+                        DIAG.record("replay_browser_stop_received", replay_token=str(payload.get("token") or ""), reason=payload.get("reason", "unspecified"), position=payload.get("position"), duration=payload.get("duration"))
                         outer.stop_obs_replay(str(payload.get("token") or ""))
                         self._send(204, b"", "text/plain")
                         return
@@ -688,7 +690,7 @@ class BrowserOverlayServer:
     def record_latency_beacon(self, event: str, key: str, browser_ms: str, push_ms: str) -> None:
         with self._lock:
             self._latency_beacons[str(key)] = {
-                "event": str(event), "received_at": time.time(),
+                "event": str(event), "received_at": time.time(), "received_monotonic": time.monotonic(),
                 "browser_ms": str(browser_ms), "push_ms": str(push_ms),
             }
             if len(self._latency_beacons) > 64:
@@ -811,6 +813,7 @@ class BrowserOverlayServer:
             )
             self._state["seq"] = int(self._state.get("seq", 0) or 0) + 1
             self._cond.notify_all()
+        DIAG.record("replay_video_requested", replay_token=token, kind=replay_kind, path=resolved, muted=muted, volume=volume, speed=replay_speed, start_from_end_sec=start_from_end_sec, end_from_end_sec=end_from_end_sec)
         return token
 
     def stop_obs_replay(self, token: str = "") -> bool:
@@ -829,6 +832,7 @@ class BrowserOverlayServer:
             self._cond.notify_all()
         try:
             if callable(self._on_obs_replay_stopped):
+                DIAG.record("replay_video_stopped", replay_token=str(token or current), kind="callback")
                 self._on_obs_replay_stopped(str(token or current or ""))
         except Exception:
             logging.exception("OBS_REPLAY_STOP_CALLBACK_FAIL")
@@ -3950,6 +3954,15 @@ function playObsReplayWindow(video,s){let started=false,begin=()=>{if(started)re
 function syncObsReplay(s){s=s||latestState||{};let host=q('obsReplay'),video=q('obsReplayVideo'),label=q('obsReplayLabel');if(!host||!video)return;let token=String(s.obsReplayToken||''),active=s.obsReplayActive===true&&token!=='';document.documentElement.style.setProperty('--obs-replay-fit',String(s.obsReplayFit||'cover'));document.documentElement.style.setProperty('--obs-replay-fade',Math.max(0,Math.min(2000,Number(s.obsReplayFadeMs)||0))+'ms');video.muted=s.obsReplayMuted!==false;video.volume=Math.max(0,Math.min(1,Number(s.obsReplayVolume||0)/100));video.playbackRate=Math.max(.25,Math.min(2,Number(s.obsReplaySpeed)||1));if(!active){if(obsReplayActive)stopObsReplayLocal(false);return}let key=token+'|'+String(s.obsReplayRev||0),kind=String(s.obsReplayKind||'').toLowerCase(),cinematic=(kind==='potm'?s.idleHighlightCinematicPotmEnabled===true:((kind==='kd'||kind==='tko')&&s.idleHighlightCinematicKdTkoEnabled===true));host.dataset.token=token;host.classList.toggle('cinematic',cinematic);host.classList.remove('tko');if(kind==='tko')host.classList.add('tko');let showLabel=()=>{if(label){let title=kind==='tko'?'T.K.O. REPLAY':(kind==='kd'?'K.D. REPLAY':'');label.textContent=title;label.classList.toggle('show',title!=='')}};host.classList.add('active');document.body.classList.add('obs-replay-active');obsReplayActive=true;if(obsReplayKey!==key){if(label)label.classList.remove('show');host.classList.remove('afterTransition');obsReplayKey=key;obsReplayAfterStarted=false;prepareObsReplay(host,video,token,s);let replayStarted=false,startReplay=()=>{if(replayStarted)return;replayStarted=true;playObsReplayWindow(video,s)},revealReplay=()=>{host.classList.remove('preparingReplay')};if(s.obsReplayTransitionBefore===true)playObsTransition('before',s,()=>{startReplay();revealReplay();showLabel()},{onPreroll:startReplay,onCover:revealReplay});else{startReplay();revealReplay();showLabel()}}}
 function startObsReplayAfterTransition(){let s=latestState||{},host=q('obsReplay'),label=q('obsReplayLabel'),token=host?String(host.dataset.token||''):'';if(obsReplayAfterStarted||!obsReplayActive||!token||token!==String(s.obsReplayToken||''))return;clearTimeout(obsReplayAfterTimer);obsReplayAfterStarted=true;playObsTransition('after',s,()=>stopObsReplayLocal(true),{onStart:()=>{if(label)label.classList.remove('show')},onCover:()=>{if(host)host.classList.add('afterTransition')}})}
 function scheduleObsReplayAfterTransition(){let s=latestState||{},video=q('obsReplayVideo');clearTimeout(obsReplayAfterTimer);if(!video||obsReplayAfterStarted||!Number.isFinite(video.duration)||video.duration<=0)return;let replayRate=Math.max(.25,Number(video.playbackRate)||1),stingerRate=Math.max(.25,Math.min(2,Number(s.obsReplayTransitionSpeed)||1)),coverLeadSec=s.obsReplayTransitionAfter===true?.560/stingerRate:0,window=obsReplayWindow(video,s),delay=Math.max(0,((window.end-video.currentTime)/replayRate-coverLeadSec)*1000);obsReplayAfterTimer=setTimeout(startObsReplayAfterTransition,delay)}
+// Browser media events are evidence of playback, unlike a Python play request.
+// Never send timeupdate/frame-by-frame diagnostics.
+for(const eventName of ['loadedmetadata','playing','waiting','stalled','ended','error']){
+  q('obsReplayVideo').addEventListener(eventName,()=>{
+    const v=q('obsReplayVideo'),host=q('obsReplay'),token=host?String(host.dataset.token||''):'';
+    if(!token)return;
+    overlayBeacon('replay_'+eventName,{key:token,browserMs:Date.now(),position:v.currentTime,duration:v.duration,speed:v.playbackRate,muted:v.muted,errorCode:v.error?v.error.code:0});
+  });
+}
 q('obsReplayVideo').addEventListener('loadedmetadata',scheduleObsReplayAfterTransition);q('obsReplayVideo').addEventListener('durationchange',scheduleObsReplayAfterTransition);q('obsReplayVideo').addEventListener('canplay',scheduleObsReplayAfterTransition);q('obsReplayVideo').addEventListener('playing',scheduleObsReplayAfterTransition);
 q('obsReplayVideo').addEventListener('timeupdate',()=>{let s=latestState||{},video=q('obsReplayVideo');if(!video||obsReplayAfterStarted||!Number.isFinite(video.duration)||video.duration<=0)return;let replayRate=Math.max(.25,Number(video.playbackRate)||1),stingerRate=Math.max(.25,Math.min(2,Number(s.obsReplayTransitionSpeed)||1)),coverLeadSec=s.obsReplayTransitionAfter===true?.560/stingerRate:0,window=obsReplayWindow(video,s);if((window.end-video.currentTime)/replayRate<=coverLeadSec)startObsReplayAfterTransition()});
 q('obsReplayVideo').addEventListener('ended',()=>{if(obsReplayAfterStarted)return;let s=latestState||{},host=q('obsReplay'),activeToken=host?String(host.dataset.token||''):'';if(!obsReplayActive||!activeToken||activeToken!==String(s.obsReplayToken||''))return;startObsReplayAfterTransition()});q('obsReplayVideo').addEventListener('error',()=>{if(obsReplayActive)setTimeout(()=>stopObsReplayLocal(true),180)});let idleHighlightIndex=-1,idleHighlightKey='',idleHighlightActive=false;

@@ -189,6 +189,7 @@ from config_model import (
 from runtime_support import resolve_config_path, _setup_logging
 from update_manager import _parse_version, _download_file, _file_sha256, _write_update_script
 from diagnostics import diagnostics as DIAG
+from diagnostic_context import prepare_diagnostic_export
 from ai_project_snapshot import export_project_snapshot
 
 _MP_SELFIE = None
@@ -4403,37 +4404,17 @@ class TimerBackend(QObject):
             pass
         return item
 
-    def _diagnostic_export_zip(self) -> str:
-        try:
-            DIAG.set_options(
-                enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
-                max_events=max(500, int(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 500),
-                raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
-                mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
-            )
-        except Exception:
-            pass
-        root = self._diagnostic_spectator_root()
-        overlay_snapshot = {}
-        try:
-            if getattr(self, "browser_overlay", None) is not None:
-                overlay_snapshot = self.browser_overlay.snapshot()
-        except Exception:
-            overlay_snapshot = {"error": "snapshot failed"}
-        path = DIAG.export_zip(
-            self._diagnostic_folder(),
-            app_state=self._diagnostic_app_state(),
-            cfg_snapshot=getattr(self.cfg, "__dict__", {}),
-            spectator_root=root,
-            overlay_snapshot=overlay_snapshot,
+    def _diagnostic_prepare_export(self) -> dict:
+        DIAG.set_options(
+            enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
+            trace_seconds=float(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 60,
+            max_events=max(500, int(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 500),
             mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
-            raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
         )
-        try:
-            self.timer_win.set_status(f"진단 ZIP 생성: {os.path.basename(path)}")
-        except Exception:
-            pass
-        return path
+        return prepare_diagnostic_export(self)
+
+    def _diagnostic_export_zip(self) -> str:
+        return DIAG.export_zip(**self._diagnostic_prepare_export())
 
     def _diagnostic_open_folder(self) -> str:
         return self._diagnostic_folder()
@@ -7424,6 +7405,11 @@ class SettingsDialog(QDialog):
             "1) 이상한 장면이 나오면 [문제 발생 표시]를 누름\n"
             "2) 테스트/방송 끝나고 [진단 ZIP 생성]을 누름\n"
             "3) 생성된 ZIP을 채팅에 업로드\n\n"
+            "문제 표시는 직전 최대 2분을 보존하고 이후 30초를 추가 수집합니다(기록 수 제한 있음). "
+            "급하면 바로 ZIP을 만들어도 되지만, 이후 상황까지 보려면 30초 기다려 주세요.\n"
+            "중요 사건은 용량 제한 블랙박스에 남아 재시작 후에도 포함됩니다. "
+            "설정·리플레이 선택·OBS 상태·현재/최근 경기 근거와 진단요약.txt도 포함합니다. "
+            "ZIP 수집·압축은 별도 작업으로 진행하며 OBS를 켜거나 소스를 바꾸지 않습니다.\n\n"
             "진단 ZIP 안에는 recent_trace.jsonl, app_state.json, settings_snapshot.json, "
             "raw_log_samples, spectator_format_detected.json 등이 들어갑니다.\n"
             "초상화/피격 이펙트, 로그 파싱, 타이머 꼬임, 해설 지연 같은 문제를 추적하기 위한 기능입니다.\n\n"
@@ -7445,6 +7431,7 @@ class SettingsDialog(QDialog):
                 DIAG.set_options(
                     enabled=self.cfg.diagnostics_enabled,
                     max_events=max(500, int(self.cfg.diagnostics_trace_minutes) * 500),
+                    trace_seconds=float(self.cfg.diagnostics_trace_minutes) * 60,
                     raw_sample_lines=self.cfg.diagnostics_raw_sample_lines,
                     mask_sensitive=self.cfg.diagnostics_mask_sensitive,
                 )
@@ -7461,13 +7448,39 @@ class SettingsDialog(QDialog):
                 self._diagnostic_mark_incident(note)
             else:
                 DIAG.mark_incident(note)
-            self.lbl_diag_status.setText("문제 발생 시점 표시 완료. 이제 진단 ZIP을 만들면 이 시점이 같이 들어갑니다.")
+            self.lbl_diag_status.setText("직전 최대 2분 기록을 보존했습니다. 이후 30초도 모으니, 가능하면 30초 뒤 ZIP을 만드세요.")
         except Exception as e:
             self.lbl_diag_status.setText(f"문제 발생 표시 실패: {e}")
 
     def _diagnostics_export_clicked(self):
         self._diagnostics_apply_options()
         try:
+            owner = getattr(self._diagnostic_export_zip, "__self__", None)
+            if owner is not None and hasattr(owner, "_diagnostic_prepare_export"):
+                if getattr(self, "_diagnostic_export_job", None) is not None:
+                    return
+                # Capture Qt-owned values here; compression/OBS read waits run off UI.
+                kwargs = owner._diagnostic_prepare_export()
+                self._diagnostic_export_job = DIAG.start_export(**kwargs)
+                self.btn_diag_export.setEnabled(False)
+                self.lbl_diag_status.setText("진단 수집·압축 중… 방송/타이머는 계속 동작합니다.")
+                def poll():
+                    job = self._diagnostic_export_job
+                    if not job.done.is_set():
+                        return
+                    self._diagnostic_export_job = None
+                    self._diagnostic_poll_timer.stop()
+                    self.btn_diag_export.setEnabled(True)
+                    if job.error:
+                        self.lbl_diag_status.setText(f"진단 ZIP 생성 실패: {job.error}")
+                        QMessageBox.warning(self, "진단 ZIP 생성 실패", job.error)
+                    else:
+                        self.lbl_diag_status.setText(f"진단 ZIP 생성 완료: {job.path}")
+                        QMessageBox.information(self, "진단 ZIP 생성", f"진단 ZIP을 만들었습니다.\n\n{job.path}")
+                self._diagnostic_poll_timer = QTimer(self)
+                self._diagnostic_poll_timer.timeout.connect(poll)
+                self._diagnostic_poll_timer.start(200)
+                return
             path = self._diagnostic_export_zip() if self._diagnostic_export_zip else ""
             if path:
                 self.lbl_diag_status.setText(f"진단 ZIP 생성 완료: {path}")
@@ -11248,6 +11261,8 @@ class SettingsDialog(QDialog):
             return
         key = "ko-probe-%d" % time.time_ns()
         sent_ms = int(time.time() * 1000)
+        sent_monotonic = time.monotonic()
+        DIAG.record("latency_probe_sent", key=key, sent_ms=sent_ms)
         self.lbl_ko_latency_probe.setText("KO 신호 전송 중… 화면과 효과음이 동시에 나오는지도 확인하세요.")
         try:
             overlay.push_event("ko", side="blue", latencyProbeKey=key, pushEpochMs=sent_ms)
@@ -11263,15 +11278,18 @@ class SettingsDialog(QDialog):
             beacon = overlay.latency_beacon(key)
             if beacon:
                 try:
-                    browser_ms = float(beacon["browser_ms"])
-                    render_ms = max(0.0, browser_ms - sent_ms)
+                    # OBS can be on another PC with an unsynchronised wall clock.
+                    # Measure the local send-to-ack interval, not mixed clocks.
+                    render_ms = max(0.0, (float(beacon["received_monotonic"]) - sent_monotonic) * 1000)
                 except (TypeError, ValueError, KeyError):
                     render_ms = -1.0
-                result = ("브라우저 KO 표시: 전송 후 약 %.0fms. " % render_ms) if render_ms >= 0 else "브라우저 KO 표시 확인됨. "
-                result += "효과음은 직접 들리는지 확인하세요. 이 수치는 OBS 송출·인터넷·시청자 지연은 포함하지 않습니다."
+                result = ("KO 실행 확인 응답 왕복: 약 %.0fms. " % render_ms) if render_ms >= 0 else "브라우저 KO 실행 응답 확인됨. "
+                result += "화면 실행과 응답 전달을 합친 값입니다. 실제 소리 출력·OBS 송출·시청자 지연은 별도입니다."
+                DIAG.record("latency_probe_result", key=key, acknowledged=True, round_trip_ms=render_ms, clock="local_monotonic")
                 self.lbl_ko_latency_probe.setText(result)
                 logging.info("KO_LATENCY_PROBE_RESULT key=%s render_ms=%.1f", key, render_ms)
             else:
+                DIAG.record("latency_probe_result", key=key, acknowledged=False, timeout_sec=2)
                 self.lbl_ko_latency_probe.setText(
                     "2초 내 브라우저 응답 없음. OBS 브라우저 소스가 실제로 열려 있는지, 표시 설정이 켜졌는지 확인하세요."
                 )
@@ -20574,7 +20592,11 @@ class MainApp(QObject):
                 raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
                 mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
             )
+            DIAG.set_options(trace_seconds=float(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 60)
+            DIAG.configure_storage(app_path("diagnostics", "_blackbox"))
             DIAG.record("app_start", app_version=APP_VERSION, cfg_path=cfg_path)
+            if QApplication.instance() is not None:
+                QApplication.instance().aboutToQuit.connect(DIAG.close)
         except Exception:
             pass
         # Chapter anchor is session-scoped runtime state.
@@ -21270,7 +21292,9 @@ class MainApp(QObject):
         if not text:
             return
         role = "caster" if str(role or "").lower() == "caster" else "analyst"
+        DIAG.record("commentary_request", role=role, text=text, from_queue=_from_queue, final_report=hide_round_report_on_complete, allow_during_potm=allow_during_potm)
         if bool(getattr(self, "_potm_presentation_active", False)) and not bool(allow_during_potm):
+            DIAG.record("commentary_suppressed", reason="potm_active", role=role, text=text)
             logging.info("COMMENTARY_TTS_SKIP_POTM_ACTIVE role=%s text=%s", role, text)
             return
         busy = getattr(self, "_commentary_tts_busy", {}) or {}
@@ -21659,6 +21683,7 @@ class MainApp(QObject):
             audio_out.setVolume(max(0.0, min(1.0, volume / 100.0)))
             _refresh_default_audio_device(player)
             player.play()
+            DIAG.record("commentary_audio_play_requested", role=role, path=path, volume=volume)
             logging.info("COMMENTARY_TTS_QT_PLAY role=%s path=%s", role, path)
         except Exception as e:
             logging.warning("COMMENTARY_TTS_QT_PLAY_FAIL err=%s", e)
@@ -23861,37 +23886,17 @@ class MainApp(QObject):
             pass
         return item
 
-    def _diagnostic_export_zip(self) -> str:
-        try:
-            DIAG.set_options(
-                enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
-                max_events=max(500, int(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 500),
-                raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
-                mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
-            )
-        except Exception:
-            pass
-        root = self._diagnostic_spectator_root()
-        overlay_snapshot = {}
-        try:
-            if getattr(self, "browser_overlay", None) is not None:
-                overlay_snapshot = self.browser_overlay.snapshot()
-        except Exception:
-            overlay_snapshot = {"error": "snapshot failed"}
-        path = DIAG.export_zip(
-            self._diagnostic_folder(),
-            app_state=self._diagnostic_app_state(),
-            cfg_snapshot=getattr(self.cfg, "__dict__", {}),
-            spectator_root=root,
-            overlay_snapshot=overlay_snapshot,
+    def _diagnostic_prepare_export(self) -> dict:
+        DIAG.set_options(
+            enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
+            trace_seconds=float(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 60,
+            max_events=max(500, int(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 500),
             mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
-            raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
         )
-        try:
-            self.timer_win.set_status(f"진단 ZIP 생성: {os.path.basename(path)}")
-        except Exception:
-            pass
-        return path
+        return prepare_diagnostic_export(self)
+
+    def _diagnostic_export_zip(self) -> str:
+        return DIAG.export_zip(**self._diagnostic_prepare_export())
 
     def _project_snapshot_export_zip(self) -> str:
         try:
@@ -24848,6 +24853,7 @@ class MainApp(QObject):
                     index += 1
                 shutil.copy2(source, target)
                 logging.info("OBS_REPLAY_ARCHIVE_COPY_OK source=%s target=%s", source, target)
+                DIAG.record("replay_archive_copied", capture_source="replay_buffer", source=source, target=target, context=context)
                 self._prune_source_record_archive()
             except Exception:
                 logging.exception("OBS_REPLAY_ARCHIVE_COPY_FAIL source=%s", source)
@@ -24877,6 +24883,7 @@ class MainApp(QObject):
                 shutil.copy2(source, temp)
                 os.replace(temp, target)
                 logging.info("POTM_FINAL_ARCHIVE_OK source=%s target=%s", source, target)
+                DIAG.record("potm_final_archived", source=source, target=target, candidate_id=candidate_id)
                 self._prune_source_record_archive()
             except Exception:
                 logging.exception("POTM_FINAL_ARCHIVE_FAIL source=%s target=%s", source, target)
@@ -25060,6 +25067,7 @@ class MainApp(QObject):
         candidate["capture_source"] = str(getattr(self.cfg, "potm_capture_source", "source_record") or "source_record")
         candidate["nickname"] = str(dict(getattr(self, "_source_record_names", {}) or {}).get(candidate.get("side")) or candidate.get("side") or "UNKNOWN")
         self._potm_best = candidate
+        DIAG.record("potm_candidate_selected", match_id=self.__dict__.get("_potm_archive_session_id", ""), event_id=event_id, candidate=candidate, previous_id=previous.get("id"))
         self._persist_potm_candidate()
         logging.info(
             "POTM_CANDIDATE_SELECTED score=%s qualification=%s label=%s",
@@ -25124,15 +25132,18 @@ class MainApp(QObject):
     def _register_potm_file(self, path: str, candidate_id: str, *, managed: bool = False, capture_source: str) -> None:
         expected = str((self._potm_best or {}).get("capture_source") or getattr(self.cfg, "potm_capture_source", "source_record"))
         if not path or candidate_id != str((self._potm_best or {}).get("id") or "") or capture_source != expected:
+            DIAG.record("potm_file_rejected", candidate_id=candidate_id, selected_id=(self._potm_best or {}).get("id"), capture_source=capture_source, expected_source=expected, path=path)
             try:
                 if managed and path and os.path.isfile(path): os.remove(path)
             except OSError: pass
             return
         if self._potm_played:
+            DIAG.record("potm_file_rejected", candidate_id=candidate_id, reason="presentation_already_started", path=path)
             return  # Never swap the selected file after the presentation starts.
         self._potm_best["file"] = path
         self._potm_best["file_source"] = capture_source
         self._potm_best["managed"] = bool(managed)
+        DIAG.record("potm_file_attached", candidate_id=candidate_id, capture_source=capture_source, path=path, exists=os.path.isfile(path))
         self._persist_potm_candidate()
         logging.info("POTM_CANDIDATE_FILE_READY score=%s path=%s", self._potm_best.get("score"), path)
         self._maybe_play_potm()
@@ -25193,10 +25204,12 @@ class MainApp(QObject):
         # Broadcast order: decisive final-round report -> POTM -> full match
         # report.  The full report is intentionally retained for after POTM.
         if not bool(getattr(self, "_potm_opening_round_report_shown", False)):
+            DIAG.record("potm_wait", candidate_id=(self._potm_best or {}).get("id"), reason="opening_round_report")
             logging.info("POTM_WAITING_FOR_OPENING_ROUND_REPORT")
             return
         path = str((self._potm_best or {}).get("file") or "")
         if not path or not os.path.isfile(path):
+            DIAG.record("potm_wait", candidate_id=(self._potm_best or {}).get("id"), reason="video_missing", path=path)
             return
         self._potm_played = True
         self._archive_final_potm(dict(self._potm_best or {}))
@@ -25206,6 +25219,7 @@ class MainApp(QObject):
         report_hold = max(0, int(getattr(self, "_potm_opening_round_report_display_ms", 0) or 0))
         extra_delay = max(0, int(float(getattr(self.cfg, "potm_play_delay_sec", 0.0) or 0.0) * 1000))
         delay = report_hold + extra_delay
+        DIAG.record("potm_presentation_scheduled", candidate_id=(self._potm_best or {}).get("id"), generation=generation, path=path, hold_ms=report_hold, extra_ms=extra_delay)
         logging.info("POTM_WAIT_AFTER_OPENING_ROUND_REPORT hold_ms=%s extra_ms=%s", report_hold, extra_delay)
         def _play():
             if generation != self._potm_play_generation: return
@@ -25224,10 +25238,12 @@ class MainApp(QObject):
                     # this app's normal audio lane instead (like its BGM).
                     self._play_potm_replay_audio(path)
                     self._potm_replay_token = overlay.play_obs_replay(path, muted=True, volume=0, fit="cover", fade_ms=160, replay_speed=float(getattr(self.cfg, "potm_replay_speed", 0.85) or 0.85), replay_kind="potm")
+                    DIAG.record("potm_video_requested", candidate_id=(self._potm_best or {}).get("id"), replay_token=self._potm_replay_token, path=path, speed=float(getattr(self.cfg, "potm_replay_speed", .85) or .85), audio_route="timerauto_separate_player")
                 QTimer.singleShot(110, _reveal)
         QTimer.singleShot(delay, _play)
 
     def _show_potm_intro(self, candidate: Dict[str, Any]) -> None:
+        DIAG.record("potm_card_requested", candidate_id=candidate.get("id"), candidate=candidate)
         self._hold_idle_highlight_for_presentation("potm_intro")
         # POTM owns the entire audio lane from its card through replay end.
         # Stop anything already playing and reject delayed normal commentary;
@@ -25302,6 +25318,7 @@ class MainApp(QObject):
                 QTimer.singleShot(700, self._stop_broadcast_rehearsal)
 
     def _show_final_report_after_potm(self) -> None:
+        DIAG.record("report_after_potm_requested", match_id=self.__dict__.get("_potm_archive_session_id", ""))
         # The replay has ended. Normal commentary may resume with the retained
         # full-match report from this point onward.
         self._potm_presentation_active = False
@@ -25438,6 +25455,7 @@ class MainApp(QObject):
             playable_path = self._potm_bgm_media_path(path)
             self._potm_bgm_player.setSource(QUrl.fromLocalFile(playable_path)); self._potm_bgm_active = True; self._potm_bgm_player.play()
             logging.info("POTM_BGM_PLAY path=%s playable=%s volume=%s output=%s", path, playable_path, int(getattr(self.cfg, "potm_bgm_volume", 75) or 0), output_name or "default")
+            DIAG.record("potm_bgm_play_requested", path=path, playable=playable_path, volume=int(getattr(self.cfg, "potm_bgm_volume", 75) or 0), output=output_name or "default")
         except Exception: logging.exception("POTM_BGM_PLAY_FAIL")
 
     def _play_potm_replay_audio(self, path: str) -> None:
@@ -25457,6 +25475,7 @@ class MainApp(QObject):
             self._potm_replay_audio_player.setSource(QUrl.fromLocalFile(media_path))
             self._potm_replay_audio_player.setPlaybackRate(max(0.25, min(2.0, float(getattr(self.cfg, "potm_replay_speed", 0.85) or 0.85))))
             self._potm_replay_audio_player.play()
+            DIAG.record("potm_audio_play_requested", path=media_path, output=output_name or "default", speed=self._potm_replay_audio_player.playbackRate())
             logging.info("POTM_REPLAY_AUDIO_PLAY path=%s output=%s", media_path, output_name or "default")
         except Exception:
             logging.exception("POTM_REPLAY_AUDIO_PLAY_FAIL")
@@ -25476,6 +25495,7 @@ class MainApp(QObject):
         except Exception:
             ended = failed = False
         if ended or failed:
+            DIAG.record("potm_bgm_finished", failed=failed, ended=ended)
             self._potm_bgm_active = False
             self._restore_obs_bgm_after_potm()
 
@@ -25804,6 +25824,7 @@ class MainApp(QObject):
                 shutil.move(path, target)
                 self._source_record_pending.popleft()
                 logging.info("SOURCE_RECORD_CLIP_ORGANIZED source=%s target=%s", path, target)
+                DIAG.record("replay_archive_copied", capture_source="source_record", source=path, target=target, context=meta)
                 self._play_source_record_auto_replay(target, meta)
                 if meta.get("potm_candidate_id"):
                     self._register_potm_file(
@@ -26018,6 +26039,7 @@ class MainApp(QObject):
         if source_auto_replay:
             capture_delay = max(capture_delay, float(context["replay_post_event_sec"]))
         context["replay_capture_delay_sec"] = capture_delay
+        DIAG.record("replay_capture_decision", event_id=event_key, match_id=self.__dict__.get("_potm_archive_session_id", ""), kind=normalized, reason=reason, context=context, replay_buffer=save_program_replay, source_record=save_source_record, source_record_target=source_record_context, potm_candidate_id=potm_candidate_id)
         if not save_program_replay and not save_source_record:
             logging.warning(
                 "OBS_HIGHLIGHT_SAVE_SKIPPED kind=%s auto_source=%s source_record_ready=%s fallback=%s",
@@ -28515,6 +28537,10 @@ class MainApp(QObject):
 
                     def _push_report(payload=dict(report_payload), delay_ms=report_delay_ms) -> None:
                         try:
+                            reports = dict(self.__dict__.get("_diagnostic_reports", {}) or {})
+                            reports["final" if payload.get("isFinal") else "round"] = dict(payload)
+                            self._diagnostic_reports = reports
+                            DIAG.record("report_prepared", match_id=payload.get("matchSessionId"), round=payload.get("round"), is_final=payload.get("isFinal"), payload=payload)
                             if bool(payload.get("isFinal", False)) and bool(getattr(self, "_potm_played", False)):
                                 # SpectatorLog can repeat the same settled final
                                 # payload several times.  Do not let a duplicate
@@ -28536,6 +28562,7 @@ class MainApp(QObject):
                                     if bool(getattr(self, "_potm_played", False)):
                                         return
                                     logging.warning("POTM_FINAL_REPORT_FALLBACK_NO_VIDEO")
+                                    DIAG.record("potm_fallback_no_video", candidate=dict(getattr(self, "_potm_best", {}) or {}), generation=generation)
                                     overlay.push_event("round_report", **payload)
                                     self._resume_potm_final_commentary(delay_ms=750)
                                     self._release_idle_highlight_after_presentation(

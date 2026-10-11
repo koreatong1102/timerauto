@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from diagnostics import diagnostics as DIAG
 from typing import Any, Callable, Dict, Optional
 
 
@@ -23,6 +24,7 @@ class ObsAutoReplayController:
         self._cancel_before = 0.0
 
     def cancel(self, reason: str = "") -> None:
+        DIAG.record("replay_cancel_requested", reason=reason)
         self._generation += 1
         self._cancel_before = self._clock()
         overlay = self._overlay_getter()
@@ -68,6 +70,7 @@ class ObsAutoReplayController:
             remaining_ms,
             replay_path,
         )
+        DIAG.record("replay_scheduled", kind=kind, path=replay_path, context=context, delay_ms=remaining_ms, generation=generation)
         return True
 
     def _start(self, generation: int, path: str, kind: str, context: Optional[Dict[str, Any]] = None) -> bool:
@@ -108,6 +111,7 @@ class ObsAutoReplayController:
         if not token:
             logging.warning("OBS_AUTO_REPLAY_START_REJECTED kind=%s path=%s", kind, path)
             return False
+        DIAG.record("replay_start_accepted", kind=kind, path=path, replay_token=token, context=context)
         logging.info("OBS_AUTO_REPLAY_START kind=%s token=%s path=%s", kind, token, path)
         return True
 

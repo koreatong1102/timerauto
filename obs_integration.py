@@ -13,6 +13,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+from diagnostics import diagnostics as DIAG
 
 try:
     import aiohttp
@@ -115,6 +116,8 @@ class ObsIntegration:
         self._source_record_watch_next_at = 0.0
         self._source_record_watch_request_id = ""
         self._pending_source_record_config: Dict[str, str] = {}
+        self._diagnostic_lock = threading.Lock()
+        self._diagnostic_queries: Dict[str, Dict[str, Any]] = {}
 
     @property
     def status(self) -> str:
@@ -126,7 +129,65 @@ class ObsIntegration:
             changed = self._status != value
             self._status = value
         if changed or detail:
+            DIAG.record("obs_connection_status", status=value, detail=detail)
             self._events.put({"type": "status", "status": value, "detail": str(detail or "")})
+
+    def diagnostic_snapshot(self, timeout: float = 2.0) -> dict:
+        """Read-only query, called only by ZIP worker. Never start OBS/capture here."""
+        if self.status != "connected":
+            return {"status": "unavailable", "connection": self.status}
+        token = uuid.uuid4().hex
+        query = {"done": threading.Event(), "pending": set(), "responses": {}, "requested_at": time.time()}
+        with self._diagnostic_lock:
+            self._diagnostic_queries[token] = query
+        self._commands.put({"type": "diagnostic_snapshot", "token": token})
+        complete = query["done"].wait(max(0, min(3, timeout)))
+        with self._diagnostic_lock:
+            self._diagnostic_queries.pop(token, None)
+            return {"status": "complete" if complete else "timeout", "requested_at": query["requested_at"],
+                    "received_at": time.time(), "responses": dict(query["responses"]),
+                    "pending": sorted(query["pending"]), "limits": "current scene; first 12 inputs/items; no media or input settings"}
+
+    async def _send_diagnostic_read(self, ws, token, request_type, request_data=None, label=""):
+        rid = f"diagnostic-{token}-{label or request_type}"
+        with self._diagnostic_lock:
+            query = self._diagnostic_queries.get(token)
+            if query is None:
+                return
+            query["pending"].add(rid)
+        await self._send_request(ws, request_type, request_id=rid, request_data=request_data)
+
+    async def _handle_diagnostic_response(self, ws, data):
+        rid = str(data.get("requestId") or "")
+        token = rid.split("-", 2)[1]
+        status = data.get("requestStatus") or {}
+        response = data.get("responseData") or {}
+        request_type = str(data.get("requestType") or "")
+        with self._diagnostic_lock:
+            query = self._diagnostic_queries.get(token)
+            if query is None:
+                return
+            query["responses"][rid.split("-", 2)[2]] = {"request_type": request_type, "ok": bool(status.get("result")), "message": status.get("comment", ""), "data": response}
+        if status.get("result"):
+            if request_type == "GetCurrentProgramScene" and response.get("currentProgramSceneName"):
+                await self._send_diagnostic_read(ws, token, "GetSceneItemList", {"sceneName": response["currentProgramSceneName"]})
+            elif request_type == "GetInputList":
+                for i, item in enumerate(list(response.get("inputs") or [])[:12]):
+                    name = str(item.get("inputName") or "")
+                    for kind in ("GetInputMute", "GetInputVolume", "GetInputAudioMonitorType"):
+                        await self._send_diagnostic_read(ws, token, kind, {"inputName": name}, f"{kind}-{i}")
+            elif request_type == "GetSceneItemList":
+                names = [str(item.get("sourceName") or "") for item in list(response.get("sceneItems") or [])[:12]]
+                target = source_record_source_name(str(getattr(self._cfg, "obs_source_record_context", "") or ""))
+                if target:
+                    names.append(target)
+                for i, name in enumerate(dict.fromkeys(names)):
+                    if name:
+                        await self._send_diagnostic_read(ws, token, "GetSourceFilterList", {"sourceName": name}, f"filters-{i}")
+        with self._diagnostic_lock:
+            query["pending"].discard(rid)
+            if not query["pending"]:
+                query["done"].set()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -195,6 +256,7 @@ class ObsIntegration:
         })
 
     def save_replay(self, reason: str = "", *, context: Optional[Dict[str, Any]] = None) -> None:
+        DIAG.record("obs_save_queued", capture_source="replay_buffer", reason=reason, context=context or {}, enabled=self._settings.enabled)
         if not self._settings.enabled:
             return
         self._commands.put(
@@ -215,6 +277,7 @@ class ObsIntegration:
     ) -> None:
         """Save a Source Record plugin replay buffer through OBS WebSocket."""
         hotkey_context = source_record_hotkey_context(context_name)
+        DIAG.record("obs_save_queued", capture_source="source_record", reason=reason, context=context or {}, target=hotkey_context, enabled=self._settings.enabled)
         if not self._settings.enabled or not hotkey_context:
             return
         logging.info("OBS_SOURCE_RECORD_SAVE_REQUEST context=%s", hotkey_context)
@@ -400,6 +463,11 @@ class ObsIntegration:
                     return
                 if kind == "test":
                     await self._send_request(ws, "GetVersion", request_id="connection-test")
+                elif kind == "diagnostic_snapshot":
+                    token = str(command.get("token") or "")
+                    # Register every base request before any response may finish the query.
+                    for request_type in ("GetVersion", "GetStats", "GetStreamStatus", "GetRecordStatus", "GetReplayBufferStatus", "GetCurrentProgramScene", "GetInputList"):
+                        await self._send_diagnostic_read(ws, token, request_type)
                 elif kind == "request":
                     request_type = str(command.get("requestType") or "")
                     request_id = await self._send_request(
@@ -408,6 +476,7 @@ class ObsIntegration:
                         reason=str(command.get("reason") or ""),
                         request_data=dict(command.get("requestData") or {}),
                     )
+                    DIAG.record("obs_request_sent", request_id=request_id, request_type=request_type, reason=command.get("reason"), context=command.get("context") or {})
                     if request_type == "SaveReplayBuffer" and request_id:
                         self._pending_replay_requests.append(
                             {
@@ -522,12 +591,14 @@ class ObsIntegration:
                 })
             elif event_type == "ReplayBufferSaved":
                 pending = self._pending_replay_requests.popleft() if self._pending_replay_requests else {}
+                DIAG.record("obs_replay_file_received", request_id=pending.get("request_id"), path=event_data.get("savedReplayPath"), context=pending.get("context") or {}, matched_request=bool(pending), association="pending_request_fifo_not_verified")
                 self._events.put(
                     {
                         "type": "replay_file_saved",
                         "path": str(event_data.get("savedReplayPath") or ""),
                         "reason": str(pending.get("reason") or ""),
                         "context": dict(pending.get("context") or {}),
+                        "request_id": pending.get("request_id", ""),
                     }
                 )
         elif op == 7:
@@ -535,6 +606,10 @@ class ObsIntegration:
             request_id = str(data.get("requestId") or "")
             status = data.get("requestStatus") or {}
             ok = bool(status.get("result", False))
+            if request_id.startswith("diagnostic-"):
+                await self._handle_diagnostic_response(ws, data)
+                return  # In particular, do NOT auto-start a buffer from a diagnostic read.
+            DIAG.record("obs_request_result", request_id=request_id, request_type=request_type, ok=ok, code=status.get("code"), message=status.get("comment", ""))
             if request_id.startswith("source-record-config-"):
                 configured_target = str(self._pending_source_record_config.pop(request_id, "") or "")
                 self._events.put({

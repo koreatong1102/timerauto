@@ -1100,7 +1100,9 @@ def _refresh_default_audio_device(player) -> None:
     try:
         audio_output = player.audioOutput()
         if audio_output is not None:
-            audio_output.setDevice(QMediaDevices.defaultAudioOutput())
+            device = QMediaDevices.defaultAudioOutput()
+            if audio_output.device() != device:
+                audio_output.setDevice(device)
     except Exception:
         logging.debug("AUDIO_DEFAULT_DEVICE_REFRESH_FAIL", exc_info=True)
 
@@ -27767,12 +27769,12 @@ class MainApp(QObject):
             self._browser_vs_pending_since = None
             logging.info("BROWSER_VS_SKIP_AFTER_INTRO state=%s waited=%.2fs", state, waited)
 
-    def _apply_browser_overlay_direct_update(self, d: dict, *, skip_effect_push: bool = False):
+    def _apply_browser_overlay_direct_update(self, d: dict, *, skip_effect_push: bool = False, impacts_only: bool = False, skip_impact_push: bool = False):
         try:
             overlay = getattr(self, "browser_overlay", None)
             if overlay is None:
                 return
-            state = overlay.snapshot()
+            state = {} if impacts_only else overlay.snapshot()
 
             def _num(value, default=0.0):
                 try:
@@ -27795,7 +27797,7 @@ class MainApp(QObject):
                 except Exception:
                     return 1.0, 0.0
 
-            impact_events_pushed = False
+            impact_events_pushed = bool(skip_impact_push)
 
             def _push_hit_impacts_fast():
                 nonlocal impact_events_pushed
@@ -27977,6 +27979,9 @@ class MainApp(QObject):
                     )
 
             # Absolute priority: push impact before image/name/report/state-heavy work.
+            if impacts_only:
+                _push_hit_impacts_fast()
+                return True
             if bool(getattr(self.cfg, "spectator_hit_effect_fast_emit", True)) and d.get("spectator_hit_effect_events"):
                 _push_hit_impacts_fast()
 
@@ -29389,6 +29394,15 @@ class MainApp(QObject):
                     logging.exception("SPECTATOR_EARLY_SFX_FAIL kind=%s side=%s", kind, side)
         if played_sfx:
             DIAG.record("spectator_urgent_effect_feedback", count=len(played_sfx), browser=early_browser_effects)
+        if (browser_output_only
+                and bool(getattr(self.cfg, "spectator_hit_effect_fast_emit", True))
+                and not bool((d or {}).get("_hitfx_already_emitted", False))
+                and (d or {}).get("spectator_hit_effect_events")):
+            # Share the existing semantic dedupe maps with the later full
+            # update. Only publish classified combat/impact events here;
+            # POTM scoring, media saving and portraits follow afterwards.
+            if self._apply_browser_overlay_direct_update(d, skip_effect_push=True, impacts_only=True):
+                d["_browser_impacts_published_early"] = True
         return played_sfx, early_browser_effects
 
     def apply_ui_update(self, d: dict):
@@ -29574,7 +29588,10 @@ class MainApp(QObject):
             or bool(d.get("spectator_match_stats_reset", False))
         )
         if browser_output_only:
-            self._apply_browser_overlay_direct_update(d, skip_effect_push=early_browser_effects)
+            self._apply_browser_overlay_direct_update(
+                d, skip_effect_push=early_browser_effects,
+                skip_impact_push=bool(d.get("_browser_impacts_published_early") or d.get("_hitfx_already_emitted")),
+            )
         elif sp_authority_update:
             # Even when QML effects are enabled, keep the browser/log calculator
             # authoritative and feed its result back to both renderers.

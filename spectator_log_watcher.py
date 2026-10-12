@@ -7568,7 +7568,42 @@ class SpectatorLogWatcher(QObject):
         except Exception:
             logging.exception("SPECTATORLOG_MATCH_SUMMARY_COMPAT_FAIL state=%s", state)
             return ""
+    def _read_damage_snapshot(self, path: str, signature: tuple) -> List[dict]:
+        """Reuse immutable parsed rows across hot/full passes and append writes.
+
+        Compare the actual line, not just its index, so truncation, rolling
+        rewrites and a partially written final row are re-parsed correctly.
+        Keep only one bounded source snapshot; never cache derived verdicts.
+        """
+        key = os.path.normcase(os.path.abspath(path))
+        cache = getattr(self, "_damage_parse_cache", None)
+        previous = cache if cache and cache[0] == key else None
+        if previous and previous[1] == signature:
+            return [dict(event) for _line, event in previous[2] if event is not None]
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as stream:
+            lines = stream.readlines()
+        old_rows = previous[2] if previous else ()
+        source_rows = []
+        for index, line in enumerate(lines):
+            raw = str(line or "").strip()
+            if index < len(old_rows) and old_rows[index][0] == raw:
+                event = old_rows[index][1]
+            else:
+                event = self._parse_damage_event_parts(raw.split("\t")) if raw else None
+                if event:
+                    event = dict(event, raw_line=raw)
+            source_rows.append((raw, event))
+        # A rewrite during the read must not be labeled with the old signature.
+        # The next pass retries it. Large sources still work without caching.
+        if int(signature[1] or 0) <= 4 * 1024 * 1024 and self._file_sig(path) == signature:
+            self._damage_parse_cache = (key, signature, source_rows)
+        else:
+            self._damage_parse_cache = None
+        return [dict(event) for _line, event in source_rows if event is not None]
+
     def _read_damage_update(self, path: str, fast_only: bool = False) -> dict:
+        read_start_perf_ms = time.perf_counter() * 1000.0
+        read_start_wall_ms = time.time() * 1000.0
         if not os.path.exists(path):
             return {}
         # Fast path: round_time/head/glove files can change many times per second.
@@ -7607,19 +7642,10 @@ class SpectatorLogWatcher(QObject):
         parsed_events: List[dict] = []
         rows = 0
         try:
-            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
-                lines = f.readlines()
+            snapshot = self._read_damage_snapshot(path, cur_sig)
         except Exception:
             return {}
-        for line in lines:
-            line = str(line or "").strip()
-            if not line:
-                continue
-            parts = line.split("\t")
-            latest = self._parse_damage_event_parts(parts)
-            if not latest:
-                continue
-            latest["raw_line"] = line
+        for latest in snapshot:
             try:
                 damage = float(latest.get("damage", 0.0) or 0.0)
             except Exception:
@@ -7745,11 +7771,9 @@ class SpectatorLogWatcher(QObject):
                         self._event_engine.reset()
                         self._event_engine_round = int(active_round_no or 1)
                     self._attach_central_event_classification(new_events)
-                    if self._match_archive.active():
-                        for source_round, events_for_round in self._events_by_source_round(new_events, active_round_no).items():
-                            self._match_archive.record_classified(
-                                source_round, events_for_round, ruleset_version=ruleset_version,
-                            )
+                    # Persist the verdict after broadcasting feedback below,
+                    # after broadcast feedback. Slow disk commits must not
+                    # delay an already completed central-engine verdict.
                 except Exception:
                     logging.exception("EVENT_ENGINE_EARLY_CLASSIFY_FAIL")
             self._last_damage_seen_at = time.time()
@@ -7870,8 +7894,10 @@ class SpectatorLogWatcher(QObject):
                         "event_tags": list(ev.get("event_tags") or []),
                         "combo_hits": int(ev.get("combo_hits", 0) or 0),
                         "combo_damage": round(float(ev.get("combo_damage", 0.0) or 0.0), 2),
-                        "hitfx_detect_perf_ms": time.perf_counter() * 1000.0,
-                        "hitfx_detect_wall_ms": time.time() * 1000.0,
+                        "hitfx_detect_perf_ms": read_start_perf_ms,
+                        "hitfx_detect_wall_ms": read_start_wall_ms,
+                        "hitfx_ready_perf_ms": time.perf_counter() * 1000.0,
+                        "hitfx_source_mtime_ns": int(cur_sig[0] or 0),
                     })
         if hit_effect_events:
             try:
@@ -7879,16 +7905,34 @@ class SpectatorLogWatcher(QObject):
             except Exception:
                 pass
             out["spectator_hit_effect_events"] = hit_effect_events
-            if bool(getattr(self.cfg, "spectator_hit_effect_fast_emit", True)) and not fast_only:
+            if bool(getattr(self.cfg, "spectator_hit_effect_fast_emit", True)):
                 try:
-                    self._safe_emit_update({
+                    published = self._safe_emit_update({
                         "spectator_hit_effect_events": list(hit_effect_events),
                         "_hitfx_fast_emit": True,
                     })
+                    if published:
+                        # This later state update still carries the events for
+                        # bookkeeping, but must not replay their visuals after
+                        # a slow disk pass outlasts the short dedupe window.
+                        out["_hitfx_already_emitted"] = True
                     if bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)):
                         logging.info("HITFX_FAST_EMIT count=%s keys=%s", len(hit_effect_events), ",".join(str(x.get("hitfx_key") or "") for x in hit_effect_events[:5]))
                 except Exception:
                     logging.exception("HITFX_FAST_EMIT_FAIL")
+
+        # Preserve the durable central verdict even if the source is rewritten
+        # between hot and full passes. Queue FX first so a slow SQLite commit
+        # cannot keep an already classified event from reaching the UI.
+        if new_events and bool(getattr(self.cfg, "event_engine_enabled", True)) and self._match_archive.active():
+            try:
+                for source_round, events_for_round in self._events_by_source_round(new_events, active_round_no).items():
+                    self._match_archive.record_classified(
+                        source_round, events_for_round,
+                        ruleset_version=str(getattr(self, "_event_engine_ruleset_version", "") or ""),
+                    )
+            except Exception:
+                logging.exception("EVENT_ENGINE_CLASSIFIED_ARCHIVE_FAIL")
 
         if fast_only:
             # Hand the same new rows to the full pass so TTS/commentary/report

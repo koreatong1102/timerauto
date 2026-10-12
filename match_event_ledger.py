@@ -266,7 +266,7 @@ class MatchEventLedger:
                     raw = raw_event(data)
                     verdict = classified_event(data)
                     existing = db.execute(
-                        "SELECT classified_json,ruleset_version FROM events WHERE event_id=?",
+                        "SELECT raw_json,classified_json,ruleset_version FROM events WHERE event_id=?",
                         (event_id,),
                     ).fetchone()
                     if existing is None:
@@ -288,13 +288,20 @@ class MatchEventLedger:
                     else:
                         classified_json = _json(verdict) if verdict else existing["classified_json"]
                         version = str(ruleset_version or "") if verdict else str(existing["ruleset_version"] or "")
-                        db.execute(
-                            """
-                            UPDATE events SET raw_json=?,classified_json=?,ruleset_version=?,updated_at=?
-                            WHERE event_id=?
-                            """,
-                            (_json(raw), classified_json, version, now, event_id),
-                        )
+                        raw_json = _json(raw)
+                        # A cumulative log contains every old hit on each poll.
+                        # Do not rewrite unchanged rows (and their timestamps)
+                        # hundreds of times merely because a new hit arrived.
+                        if (raw_json != existing["raw_json"]
+                                or classified_json != existing["classified_json"]
+                                or version != existing["ruleset_version"]):
+                            db.execute(
+                                """
+                                UPDATE events SET raw_json=?,classified_json=?,ruleset_version=?,updated_at=?
+                                WHERE event_id=?
+                                """,
+                                (raw_json, classified_json, version, now, event_id),
+                            )
                     ids.append(event_id)
                 db.commit()
             except Exception:

@@ -16,6 +16,8 @@ from typing import List, Optional, Deque, Tuple
 
 from PyQt6.QtCore import QObject, QTimer
 
+from edge_tts_compat import configure_edge_tts_endpoint
+
 # Heavy optional runtime dependencies are imported lazily. This keeps the main
 # window responsive on first launch and avoids loading input/TTS stacks unless
 # the user actually runs those actions.
@@ -724,11 +726,13 @@ class ActionRunner(QObject):
 
     def _ensure_tts_ready(self) -> bool:
         global HAS_EDGE_TTS, edge_tts
-        if HAS_EDGE_TTS and edge_tts is not None:
-            return True
         try:
-            import edge_tts as _edge_tts
-            edge_tts = _edge_tts
+            if not HAS_EDGE_TTS or edge_tts is None:
+                import edge_tts as _edge_tts
+                edge_tts = _edge_tts
+            # All commentary, matchup announcements and voice tests share
+            # this initializer, including the frozen EXE's bundled library.
+            configure_edge_tts_endpoint()
             HAS_EDGE_TTS = True
             return True
         except Exception as e:

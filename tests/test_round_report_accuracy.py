@@ -967,6 +967,107 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertEqual(report["red"]["roundTrend"]["earlyDamage"], 5.0)
         self.assertEqual(report["red"]["roundTrend"]["lateDamage"], 0.0)
 
+    def test_official_totals_do_not_replace_measured_round_or_match_average(self):
+        with tempfile.TemporaryDirectory() as root:
+            match_dir = os.path.join(root, "match")
+            os.makedirs(match_dir)
+            damage_path = os.path.join(match_dir, "damage_events.txt")
+            open(damage_path, "w", encoding="utf-8").close()
+            open(os.path.join(match_dir, "punches_thrown.txt"), "w", encoding="utf-8").close()
+            scores_path = os.path.join(match_dir, "scores.csv")
+            winner_path = os.path.join(match_dir, "winner.txt")
+            header = "round,blue_score,red_score,blue_total,red_total,blue_damage_taken,red_damage_taken,blue_kds,red_kds\n"
+            score_rows = ["1,10,9,10,9,888,999,0,1\n", "2,10,8,20,17,666,777,1,0\n"]
+            with open(scores_path, "w", encoding="utf-8") as stream:
+                stream.write(header + "".join(score_rows))
+            with open(winner_path, "w", encoding="utf-8") as stream:
+                stream.write("blue\tBLUE\n")
+            archive = MatchLogArchive(os.path.join(root, "archive"))
+            archive.start("measured-average", ("BLUE", "RED"))
+            self.watcher._match_archive = archive
+            for round_no, punches in (
+                (1, [("blue", 100.0, 5.0), ("blue", 99.0, 30.0), ("red", 97.0, 10.0)]),
+                (2, [("blue", 100.0, 50.0), ("red", 98.0, 20.0)]),
+            ):
+                events = [
+                    {"round": round_no, "time": clock, "attacker_side": side,
+                     "receiver_side": "red" if side == "blue" else "blue",
+                     "damage": damage, "counter_mult": 1.0, "hand": "left",
+                     "punch": "Jab", "damage_type": "Hit"}
+                    for side, clock, damage in punches
+                ]
+                archive.record_damage(round_no, events)
+                archive.record_throws(round_no, [
+                    {"round": round_no, "time": clock, "side": side, "hand": "left", "punch": "Jab"}
+                    for side, clock, _damage in punches
+                ])
+            archive.snapshot_scores(2, scores_path, final=True)
+            archive.snapshot_winner(winner_path)
+
+            for round_no, blue_average, red_average in ((1, 30.0, 10.0), (2, 50.0, 20.0)):
+                with open(scores_path, "w", encoding="utf-8") as stream:
+                    stream.write(header + "".join(score_rows[:round_no]))
+                self.watcher._last_round_state = "break"
+                self.watcher._last_fight_round_no = round_no
+                self.watcher._last_round_report_key = None
+                report = self.watcher._build_round_report_payload(
+                    damage_path, round_no, ("BLUE", "RED"), force_final=False
+                )
+                self.assertEqual(report["blue"]["averageDamage"], blue_average)
+                self.assertEqual(report["red"]["averageDamage"], red_average)
+
+            self.watcher._last_round_state = "results"
+            report = self.watcher._build_round_report_payload(
+                damage_path, 2, ("BLUE", "RED"), force_final=True
+            )
+            self.assertEqual(report["winner"], "blue")
+            for side, total, landed_damage, average, maximum, score in (
+                ("blue", 1776, 80.0, 40.0, 50.0, 20),
+                ("red", 1554, 30.0, 15.0, 20.0, 17),
+            ):
+                self.assertEqual(report[side]["damage"], total)
+                self.assertEqual(report[side]["officialScore"], score)
+                self.assertEqual(report[side]["knockdowns"], 1)
+                self.assertEqual(report[side]["landed"], 2)
+                self.assertEqual(report[side]["landedDamage"], landed_damage)
+                self.assertEqual(report[side]["averageDamage"], average)
+                self.assertEqual(report[side]["maxPunch"]["damage"], maximum)
+            archive.close()
+
+    def test_round_nickname_uses_attacking_eye_hits_only_in_that_round(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "damage_events.txt")
+            open(path, "w", encoding="utf-8").close()
+            archive = MatchLogArchive(os.path.join(root, "archive"))
+            archive.start("round-eye-label", ("BLUE", "RED"))
+            self.watcher._match_archive = archive
+            for round_no in (1, 2):
+                events = []
+                throws = []
+                for index in range(10):
+                    location = ("EyeLeft" if index % 2 else "EyeRight") if round_no == 1 and index < 8 else "Head"
+                    line = f"{round_no}\t{100-index}.00\t20\t1.00\tred\tleft\t.5\t.5\t0\t0\t0\tJab\tHit\t{location}"
+                    event = self.watcher._parse_damage_event_parts(line.split("\t"))
+                    event["raw_line"] = line
+                    events.append(event)
+                    throws.append({"round": round_no, "time": 100-index, "side": "blue", "hand": "left", "punch": "Jab",
+                                   "raw_line": f"{round_no}\t{100-index}.00\tblue\tleft\tJab"})
+                archive.record_damage(round_no, events)
+                archive.record_throws(round_no, throws)
+            self.watcher._last_round_state = "break"
+            for round_no in (1, 2):
+                self.watcher._last_fight_round_no = round_no
+                report = self.watcher._build_round_report_payload(path, round_no, ("BLUE", "RED"), force_final=False)
+                blue_style = report["blue"]["fightStyle"]
+                if round_no == 1:
+                    self.assertEqual(blue_style["roundNickname"]["label"], "눈사냥꾼")
+                    self.assertEqual(blue_style["roundNickname"]["count"], 8)
+                else:
+                    self.assertEqual(blue_style["roundNickname"], {})
+                self.assertEqual(report["red"]["fightStyle"]["roundNickname"], {})
+                self.assertFalse(any("실제체력" in chip for chip in blue_style["chips"]))
+            archive.close()
+
     def test_final_report_reads_frozen_archive_not_mutated_live_files(self):
         with tempfile.TemporaryDirectory() as root:
             match_dir = os.path.join(root, "live", "match")

@@ -1,9 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, copy_metadata
 from pathlib import Path
 import os
+import sys
 
 
 def _try_collect(name):
@@ -39,6 +40,10 @@ datas_extra += _try_collect_data('mouseinfo')
 datas_extra += _try_collect_data('edge_tts')
 datas_extra += _try_collect_data('aiohttp')
 datas_extra += _try_collect_data('certifi')
+# Preserve dependency identities in diagnostics from frozen builds too.
+for line in Path('requirements-release.lock').read_text(encoding='utf-8').splitlines():
+    if line.strip() and not line.lstrip().startswith('#'):
+        datas_extra += copy_metadata(line.split('==', 1)[0].strip())
 
 datas_base = [
     ('HELP.md', '.'),
@@ -68,6 +73,13 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Refuse ambient DLL contamination even if another hook expands its search path.
+allowed_binary_roots = [Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(),
+                        Path(os.environ['SystemRoot']).resolve(), Path('.').resolve()]
+for destination, source, kind in a.binaries:
+    source_path = Path(source).resolve()
+    if not any(source_path.is_relative_to(root) for root in allowed_binary_roots):
+        raise RuntimeError(f'Uncontrolled native dependency: {destination} <- {source}')
 pyz = PYZ(a.pure)
 
 exe = EXE(

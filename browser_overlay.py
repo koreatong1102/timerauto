@@ -18,7 +18,9 @@ import numpy as np
 from PyQt6.QtCore import QUrl
 from PyQt6.QtGui import QImage
 from browser_hit_effects import HIT_EFFECT_CSS, HIT_EFFECT_HTML, HIT_EFFECT_JS
-from app_paths import normalize_builtin_asset_path
+from browser_player_identity import add_player_identity_layout
+from venue_backgrounds import VENUES, add_venue_background_layout
+from app_paths import app_path, normalize_builtin_asset_path
 from diagnostics import diagnostics as DIAG
 from overlay_studio import OverlayStudioStore, runtime_js, studio_html
 
@@ -42,7 +44,11 @@ class BrowserOverlayServer:
             "roundText": "RD 1 of 3",
             "blueName": "BLUE",
             "redName": "RED",
+            "bluePlayerId": "",
+            "redPlayerId": "",
+            "showPlayerIds": True,
             "arenaName": "",
+            "venueId": None,
             "blueDamageText": "DMG 0",
             "redDamageText": "DMG 0",
             "blueTotalDamageText": "0",
@@ -185,6 +191,8 @@ class BrowserOverlayServer:
         self._image_paths: Dict[str, str] = {}
         self._image_hashes: Dict[str, str] = {}
         self._asset_paths: Dict[str, str] = {}
+        for venue_id, (_title, relative_path) in VENUES.items():
+            self.set_asset_path(f"venue{venue_id}", app_path(relative_path))
         self._highlight_paths: list[str] = []
         self._obs_replay_path = ""
         self._obs_transition_paths = {"before": "", "after": ""}
@@ -4240,6 +4248,8 @@ if(potmReplayAudioVideo)potmReplayAudioVideo.addEventListener('playing',()=>{let
             .replace("__HIT_EFFECT_HTML__", HIT_EFFECT_HTML)
             .replace("__HIT_EFFECT_JS__", HIT_EFFECT_JS)
         )
+        html = add_player_identity_layout(html)
+        html = add_venue_background_layout(html)
         return html.replace(
             "</body>",
             '<svg aria-hidden="true" width="0" height="0" style="position:absolute">'

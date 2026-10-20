@@ -1,5 +1,7 @@
 # Python caches
 __pycache__/
+.runtime/
+.venv-release/
 *.py[cod]
 *.pyo
 

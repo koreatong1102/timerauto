@@ -532,15 +532,58 @@ def analyze_fight_style(
     }
 
 
+def _round_nickname(stats: dict) -> Dict[str, Any]:
+    """At most one evidence-backed broadcast nickname for this round.
+
+    These are optional accents, not a replacement for every method/result chip.
+    Unknown body regions and low samples must not manufacture a funny label.
+    """
+    landed = _count(stats.get("landed"))
+    if landed < 10:
+        return {}
+    targets: Dict[str, int] = {}
+    for item in list(stats.get("weakHitAll") or stats.get("weakHitTop") or []):
+        label = str((item or {}).get("label") or "").strip()
+        count = _count((item or {}).get("count"))
+        if label and count:
+            targets[label] = targets.get(label, 0) + count
+    # Raw weak-point impacts can include a hit whose throw row was missing.
+    # Never let the headline imply a share greater than the measured sample.
+    base = max(landed, sum(targets.values()))
+    eyes = sum(count for label, count in targets.items() if "눈" in label)
+    if eyes >= 6 and eyes / base >= 0.30:
+        return {"label": "눈사냥꾼", "evidence": f"눈 주변 적중 {eyes}회", "kind": "eyes", "count": eyes}
+    groups: Dict[str, int] = {}
+    for label, count in targets.items():
+        group = "관자놀이" if "관자놀이" in label else label
+        groups[group] = groups.get(group, 0) + count
+    if groups:
+        label, count = max(groups.items(), key=lambda item: item[1])
+        if count >= 8 and count / base >= 0.40:
+            return {"label": "한 곳만 조진다", "evidence": f"{label} 적중 {count}회", "kind": "target_focus", "count": count}
+    head = sum(count for label, count in targets.items()
+               if any(token in label for token in ("눈", "턱", "코", "관자", "이마", "얼굴", "머리")))
+    if head >= 12 and head / base >= 0.65:
+        return {"label": "안면 리모델링", "evidence": f"얼굴 급소 적중 {head}회", "kind": "head", "count": head}
+    counters = _count(stats.get("counterHits"))
+    if counters >= 8 and counters / max(landed, counters) >= 0.30:
+        return {"label": "건드리면 문다", "evidence": f"카운터 성공 {counters}회", "kind": "counter", "count": counters}
+    punches = _punch_count_map(stats)
+    jabs = punches.get("jab", 0)
+    if jabs >= 16 and jabs / max(landed, sum(punches.values())) >= 0.55:
+        return {"label": "잽에 미친놈", "evidence": f"잽 적중 {jabs}회", "kind": "jab", "count": jabs}
+    return {}
+
+
 def analyze_round_approach(stats: Optional[dict], opponent_stats: Optional[dict] = None) -> Dict[str, Any]:
-    """Describe one round as method, result and condition.
+    """Describe one round as method, result and an optional factual nickname.
 
     A knockdown is a result, not a permanent fighting style.  Older builds put
     knockdowns, counters, pressure and punch preference in one winner-takes-all
     score.  Since a single knockdown started above every normal method score,
     nearly every break card became ``다운 마무리``.  Keep those dimensions
     separate so the card can say *how* the fighter operated, *what* it produced
-    and *what condition* the fighter finished the round in.
+    and one distinctive, record-backed broadcast nickname when warranted.
     """
     data = dict(stats or {})
     opponent = dict(opponent_stats or {})
@@ -688,30 +731,17 @@ def analyze_round_approach(stats: Optional[dict], opponent_stats: Optional[dict]
         result_label = f"스턴 우세 {stuns}:{opponent_stuns}"
     elif big45 >= opponent_big45 + 3:
         result_label = f"강타 우세 {big45}:{opponent_big45}"
-    else:
-        result_label = "결정타 없음"
-
-    condition_label = ""
-    stamina = data.get("staminaPct")
-    if stamina is not None:
-        stamina_value = max(0, min(100, int(round(_number(stamina)))))
-        if stamina_value <= 30:
-            condition_label = f"실제체력 위험 {stamina_value}%"
-        elif stamina_value <= 50:
-            condition_label = f"실제체력 부담 {stamina_value}%"
-        elif stamina_value >= 75:
-            condition_label = f"실제체력 안정 {stamina_value}%"
-        else:
-            condition_label = f"실제체력 {stamina_value}%"
+    nickname = _round_nickname(data)
+    nickname_label = str(nickname.get("label") or "")
 
     chips: List[str] = []
-    for value in (result_label, condition_label, *support_labels, evidence_text):
+    for value in (nickname_label, result_label, *support_labels, evidence_text):
         text = str(value or "").strip()
         if text and text != label and text not in chips:
             chips.append(text)
         if len(chips) >= 4:
             break
-    evidence = [evidence_text] if evidence_text else []
+    evidence = [text for text in (evidence_text, nickname.get("evidence")) if text]
     return {
         "label": label,
         "signature": "이번 라운드 운영",
@@ -722,11 +752,12 @@ def analyze_round_approach(stats: Optional[dict], opponent_stats: Optional[dict]
         "chips": chips,
         "styles": [{"label": label, "tier": "", "role": "round_method"}]
         + ([{"label": result_label, "tier": "", "role": "round_result"}] if result_label else [])
-        + ([{"label": condition_label, "tier": "", "role": "round_condition"}] if condition_label else []),
+        + ([{"label": nickname_label, "tier": "", "role": "round_nickname"}] if nickname_label else []),
         "secondaryLabel": result_label,
-        "tertiaryLabel": condition_label,
+        "tertiaryLabel": nickname_label,
         "roundResultLabel": result_label,
-        "roundConditionLabel": condition_label,
+        "roundConditionLabel": "",
+        "roundNickname": nickname,
         "roundEvidence": evidence_text,
         "roundApproach": True,
     }

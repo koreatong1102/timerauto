@@ -51,3 +51,17 @@ counter/combo context continues.
 Every report read reconciles the primary ledger against its JSONL mirror.
 Official score/winner snapshots and integrity results are recorded in the
 ledger audit table.
+
+## Immutable multiplier and duplicate repair
+
+`counter_reason` is derived metadata, never evidence that the game's
+`counter_mult=1.01` was synthetic. When a retained `raw_line` exists, its
+original multiplier is authoritative for both the stored raw fact and stable
+identity. Without source evidence, the multiplier must not be guessed away.
+
+Ledger raw-fact revision 2 repairs the old 1.01/1.00 identity split once when
+an existing ledger opens. It makes a SQLite backup (including WAL), merges
+only matching canonical identities within a round, and invalidates derived
+verdicts for affected rounds so combos are replayed without the duplicate.
+Official snapshots, vitals and the original JSONL recovery evidence stay
+unchanged. Reopening an already repaired ledger does not repeat this work.

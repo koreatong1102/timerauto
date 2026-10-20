@@ -512,6 +512,15 @@ class DiagnosticRecorder:
     @staticmethod
     def _build_fingerprints(base: str) -> dict:
         result = {}
+        if os.path.isfile(os.path.join(base, "release_manifest.json")):
+            from release_integrity import verify_package
+            try:
+                result["release_integrity"] = verify_package(base)
+                with open(os.path.join(base, "release_manifest.json"), encoding="utf-8") as stream:
+                    manifest = json.load(stream)
+                result["release_build"] = {key: manifest.get(key) for key in ("version", "commit", "python", "dependencies", "sources")}
+            except Exception as exc:
+                result["release_integrity"] = {"ok": False, "error": str(exc)}
         for name in ("diagnostics.py", "timerauto.py", "event_engine.py", "spectator_log_watcher.py", "match_analytics.py", "browser_overlay.py", "obs_integration.py"):
             path = os.path.join(base, name)
             if os.path.isfile(path):

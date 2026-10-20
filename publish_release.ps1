@@ -34,10 +34,12 @@ if (-not $branch) {
 Write-Host "Current branch: $branch"
 
 if (-not $SkipChecks) {
+  & (Join-Path $root "setup_release_env.ps1") -Install
+  $python = Join-Path $root ".venv-release\Scripts\python.exe"
   Write-Host "Running validation..."
-  python -m unittest discover -s tests -p "test_*.py"
+  & $python -m unittest discover -s tests -p "test_*.py"
   Assert-CommandSuccess "Unit tests"
-  python -m py_compile timerauto.py update_manager.py spectator_log_watcher.py browser_overlay.py
+  & $python -m py_compile timerauto.py update_manager.py spectator_log_watcher.py browser_overlay.py
   Assert-CommandSuccess "Python compile check"
   # Git for Windows can emit one CRLF warning per modified file and has been
   # observed to remain attached to the legacy console afterwards.  Disable

@@ -124,7 +124,13 @@ class EdgeTtsActionIntegrationTests(unittest.TestCase):
             library.Communicate.assert_called_once_with(
                 "음성 확인", "ko-KR-InJoonNeural", rate="+15%", volume="-10%", pitch="+10Hz"
             )
-            save_mock.assert_awaited_once_with(path)
+            save_mock.assert_awaited_once()
+            staging = save_mock.await_args.args[0]
+            self.assertEqual(os.path.dirname(staging), os.path.dirname(path))
+            self.assertTrue(os.path.basename(staging).startswith(".speech_"))
+            self.assertFalse(os.path.exists(staging))
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), b"test-audio")
 
 
 if __name__ == "__main__":

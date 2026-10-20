@@ -12,6 +12,17 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
+function Get-SourceSnapshot {
+  $snapshot = [ordered]@{}
+  foreach ($file in (Get-ChildItem -LiteralPath $root -File | Where-Object { $_.Extension -in @('.py', '.qml', '.spec', '.lock') -or $_.Name -eq '.python-version' } | Sort-Object Name)) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($file.FullName)
+    try { $snapshot[$file.Name] = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
+    finally { $stream.Dispose(); $sha.Dispose() }
+  }
+  return ($snapshot | ConvertTo-Json -Compress)
+}
+
 if ([string]::IsNullOrWhiteSpace($Version)) {
   $source = Get-Content -LiteralPath (Join-Path $root "timerauto.py") -Raw -Encoding UTF8
   $match = [regex]::Match($source, 'APP_VERSION\s*=\s*["'']([^"'']+)["'']')
@@ -29,23 +40,18 @@ if (-not (Test-Path $releaseDir)) {
 }
 
 if (-not $SkipPip) {
-  Write-Host "Ensuring build deps..."
-  python -m pip install --upgrade pip
-  $deps = @(
-    "pyinstaller",
-    "pyautogui",
-    "pyqt6",
-    "rapidfuzz",
-    "mss",
-    "opencv-python",
-    "numpy",
-    "pillow",
-    "edge-tts",
-    "aiohttp",
-    "pywin32"
-  )
-  python -m pip install --upgrade --prefer-binary $deps
+  & (Join-Path $root "setup_release_env.ps1") -Install
 }
+$python = Join-Path $root ".venv-release\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) { throw "Missing release environment. Run setup_release_env.ps1 -Install." }
+& $python (Join-Path $root "release_integrity.py") environment $root
+if ($LASTEXITCODE -ne 0) { throw "Release environment mismatch." }
+& $python -m unittest discover -s tests -p "test_*.py"
+if ($LASTEXITCODE -ne 0) { throw "Release unit tests failed." }
+$sourceCheck = Join-Path $releaseDir "parity-source.json"
+$sourceSnapshot = Get-SourceSnapshot
+& $python timerauto.py --release-self-test --output $sourceCheck
+if ($LASTEXITCODE -ne 0) { throw "Source self-test failed. See $sourceCheck" }
 
 Write-Host "Building with PyInstaller..."
 if ($IncludeUserConfig) { $env:TIMERAUTO_INCLUDE_USER_CONFIG = "1" } else { Remove-Item Env:TIMERAUTO_INCLUDE_USER_CONFIG -ErrorAction SilentlyContinue }
@@ -57,7 +63,24 @@ foreach ($dir in @($buildDir, $distDir)) {
     Remove-Item -LiteralPath $dir -Recurse -Force
   }
 }
-python -m PyInstaller --clean timerauto.spec
+# Native dependency scanning must not borrow DLLs from unrelated tools in PATH
+# (for example Poppler's icuuc.dll is incompatible with Windows' ICU API).
+$originalBuildPath = $env:PATH
+$nativeEnvironment = @{}
+foreach ($name in @('PYTHONPATH', 'PYTHONHOME', 'QT_PLUGIN_PATH', 'QML2_IMPORT_PATH', 'QML_IMPORT_PATH')) {
+  $nativeEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+  [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
+try {
+  $basePython = (& $python -c "import sys; print(sys.base_prefix)").Trim()
+  $env:PATH = @((Split-Path -Parent $python), $basePython, (Join-Path $basePython 'DLLs'), (Join-Path $env:SystemRoot 'System32'), $env:SystemRoot) -join ';'
+  & $python -m PyInstaller --clean timerauto.spec
+  if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }
+} finally {
+  $env:PATH = $originalBuildPath
+  foreach ($name in $nativeEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $nativeEnvironment[$name], 'Process') }
+}
+if ($sourceSnapshot -ne (Get-SourceSnapshot)) { throw "Source files changed during build. Retry from a stable source snapshot." }
 
 $dist = Join-Path $root "dist\\timerauto"
 if (-not (Test-Path $dist)) {
@@ -123,41 +146,17 @@ function Copy-RelativeFile([string]$src, [string]$root, [string]$dist) {
   Copy-Item -Force $src $dst
 }
 
-$audioFiles = @()
-$audioFiles += Get-ChildItem -Path $root -Recurse -Filter *.mp3 -File -ErrorAction SilentlyContinue |
-  Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
-$audioFiles += Get-ChildItem -Path $root -Recurse -Filter *.wav -File -ErrorAction SilentlyContinue |
-  Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
-foreach ($af in $audioFiles) {
-  Copy-RelativeFile $af.FullName $root $dist
+# Ship reviewed project media only, never recordings, diagnostics or venv files.
+$trackedMedia = @(git -c core.quotepath=false ls-files)
+if ($LASTEXITCODE -ne 0) { throw "Unable to enumerate release assets." }
+foreach ($relative in $trackedMedia) {
+  if ([IO.Path]::GetExtension($relative).ToLowerInvariant() -notin @(".mp3", ".wav", ".mp4", ".webm", ".mov", ".m4v", ".avi", ".ogv", ".ogg", ".png", ".jpg", ".jpeg", ".bmp")) { continue }
+  if (-not $IncludePlayerImages -and $relative.Replace('\', '/').StartsWith('image/players/')) { continue }
+  Copy-RelativeFile (Join-Path $root $relative) $root $dist
 }
-
-# Replay transition and test clips are runtime assets too.  Keep their relative
-# paths so the same config works after an update on another user's PC.
-$videoFiles = @()
-foreach ($extension in @("*.mp4", "*.webm", "*.mov", "*.m4v", "*.avi", "*.ogv", "*.ogg")) {
-  $videoFiles += Get-ChildItem -Path $root -Recurse -Filter $extension -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\logs\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
-}
-foreach ($video in $videoFiles) {
-  Copy-RelativeFile $video.FullName $root $dist
-}
-
-$imageFiles = @()
-$imageFiles += Get-ChildItem -Path $root -Recurse -Filter *.png -File -ErrorAction SilentlyContinue |
-  Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\logs\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
-$imageFiles += Get-ChildItem -Path $root -Recurse -Filter *.jpg -File -ErrorAction SilentlyContinue |
-  Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\logs\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
-$imageFiles += Get-ChildItem -Path $root -Recurse -Filter *.jpeg -File -ErrorAction SilentlyContinue |
-  Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\logs\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
-$imageFiles += Get-ChildItem -Path $root -Recurse -Filter *.bmp -File -ErrorAction SilentlyContinue |
-  Where-Object { $_.FullName -notmatch "\\dist\\|\\build\\|\\release\\|\\backup\\|\\백업\\|\\logs\\|\\_internal\\|\\__pycache__\\|\\.git\\" }
-if (-not $IncludePlayerImages) {
-  $playersDir = [Regex]::Escape((Join-Path $root "image\players"))
-  $imageFiles = $imageFiles | Where-Object { $_.FullName -notmatch $playersDir }
-}
-foreach ($img in $imageFiles) {
-  Copy-RelativeFile $img.FullName $root $dist
+# Also support validating newly added venue assets before they are Git-staged.
+foreach ($venueImage in @('home_gym.png', 'night_gym.jpg', 'hotel.png', 'memorial_hall.png', 'philly_parkway.jpg')) {
+  Copy-RelativeFile (Join-Path $root "assets/images/venues/$venueImage") $root $dist
 }
 
 # Ensure SFX referenced by config are present even if stored elsewhere
@@ -256,7 +255,12 @@ $requiredReleaseFiles = @(
   "cinematic_overlay.qml",
   "timer_controls.qml",
   "assets\\images\\overlays\\KD.png",
-  "assets\\images\\overlays\\TKO.png"
+  "assets\\images\\overlays\\TKO.png",
+  "assets/images/venues/home_gym.png",
+  "assets/images/venues/night_gym.jpg",
+  "assets/images/venues/hotel.png",
+  "assets/images/venues/memorial_hall.png",
+  "assets/images/venues/philly_parkway.jpg"
 )
 foreach ($required in $requiredReleaseFiles) {
   $requiredPath = Join-Path $dist $required
@@ -274,6 +278,22 @@ if ($IncludeUserConfig) {
     }
   }
 }
+
+& $python release_integrity.py create $root $dist $Version
+if ($LASTEXITCODE -ne 0) { throw "Release manifest creation failed." }
+$frozenCheck = Join-Path $releaseDir "parity-frozen.json"
+if (Test-Path -LiteralPath $frozenCheck) { Remove-Item -LiteralPath $frozenCheck -Force }
+$exe = Join-Path $dist "timerauto.exe"
+$checkArgs = '--release-self-test --output "{0}" --expected "{1}" --verify-package' -f $frozenCheck, $sourceCheck
+$checkProcess = Start-Process -FilePath $exe -ArgumentList $checkArgs -WorkingDirectory $dist -WindowStyle Hidden -PassThru
+if (-not $checkProcess.WaitForExit(120000)) {
+  Stop-Process -Id $checkProcess.Id -Force
+  throw "Frozen self-test timed out."
+}
+if ($checkProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $frozenCheck)) { throw "Frozen/source parity failed. See $frozenCheck" }
+$checkResult = Get-Content -LiteralPath $frozenCheck -Raw -Encoding UTF8 | ConvertFrom-Json
+if (-not $checkResult.ok) { throw "Frozen/source parity failed. See $frozenCheck" }
+Write-Host "Verified: source and frozen runtime, verdicts, reports and assets match."
 
 $portableZip = Join-Path $releaseDir ("TimerAuto_v{0}_portable.zip" -f $Version)
 if (-not $NoZip) {

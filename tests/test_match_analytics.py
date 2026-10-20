@@ -11,6 +11,47 @@ from match_analytics import (
 
 
 class MatchAnalyticsTests(unittest.TestCase):
+    def test_round_eye_nickname_combines_both_eyes_and_has_evidence(self):
+        result = analyze_round_approach({
+            "landed": 20, "thrown": 40,
+            "weakHitAll": [{"label": "왼쪽 눈", "count": 4}, {"label": "오른쪽 눈", "count": 3}],
+            "staminaPct": 92,
+        })
+        self.assertEqual(result["roundNickname"]["label"], "눈사냥꾼")
+        self.assertEqual(result["roundNickname"]["count"], 7)
+        self.assertIn("눈 주변 적중 7회", result["evidence"])
+        self.assertIn("눈사냥꾼", result["chips"])
+        self.assertFalse(any("실제체력" in text for text in result["chips"]))
+
+    def test_round_nickname_is_one_optional_accent_not_all_chips(self):
+        result = analyze_round_approach({
+            "landed": 30, "thrown": 60, "counterHits": 15,
+            "landedBreakdown": [{"key": "jab", "count": 25}],
+            "weakHitAll": [{"label": "왼쪽 눈", "count": 12}],
+        })
+        accents = [item for item in result["styles"] if item["role"] == "round_nickname"]
+        self.assertEqual(len(accents), 1)
+        self.assertEqual(accents[0]["label"], "눈사냥꾼")
+        self.assertNotIn("잽에 미친놈", result["chips"])
+        self.assertNotIn("건드리면 문다", result["chips"])
+        self.assertLessEqual(len(result["chips"]), 4)
+
+    def test_round_nickname_does_not_use_received_hits_or_weak_samples(self):
+        for stats in (
+            {"landed": 8, "thrown": 12, "weakHitAll": [{"label": "왼쪽 눈", "count": 8}]},
+            {"landed": 50, "thrown": 100, "weakHitAll": [{"label": "왼쪽 눈", "count": 6}]},
+            {"landed": 20, "thrown": 40, "weakReceivedAll": [{"label": "왼쪽 눈", "count": 15}]},
+        ):
+            self.assertEqual(analyze_round_approach(stats)["roundNickname"], {})
+
+    def test_round_stamina_does_not_create_identity_chips(self):
+        stats = {"landed": 30, "thrown": 60, "counterHits": 12}
+        low = analyze_round_approach({**stats, "staminaPct": 10})
+        high = analyze_round_approach({**stats, "staminaPct": 100})
+        self.assertEqual(low, high)
+        self.assertEqual(high["roundNickname"]["label"], "건드리면 문다")
+        self.assertEqual(high["roundConditionLabel"], "")
+
     def test_round_approach_keeps_knockdown_as_result_not_style(self):
         blue = {
             "thrown": 130,
@@ -54,8 +95,9 @@ class MatchAnalyticsTests(unittest.TestCase):
         self.assertNotEqual(red_round["label"], "다운 마무리")
         self.assertIn("다운 1회", blue_round["chips"])
         self.assertIn("다운 1회", red_round["chips"])
-        self.assertIn("실제체력 부담 43%", blue_round["chips"])
-        self.assertIn("실제체력 위험 26%", red_round["chips"])
+        self.assertFalse(any("실제체력" in text for text in blue_round["chips"] + red_round["chips"]))
+        self.assertEqual(blue_round["roundConditionLabel"], "")
+        self.assertEqual(red_round["roundConditionLabel"], "")
         self.assertTrue(blue_round["roundApproach"])
         self.assertTrue(red_round["roundApproach"])
 
@@ -90,7 +132,7 @@ class MatchAnalyticsTests(unittest.TestCase):
 
         self.assertNotIn("다운", result["label"])
         self.assertEqual(result["roundResultLabel"], "다운 우세 2:1")
-        self.assertIn("실제체력 안정 78%", result["chips"])
+        self.assertFalse(any("실제체력" in text for text in result["chips"]))
         self.assertEqual(result["tier"], "")
 
     def test_commentary_uses_correct_korean_particles_for_display_names(self):

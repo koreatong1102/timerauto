@@ -874,6 +874,9 @@ class AppConfig:
     spectator_fight_style_min_landed: int = 10
     spectator_commentary_enabled: bool = True
     spectator_commentary_mode: str = "standard"
+    spectator_commentary_style: str = "sports"
+    spectator_bgrade_density: str = "full"
+    spectator_bgrade_swearing: str = "strong"
     spectator_break_promo_enabled: bool = True
     spectator_break_promo_text: str = "구독과 좋아요 부탁드려요"
     spectator_commentary_min_damage: float = 25.0
@@ -965,6 +968,7 @@ class AppConfig:
     overlay_show_red_name: bool = True
     overlay_show_arena_name: bool = True
     overlay_show_flags: bool = True
+    overlay_show_player_ids: bool = True
     overlay_show_cinematic: bool = True
     overlay_vs_bg_path: str = ""
     overlay_vs_bg_opacity: float = 1.0
@@ -1302,6 +1306,13 @@ class AppConfig:
             cfg.spectator_fight_style_min_landed = 10
         cfg.spectator_commentary_enabled = bool(raw.get("spectator_commentary_enabled", True))
         cfg.spectator_commentary_mode = str(raw.get("spectator_commentary_mode", "standard") or "standard")
+        cfg.spectator_commentary_style = (
+            "b_grade" if str(raw.get("spectator_commentary_style", "sports") or "").strip().lower() == "b_grade" else "sports"
+        )
+        cfg.spectator_bgrade_density = "compact" if raw.get("spectator_bgrade_density") == "compact" else "full"
+        cfg.spectator_bgrade_swearing = str(raw.get("spectator_bgrade_swearing", "strong"))
+        if cfg.spectator_bgrade_swearing not in ("light", "mixed", "strong"):
+            cfg.spectator_bgrade_swearing = "strong"
         cfg.spectator_break_promo_enabled = bool(raw.get("spectator_break_promo_enabled", True))
         cfg.spectator_break_promo_text = str(
             raw.get("spectator_break_promo_text", "구독과 좋아요 부탁드려요")
@@ -1560,6 +1571,7 @@ class AppConfig:
         cfg.overlay_show_red_name = bool(raw.get("overlay_show_red_name", True))
         cfg.overlay_show_arena_name = bool(raw.get("overlay_show_arena_name", True))
         cfg.overlay_show_flags = bool(raw.get("overlay_show_flags", True))
+        cfg.overlay_show_player_ids = bool(raw.get("overlay_show_player_ids", True))
         cfg.overlay_show_cinematic = bool(raw.get("overlay_show_cinematic", True))
         cfg.overlay_vs_bg_path = str(raw.get("overlay_vs_bg_path", "") or "")
         try:
@@ -2004,6 +2016,9 @@ class AppConfig:
             ),
             "spectator_commentary_enabled": bool(self.spectator_commentary_enabled),
             "spectator_commentary_mode": str(self.spectator_commentary_mode or "standard"),
+            "spectator_commentary_style": "b_grade" if self.spectator_commentary_style == "b_grade" else "sports",
+            "spectator_bgrade_density": "compact" if self.spectator_bgrade_density == "compact" else "full",
+            "spectator_bgrade_swearing": self.spectator_bgrade_swearing if self.spectator_bgrade_swearing in ("light", "mixed", "strong") else "strong",
             "spectator_break_promo_enabled": bool(self.spectator_break_promo_enabled),
             "spectator_break_promo_text": str(self.spectator_break_promo_text or "").strip(),
             "spectator_commentary_min_damage": float(self.spectator_commentary_min_damage or 25.0),
@@ -2084,6 +2099,7 @@ class AppConfig:
             "overlay_show_red_name": self.overlay_show_red_name,
             "overlay_show_arena_name": self.overlay_show_arena_name,
             "overlay_show_flags": self.overlay_show_flags,
+            "overlay_show_player_ids": self.overlay_show_player_ids,
             "overlay_show_cinematic": self.overlay_show_cinematic,
             "overlay_vs_bg_path": to_app_rel(str(self.overlay_vs_bg_path or "")),
             "overlay_vs_bg_opacity": float(self.overlay_vs_bg_opacity if self.overlay_vs_bg_opacity is not None else 1.0),

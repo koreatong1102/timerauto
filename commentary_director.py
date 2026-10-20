@@ -19,6 +19,7 @@ class CommentaryCandidate:
     urgent: bool = False
     attacker_side: str = ""
     attacker_name: str = ""
+    presentation: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)

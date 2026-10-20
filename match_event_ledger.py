@@ -10,9 +10,11 @@ report projection after an application restart.
 
 import hashlib
 import json
+import math
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -42,16 +44,12 @@ def _json(value: Any) -> str:
 def raw_event(event: Dict[str, Any]) -> Dict[str, Any]:
     source = dict(event or {})
     result = {key: value for key, value in source.items() if key not in DERIVED_FIELDS}
-    # Older builds encoded an inferred whiff/graze counter by overwriting the
-    # game's multiplier with 1.01. Undo only that synthetic sentinel while
-    # importing legacy JSONL; genuine official multipliers remain untouched.
-    inferred_reason = str(source.get("counter_reason") or "").lower().strip()
-    if inferred_reason in ("whiff", "graze", "light_trade") and "counter_mult" in result:
-        try:
-            if float(result.get("counter_mult", 1.0) or 1.0) <= 1.011:
-                result["counter_mult"] = 1.0
-        except (TypeError, ValueError):
-            result["counter_mult"] = 1.0
+    # A classification reason cannot tell a genuine 1.01 game multiplier from
+    # an old synthetic sentinel. Only the retained source line can restore it.
+    # With no source evidence, preserve the value rather than inventing 1.00.
+    multiplier = _source_counter_multiplier(source.get("raw_line"))
+    if multiplier is not None:
+        result["counter_mult"] = multiplier
     # ``is_counter`` is also exposed as a live derived field. Recover the
     # immutable game verdict from counter_mult before persisting the raw fact.
     if "counter_mult" in result:
@@ -60,6 +58,24 @@ def raw_event(event: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             result["is_counter"] = False
     return result
+
+
+def _source_counter_multiplier(raw_line: Any) -> Optional[float]:
+    parts = str(raw_line or "").split("\t")
+    try:
+        if len(parts) >= 14 and parts[4].strip().lower() in ("blue", "red"):
+            if int(parts[0]) < 1:
+                return None
+            value = float(parts[3])  # Current format: round, time, damage, mult.
+        elif len(parts) >= 13 and parts[3].strip().lower() in ("blue", "red"):
+            value = float(parts[2])  # Previous format without round prefix.
+        elif len(parts) >= 11 and parts[2].strip().lower() in ("blue", "red"):
+            value = 1.0  # Older formats did not carry a multiplier at all.
+        else:
+            return None
+        return value if math.isfinite(value) and value >= 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def classified_event(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,7 +126,8 @@ def stable_event_id(round_no: int, kind: str, event: Dict[str, Any]) -> str:
 
 
 class MatchEventLedger:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
+    RAW_FACT_REVISION = 2
 
     def __init__(self, path: str) -> None:
         self.path = str(path)
@@ -120,8 +137,11 @@ class MatchEventLedger:
         self._wal_initialized = False
         with self._lock:
             self._connect()
-            self._create_schema()
-            self._disconnect()
+            try:
+                self._create_schema()
+                self._repair_raw_identities()
+            finally:
+                self._disconnect()
 
     def _connect(self) -> sqlite3.Connection:
         if self._db is None:
@@ -209,6 +229,61 @@ class MatchEventLedger:
             except sqlite3.Error:
                 pass
             self._disconnect()
+
+    def _repair_raw_identities(self) -> None:
+        """One-time, backed-up migration; never run on the per-hit hot path.
+
+        Canonicalize only facts provable from each retained source row. Merge
+        duplicate IDs in the same round, keep the earliest sequence, then clear
+        the affected round's *derived* verdicts so its combos replay correctly.
+        Official scores, winner, vitals and original JSONL are not modified.
+        """
+        db = self._connect()
+        marker = db.execute("SELECT value_json FROM metadata WHERE key='raw_fact_revision'").fetchone()
+        if marker is not None and json.loads(marker[0]) == self.RAW_FACT_REVISION:
+            return
+        rows = db.execute("SELECT * FROM events WHERE kind='damage' ORDER BY sequence_no").fetchall()
+        groups: Dict[str, list] = {}
+        affected = set()
+        for row in rows:
+            # Do not silently discard corrupt records during a compatibility repair.
+            saved_raw = dict(json.loads(row["raw_json"]))
+            data = raw_event(saved_raw)
+            event_id = stable_event_id(row["round_no"], "damage", data)
+            if event_id in groups or event_id != row["event_id"] or data != saved_raw:
+                affected.add(int(row["round_no"]))
+            groups.setdefault(event_id, []).append((row, data))
+        backup = ""
+        if affected:
+            backup_path = Path(self.path).with_name(Path(self.path).stem + f".before_raw_fact_v2_{time.time_ns()}.db")
+            # sqlite backup includes WAL contents and all official evidence.
+            with closing(sqlite3.connect(str(backup_path))) as target:
+                db.backup(target)
+            backup = backup_path.name
+        now = time.time()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            for round_no in sorted(affected):
+                db.execute("DELETE FROM events WHERE kind='damage' AND round_no=?", (round_no,))
+            for event_id, items in groups.items():
+                row, data = items[0]
+                if int(row["round_no"]) not in affected:
+                    continue
+                db.execute(
+                    "INSERT INTO events(event_id,round_no,kind,sequence_no,raw_json,classified_json,ruleset_version,first_seen_at,updated_at) VALUES(?,?,?,?,?,NULL,'',?,?)",
+                    (event_id, row["round_no"], "damage", row["sequence_no"], _json(data),
+                     min(float(item[0]["first_seen_at"]) for item in items), now),
+                )
+            details = {"revision": self.RAW_FACT_REVISION, "rounds": sorted(affected),
+                       "duplicates_removed": len(rows) - len(groups), "backup": backup}
+            db.execute("INSERT INTO metadata(key,value_json,updated_at) VALUES('raw_fact_revision',?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                       (_json(self.RAW_FACT_REVISION), now))
+            if affected:
+                db.execute("INSERT INTO audits(phase,ok,details_json,created_at) VALUES('raw_fact_identity_repair',1,?,?)", (_json(details), now))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
     def set_metadata(self, key: str, value: Any) -> None:
         now = time.time()

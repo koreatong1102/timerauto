@@ -9,6 +9,7 @@ import time
 import ctypes
 from ctypes import wintypes
 from collections import deque
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -23,6 +24,7 @@ from match_analytics import (
     resolve_match_result,
 )
 from commentary_director import CommentaryCandidate, CommentaryDirector
+from commentary_entertainment import BGradeCommentary, normalize_style
 from app_paths import app_path
 from match_log_archive import MatchLogArchive
 from spectator_log_blackbox import SpectatorLogBlackboxRecorder
@@ -168,6 +170,7 @@ class SpectatorLogWatcher(QObject):
         self._last_lobby_rounds: Optional[int] = None
         self._last_lobby_round_duration: Optional[int] = None
         self._last_lobby_break_duration: Optional[int] = None
+        self._last_lobby_venue_id = None
         self._break_started_wall: Optional[float] = None
         self._break_started_round: Optional[int] = None
         self._last_scorecard_overlay_key: Tuple[Any, ...] = tuple()
@@ -214,6 +217,8 @@ class SpectatorLogWatcher(QObject):
         self._commentary_semantic_last_key: Dict[str, str] = {}
         self._commentary_round_story: Dict[int, Dict[str, Any]] = {}
         self._commentary_director = CommentaryDirector()
+        self._bgrade_commentary = BGradeCommentary()
+        self._bgrade_pending_idle = None
         self._last_damage_seen_at = 0.0
         self._last_fight_state_started_at = 0.0
         self._last_idle_commentary_at = 0.0
@@ -907,6 +912,8 @@ class SpectatorLogWatcher(QObject):
             self._round_time_auto_modes = {}
             self._reset_down_state_machine()
             self._commentary_director.reset_match()
+            self._bgrade_commentary.reset_match()
+            self._bgrade_pending_idle = None
             if pair_ready:
                 self._last_match_reset_pair = pair_key
             self._last_active_match_pair = ("", "")
@@ -932,7 +939,10 @@ class SpectatorLogWatcher(QObject):
                 # The UI only needs a truthy value, but the chapter logger
                 # needs this match identity to distinguish a later rematch
                 # between the exact same two players.
-                out["vs_intro_event"] = {"matchSessionId": str(self._match_session_id or "")}
+                out["vs_intro_event"] = {
+                    "matchSessionId": str(self._match_session_id or ""),
+                    "venueId": getattr(self, "_last_lobby_venue_id", None),
+                }
                 self._last_vs_intro_pair = pair_key
                 self._set_caster_event_once(out, "vs", round_no, "intro", self._build_vs_caster_text())
         elif state in ("fight", "break", "results", "end", "knockout", "disqualified") and pair_ready:
@@ -1149,7 +1159,7 @@ class SpectatorLogWatcher(QObject):
                 )
                 out["spectator_lobby_status"] = {
                     "slots": list(lobby_info.get("slots") or []),
-                    "venueId": lobby_info.get("venue_id", ""),
+                    "venueId": lobby_info.get("venue_id", getattr(self, "_last_lobby_venue_id", None)),
                     "rounds": lobby_info.get("rounds", ""),
                     "roundDuration": lobby_info.get("round_duration", ""),
                     "breakDuration": lobby_info.get("break_duration", ""),
@@ -1362,6 +1372,7 @@ class SpectatorLogWatcher(QObject):
                     report_payload=report_payload,
                 )
                 if summary_text:
+                    summary_text = self._style_report_commentary(summary_text, "round", report_payload)
                     logging.info("SPECTATORLOG_ROUND_SUMMARY round=%s text=%s", caster_round_no, summary_text)
                     out["commentary_tts_round_summary_text"] = summary_text
                     out["commentary_tts_round_summary_role"] = "analyst"
@@ -1648,7 +1659,8 @@ class SpectatorLogWatcher(QObject):
 
         if state == "fight" and "commentary_tts_text" in out:
             out["commentary_tts_text"] = self._compact_live_commentary(
-                str(out.get("commentary_tts_text") or "")
+                str(out.get("commentary_tts_text") or ""),
+                single_sentence=not self._bgrade_enabled(),
             )
 
         if out and (damage_update or player_payload_due or "spectator_round_report" in out or "spectator_round_reports" in out or "round_intro_event" in out or "vs_intro_event" in out):
@@ -2666,6 +2678,8 @@ class SpectatorLogWatcher(QObject):
     def _remember_lobby_settings(self, lobby: dict) -> None:
         if not isinstance(lobby, dict) or not lobby:
             return
+        if "venue_id" in lobby:
+            self._last_lobby_venue_id = lobby["venue_id"]
         for attr, key in (("_last_lobby_rounds", "rounds"), ("_last_lobby_round_duration", "round_duration"), ("_last_lobby_break_duration", "break_duration")):
             try:
                 val = int(float(lobby.get(key)))
@@ -2789,7 +2803,7 @@ class SpectatorLogWatcher(QObject):
         return {
             "title": "MATCH LOBBY",
             "slots": slots,
-            "venueId": lobby.get("venue_id", ""),
+            "venueId": lobby.get("venue_id", getattr(self, "_last_lobby_venue_id", None)),
             "rounds": lobby.get("rounds", self._configured_total_rounds()),
             "roundDuration": lobby.get("round_duration", self._configured_round_duration()),
             "breakDuration": lobby.get("break_duration", self._configured_break_duration()),
@@ -2903,6 +2917,8 @@ class SpectatorLogWatcher(QObject):
         self._last_live_vitals_archive_at = 0.0
         self._last_live_vitals_archive_sig = tuple()
         self._commentary_director.reset_match()
+        self._bgrade_commentary.reset_match()
+        self._bgrade_pending_idle = None
         self._match_archive_resumed = False
         try:
             archive_dir = str(getattr(self.cfg, "spectator_match_archive_dir", "MatchLogArchive") or "MatchLogArchive")
@@ -3027,6 +3043,7 @@ class SpectatorLogWatcher(QObject):
         text = build_match_commentary(payload)
         if not text:
             return
+        text = self._style_report_commentary(text, "final", payload)
         logging.info(
             "SPECTATORLOG_MATCH_SUMMARY state=%s round=%s session=%s text=%s",
             state,
@@ -3211,13 +3228,13 @@ class SpectatorLogWatcher(QObject):
             out["commentary_tts_pitch"] = 0
 
     @staticmethod
-    def _compact_live_commentary(text: str, limit: int = 78) -> str:
+    def _compact_live_commentary(text: str, limit: int = 78, *, single_sentence: bool = True) -> str:
         """Keep fight commentary immediate: one sentence, no stale monologue."""
         clean = re.sub(r"\s+", " ", str(text or "")).strip()
         if not clean:
             return ""
         match = re.search(r"[.!?。！？]", clean)
-        if match:
+        if match and single_sentence:
             clean = clean[:match.end()].strip()
         if len(clean) <= limit:
             return clean
@@ -4391,14 +4408,9 @@ class SpectatorLogWatcher(QObject):
             else:
                 report[side]["roundsObserved"] = 1
             landed_count = max(0, int(report[side].get("landed", 0) or 0))
-            if bool(is_final):
-                # The displayed total damage is the archived official score
-                # value. A final-card average must use that same numerator;
-                # mixing it with only the throw-matched subset made the two
-                # match cards contradict each other.
-                report[side]["landedDamage"] = round(
-                    max(0.0, float(report[side].get("damage", 0.0) or 0.0)), 1
-                )
+            # Official total damage includes contacts outside the app's landed
+            # sample. Keep it in ``damage`` only: both report scopes average
+            # the app-measured landed damage over those same landed punches.
             report[side]["averageDamage"] = round(
                 float(report[side].get("landedDamage", 0.0) or 0.0) / landed_count, 1
             ) if landed_count else 0.0
@@ -8057,12 +8069,17 @@ class SpectatorLogWatcher(QObject):
             event_role=event_role,
             counter_commentary=counter_commentary,
             combo_commentary=combo_commentary,
+            effect_events=effect_events,
         )
         if selected_commentary and bool(getattr(self.cfg, "spectator_commentary_enabled", False)):
             out["commentary_tts_text"] = str(selected_commentary.text or "")
             out["commentary_tts_role"] = str(selected_commentary.role or "analyst")
+            out["commentary_tts_category"] = selected_commentary.category
+            out["commentary_tts_observed_at"] = time.monotonic()
             self._commentary_last_at = time.time()
-            if down_plan and selected_commentary.category == "knockdown":
+            if self._bgrade_enabled():
+                self._emit_bgrade_dialogue(out, selected_commentary)
+            elif down_plan and selected_commentary.category == "knockdown":
                 followups = list(down_plan.get("followups") or [])
                 if followups:
                     out["commentary_tts_followups"] = followups
@@ -8685,6 +8702,21 @@ class SpectatorLogWatcher(QObject):
     # Clean live-commentary overrides.  Older releases accumulated several
     # mojibake phrase pools above; defining the live path here keeps parsing
     # compatibility while making every broadcast-facing sentence UTF-8 Korean.
+    def _bgrade_enabled(self) -> bool:
+        return normalize_style(getattr(self.cfg, "spectator_commentary_style", "sports")) == "b_grade"
+
+    def _style_report_commentary(self, text: str, tag: str, report: Optional[dict] = None) -> str:
+        if not self._bgrade_enabled():
+            return text
+        if report:
+            self._bgrade_commentary.story.configure(self.cfg)
+            script = self._bgrade_commentary.report_text(report, final=tag == "final")
+            if script:
+                return script
+        # Missing report evidence is not a license to invent a recap or revive
+        # an old suffix joke; keep the existing factual sentence untouched.
+        return text
+
     def _live_commentary_name(self, side: str) -> str:
         side = str(side or "").lower().strip()
         raw = self._side_raw_name(side)
@@ -8850,6 +8882,10 @@ class SpectatorLogWatcher(QObject):
                 allow_repeat=True,
             )
             followups = [{"text": "방금 한 방의 충격이 큽니다.", "role": "analyst", "delay_ms": 1450, "retries": 1}]
+        if self._bgrade_enabled():
+            joke = self._bgrade_commentary.pick("knockdown", now=time.monotonic())
+            if joke:
+                followups = [{"text": joke, "role": "analyst", "delay_ms": 1450, "retries": 1}]
         return {"text": primary, "role": "caster", "side": side, "count": count, "followups": followups}
 
     def _build_fight_summary_commentary(self, new_events: List[dict], effect_events: List[dict], damage_path: str, punishment_snapshot: Optional[Dict[str, Dict[str, float]]] = None) -> Tuple[str, str]:
@@ -8942,30 +8978,126 @@ class SpectatorLogWatcher(QObject):
             text = self._live_line(key, ["잠시 탐색전이 이어집니다.", "서로 타이밍을 재고 있습니다.", "거리 싸움이 길어집니다."])
             role = "caster"
         self._last_idle_commentary_at = now
+        if self._bgrade_enabled():
+            bank = self._bgrade_commentary
+            bank.story.configure(self.cfg)
+            bank.story.round = max(1, int(round_no or 1))
+            presentation = bank.story.idle(seconds_left=seconds_left)
+            if not presentation:
+                self._bgrade_pending_idle = None
+                return "", ""
+            turns = presentation["turns"]
+            text, role = turns[0]["text"], turns[0]["role"]
+            self._bgrade_pending_idle = CommentaryCandidate(
+                " ".join(turn["text"] for turn in turns), role, "idle", 10,
+                presentation=presentation)
         return text, role
+
+    def _emit_bgrade_dialogue(self, out: Dict[str, Any], candidate: CommentaryCandidate) -> None:
+        setup, replies = self._bgrade_commentary.dialogue_for(candidate)
+        out["commentary_tts_text"] = setup
+        out["commentary_tts_role"] = candidate.role
+        out["commentary_tts_live_dialogue"] = True
+        out["commentary_tts_category"] = candidate.category
+        out["commentary_tts_observed_at"] = time.monotonic()
+        out["commentary_tts_continuations"] = replies
+        if candidate.presentation:
+            out["commentary_tts_story"] = dict(candidate.presentation["story"])
+            out["commentary_tts_focus"] = dict(candidate.presentation.get("focus") or {})
 
     def _attach_witty_duo_followup(self, out: Dict[str, Any], state: str = "", round_no: Optional[int] = None) -> None:
         # Follow-ups are filler only.  They never attach to a hit update, so a
         # delayed analyst line cannot step on the next important exchange.
         if str(state or "").lower() != "fight" or "latest_hit" in out:
             return
+        if self._bgrade_enabled():
+            pending = self._bgrade_pending_idle
+            self._bgrade_pending_idle = None
+            if not pending or not isinstance(pending, CommentaryCandidate):
+                return
+            lead, replies = self._bgrade_commentary.dialogue_for(pending)
+            if lead != str(out.get("commentary_tts_text") or "") or pending.presentation["story"]["round"] != int(round_no or 1):
+                return
+            if int(getattr(self, "_witty_duo_round_count", 0) or 0) >= 6:
+                return
+            self._emit_bgrade_dialogue(out, pending)
+            self._bgrade_commentary.accept_call(pending)
+            # Legacy fields are retained for old UI clients, but live playback
+            # uses continuations bound to EndOfMedia, never a fixed delay.
+            if replies:
+                out["commentary_tts_followup_text"] = replies[0]["text"]
+                out["commentary_tts_followup_role"] = replies[0]["role"]
+                out["commentary_tts_followup_retries"] = 1
+            self._witty_duo_round_count = int(getattr(self, "_witty_duo_round_count", 0) or 0) + 1
+            return
         if str(out.get("commentary_tts_role") or "").lower() != "caster":
             return
         text = str(out.get("commentary_tts_text") or "").strip()
-        if not text or int(getattr(self, "_witty_duo_round_count", 0) or 0) >= 2:
+        limit = 2
+        if not text or int(getattr(self, "_witty_duo_round_count", 0) or 0) >= limit:
             return
         follow = self._live_line(f"duo:{round_no}:{text}", ["서로 쉽게 거리를 주지 않습니다.", "다음 한 번의 진입이 중요합니다.", "수비 복귀가 승부를 가를 수 있습니다."])
+        if not follow:
+            return
         out["commentary_tts_followup_text"] = follow
         out["commentary_tts_followup_role"] = "analyst"
         out["commentary_tts_followup_delay_ms"] = 1500
         out["commentary_tts_followup_retries"] = 1
         self._witty_duo_round_count = int(getattr(self, "_witty_duo_round_count", 0) or 0) + 1
 
-    def _direct_live_commentary(self, *, round_no: Optional[int], new_events: List[dict], down_plan: Optional[Dict[str, Any]], event_commentary: str, event_role: str, counter_commentary: str, combo_commentary: str) -> Optional[CommentaryCandidate]:
+    def _direct_live_commentary(self, *, round_no: Optional[int], new_events: List[dict], down_plan: Optional[Dict[str, Any]], event_commentary: str, event_role: str, counter_commentary: str, combo_commentary: str, effect_events: Optional[List[dict]] = None) -> Optional[CommentaryCandidate]:
         names = {"blue": self._live_commentary_name("blue"), "red": self._live_commentary_name("red")}
         candidates: List[CommentaryCandidate] = []
         mode = str(getattr(self.cfg, "spectator_commentary_mode", "standard") or "standard").lower()
         flow = self._commentary_director.observe_events(round_no, new_events, names)
+        if self._bgrade_enabled():
+            self._bgrade_commentary.story.configure(self.cfg)
+            self._bgrade_commentary.story.observe(round_no, new_events)
+            # The alternate style has its own complete scripts and rotation.
+            # Sports phrase exhaustion/suppression must not silence this mode.
+            if down_plan:
+                receiver = str(down_plan.get("side") or "").lower()
+                call = self._bgrade_commentary.make_call("knockdown",
+                    receiver=names.get(receiver, "상대 선수"), count=int(down_plan.get("count") or 1),
+                    receiver_side=receiver,
+                    key=f"{round_no}:{receiver}:{down_plan.get('count', 0)}")
+                if call:
+                    candidates.append(call)
+            else:
+                for effect in effect_events or []:
+                    tag = str(effect.get("kind") or "").lower()
+                    receiver = str(effect.get("side") or "").lower()
+                    if tag in ("tko", "stun", "knockdown") and receiver in names:
+                        call = self._bgrade_commentary.make_call(tag, receiver=names[receiver],
+                            receiver_side=receiver,
+                            count=int(effect.get("round_down_count") or 1), key=f"{round_no}:{receiver}:{tag}")
+                        if call:
+                            candidates.append(call)
+                for index, event in enumerate(new_events or []):
+                    side = str(event.get("attacker_side") or "").lower()
+                    receiver = str(event.get("receiver_side") or "").lower()
+                    if side not in names or receiver not in names:
+                        continue
+                    call = self._bgrade_commentary.event_call(event,
+                        name=names[side], receiver=names[receiver],
+                        target=self._weak_point_ko(str(event.get("weak_point") or "")) or "급소",
+                        min_damage=float(getattr(self.cfg, "spectator_commentary_min_damage", 25.0)),
+                        key=f"{round_no}:{event.get('event_id') or event.get('raw_line') or index}:{event.get('time')}:{side}")
+                    if call and (mode != "quiet" or call.category in ("tko", "stun")):
+                        candidates.append(replace(call, attacker_side=side))
+            # Select one actual scene first: do not merge unrelated fighters'
+            # counter/combo candidates merely because they share a poll batch.
+            best = max(enumerate(candidates), key=lambda item: (item[1].priority, item[0]), default=None)
+            decision = self._commentary_director.choose_live([best[1]] if best else [],
+                cooldown_sec=max(0.0, float(getattr(self.cfg, "spectator_commentary_cooldown_sec", 6.0))))
+            if decision.candidate:
+                self._bgrade_commentary.accept_call(decision.candidate)
+            DIAG.record("commentary_decision", round=round_no, style="b_grade", selected=decision.candidate.category if decision.candidate else "",
+                text=decision.candidate.text if decision.candidate else "", reason=decision.reason, suppressed=list(decision.suppressed),
+                scene=(decision.candidate.presentation or {}).get("story", {}).get("scene", "") if decision.candidate else "",
+                direction=(decision.candidate.presentation or {}).get("story", {}).get("direction", "") if decision.candidate else "",
+                content=(decision.candidate.presentation or {}).get("story", {}).get("content", []) if decision.candidate else [])
+            return decision.candidate
         if flow and mode != "quiet":
             candidates.append(flow)
         effects = {str((event or {}).get("effect_kind") or "").lower() for event in list(new_events or [])}

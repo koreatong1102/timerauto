@@ -3,6 +3,12 @@
 
 from __future__ import annotations
 
+# Safe offline release check: exit before GUI setup, hotkeys, OBS or logging.
+import sys
+if __name__ == "__main__" and "--release-self-test" in sys.argv:
+    from release_selftest import main as _release_selftest_main
+    raise SystemExit(_release_selftest_main())
+
 import copy
 import glob
 import ctypes
@@ -31,6 +37,7 @@ from dataclasses import asdict
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from collections import deque
+from venue_backgrounds import venue_from_update
 
 APP_VERSION = "1.0.18"
 UPDATE_FEED_URL = "https://github.com/koreatong1102/timerauto/releases/download/latest/latest.json"
@@ -128,6 +135,11 @@ from actions import ActionRunner
 from browser_overlay import BrowserOverlayServer
 from browser_overlay_sync import BrowserOverlaySync
 from commentary_demo import build_commentary_director_demo
+from commentary_entertainment import STYLE_CHOICES, normalize_style, bgrade_demo_steps
+from speech_runtime import commentary_cache_path, is_cached_commentary, last_speech_error
+from commentary_story import SPOKEN_MEMORY
+from commentary_calls import SPOKEN_FOCUS
+from commentary_handoff import importance as handoff_importance, sentence_ends, handoff_delay
 from event_engine import FightEventEngine
 from match_analytics import analyze_fight_style
 from obs_auto_replay import ObsAutoReplayController
@@ -6531,6 +6543,7 @@ class SettingsDialog(QDialog):
         self._tts_test_players: Dict[str, Any] = {}
         self._tts_test_files: Dict[str, List[str]] = {"analyst": [], "caster": []}
         self._tts_test_busy: Dict[str, bool] = {"analyst": False, "caster": False}
+        self._tts_test_generation = 0
         self._commentary_test_script_token: Optional[object] = None
         self._commentary_test_script_queue = deque()
         self._commentary_test_script_name: str = ""
@@ -8221,6 +8234,39 @@ class SettingsDialog(QDialog):
         sound_lay.addWidget(self.le_spectator_tko_sfx, 15, 1, 1, 3)
         sound_lay.addWidget(self.btn_spectator_tko_sfx_pick, 15, 4)
         sound_lay.addWidget(self.btn_spectator_tko_sfx_test, 15, 5)
+        self.cmb_spectator_commentary_style = QComboBox()
+        for label, value in STYLE_CHOICES:
+            self.cmb_spectator_commentary_style.addItem(label, value)
+        self.cmb_spectator_commentary_style.setCurrentIndex(
+            self.cmb_spectator_commentary_style.findData(
+                normalize_style(getattr(self.cfg, "spectator_commentary_style", "sports"))
+            )
+        )
+        self.cmb_spectator_commentary_style.setToolTip(
+            "일반 스포츠는 기존 해설입니다. B급 인방 예능은 비속어를 검열하지 않고 상황 드립과 티키타카를 사용합니다. "
+            "빈도(조용함/표준/활발함)와 별개이며 경기 판정·리포트 수치는 바뀌지 않습니다."
+        )
+        sound_lay.addWidget(QLabel("해설 스타일"), 16, 0)
+        sound_lay.addWidget(self.cmb_spectator_commentary_style, 16, 1, 1, 2)
+        style_note = QLabel("B급 예능: 비속어 검열 없음 · ‘듀오 해설 테스트’로 미리 듣기")
+        style_note.setWordWrap(True)
+        sound_lay.addWidget(style_note, 16, 3, 1, 3)
+        self.cmb_spectator_bgrade_density = QComboBox()
+        self.cmb_spectator_bgrade_density.addItem("간결 · 짧은 반응 위주", "compact")
+        self.cmb_spectator_bgrade_density.addItem("풍성 · 티키타카와 앞말 회수", "full")
+        self.cmb_spectator_bgrade_density.setCurrentIndex(max(0, self.cmb_spectator_bgrade_density.findData(
+            getattr(self.cfg, "spectator_bgrade_density", "full"))))
+        self.cmb_spectator_bgrade_swearing = QComboBox()
+        for label, value in (("순한 드립", "light"), ("가벼운 비속어 혼합", "mixed"), ("거친 비속어까지 다양하게", "strong")):
+            self.cmb_spectator_bgrade_swearing.addItem(label, value)
+        self.cmb_spectator_bgrade_swearing.setCurrentIndex(max(0, self.cmb_spectator_bgrade_swearing.findData(
+            getattr(self.cfg, "spectator_bgrade_swearing", "strong"))))
+        sound_lay.addWidget(QLabel("B급 예능 농도"), 17, 0)
+        sound_lay.addWidget(self.cmb_spectator_bgrade_density, 17, 1, 1, 2)
+        sound_lay.addWidget(QLabel("B급 비속어"), 17, 3)
+        sound_lay.addWidget(self.cmb_spectator_bgrade_swearing, 17, 4, 1, 2)
+        self.cmb_spectator_bgrade_density.setToolTip("말하는 빈도와 별개입니다. 간결은 단문 위주, 풍성은 상황에 맞는 두 사람 대화와 앞말 회수를 사용합니다.")
+        self.cmb_spectator_bgrade_swearing.setToolTip("단어를 무작위로 바꾸지 않습니다. 선택한 수위 안에서 상황에 맞게 작성된 대화를 고릅니다. 일반 스포츠 모드에는 적용되지 않습니다.")
         spectator_group.setToolTip("위쪽은 SpectatorLog 읽기 설정, 아래쪽은 리플레이 / 피격 이펙트 설정입니다.")
         _spectator_tips = {
             self.chk_spectatorlog_enabled: "TOTF2 SpectatorLog 폴더를 읽어서 HUD를 자동으로 움직입니다.",
@@ -8365,6 +8411,9 @@ class SettingsDialog(QDialog):
         self.btn_spectator_tko_sfx_test.clicked.connect(lambda: self._test_spectator_sfx("tko"))
         self.chk_spectator_commentary.stateChanged.connect(self._schedule_apply)
         self.cmb_spectator_commentary_mode.currentIndexChanged.connect(self._schedule_apply)
+        self.cmb_spectator_commentary_style.currentIndexChanged.connect(self._schedule_apply)
+        self.cmb_spectator_bgrade_density.currentIndexChanged.connect(self._schedule_apply)
+        self.cmb_spectator_bgrade_swearing.currentIndexChanged.connect(self._schedule_apply)
         self.chk_spectator_break_promo.stateChanged.connect(self._schedule_apply)
         self.le_spectator_break_promo_text.textChanged.connect(self._schedule_apply)
         self.cmb_spectator_commentary_voice.currentIndexChanged.connect(self._schedule_apply)
@@ -12221,6 +12270,7 @@ class SettingsDialog(QDialog):
 
     def _stop_spectator_commentary_test_script(self):
         self._commentary_test_script_token = None
+        self._tts_test_generation = int(getattr(self, "_tts_test_generation", 0)) + 1
         try:
             self._commentary_test_script_queue.clear()
         except Exception:
@@ -12238,7 +12288,8 @@ class SettingsDialog(QDialog):
                 self._tts_test_files[role] = []
             for path in old_files:
                 try:
-                    os.remove(path)
+                    if not is_cached_commentary(path):
+                        os.remove(path)
                 except Exception:
                     pass
         except Exception:
@@ -12254,9 +12305,27 @@ class SettingsDialog(QDialog):
         token = object()
         self._commentary_test_script_token = token
         self._commentary_test_script_name = str(name or "자동해설 테스트")
-        self._commentary_test_script_queue = deque(list(steps or []))
+        self._commentary_test_script_queue = deque(self._commentary_preview_turns(steps))
         self._noop_status(f"{self._commentary_test_script_name} 시작")
         QTimer.singleShot(0, lambda t=token: self._run_next_spectator_commentary_script_step(t))
+
+    @staticmethod
+    def _commentary_preview_turns(steps: List[dict]) -> List[dict]:
+        # The test runner already waits for the shared channel to finish each
+        # step. Expand the reply into a step too: no timer-based overlap/drop.
+        turns = []
+        for source in steps or []:
+            step = dict(source)
+            follow = str(step.pop("followup_text", "") or step.pop("duo_text", "") or "").strip()
+            step.pop("duo_text", None)
+            if not follow:
+                turns.append(step)
+                continue
+            role = step.pop("followup_role", "analyst")
+            post_ms = step.get("post_ms", 600)
+            step["post_ms"] = 180
+            turns.extend((step, {"text": follow, "role": role, "post_ms": post_ms}))
+        return turns
 
 
     def _schedule_tts_test_followup(self, text: str, role: str = "analyst", delay_ms: int = 1050, token=None):
@@ -12399,6 +12468,13 @@ class SettingsDialog(QDialog):
 
 
     def _test_spectator_commentary_duo_suite(self):
+        style_combo = getattr(self, "cmb_spectator_commentary_style", None)
+        style = style_combo.currentData() if style_combo is not None else getattr(self.cfg, "spectator_commentary_style", "sports")
+        if normalize_style(style) == "b_grade":
+            self._start_spectator_commentary_script("B급 인방 예능 · 경기 기억 리허설", bgrade_demo_steps(
+                density=self.cmb_spectator_bgrade_density.currentData(),
+                swearing=self.cmb_spectator_bgrade_swearing.currentData()))
+            return
         steps = [
             {"role": "caster", "text": "듀오 해설 테스트 시작합니다.", "post_ms": 800},
             {"role": "caster", "text": "잠시 소강상태입니다.", "followup_text": "둘 다 먼저 가긴 싫죠.", "followup_delay_ms": 950, "post_ms": 700},
@@ -12517,9 +12593,24 @@ class SettingsDialog(QDialog):
             self._noop_status("자동해설 TTS 테스트 재생 요청")
             return
         self._tts_test_busy[role] = True
+        self._tts_test_generation += 1
+        generation = self._tts_test_generation
+        # Read Qt widgets on the UI thread, not inside a synthesis worker.
+        voice = self._commentary_tts_voice(role)
+        rate = self._commentary_tts_rate()
+        pitch = self._commentary_tts_pitch()
+        volume = self._commentary_tts_volume()
+        if rate_override is not None:
+            rate = max(80, min(320, int(rate_override)))
+        if pitch_override is not None:
+            pitch = max(-100, min(100, int(pitch_override)))
+        cached_path = commentary_cache_path(text, role, voice, rate, volume, pitch)
+        if os.path.isfile(cached_path) and os.path.getsize(cached_path) > 0:
+            self._play_tts_test_file(role, cached_path, generation)
+            return
 
         def _worker():
-            media_path = ""
+            media_path = cached_path
             try:
                 if not self.action_runner._ensure_tts_ready():
                     QMetaObject.invokeMethod(
@@ -12527,53 +12618,38 @@ class SettingsDialog(QDialog):
                         "_clear_tts_test_busy",
                         Qt.ConnectionType.QueuedConnection,
                         Q_ARG(str, role),
+                        Q_ARG(int, generation),
                     )
                     QMetaObject.invokeMethod(
                         self,
                         "_show_tts_test_error",
                         Qt.ConnectionType.QueuedConnection,
                         Q_ARG(str, "edge-tts를 사용할 수 없습니다. pip install edge-tts 확인 필요"),
+                        Q_ARG(int, generation),
                     )
                     return
-                fd, media_path = tempfile.mkstemp(prefix="timerauto_tts_test_", suffix=".mp3")
-                os.close(fd)
-                voice = self._commentary_tts_voice(role)
-                rate = self._commentary_tts_rate()
-                pitch = self._commentary_tts_pitch()
-                if rate_override is not None:
-                    try:
-                        rate = max(80, min(320, int(rate_override)))
-                    except Exception:
-                        rate = 200
-                if pitch_override is not None:
-                    try:
-                        pitch = max(-100, min(100, int(pitch_override)))
-                    except Exception:
-                        pitch = 0
                 ok = self.action_runner._edge_save_cli(
                     str(text or ""),
                     media_path,
                     voice,
                     self.action_runner._edge_rate(rate),
-                    self.action_runner._edge_volume(self._commentary_tts_volume()),
+                    self.action_runner._edge_volume(volume),
                     self.action_runner._edge_pitch(pitch),
                 )
                 if not ok:
-                    try:
-                        os.remove(media_path)
-                    except Exception:
-                        pass
                     QMetaObject.invokeMethod(
                         self,
                         "_clear_tts_test_busy",
                         Qt.ConnectionType.QueuedConnection,
                         Q_ARG(str, role),
+                        Q_ARG(int, generation),
                     )
                     QMetaObject.invokeMethod(
                         self,
                         "_show_tts_test_error",
                         Qt.ConnectionType.QueuedConnection,
-                        Q_ARG(str, "Edge TTS 음성 파일 생성 실패"),
+                        Q_ARG(str, last_speech_error()),
+                        Q_ARG(int, generation),
                     )
                     return
                 QMetaObject.invokeMethod(
@@ -12582,32 +12658,33 @@ class SettingsDialog(QDialog):
                     Qt.ConnectionType.QueuedConnection,
                     Q_ARG(str, role),
                     Q_ARG(str, media_path),
+                    Q_ARG(int, generation),
                 )
             except Exception as e:
-                if media_path:
-                    try:
-                        os.remove(media_path)
-                    except Exception:
-                        pass
                 QMetaObject.invokeMethod(
                     self,
                     "_clear_tts_test_busy",
                     Qt.ConnectionType.QueuedConnection,
                     Q_ARG(str, role),
+                    Q_ARG(int, generation),
                 )
                 QMetaObject.invokeMethod(
                     self,
                     "_show_tts_test_error",
                     Qt.ConnectionType.QueuedConnection,
-                    Q_ARG(str, str(e)),
+                    Q_ARG(str, f"음성 테스트 처리 실패({type(e).__name__})"),
+                    Q_ARG(int, generation),
                 )
 
         threading.Thread(target=_worker, daemon=True).start()
         self._noop_status("자동해설 TTS 생성 중...")
 
     @pyqtSlot(str, str)
-    def _play_tts_test_file(self, role: str, media_path: str):
+    @pyqtSlot(str, str, int)
+    def _play_tts_test_file(self, role: str, media_path: str, generation: int = -1):
         try:
+            if generation >= 0 and generation != self._tts_test_generation:
+                return
             role = "caster" if str(role or "").lower() == "caster" else "analyst"
             path = os.path.abspath(str(media_path or ""))
             if not os.path.isfile(path):
@@ -12646,24 +12723,34 @@ class SettingsDialog(QDialog):
                 self._tts_test_files[role] = []
                 for path in old:
                     try:
-                        os.remove(path)
+                        if not is_cached_commentary(path):
+                            os.remove(path)
                     except Exception:
                         pass
                 self._tts_test_busy[role] = False
+                if status == QMediaPlayer.MediaStatus.InvalidMedia:
+                    self._show_tts_test_error("음성 파일을 재생하지 못했습니다. 뒤의 대화는 중단합니다.")
         except Exception:
             pass
 
     @pyqtSlot(str)
-    def _clear_tts_test_busy(self, role: str):
+    @pyqtSlot(str, int)
+    def _clear_tts_test_busy(self, role: str, generation: int = -1):
         try:
+            if generation >= 0 and generation != self._tts_test_generation:
+                return
             role = "caster" if str(role or "").lower() == "caster" else "analyst"
             self._tts_test_busy[role] = False
         except Exception:
             pass
 
     @pyqtSlot(str)
-    def _show_tts_test_error(self, message: str):
+    @pyqtSlot(str, int)
+    def _show_tts_test_error(self, message: str, generation: int = -1):
+        if generation >= 0 and generation != self._tts_test_generation:
+            return
         msg = str(message or "알 수 없는 오류")
+        self._stop_spectator_commentary_test_script()
         try:
             logging.warning("TTS_TEST_FAIL %s", msg)
         except Exception:
@@ -13493,6 +13580,8 @@ class SettingsDialog(QDialog):
             self.cfg.overlay_show_arena_name = bool(self.chk_overlay_arena_name.isChecked())
         if hasattr(self, "chk_overlay_flags"):
             self.cfg.overlay_show_flags = bool(self.chk_overlay_flags.isChecked())
+        if hasattr(self, "chk_overlay_player_ids"):
+            self.cfg.overlay_show_player_ids = bool(self.chk_overlay_player_ids.isChecked())
         if hasattr(self, "chk_overlay_cinematic"):
             self.cfg.overlay_show_cinematic = bool(self.chk_overlay_cinematic.isChecked())
         if hasattr(self, "sp_browser_overlay_scale"):
@@ -13525,6 +13614,7 @@ class SettingsDialog(QDialog):
                     "overlay_show_red_name": self.cfg.overlay_show_red_name,
                     "overlay_show_arena_name": self.cfg.overlay_show_arena_name,
                     "overlay_show_flags": self.cfg.overlay_show_flags,
+                    "overlay_show_player_ids": self.cfg.overlay_show_player_ids,
                     "overlay_show_cinematic": self.cfg.overlay_show_cinematic,
                     "overlay_timer_font_size": int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54),
                     "overlay_timer_x": int(getattr(self.cfg, "overlay_timer_x", 0) or 0),
@@ -13879,6 +13969,7 @@ class SettingsDialog(QDialog):
             "overlay_show_red_name": show_red_name,
             "overlay_show_arena_name": show_arena_name,
             "overlay_show_flags": show_flags,
+            "overlay_show_player_ids": bool(getattr(self.cfg, "overlay_show_player_ids", True)),
             "overlay_show_cinematic": show_cinematic,
             "browser_overlay_scale": float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),
             "browser_overlay_output_only": bool(getattr(self.cfg, "browser_overlay_output_only", True)),
@@ -14031,6 +14122,9 @@ class SettingsDialog(QDialog):
             self.chk_overlay_arena_name.setChecked(show_arena)
         if hasattr(self, "chk_overlay_flags"):
             self.chk_overlay_flags.setChecked(show_flags)
+        self.cfg.overlay_show_player_ids = bool(data.get("overlay_show_player_ids", getattr(self.cfg, "overlay_show_player_ids", True)))
+        if hasattr(self, "chk_overlay_player_ids"):
+            self.chk_overlay_player_ids.setChecked(self.cfg.overlay_show_player_ids)
         if hasattr(self, "chk_overlay_cinematic"):
             self.chk_overlay_cinematic.setChecked(show_cinematic)
         if hasattr(self, "sp_browser_overlay_scale"):
@@ -14733,6 +14827,12 @@ class SettingsDialog(QDialog):
         row_bg4.addWidget(self.chk_overlay_time_during_knockdown)
         row_bg4.addStretch(1)
         overlay_lay.addLayout(row_bg4)
+
+        self.chk_overlay_player_ids = QCheckBox("닉네임 아래 게임 ID 표시 (체력바 / VS)")
+        self.chk_overlay_player_ids.setChecked(bool(getattr(self.cfg, "overlay_show_player_ids", True)))
+        self.chk_overlay_player_ids.setToolTip("등록 닉네임 아래에 게임 ID를 작은 글씨로 표시합니다. 경기 중 체력바와 경기 시작 전 전체화면 VS에 함께 적용됩니다.")
+        self.chk_overlay_player_ids.stateChanged.connect(lambda _s: self._apply_overlay_elements_live())
+        overlay_lay.addWidget(self.chk_overlay_player_ids)
 
         vs_bg_group = QGroupBox("철권8 VS 오버레이 배경")
         vs_bg_lay = QGridLayout(vs_bg_group)
@@ -19656,6 +19756,11 @@ class SettingsDialog(QDialog):
             self.cfg.spectator_commentary_enabled = bool(self.chk_spectator_commentary.isChecked())
         if hasattr(self, "cmb_spectator_commentary_mode"):
             self.cfg.spectator_commentary_mode = str(self.cmb_spectator_commentary_mode.currentData() or "standard")
+        if hasattr(self, "cmb_spectator_commentary_style"):
+            self.cfg.spectator_commentary_style = normalize_style(self.cmb_spectator_commentary_style.currentData())
+        if hasattr(self, "cmb_spectator_bgrade_density"):
+            self.cfg.spectator_bgrade_density = str(self.cmb_spectator_bgrade_density.currentData() or "full")
+            self.cfg.spectator_bgrade_swearing = str(self.cmb_spectator_bgrade_swearing.currentData() or "strong")
         if hasattr(self, "chk_spectator_break_promo"):
             self.cfg.spectator_break_promo_enabled = bool(self.chk_spectator_break_promo.isChecked())
         if hasattr(self, "le_spectator_break_promo_text"):
@@ -20294,6 +20399,9 @@ class SettingsDialog(QDialog):
         if hasattr(self, "cmb_spectator_commentary_mode"):
             idx = self.cmb_spectator_commentary_mode.findData(str(getattr(self.cfg, "spectator_commentary_mode", "standard") or "standard"))
             self.cmb_spectator_commentary_mode.setCurrentIndex(idx if idx >= 0 else 1)
+        if hasattr(self, "cmb_spectator_commentary_style"):
+            idx = self.cmb_spectator_commentary_style.findData(normalize_style(getattr(self.cfg, "spectator_commentary_style", "sports")))
+            self.cmb_spectator_commentary_style.setCurrentIndex(max(0, idx))
         if hasattr(self, "chk_spectator_break_promo"):
             self.chk_spectator_break_promo.setChecked(
                 bool(getattr(self.cfg, "spectator_break_promo_enabled", True))
@@ -20446,6 +20554,8 @@ class SettingsDialog(QDialog):
             self.chk_overlay_arena_name.setChecked(bool(getattr(self.cfg, "overlay_show_arena_name", True)))
         if hasattr(self, "chk_overlay_flags"):
             self.chk_overlay_flags.setChecked(bool(getattr(self.cfg, "overlay_show_flags", True)))
+        if hasattr(self, "chk_overlay_player_ids"):
+            self.chk_overlay_player_ids.setChecked(bool(getattr(self.cfg, "overlay_show_player_ids", True)))
         if hasattr(self, "chk_overlay_cinematic"):
             self.chk_overlay_cinematic.setChecked(bool(getattr(self.cfg, "overlay_show_cinematic", True)))
         if hasattr(self, "le_overlay_vs_bg"):
@@ -20821,6 +20931,14 @@ class MainApp(QObject):
         # 버리면 다운·TKO 같은 핵심 상황도 조용히 지나가므로, 짧은 우선순위 큐에
         # 보관했다가 현재 문장이 끝난 직후 이어서 재생한다.
         self._commentary_tts_queue = deque()
+        self._commentary_handoff_pending = None
+        self._commentary_handoff_worker_id = 0
+        self._commentary_handoff_counter = 0
+        self._commentary_handoff_fade = None
+        self._commentary_live_serial = 0
+        self._commentary_tts_deliveries = {}
+        self._commentary_tts_dialogues = {}
+        self._commentary_tts_generations = {"caster": 0, "analyst": 0}
         self._commentary_tts_queue_draining = False
         self._commentary_hide_round_report_on_complete: Dict[str, bool] = {"analyst": False, "caster": False}
         self._commentary_release_idle_highlight_on_complete: Dict[str, bool] = {"analyst": False, "caster": False}
@@ -20839,6 +20957,7 @@ class MainApp(QObject):
                     player.setAudioOutput(audio_out)
                     audio_out.setVolume(1.0)
                     player.mediaStatusChanged.connect(lambda status, r=role: self._on_commentary_media_status(r, status))
+                    player.playbackStateChanged.connect(lambda state, r=role: self._on_commentary_playback_state(r, state))
                     self._commentary_audio_outs[role] = audio_out
                     self._commentary_players[role] = player
                 except Exception:
@@ -21032,7 +21151,7 @@ class MainApp(QObject):
             except Exception:
                 pass
 
-    def _split_commentary_tts_sentences(self, text: str) -> List[str]:
+    def _split_commentary_tts_sentences(self, text: str, max_sentences: Optional[int] = 8) -> List[str]:
         text = re.sub(r"\s+", " ", str(text or "").strip())
         if not text:
             return []
@@ -21062,7 +21181,7 @@ class MainApp(QObject):
                     chunk = nxt
             if chunk.strip():
                 out.append(chunk.strip(" ,，"))
-        return out[:8]
+        return out if max_sentences is None else out[:max_sentences]
 
     def _estimate_commentary_sentence_ms(self, text: str) -> int:
         # Conservative Korean TTS length estimate. Only used to space queued recap sentences.
@@ -21193,7 +21312,7 @@ class MainApp(QObject):
             except Exception:
                 logging.exception("COMMENTARY_TTS_FOLLOWUP_FAIL")
 
-        QTimer.singleShot(max(0, min(60000, int(delay_ms or 2400))), lambda: _attempt(max(0, int(retries or 0))))
+        QTimer.singleShot(max(0, min(60000, int(delay_ms))), lambda: _attempt(max(0, int(retries or 0))))
 
     @staticmethod
     def _commentary_tts_priority(text: str, hide_round_report_on_complete: bool = False) -> int:
@@ -21207,7 +21326,296 @@ class MainApp(QObject):
             return 45
         return 10
 
-    def _enqueue_commentary_tts(self, text: str, role: str, **kwargs) -> None:
+    @staticmethod
+    def _commentary_timing_from_update(update: dict) -> dict:
+        category = str(update.get("commentary_tts_category") or "")
+        created = float(update.get("commentary_tts_observed_at") or time.monotonic())
+        terminal = category in ("knockdown", "tko", "stun")
+        return {"kind": "terminal" if terminal else "live", "created_at": created,
+                "category": category, "scene": dict(update.get("commentary_tts_story") or {}).get("scene", ""),
+                "expires_at": created + (5.0 if terminal else 3.2)}
+
+    def _handoff_voice_settings(self, role: str, kwargs: dict) -> tuple:
+        default_voice = "ko-KR-InJoonNeural" if role == "caster" else "ko-KR-SunHiNeural"
+        voice = str(getattr(self.cfg, "spectator_caster_voice" if role == "caster" else "spectator_commentary_voice", default_voice) or default_voice)
+        rate = int(getattr(self.cfg, "spectator_commentary_rate", 200) or 200)
+        if kwargs.get("rate_override") is not None:
+            rate = max(80, min(320, int(kwargs["rate_override"])))
+        pitch = int(getattr(self.cfg, "spectator_commentary_pitch", 0) or 0)
+        if kwargs.get("pitch_override") is not None:
+            pitch = max(-100, min(100, int(kwargs["pitch_override"])))
+        volume = float(getattr(self.cfg, "spectator_commentary_volume", 100.) or 100.)
+        return voice, rate, volume, pitch
+
+    def _restore_commentary_handoff_volume(self) -> None:
+        fade = self.__dict__.get("_commentary_handoff_fade")
+        self._commentary_handoff_fade = None
+        if not fade:
+            return
+        role = fade["role"]
+        if self._commentary_tts_generations.get(role) == fade["generation"]:
+            output = self._commentary_audio_outs.get(role)
+            if output:
+                output.setVolume(fade["volume"])
+
+    def _cancel_commentary_handoff(self, reason: str) -> None:
+        pending = self.__dict__.get("_commentary_handoff_pending")
+        self._restore_commentary_handoff_volume()
+        self._commentary_handoff_pending = None
+        if pending:
+            DIAG.record("commentary_handoff_cancel", reason=reason, token=pending["token"])
+
+    def _prepare_commentary_handoff(self, text: str, role: str, kwargs: dict) -> None:
+        """One latest pending item and at most one preparation worker.
+
+        The playing voice is untouched until a fresh replacement file exists.
+        Preparation shares the normal request gate/cache, never a second API.
+        """
+        self._cancel_commentary_handoff("replaced")
+        token = int(self.__dict__.get("_commentary_handoff_counter", 0)) + 1
+        self._commentary_handoff_counter = token
+        settings = self._handoff_voice_settings(role, kwargs)
+        path = self._commentary_tts_cache_path(text, role, *settings)
+        if not path:
+            return
+        self._commentary_handoff_pending = {"token": token, "text": text, "role": role,
+            "kwargs": kwargs, "settings": settings, "path": path, "ready": False,
+            "epochs": dict(self._commentary_followup_epoch)}
+        DIAG.record("commentary_handoff_prepare", token=token, role=role,
+                    category=kwargs["_timing"].get("category", ""))
+        timeout_ms = max(1, int(math.ceil((kwargs["_timing"]["expires_at"] - time.monotonic()) * 1000)) + 1)
+        QTimer.singleShot(timeout_ms, lambda: self._expire_commentary_handoff(token))
+        self._start_commentary_handoff_worker()
+
+    def _expire_commentary_handoff(self, token: int) -> None:
+        pending = self.__dict__.get("_commentary_handoff_pending")
+        if pending and pending["token"] == token and time.monotonic() >= pending["kwargs"]["_timing"]["expires_at"]:
+            self._cancel_commentary_handoff("prepare_or_play_deadline")
+            self._drain_commentary_tts_queue()
+
+    def _start_commentary_handoff_worker(self) -> None:
+        pending = self.__dict__.get("_commentary_handoff_pending")
+        if not pending or self.__dict__.get("_commentary_handoff_worker_id", 0):
+            return
+        token, path = pending["token"], pending["path"]
+        if time.monotonic() >= pending["kwargs"]["_timing"]["expires_at"]:
+            self._cancel_commentary_handoff("expired_before_prepare")
+            return
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+            self._on_commentary_handoff_ready(token, path)
+            return
+        self._commentary_handoff_worker_id = token
+        voice, rate, volume, pitch = pending["settings"]
+        text, deadline = pending["text"], pending["kwargs"]["_timing"]["expires_at"]
+        def _worker():
+            result = ""
+            try:
+                if time.monotonic() < deadline and self.action_runner._ensure_tts_ready():
+                    ok = self.action_runner._edge_save_cli(text, path, voice,
+                        self.action_runner._edge_rate(rate), self.action_runner._edge_volume(volume),
+                        self.action_runner._edge_pitch(pitch))
+                    if ok:
+                        result = path
+            except Exception:
+                logging.exception("COMMENTARY_HANDOFF_PREPARE_FAIL")
+            try:
+                QMetaObject.invokeMethod(self, "_on_commentary_handoff_ready", Qt.ConnectionType.QueuedConnection,
+                                         Q_ARG(int, token), Q_ARG(str, result))
+            except RuntimeError:
+                pass  # Main window was destroyed while a network request completed.
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @pyqtSlot(int, str)
+    def _on_commentary_handoff_ready(self, token: int, path: str):
+        if self.__dict__.get("_commentary_handoff_worker_id", 0) == token:
+            self._commentary_handoff_worker_id = 0
+        pending = self.__dict__.get("_commentary_handoff_pending")
+        if not pending or pending["token"] != token:
+            self._start_commentary_handoff_worker()
+            return
+        if not path:
+            self._cancel_commentary_handoff("prepare_failed")
+            QTimer.singleShot(0, self._drain_commentary_tts_queue)
+            return
+        pending["ready"] = True
+        self._try_commentary_handoff(token)
+
+    def _valid_commentary_handoff(self, pending: dict) -> bool:
+        timing = pending["kwargs"]["_timing"]
+        if (time.monotonic() >= timing["expires_at"] or self._potm_presentation_active
+                or pending["epochs"] != dict(self._commentary_followup_epoch)):
+            return False
+        if pending["settings"] != self._handoff_voice_settings(pending["role"], pending["kwargs"]):
+            return False
+        packet = pending["kwargs"].get("_dialogue") or {}
+        if packet.get("focus") and not SPOKEN_FOCUS.valid(packet["focus"]):
+            return False
+        return bool(pending["path"] and os.path.isfile(pending["path"]) and os.path.getsize(pending["path"]) > 0)
+
+    def _try_commentary_handoff(self, token: int) -> None:
+        pending = self.__dict__.get("_commentary_handoff_pending")
+        if not pending or pending["token"] != token or not pending["ready"]:
+            return
+        if not self._valid_commentary_handoff(pending):
+            self._cancel_commentary_handoff("stale_scene_or_audio")
+            QTimer.singleShot(0, self._drain_commentary_tts_queue)
+            return
+        if self.__dict__.get("_commentary_handoff_fade"):
+            return
+        active = [role for role, busy in self._commentary_tts_busy.items() if busy]
+        if not active:
+            self._commit_commentary_handoff(token)
+            return
+        role = active[0]
+        current = self._commentary_tts_deliveries.get(role) or {}
+        player = self._commentary_players.get(role)
+        try:
+            position, duration = int(player.position()), int(player.duration())
+        except (AttributeError, TypeError, ValueError):
+            position, duration = 0, 0
+        delay = handoff_delay(pending["kwargs"]["_timing"], current, position_ms=position,
+                              duration_ms=duration, boundaries=current.get("boundaries", ()))
+        if delay is None:
+            QTimer.singleShot(80, lambda: self._try_commentary_handoff(token))
+            return
+        # Finish the fade AT the sentence end, not after the next word begins.
+        emergency = handoff_importance(pending["kwargs"]["_timing"]) == 3
+        fade_ms = 100 if emergency else min(80, delay)
+        QTimer.singleShot(max(0, delay - (0 if emergency else fade_ms)),
+                          lambda: self._fade_commentary_handoff(token, role, fade_ms))
+
+    def _fade_commentary_handoff(self, token: int, role: str, fade_ms: int = 100) -> None:
+        pending = self.__dict__.get("_commentary_handoff_pending")
+        if not pending or pending["token"] != token or self.__dict__.get("_commentary_handoff_fade"):
+            return
+        if not self._valid_commentary_handoff(pending):
+            self._cancel_commentary_handoff("expired_at_clause")
+            return
+        if fade_ms <= 0:
+            self._commit_commentary_handoff(token)
+            return
+        output = self._commentary_audio_outs.get(role)
+        try:
+            volume = float(output.volume())
+        except (AttributeError, TypeError, ValueError):
+            volume = 1.
+        fade = {"role": role, "generation": self._commentary_tts_generations.get(role, 0), "volume": volume}
+        self._commentary_handoff_fade = fade
+        def _step(index):
+            current = self.__dict__.get("_commentary_handoff_pending")
+            if (not current or current["token"] != token or self.__dict__.get("_commentary_handoff_fade") is not fade
+                    or self._commentary_tts_generations.get(role, 0) != fade["generation"]):
+                return
+            if not self._valid_commentary_handoff(current):
+                self._cancel_commentary_handoff("expired_during_fade")
+                return
+            if output:
+                output.setVolume(max(0., volume * (1 - index / 4)))
+            if index == 4:
+                self._commit_commentary_handoff(token)
+            else:
+                QTimer.singleShot(max(1, fade_ms // 4), lambda: _step(index + 1))
+        QTimer.singleShot(max(1, fade_ms // 4), lambda: _step(1))
+
+    def _commit_commentary_handoff(self, token: int) -> None:
+        pending = self.__dict__.get("_commentary_handoff_pending")
+        if not pending or pending["token"] != token:
+            return
+        if not self._valid_commentary_handoff(pending):
+            self._cancel_commentary_handoff("expired_before_switch")
+            return
+        active = [role for role, busy in self._commentary_tts_busy.items() if busy]
+        if any((self._commentary_tts_deliveries.get(role) or {}).get("kind") == "report" for role in active):
+            self._cancel_commentary_handoff("report_protected")
+            return
+        self._commentary_handoff_pending = None
+        # Restore after stopping the old clip, not while it is still audible.
+        fade = self.__dict__.get("_commentary_handoff_fade")
+        self._commentary_handoff_fade = None
+        for role in active:
+            self._stop_commentary_tts_role(role, "prepared_handoff")
+        if fade and self._commentary_audio_outs.get(fade["role"]):
+            self._commentary_audio_outs[fade["role"]].setVolume(fade["volume"])
+        kwargs = dict(pending["kwargs"])
+        if kwargs.get("_dialogue"):
+            kwargs["_dialogue"] = {**kwargs["_dialogue"], "epochs": dict(self._commentary_followup_epoch)}
+        DIAG.record("commentary_handoff_commit", token=token, interrupted=bool(active), role=pending["role"])
+        self._speak_commentary_tts(pending["text"], pending["role"], _from_queue=True, **kwargs)
+
+    def _commentary_dialogue_from_update(self, update: dict) -> Optional[dict]:
+        if not update.get("commentary_tts_live_dialogue"):
+            return None
+        lines = [dict(line) for line in update.get("commentary_tts_continuations", [])
+                 if isinstance(line, dict) and str(line.get("text") or "").strip()]
+        story = dict(update.get("commentary_tts_story") or {})
+        if not lines and not story:
+            return None
+        return {"lines": lines[:2], "epochs": dict(getattr(self, "_commentary_followup_epoch", {}) or {}),
+                "expires_at": time.monotonic() + 8.0, "story": story,
+                "category": str(update.get("commentary_tts_category") or ""),
+                "focus": dict(update.get("commentary_tts_focus") or {}),
+                "observed_at": float(update.get("commentary_tts_observed_at") or time.monotonic())}
+
+    def _complete_commentary_dialogue(self, role: str, *, ended: bool) -> bool:
+        """Release the reply only after its own setup actually finished playing."""
+        packet = (getattr(self, "_commentary_tts_dialogues", {}) or {}).pop(role, None)
+        if not packet:
+            return False
+        epochs = dict(getattr(self, "_commentary_followup_epoch", {}) or {})
+        reason = ""
+        if not ended:
+            reason = "setup_not_completed"
+        elif packet["epochs"] != epochs:
+            reason = "scene_changed"
+        elif packet.get("story") and not packet.get("play_started"):
+            reason = "audio_not_started"
+        # A finished setup was heard even when a newer action cancels its
+        # unplayed reply. This must NOT authorize that reply's callback seed.
+        if not reason and packet.get("story"):
+            turn_index = int(packet.get("turn_index", 0))
+            SPOKEN_MEMORY.complete_turn(packet["story"], turn_index)
+            content = packet["story"].get("content") or ()
+            if 0 <= turn_index < len(content):
+                DIAG.record("commentary_content_completed", scene=packet["story"].get("scene"),
+                            intent=content[turn_index].get("intent"), topic=content[turn_index].get("topic"),
+                            turn=turn_index, role=role)
+        if not reason and not packet.get("is_report") and packet.get("live_serial", 0) < int(getattr(self, "_commentary_live_serial", 0)):
+            reason = "newer_action"
+        # Only the completed last turn can authorize a future callback.
+        if not reason and not packet.get("lines"):
+            story = dict(packet.get("story") or {})
+            if story:
+                SPOKEN_MEMORY.complete(story)
+                DIAG.record("commentary_dialogue_completed", scene=story.get("scene"),
+                            family=story.get("family"), seed=story.get("seed"), round=story.get("round"))
+            return False
+        if not reason and time.monotonic() > packet["expires_at"]:
+            reason = "stale"
+        elif not reason and any(int(item.get("priority", 0)) >= 80 for item in getattr(self, "_commentary_tts_queue", [])):
+            reason = "urgent_or_report_pending"
+        if reason:
+            logging.info("COMMENTARY_DUO_CANCEL reason=%s role=%s", reason, role)
+            if packet.get("is_report") and packet.get("hide_on_end"):
+                self._commentary_hide_round_report_on_complete[role] = True
+            return False
+        lines = list(packet.get("lines") or [])
+        if not lines:
+            return False
+        line = lines.pop(0)
+        continuation = {**packet, "lines": lines}
+        continuation["continuation"] = True
+        continuation["turn_index"] = int(packet.get("turn_index", 0)) + 1
+        reply_role = "caster" if line.get("role") == "caster" else "analyst"
+        is_report = bool(packet.get("is_report"))
+        self._enqueue_commentary_tts(str(line["text"]), reply_role, _priority=90 if is_report else 35,
+                                     _dialogue=continuation, allow_slow=is_report,
+                                     hide_round_report_on_complete=bool(is_report and packet.get("hide_on_end") and not lines),
+                                     _timing={"kind": "report" if is_report else "reply", "created_at": time.monotonic(),
+                                              "expires_at": packet["expires_at"] if is_report else min(packet["expires_at"], time.monotonic() + 2.0)})
+        logging.info("COMMENTARY_DUO_HANDOFF from=%s to=%s text=%s", role, reply_role, line["text"])
+        return True
+
+    def _enqueue_commentary_tts(self, text: str, role: str, _priority: Optional[int] = None, **kwargs) -> None:
         """Queue a live line while the shared TTS channel is occupied.
 
         Generic live calls have a short lifetime: a delayed jab/counter call is
@@ -21218,8 +21626,26 @@ class MainApp(QObject):
         if queue is None:
             queue = deque()
             self._commentary_tts_queue = queue
-        priority = self._commentary_tts_priority(text, bool(kwargs.get("hide_round_report_on_complete", False)))
+        priority = (int(_priority) if _priority is not None else
+                    self._commentary_tts_priority(text, bool(kwargs.get("hide_round_report_on_complete", False))))
         now = time.monotonic()
+        timing = dict(kwargs.get("_timing") or {})
+        if not timing:
+            kind = "report" if kwargs.get("allow_slow") else "terminal" if priority >= 80 else "live"
+            timing = {"kind": kind, "created_at": now, "expires_at": now + (30.0 if kind == "report" else 5.0 if kind == "terminal" else 3.2)}
+            kwargs["_timing"] = timing
+        if timing["expires_at"] <= now:
+            return
+        if timing["kind"] == "report":
+            priority = max(priority, 80)
+        elif timing["kind"] == "terminal":
+            priority = max(priority, 100)
+        # There is no value in replaying a backlog of ordinary hits. Keep only
+        # the newest action; an unplayed old reply must yield to a new call.
+        if timing["kind"] in ("live", "terminal"):
+            kept = [item for item in queue if item.get("kwargs", {}).get("_timing", {}).get("kind") not in ("live", "reply")]
+            queue.clear()
+            queue.extend(kept)
         normalized = re.sub(r"\s+", " ", str(text or "").strip())
         # Do not repeat the same sentence when the watcher applies a snapshot
         # more than once while audio is playing.
@@ -21232,7 +21658,7 @@ class MainApp(QObject):
             "kwargs": dict(kwargs),
             "priority": priority,
             "created_at": now,
-            "expires_at": now + (30.0 if priority >= 80 else 8.0),
+            "expires_at": timing["expires_at"],
         }
         # Keep urgent state changes ahead of ordinary punch-by-punch calls,
         # while preserving order among calls with the same priority.
@@ -21258,6 +21684,13 @@ class MainApp(QObject):
         if any(bool(value) for value in busy.values()):
             return
         queue = getattr(self, "_commentary_tts_queue", None)
+        pending = self.__dict__.get("_commentary_handoff_pending")
+        if pending:
+            if time.monotonic() >= pending["kwargs"]["_timing"]["expires_at"]:
+                self._cancel_commentary_handoff("queue_deadline")
+            else:
+                self._try_commentary_handoff(pending["token"])
+                return
         if not queue:
             return
         self._commentary_tts_queue_draining = True
@@ -21289,6 +21722,8 @@ class MainApp(QObject):
         hide_round_report_on_complete: bool = False,
         allow_during_potm: bool = False,
         _from_queue: bool = False,
+        _dialogue: Optional[dict] = None,
+        _timing: Optional[dict] = None,
     ):
         text = str(text or "").strip()
         if not text:
@@ -21299,7 +21734,61 @@ class MainApp(QObject):
             DIAG.record("commentary_suppressed", reason="potm_active", role=role, text=text)
             logging.info("COMMENTARY_TTS_SKIP_POTM_ACTIVE role=%s text=%s", role, text)
             return
+        now = time.monotonic()
+        # Start a report with its first thought instead of waiting for one
+        # large MP3. Subsequent thoughts are tied to actual audio completion,
+        # and the final board remains visible through the very last chunk.
+        if (allow_slow or hide_round_report_on_complete) and not _dialogue and len(text) > 160:
+            sentences = self._split_commentary_tts_sentences(text, max_sentences=None)
+            chunks = []
+            for sentence in sentences:
+                if chunks and len(chunks[-1]) + len(sentence) < 135:
+                    chunks[-1] += " " + sentence
+                else:
+                    chunks.append(sentence)
+            if len(chunks) > 1:
+                _dialogue = {"lines": [{"text": chunk, "role": role} for chunk in chunks[1:]],
+                             "epochs": dict(getattr(self, "_commentary_followup_epoch", {}) or {}),
+                             "expires_at": now + 90., "story": {}, "is_report": True,
+                             "hide_on_end": bool(hide_round_report_on_complete)}
+                text = chunks[0]
+                hide_round_report_on_complete = False
+        timing = dict(_timing or {})
+        if not timing:
+            category = str((_dialogue or {}).get("category") or "")
+            terminal = category in ("knockdown", "tko", "stun")
+            kind = "report" if allow_slow or hide_round_report_on_complete or (_dialogue or {}).get("is_report") else "terminal" if terminal else "live"
+            created = float((_dialogue or {}).get("observed_at") or now)
+            timing = {"kind": kind, "created_at": created,
+                      "category": category, "scene": dict((_dialogue or {}).get("story") or {}).get("scene", ""),
+                      "expires_at": created + (90.0 if kind == "report" else 5.0 if terminal else 3.2)}
+        if now >= timing["expires_at"]:
+            logging.info("COMMENTARY_TTS_DROP_DEADLINE role=%s stage=request age=%.2f", role, now-timing["created_at"])
+            return
+        pending = self.__dict__.get("_commentary_handoff_pending")
+        if not _from_queue and pending and timing["kind"] in ("live", "terminal"):
+            old_timing = pending["kwargs"]["_timing"]
+            if old_timing["expires_at"] > now and handoff_importance(old_timing) > handoff_importance(timing):
+                DIAG.record("commentary_suppressed", reason="important_handoff_pending", role=role, text=text)
+                return
+        if timing["kind"] == "report":
+            self._cancel_commentary_handoff("report_start")
+        if timing["kind"] in ("live", "terminal") and not _from_queue:
+            self._commentary_live_serial = int(getattr(self, "_commentary_live_serial", 0)) + 1
+            timing["live_serial"] = self._commentary_live_serial
+            if _dialogue:
+                _dialogue["live_serial"] = self._commentary_live_serial
+        if _dialogue and (dict(getattr(self, "_commentary_followup_epoch", {}) or {}) != _dialogue["epochs"]
+                          or time.monotonic() > _dialogue["expires_at"]):
+            logging.info("COMMENTARY_DUO_CANCEL reason=stale_queued_turn role=%s", role)
+            return
         busy = getattr(self, "_commentary_tts_busy", {}) or {}
+        if not _from_queue and any(bool(v) for v in busy.values()) and timing["kind"] in ("live", "terminal") and handoff_importance(timing) >= 2:
+            self._prepare_commentary_handoff(text, role, dict(rate_override=rate_override,
+                pitch_override=pitch_override, allow_slow=allow_slow,
+                hide_round_report_on_complete=hide_round_report_on_complete,
+                allow_during_potm=allow_during_potm, _dialogue=_dialogue, _timing=timing))
+            return
         if not bool(_from_queue) and (any(bool(value) for value in busy.values()) or bool(getattr(self, "_commentary_tts_queue", None))):
             self._enqueue_commentary_tts(
                 text,
@@ -21309,6 +21798,8 @@ class MainApp(QObject):
                 allow_slow=allow_slow,
                 hide_round_report_on_complete=hide_round_report_on_complete,
                 allow_during_potm=allow_during_potm,
+                _dialogue=_dialogue,
+                _timing=timing,
             )
             self._drain_commentary_tts_queue()
             return
@@ -21323,6 +21814,8 @@ class MainApp(QObject):
                 allow_slow=allow_slow,
                 hide_round_report_on_complete=hide_round_report_on_complete,
                 allow_during_potm=allow_during_potm,
+                _dialogue=_dialogue,
+                _timing=timing,
             )
             return
         if str(role or "").lower() == "caster":
@@ -21357,6 +21850,17 @@ class MainApp(QObject):
             self.action_runner.speak_text(text, rate=rate, volume=volume, voice_mode=voice)
             return
         self._commentary_tts_busy[role] = True
+        dialogues = getattr(self, "_commentary_tts_dialogues", None)
+        if dialogues is None:
+            dialogues = self._commentary_tts_dialogues = {}
+        dialogues[role] = {**_dialogue, "play_started": False} if _dialogue else None
+        deliveries = getattr(self, "_commentary_tts_deliveries", None)
+        if deliveries is None:
+            deliveries = self._commentary_tts_deliveries = {}
+        deliveries[role] = timing
+        generations = self._commentary_tts_generations
+        generation = int(generations.get(role, 0)) + 1
+        generations[role] = generation
         self._commentary_hide_round_report_on_complete[role] = bool(hide_round_report_on_complete)
         cached_path = self._commentary_tts_cache_path(text, role, voice, rate, volume, pitch)
         if cached_path and os.path.isfile(cached_path) and os.path.getsize(cached_path) > 0:
@@ -21366,10 +21870,11 @@ class MainApp(QObject):
                 Qt.ConnectionType.QueuedConnection,
                 Q_ARG(str, role),
                 Q_ARG(str, cached_path),
+                Q_ARG(int, generation),
             )
             return
 
-        request_started_at = time.time()
+        request_started_at = time.monotonic()
         def _worker():
             media_path = ""
             try:
@@ -21380,6 +21885,7 @@ class MainApp(QObject):
                         "_clear_commentary_tts_busy",
                         Qt.ConnectionType.QueuedConnection,
                         Q_ARG(str, role),
+                        Q_ARG(int, generation),
                     )
                     return
                 media_path = cached_path or tempfile.mktemp(prefix="timerauto_commentary_", suffix=".mp3")
@@ -21393,7 +21899,8 @@ class MainApp(QObject):
                 )
                 if not ok:
                     try:
-                        os.remove(media_path)
+                        if not is_cached_commentary(media_path):
+                            os.remove(media_path)
                     except Exception:
                         pass
                     logging.warning("COMMENTARY_TTS_SAVE_FAIL text=%s", text)
@@ -21402,18 +21909,19 @@ class MainApp(QObject):
                         "_clear_commentary_tts_busy",
                         Qt.ConnectionType.QueuedConnection,
                         Q_ARG(str, role),
+                        Q_ARG(int, generation),
                     )
                     return
                 try:
-                    elapsed_gen = time.time() - float(request_started_at or time.time())
-                    urgent = bool(re.search(r"다운|쓰러|녹아웃|TKO|케이오|시작|종료|휴식|위험", text, re.IGNORECASE))
-                    if elapsed_gen > 3.2 and not urgent and not allow_slow:
+                    elapsed_gen = time.monotonic() - request_started_at
+                    if time.monotonic() >= timing["expires_at"]:
                         logging.info("COMMENTARY_TTS_DROP_STALE role=%s elapsed=%.2f text=%s", role, elapsed_gen, text)
                         QMetaObject.invokeMethod(
                             self,
                             "_clear_commentary_tts_busy",
                             Qt.ConnectionType.QueuedConnection,
                             Q_ARG(str, role),
+                            Q_ARG(int, generation),
                         )
                         return
                 except Exception:
@@ -21424,11 +21932,13 @@ class MainApp(QObject):
                     Qt.ConnectionType.QueuedConnection,
                     Q_ARG(str, role),
                     Q_ARG(str, media_path),
+                    Q_ARG(int, generation),
                 )
             except Exception as e:
                 if media_path:
                     try:
-                        os.remove(media_path)
+                        if not is_cached_commentary(media_path):
+                            os.remove(media_path)
                     except Exception:
                         pass
                 logging.warning("COMMENTARY_TTS_FAIL err=%s", e)
@@ -21437,26 +21947,15 @@ class MainApp(QObject):
                     "_clear_commentary_tts_busy",
                     Qt.ConnectionType.QueuedConnection,
                     Q_ARG(str, role),
+                    Q_ARG(int, generation),
                 )
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _commentary_tts_cache_path(self, text: str, role: str, voice: str, rate: int, volume: float, pitch: int) -> str:
         try:
-            blob = json.dumps(
-                {
-                    "text": str(text or ""),
-                    "role": str(role or ""),
-                    "voice": str(voice or ""),
-                    "rate": int(rate),
-                    "volume": round(float(volume), 1),
-                    "pitch": int(pitch),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-            name = hashlib.sha1(blob.encode("utf-8")).hexdigest() + ".mp3"
-            return os.path.join(self._commentary_tts_cache_dir, name)
+            return commentary_cache_path(text, role, voice, rate, volume, pitch,
+                                         directory=self._commentary_tts_cache_dir)
         except Exception:
             return ""
 
@@ -21594,6 +22093,24 @@ class MainApp(QObject):
                 # Put the configured break notice first so the first rest-time
                 # presentation does not wait on network TTS generation.
                 jobs.append(("caster", caster_voice, promo_text))
+            if normalize_style(getattr(self.cfg, "spectator_commentary_style", "sports")) == "b_grade":
+                from commentary_story import SCENES, IDLE_SCENES
+                from commentary_calls import SHORT_CALLS
+                # Cache short name-free calls too; these recur across players.
+                for tag in ("counter", "heavy", "hit"):
+                    for text in SHORT_CALLS[tag][:2]:
+                        jobs.append(("caster", caster_voice, text))
+                # Warm name-independent replies first. A small bounded batch
+                # must not get consumed entirely by old idle-only scripts.
+                ceiling = {"light": 0, "mixed": 1, "strong": 2}.get(getattr(self.cfg, "spectator_bgrade_swearing", "strong"), 2)
+                for tag in ("counter", "whiff", "combo", "heavy", "graze", "weak", "knockdown", "stun"):
+                    script = next(item for item in SCENES[tag] if item.swear <= ceiling)
+                    jobs.append(("analyst", analyst_voice, script.reply))
+                for script in IDLE_SCENES:
+                    if script.seed or script.swear > ceiling:
+                        continue
+                    jobs.append(("caster", caster_voice, script.lead))
+                    jobs.append(("analyst", analyst_voice, script.reply))
             for text in analyst_lines:
                 jobs.append(("analyst", analyst_voice, text))
             for text in caster_lines:
@@ -21664,19 +22181,75 @@ class MainApp(QObject):
         except Exception as e:
             logging.warning("COMMENTARY_TTS_PREWARM_FAIL err=%s", e)
 
+    def _prewarm_commentary_emergency_calls(self, names: list) -> None:
+        """Four first-event clips at most; yield to live speech and preparation."""
+        if not bool(getattr(self.cfg, "spectator_commentary_enabled", False)) or not HAS_QTMULTIMEDIA:
+            return
+        from commentary_calls import short_call
+        if normalize_style(getattr(self.cfg, "spectator_commentary_style", "sports")) != "b_grade":
+            return
+        token = object()
+        self._commentary_emergency_warm_token = token
+        voice, rate, volume, pitch = self._handoff_voice_settings("caster", {})
+        jobs = []
+        for name in list(dict.fromkeys(str(name).strip() for name in names if str(name).strip()))[:2]:
+            for tag in ("knockdown", "tko"):
+                text = short_call(tag, 0, name=name, count=1)
+                jobs.append((text, self._commentary_tts_cache_path(text, "caster", voice, rate, volume, pitch)))
+        def _worker():
+            deadline = time.monotonic() + 20.
+            for text, path in jobs:
+                if not path:
+                    continue
+                if os.path.isfile(path) and os.path.getsize(path) > 0:
+                    continue
+                while any(self._commentary_tts_busy.values()) or self.__dict__.get("_commentary_handoff_pending"):
+                    if self.__dict__.get("_commentary_emergency_warm_token") is not token or time.monotonic() >= deadline:
+                        return
+                    time.sleep(.15)
+                if self.__dict__.get("_commentary_emergency_warm_token") is not token or time.monotonic() >= deadline:
+                    return
+                if not self.action_runner._ensure_tts_ready() or not self.action_runner._edge_save_cli(
+                        text, path, voice, self.action_runner._edge_rate(rate),
+                        self.action_runner._edge_volume(volume), self.action_runner._edge_pitch(pitch)):
+                    return
+        threading.Thread(target=_worker, daemon=True).start()
+
     @pyqtSlot(str, str)
-    def _play_commentary_tts_file(self, role: str, media_path: str):
+    @pyqtSlot(str, str, int)
+    def _play_commentary_tts_file(self, role: str, media_path: str, generation: int = -1):
         try:
             role = "caster" if str(role or "").lower() == "caster" else "analyst"
+            if generation >= 0 and generation != self._commentary_tts_generations.get(role, 0):
+                logging.info("COMMENTARY_TTS_CANCELLED_GENERATION role=%s generation=%s", role, generation)
+                return
+            timing = (getattr(self, "_commentary_tts_deliveries", {}) or {}).get(role)
+            packet = (getattr(self, "_commentary_tts_dialogues", {}) or {}).get(role) or {}
+            focus = packet.get("focus")
+            if focus and not packet.get("continuation") and not SPOKEN_FOCUS.valid(focus):
+                logging.info("COMMENTARY_TTS_DROP_AMBIGUOUS_SUBJECT role=%s side=%s", role, focus.get("side"))
+                self._clear_commentary_tts_busy(role, generation)
+                return
+            if timing and timing.get("kind") == "live" and timing.get("live_serial", 0) < int(getattr(self, "_commentary_live_serial", 0)):
+                logging.info("COMMENTARY_TTS_DROP_SUPERSEDED role=%s stage=play", role)
+                self._clear_commentary_tts_busy(role, generation)
+                return
+            if timing and time.monotonic() >= timing["expires_at"]:
+                logging.info("COMMENTARY_TTS_DROP_DEADLINE role=%s stage=play age=%.2f", role, time.monotonic()-timing["created_at"])
+                self._clear_commentary_tts_busy(role, generation)
+                return
             path = os.path.abspath(str(media_path or ""))
             if not os.path.isfile(path):
+                self._clear_commentary_tts_busy(role, generation)
                 return
             player = self._commentary_players.get(role)
             audio_out = self._commentary_audio_outs.get(role)
             if player is None or audio_out is None:
-                self._commentary_tts_busy[role] = False
+                self._clear_commentary_tts_busy(role, generation)
                 return
             self._commentary_tts_files.setdefault(role, []).append(path)
+            if timing is not None:
+                timing["boundaries"] = sentence_ends(path)
             player.setSource(QUrl.fromLocalFile(path))
             try:
                 volume = float(getattr(self.cfg, "spectator_commentary_volume", 100.0) or 100.0)
@@ -21686,13 +22259,29 @@ class MainApp(QObject):
             _refresh_default_audio_device(player)
             player.play()
             DIAG.record("commentary_audio_play_requested", role=role, path=path, volume=volume)
+            if timing:
+                DIAG.record("commentary_delivery", role=role, kind=timing["kind"],
+                            age_ms=round((time.monotonic()-timing["created_at"])*1000))
             logging.info("COMMENTARY_TTS_QT_PLAY role=%s path=%s", role, path)
         except Exception as e:
             logging.warning("COMMENTARY_TTS_QT_PLAY_FAIL err=%s", e)
             try:
-                self._commentary_tts_busy[role] = False
+                self._clear_commentary_tts_busy(role, generation)
             except Exception:
                 pass
+
+    def _on_commentary_playback_state(self, role: str, state):
+        if QMediaPlayer is not None and state == QMediaPlayer.PlaybackState.PlayingState:
+            packet = (getattr(self, "_commentary_tts_dialogues", {}) or {}).get(role)
+            if packet is not None:
+                if not packet.get("play_started") and not packet.get("continuation"):
+                    if packet.get("focus"):
+                        SPOKEN_FOCUS.started(packet["focus"])
+                    else:
+                        SPOKEN_FOCUS.invalidate()
+                packet["play_started"] = True
+            else:
+                SPOKEN_FOCUS.invalidate()
 
     def _on_commentary_media_status(self, role: str, status):
         try:
@@ -21704,6 +22293,9 @@ class MainApp(QObject):
                 QMediaPlayer.MediaStatus.InvalidMedia,
                 QMediaPlayer.MediaStatus.NoMedia,
             ):
+                failed_packet = (getattr(self, "_commentary_tts_dialogues", {}) or {}).get(role) or {}
+                if status != QMediaPlayer.MediaStatus.EndOfMedia and failed_packet.get("focus") and failed_packet.get("play_started"):
+                    SPOKEN_FOCUS.invalidate()
                 old = list((getattr(self, "_commentary_tts_files", {}) or {}).get(role, []) or [])
                 self._commentary_tts_files[role] = []
                 for path in old:
@@ -21716,10 +22308,11 @@ class MainApp(QObject):
                     except Exception:
                         pass
                 self._commentary_tts_busy[role] = False
+                continuing = self._complete_commentary_dialogue(role, ended=status == QMediaPlayer.MediaStatus.EndOfMedia)
                 if bool(self._commentary_hide_round_report_on_complete.get(role, False)):
                     self._commentary_hide_round_report_on_complete[role] = False
                     self._push_browser_overlay_event("round_report_hide")
-                if bool(self._commentary_release_idle_highlight_on_complete.get(role, False)):
+                if not continuing and bool(self._commentary_release_idle_highlight_on_complete.get(role, False)):
                     self._commentary_release_idle_highlight_on_complete[role] = False
                     self._release_idle_highlight_after_presentation(0, "post_potm_final_commentary_complete")
                 QTimer.singleShot(0, self._drain_commentary_tts_queue)
@@ -21728,14 +22321,26 @@ class MainApp(QObject):
 
     def _stop_commentary_tts_role(self, role: str, reason: str = ""):
         try:
+            if reason not in ("new_action_over_banter", "prepared_handoff"):
+                self._cancel_commentary_handoff(reason or "stop")
+                SPOKEN_FOCUS.invalidate()
             role = "caster" if str(role or "").lower() == "caster" else "analyst"
             try:
+                generations = self._commentary_tts_generations
+                generations[role] = int(generations.get(role, 0)) + 1
                 epoch = getattr(self, "_commentary_followup_epoch", None)
                 if isinstance(epoch, dict):
                     epoch[role] = int(epoch.get(role, 0) or 0) + 1
             except Exception:
                 pass
             # Round-start and new-match boundaries are hard broadcast cuts.
+            (getattr(self, "_commentary_tts_dialogues", {}) or {}).pop(role, None)
+            queue = getattr(self, "_commentary_tts_queue", None)
+            if queue is not None:
+                remaining = [item for item in queue
+                             if item.get("role") != role and not item.get("kwargs", {}).get("_dialogue")]
+                queue.clear()
+                queue.extend(remaining)
             # Keeping the analyst clip alive here caused rest/final recaps to
             # overlap the next round or the next bout.
             keep_current_sentence = False
@@ -21775,10 +22380,14 @@ class MainApp(QObject):
             logging.exception("COMMENTARY_TTS_STOP_FAIL")
 
     @pyqtSlot(str)
-    def _clear_commentary_tts_busy(self, role: str):
+    @pyqtSlot(str, int)
+    def _clear_commentary_tts_busy(self, role: str, generation: int = -1):
         try:
             role = "caster" if str(role or "").lower() == "caster" else "analyst"
+            if generation >= 0 and generation != self._commentary_tts_generations.get(role, 0):
+                return
             self._commentary_tts_busy[role] = False
+            self._complete_commentary_dialogue(role, ended=False)
             if bool(self._commentary_hide_round_report_on_complete.get(role, False)):
                 self._commentary_hide_round_report_on_complete[role] = False
                 self._push_browser_overlay_event("round_report_hide")
@@ -26136,6 +26745,7 @@ class MainApp(QObject):
                 showRedName=bool(getattr(self.cfg, "overlay_show_red_name", True)),
                 showArenaName=bool(getattr(self.cfg, "overlay_show_arena_name", True)),
                 showFlags=bool(getattr(self.cfg, "overlay_show_flags", True)),
+                showPlayerIds=bool(getattr(self.cfg, "overlay_show_player_ids", True)),
                 showCinematic=bool(getattr(self.cfg, "overlay_show_cinematic", True)),
                 vsBgOpacity=max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))),
                 overlayVsHoldMs=int(max(500, min(15000, float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85) * 1000))),
@@ -27614,6 +28224,7 @@ class MainApp(QObject):
                 display = str((self.cfg.players or {}).get(ids.get(side, ""), "") or names.get(side) or ids.get(side) or "").strip()
                 if display:
                     update["blueName" if side == "blue" else "redName"] = display
+                update[side + "PlayerId"] = str(d.get(side + "_player_id", ids.get(side)) or "").strip()
             for side, gid in ids.items():
                 if side == "blue" and d.get("blue_player_img") is not None:
                     continue
@@ -27990,8 +28601,14 @@ class MainApp(QObject):
                 update["blueName"] = str(d.get("blue_name") or "")
             if "red_name" in d:
                 update["redName"] = str(d.get("red_name") or "")
+            for side in ("blue", "red"):
+                if side + "_player_id" in d:
+                    update[side + "PlayerId"] = str(d.get(side + "_player_id") or "").strip()
             if "arena_name" in d:
                 update["arenaName"] = str(d.get("arena_name") or "")
+            venue_supplied, venue_id = venue_from_update(d)
+            if venue_supplied:
+                update["venueId"] = venue_id
             if "blue_damage_dealt" in d:
                 update["blueTotalDamageText"] = str(int(round(_num(d.get("blue_damage_dealt"), 0))))
             if "red_damage_dealt" in d:
@@ -28195,6 +28812,7 @@ class MainApp(QObject):
                 "overlay_show_red_name": "showRedName",
                 "overlay_show_arena_name": "showArenaName",
                 "overlay_show_flags": "showFlags",
+                "overlay_show_player_ids": "showPlayerIds",
                 "overlay_show_cinematic": "showCinematic",
                 "overlay_bg_color": "overlayBgColor",
                 "overlay_bg_opacity": "overlayBgOpacity",
@@ -29855,6 +30473,9 @@ class MainApp(QObject):
                 backend = getattr(self.timer_win, "_backend", None)
                 blue_name = str(getattr(backend, "_blue_name", "") or d.get("blue_name", "") or "").strip()
                 red_name = str(getattr(backend, "_red_name", "") or d.get("red_name", "") or "").strip()
+                vs_source = d.get("vs_intro_event")
+                if isinstance(vs_source, dict) and vs_source.get("matchSessionId"):
+                    self._prewarm_commentary_emergency_calls([blue_name, red_name])
                 blue_text = self._chapter_competitor_text(
                     "blue",
                     blue_name,
@@ -29924,6 +30545,8 @@ class MainApp(QObject):
                         str(d.get("commentary_tts_role") or "analyst"),
                         rate_override=rate_override,
                         pitch_override=pitch_override,
+                        _dialogue=self._commentary_dialogue_from_update(d),
+                        _timing=self._commentary_timing_from_update(d),
                     )
                     logging.info("COMMENTARY_TTS text=%s", text)
             except Exception:
@@ -29942,7 +30565,7 @@ class MainApp(QObject):
                     )
             except Exception:
                 logging.exception("COMMENTARY_TTS_ROUND_SUMMARY_QUEUE_FAIL")
-        if "commentary_tts_followup_text" in d:
+        if "commentary_tts_followup_text" in d and not d.get("commentary_tts_live_dialogue"):
             try:
                 follow_text = str(d.get("commentary_tts_followup_text") or "").strip()
                 if follow_text:
@@ -29979,7 +30602,7 @@ class MainApp(QObject):
                             follow_text,
                             follow_role,
                             delay_ms=delay_ms,
-                            retries=6,
+                            retries=max(0, min(6, int(d.get("commentary_tts_followup_retries", 6)))),
                             hide_round_report_on_complete=bool(
                                 d.get("commentary_tts_followup_hide_report_on_complete", False)
                             ),
@@ -29987,7 +30610,7 @@ class MainApp(QObject):
                         logging.info("COMMENTARY_TTS_FOLLOWUP text=%s delay_ms=%s", follow_text, delay_ms)
             except Exception:
                 pass
-        if "commentary_tts_followups" in d:
+        if "commentary_tts_followups" in d and not d.get("commentary_tts_live_dialogue"):
             try:
                 followups = d.get("commentary_tts_followups") or []
                 if isinstance(followups, dict):

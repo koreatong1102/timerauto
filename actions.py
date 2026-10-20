@@ -17,6 +17,7 @@ from typing import List, Optional, Deque, Tuple
 from PyQt6.QtCore import QObject, QTimer
 
 from edge_tts_compat import configure_edge_tts_endpoint
+from speech_runtime import SPEECH_REQUESTS, set_speech_error, is_cached_commentary
 
 # Heavy optional runtime dependencies are imported lazily. This keeps the main
 # window responsive on first launch and avoids loading input/TTS stacks unless
@@ -604,11 +605,14 @@ class ActionRunner(QObject):
         return f"{hz:+d}Hz"
 
     def _edge_save_cli(self, text: str, path: str, voice: str, rate: str, volume: str, pitch: str = "+0Hz") -> bool:
+        set_speech_error()
+        staged_path = ""
+        staged_metadata = ""
         try:
             if not self._ensure_tts_ready() or edge_tts is None:
                 return False
 
-            async def _save_media():
+            async def _save_media(output, timeout):
                 communicate = edge_tts.Communicate(
                     str(text or ""),
                     str(voice),
@@ -616,20 +620,65 @@ class ActionRunner(QObject):
                     volume=str(volume or "+0%"),
                     pitch=str(pitch or "+0Hz"),
                 )
-                await communicate.save(str(path))
+                if is_cached_commentary(path):
+                    await asyncio.wait_for(communicate.save(str(output), str(output) + ".timing.jsonl"), timeout=timeout)
+                else:
+                    await asyncio.wait_for(communicate.save(str(output)), timeout=timeout)
 
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(_save_media())
-            finally:
-                loop.close()
-            return os.path.exists(path) and os.path.getsize(path) > 0
+            def _cached():
+                return os.path.isfile(path) and os.path.getsize(path) > 0
+
+            def _generate(timeout):
+                nonlocal staged_path, staged_metadata
+                directory = os.path.dirname(os.path.abspath(path))
+                os.makedirs(directory, exist_ok=True)
+                if not staged_path:
+                    fd, staged_path = tempfile.mkstemp(prefix=".speech_", suffix=".mp3", dir=directory)
+                    os.close(fd)
+                    staged_metadata = staged_path + ".timing.jsonl"
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(_save_media(staged_path, timeout))
+                finally:
+                    loop.close()
+                if not os.path.isfile(staged_path) or os.path.getsize(staged_path) <= 0:
+                    raise RuntimeError("speech response contained no audio")
+                os.replace(staged_path, path)
+                staged_path = ""
+                if staged_metadata and os.path.isfile(staged_metadata):
+                    try:
+                        os.replace(staged_metadata, str(path) + ".timing.jsonl")
+                        staged_metadata = ""
+                    except OSError:
+                        # Audio remains usable without optional timing. Never
+                        # pair it with stale metadata from an earlier response.
+                        try:
+                            os.remove(str(path) + ".timing.jsonl")
+                        except OSError:
+                            pass
+                return True
+
+            return bool(SPEECH_REQUESTS.run(_generate, cached=_cached))
         except Exception as e:
+            message = set_speech_error(e)
             try:
-                logging.warning("TTS_EDGE_SAVE_EX runner=%s err=%s", self._runner_tag, e)
+                # Exception strings from aiohttp include the complete auth URL.
+                logging.warning("TTS_EDGE_SAVE_EX runner=%s voice=%s kind=%s status=%s detail=%s",
+                    self._runner_tag, voice, type(e).__name__, getattr(e, "status", None), message)
             except Exception:
                 pass
             return False
+        finally:
+            if staged_path:
+                try:
+                    os.remove(staged_path)
+                except OSError:
+                    pass
+            if staged_metadata:
+                try:
+                    os.remove(staged_metadata)
+                except OSError:
+                    pass
 
     def _play_media_file_blocking(self, path: str, timeout_sec: float = 45.0) -> bool:
         if os.name == "nt":

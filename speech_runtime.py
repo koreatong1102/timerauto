@@ -18,7 +18,8 @@ def commentary_cache_path(text, role, voice, rate, volume, pitch, *, directory=N
         "voice": str(voice or ""), "rate": int(rate),
         "volume": round(float(volume), 1), "pitch": int(pitch)},
         ensure_ascii=False, sort_keys=True)
-    return os.path.join(directory or commentary_cache_dir(), hashlib.sha1(blob.encode("utf-8")).hexdigest() + ".mp3")
+    suffix = ".wav" if str(voice).startswith("rfc-qwen3:") else ".mp3"
+    return os.path.join(directory or commentary_cache_dir(), hashlib.sha1(blob.encode("utf-8")).hexdigest() + suffix)
 
 
 def is_cached_commentary(path):
@@ -82,6 +83,8 @@ def set_speech_error(exc=None):
     status = getattr(exc, "status", None)
     if exc is None:
         message = ""
+    elif getattr(exc, "speech_message", None):
+        message = exc.speech_message
     elif status == 429:
         message = "Edge 음성 서버가 요청을 일시 제한했습니다(429). 잠시 후 다시 테스트해 주세요."
     elif status:

@@ -629,7 +629,7 @@ class AppConfig:
     detect_hotkey: str = "F11"
     trigger_pixel_hotkey: str = "F8"
     action_pick_hotkey: str = "F7"
-    action_test_hotkey: str = "F6"
+    action_test_hotkey: str = ""
     chapter_anchor_epoch: float = 0.0
     chapter_offset_sec: int = 0
     chapter_dedupe_sec: int = 20
@@ -904,6 +904,17 @@ class AppConfig:
     spectator_commentary_cooldown_sec: float = 6.0
     spectator_commentary_voice: str = "ko-KR-SunHiNeural"
     spectator_caster_voice: str = "ko-KR-InJoonNeural"
+    spectator_tts_engine: str = "edge"
+    spectator_tts_pack_enabled: bool = False
+    spectator_tts_pack_auto_names: bool = True
+    spectator_qwen_model: str = "1.7B"
+    spectator_qwen_port: int = 8768
+    spectator_qwen_language: str = "Korean"
+    spectator_qwen_speed: float = 1.0
+    spectator_qwen_caster_speaker: str = "Sohee"
+    spectator_qwen_analyst_speaker: str = "Ryan"
+    spectator_qwen_caster_instruction: str = "Speak Korean as a lively sports caster. React naturally, clearly and briefly. Read only the provided text."
+    spectator_qwen_analyst_instruction: str = "Speak Korean as a conversational sports analyst with dry wit. Read only the provided text."
     spectator_commentary_rate: int = 200
     spectator_commentary_volume: float = 100.0
     spectator_commentary_pitch: int = 0
@@ -1050,7 +1061,9 @@ class AppConfig:
         cfg.detect_hotkey = str(raw.get("detect_hotkey", "F11"))
         cfg.trigger_pixel_hotkey = str(raw.get("trigger_pixel_hotkey", "F8"))
         cfg.action_pick_hotkey = str(raw.get("action_pick_hotkey", "F7"))
-        cfg.action_test_hotkey = str(raw.get("action_test_hotkey", "F6"))
+        cfg.action_test_hotkey = str(raw.get("action_test_hotkey", "") or "").strip()
+        if cfg.action_test_hotkey.upper() == "F6":
+            cfg.action_test_hotkey = ""  # Reserved for spectator file camera; retire legacy popup hotkey.
         try:
             cfg.chapter_anchor_epoch = float(raw.get("chapter_anchor_epoch", 0.0) or 0.0)
         except Exception:
@@ -1320,6 +1333,21 @@ class AppConfig:
         ).strip()
         cfg.spectator_commentary_voice = str(raw.get("spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
         cfg.spectator_caster_voice = str(raw.get("spectator_caster_voice", "ko-KR-InJoonNeural") or "ko-KR-InJoonNeural")
+        cfg.spectator_tts_engine = "qwen3" if raw.get("spectator_tts_engine") == "qwen3" else "edge"
+        cfg.spectator_tts_pack_enabled = bool(raw.get("spectator_tts_pack_enabled", False))
+        cfg.spectator_tts_pack_auto_names = bool(raw.get("spectator_tts_pack_auto_names", True))
+        cfg.spectator_qwen_model = raw.get("spectator_qwen_model") if raw.get("spectator_qwen_model") in ("0.6B", "1.7B") else "1.7B"
+        try:
+            cfg.spectator_qwen_port = max(1024, min(65535, int(raw.get("spectator_qwen_port", 8768))))
+            cfg.spectator_qwen_speed = max(.7, min(1.5, float(raw.get("spectator_qwen_speed", 1.))))
+        except (ValueError, TypeError, OverflowError):
+            cfg.spectator_qwen_port, cfg.spectator_qwen_speed = 8768, 1.
+        cfg.spectator_qwen_language = raw.get("spectator_qwen_language") if raw.get("spectator_qwen_language") in ("Korean", "English", "Auto") else "Korean"
+        for role in ("caster", "analyst"):
+            for field in ("speaker", "instruction"):
+                key = f"spectator_qwen_{role}_{field}"
+                value = raw.get(key, getattr(cfg, key))
+                setattr(cfg, key, str(getattr(cfg, key) if value is None else value)[:500])
         cfg.spectator_stun_sfx_path = normalize_builtin_asset_path(str(raw.get("spectator_stun_sfx_path", "") or ""))
         cfg.spectator_knockdown_sfx_path = normalize_builtin_asset_path(str(raw.get("spectator_knockdown_sfx_path", "") or ""))
         cfg.spectator_tko_sfx_path = normalize_builtin_asset_path(str(raw.get("spectator_tko_sfx_path", "") or ""))
@@ -2047,6 +2075,10 @@ class AppConfig:
             ),
             "spectator_commentary_voice": str(self.spectator_commentary_voice or "ko-KR-SunHiNeural"),
             "spectator_caster_voice": str(self.spectator_caster_voice or "ko-KR-InJoonNeural"),
+            **{key: getattr(self, key) for key in (
+                "spectator_tts_engine", "spectator_tts_pack_enabled", "spectator_tts_pack_auto_names", "spectator_qwen_model", "spectator_qwen_port", "spectator_qwen_language",
+                "spectator_qwen_speed", "spectator_qwen_caster_speaker", "spectator_qwen_analyst_speaker",
+                "spectator_qwen_caster_instruction", "spectator_qwen_analyst_instruction")},
             "spectator_commentary_rate": int(self.spectator_commentary_rate or 200),
             "spectator_commentary_volume": float(self.spectator_commentary_volume if self.spectator_commentary_volume is not None else 100.0),
             "spectator_commentary_pitch": int(self.spectator_commentary_pitch or 0),

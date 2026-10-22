@@ -137,6 +137,11 @@ from browser_overlay_sync import BrowserOverlaySync
 from commentary_demo import build_commentary_director_demo
 from commentary_entertainment import STYLE_CHOICES, normalize_style, bgrade_demo_steps
 from speech_runtime import commentary_cache_path, is_cached_commentary, last_speech_error
+from local_tts import commentary_voice as select_commentary_voice, is_local_voice, request_options as qwen_request_options
+from tts_settings import TtsEngineControls
+from commentary_pack import usage_voice as pack_usage_voice, base_voice as pack_base_voice, prepare_dialogue as pack_prepare_dialogue, prepare_names as prepare_pack_names
+from spectator_camera import create_camera_panel
+from camera_director import feed_camera_director
 from commentary_story import SPOKEN_MEMORY
 from commentary_calls import SPOKEN_FOCUS
 from commentary_handoff import importance as handoff_importance, sentence_ends, handoff_delay
@@ -988,6 +993,35 @@ def press_vk_for_window_title(
                 _activate_window_reliably(prev, restore=True)
             except Exception:
                 pass
+
+
+def toggle_file_camera_once(title_part: str, *, vk: int = 0x75) -> Tuple[bool, str]:
+    """Single F6/F4 attempt. Never fallback/retry a non-idempotent toggle."""
+    if vk not in (0x75,0x73):
+        return False, "카메라 F6/F4 키만 허용됩니다."
+    if os.name != "nt" or not str(title_part or "").strip():
+        return False, "Windows 관전툴 창 제목이 필요합니다."
+    user32 = ctypes.windll.user32
+    hwnd = _find_window_by_title_contains(str(title_part))
+    if not hwnd:
+        return False, "관전툴 창을 찾지 못했습니다."
+    previous = int(user32.GetForegroundWindow())
+    minimized = bool(user32.IsIconic(wintypes.HWND(hwnd)))
+    try:
+        ok, detail = _activate_window_reliably(hwnd, restore=True)
+        if not ok:
+            return False, detail
+        time.sleep(.12)
+        if int(user32.GetForegroundWindow()) != int(hwnd):
+            return False, "관전툴 활성화 확인 실패"
+        ok, detail = _press_vk_sendinput_held(vk, hold_sec=.08)
+        time.sleep(.08)
+        return bool(ok), str(detail or ("single F6 sent; camera log confirmation required" if vk == 0x75 else "single F4 sent; native auto-director state is not exposed"))
+    finally:
+        if minimized:
+            user32.ShowWindow(wintypes.HWND(hwnd), 6)
+        if previous and previous != hwnd:
+            _activate_window_reliably(previous, restore=True)
 
 
 def kick_lobby_slots_for_window_title(
@@ -6601,6 +6635,9 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.tab_sp, "SP 관리")
         self.tabs.addTab(self.tab_hit_effects, "피격 효과")
         self.tabs.addTab(self.tab_logs, "로그 감지")
+        self.tabs.addTab(create_camera_panel(cfg, self, toggle=lambda: toggle_file_camera_once(
+            str(getattr(cfg, "spectator_lobby_auto_start_target_title", "The Thrill of the Fight 2") or "")),
+            on_return=lambda: toggle_file_camera_once(str(getattr(cfg,"spectator_lobby_auto_start_target_title","The Thrill of the Fight 2") or ""),vk=0x73)), "선수 시점")
         self.tabs.addTab(self.tab_log_records, "기록")
         self.tabs.addTab(self.tab_obs, "OBS / 하이라이트")
         self.tabs.addTab(self.tab_potm, "POTM")
@@ -8265,6 +8302,16 @@ class SettingsDialog(QDialog):
         sound_lay.addWidget(self.cmb_spectator_bgrade_density, 17, 1, 1, 2)
         sound_lay.addWidget(QLabel("B급 비속어"), 17, 3)
         sound_lay.addWidget(self.cmb_spectator_bgrade_swearing, 17, 4, 1, 2)
+        self._local_tts_controls = TtsEngineControls(self.cfg, self)
+        self._local_tts_controls.changed.connect(self._schedule_apply)
+        self._local_tts_controls.changed.connect(self._stop_spectator_commentary_test_script)
+        self._local_tts_controls.changed.connect(self._refresh_commentary_engine_controls)
+        self._local_tts_controls.preview_requested.connect(self._play_commentary_pack_preview)
+        self._local_tts_controls.rehearsal_requested.connect(
+            lambda steps: self._start_spectator_commentary_script("해설팩 종합 테스트", steps))
+        self._local_tts_controls.rehearsal_stop_requested.connect(self._stop_spectator_commentary_test_script)
+        self._refresh_commentary_engine_controls()
+        sound_lay.addWidget(self._local_tts_controls, 18, 0, 1, 6)
         self.cmb_spectator_bgrade_density.setToolTip("말하는 빈도와 별개입니다. 간결은 단문 위주, 풍성은 상황에 맞는 두 사람 대화와 앞말 회수를 사용합니다.")
         self.cmb_spectator_bgrade_swearing.setToolTip("단어를 무작위로 바꾸지 않습니다. 선택한 수위 안에서 상황에 맞게 작성된 대화를 고릅니다. 일반 스포츠 모드에는 적용되지 않습니다.")
         spectator_group.setToolTip("위쪽은 SpectatorLog 읽기 설정, 아래쪽은 리플레이 / 피격 이펙트 설정입니다.")
@@ -11200,6 +11247,8 @@ class SettingsDialog(QDialog):
             player.setAudioOutput(audio_out)
             audio_out.setVolume(1.0)
             player.mediaStatusChanged.connect(lambda status, r=role: self._on_tts_test_media_status(r, status))
+            player.errorOccurred.connect(lambda error, message, r=role: self._on_tts_test_player_error(r, error, message))
+            player.playbackStateChanged.connect(lambda state, r=role: logging.info("TTS_TEST_STATE role=%s state=%s", r, state))
             self._tts_test_audio_outs[role] = audio_out
             self._tts_test_players[role] = player
             return True
@@ -12288,7 +12337,7 @@ class SettingsDialog(QDialog):
                 self._tts_test_files[role] = []
             for path in old_files:
                 try:
-                    if not is_cached_commentary(path):
+                    if not is_cached_commentary(path) or os.path.basename(path).startswith("pack_preview_"):
                         os.remove(path)
                 except Exception:
                     pass
@@ -12392,7 +12441,22 @@ class SettingsDialog(QDialog):
                     action()
                 except Exception:
                     logging.exception("COMMENTARY_SCRIPT_TEST_ACTION_FAIL")
-            if text:
+            if step.get("media_path"):
+                # Preview a copy: normal test cleanup must never delete the
+                # persistent voice pack. No TTS/network path is entered here.
+                import shutil
+                import uuid
+                from speech_runtime import commentary_cache_dir
+                folder = commentary_cache_dir()
+                os.makedirs(folder, exist_ok=True)
+                preview = os.path.join(folder, "pack_preview_" + uuid.uuid4().hex + ".wav")
+                shutil.copyfile(step["media_path"], preview)
+                if not self._ensure_tts_test_player(role):
+                    os.remove(preview)
+                    raise RuntimeError("음성 재생기를 준비하지 못했습니다.")
+                self._tts_test_busy[role] = True
+                self._play_tts_test_file(role, preview, self._tts_test_generation)
+            elif text:
                 self._speak_tts_test_qt(text, role=role, rate_override=rate_override, pitch_override=pitch_override)
             follow_text = str(step.get("followup_text", "") or step.get("duo_text", "") or "").strip()
             if follow_text:
@@ -12538,6 +12602,9 @@ class SettingsDialog(QDialog):
         combo.addItem("영어 여성 - Jenny", "en-US-JennyNeural")
 
     def _commentary_tts_voice(self, role: str = "analyst") -> str:
+        local_controls = self.__dict__.get("_local_tts_controls")
+        if local_controls is not None and local_controls.engine.currentData() == "qwen3":
+            return local_controls.voice(role, "")
         if str(role or "").lower() == "caster":
             if hasattr(self, "cmb_spectator_caster_voice"):
                 return str(self.cmb_spectator_caster_voice.currentData() or "ko-KR-InJoonNeural")
@@ -12546,6 +12613,15 @@ class SettingsDialog(QDialog):
             return str(self.cmb_spectator_commentary_voice.currentData() or "ko-KR-SunHiNeural")
         return str(getattr(self.cfg, "spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
 
+    def _refresh_commentary_engine_controls(self):
+        controls = self.__dict__.get("_local_tts_controls")
+        local = controls is not None and controls.engine.currentData() == "qwen3"
+        for name in ("cmb_spectator_caster_voice", "cmb_spectator_commentary_voice",
+                     "sp_spectator_commentary_rate", "sp_spectator_commentary_pitch"):
+            widget = self.__dict__.get(name)
+            if widget is not None:
+                widget.setEnabled(not local)
+
     def _commentary_tts_rate(self) -> int:
         try:
             if hasattr(self, "sp_spectator_commentary_rate"):
@@ -12553,6 +12629,14 @@ class SettingsDialog(QDialog):
             return int(getattr(self.cfg, "spectator_commentary_rate", 200) or 200)
         except Exception:
             return 200
+
+    def _play_commentary_pack_preview(self, path):
+        self._stop_spectator_commentary_test_script()
+        if not self._ensure_tts_test_player("caster"):
+            self._show_tts_test_error("음성 재생기를 준비하지 못했습니다.")
+            return
+        self._tts_test_busy["caster"] = True
+        self._play_tts_test_file("caster", path, self._tts_test_generation)
 
     def _commentary_tts_volume(self) -> float:
         try:
@@ -12612,7 +12696,7 @@ class SettingsDialog(QDialog):
         def _worker():
             media_path = cached_path
             try:
-                if not self.action_runner._ensure_tts_ready():
+                if not is_local_voice(voice) and not self.action_runner._ensure_tts_ready():
                     QMetaObject.invokeMethod(
                         self,
                         "_clear_tts_test_busy",
@@ -12635,6 +12719,7 @@ class SettingsDialog(QDialog):
                     self.action_runner._edge_rate(rate),
                     self.action_runner._edge_volume(volume),
                     self.action_runner._edge_pitch(pitch),
+                    **qwen_request_options(voice),
                 )
                 if not ok:
                     QMetaObject.invokeMethod(
@@ -12700,8 +12785,10 @@ class SettingsDialog(QDialog):
             player.setSource(QUrl.fromLocalFile(path))
             audio_out.setVolume(max(0.0, min(1.0, self._commentary_tts_volume() / 100.0)))
             _refresh_default_audio_device(player)
+            audio_out.setMuted(False)
             player.play()
-            logging.info("TTS_TEST_QT_PLAY role=%s path=%s", role, path)
+            logging.info("TTS_TEST_QT_PLAY role=%s path=%s device=%s volume=%s muted=%s", role, path,
+                         audio_out.device().description(), audio_out.volume(), audio_out.isMuted())
             self._noop_status("자동해설 TTS 테스트 재생")
         except Exception as e:
             try:
@@ -12710,7 +12797,13 @@ class SettingsDialog(QDialog):
                 pass
             QMessageBox.warning(self, "경고", "TTS 테스트 재생에 실패했습니다.")
 
+    def _on_tts_test_player_error(self, role, error, message):
+        logging.error("TTS_TEST_PLAYER_ERROR role=%s error=%s detail=%s", role, error, message)
+        self._tts_test_busy[role] = False
+        self._show_tts_test_error("음성 재생 오류: " + str(message or error))
+
     def _on_tts_test_media_status(self, role: str, status):
+        logging.info("TTS_TEST_MEDIA_STATUS role=%s status=%s", role, status)
         try:
             role = "caster" if str(role or "").lower() == "caster" else "analyst"
             if QMediaPlayer is None:
@@ -19769,6 +19862,9 @@ class SettingsDialog(QDialog):
             self.cfg.spectator_commentary_voice = str(self.cmb_spectator_commentary_voice.currentData() or "ko-KR-SunHiNeural")
         if hasattr(self, "cmb_spectator_caster_voice"):
             self.cfg.spectator_caster_voice = str(self.cmb_spectator_caster_voice.currentData() or "ko-KR-InJoonNeural")
+        local_controls = self.__dict__.get("_local_tts_controls")
+        if local_controls is not None:
+            local_controls.write(self.cfg)
         if hasattr(self, "sp_spectator_commentary_damage"):
             self.cfg.spectator_commentary_min_damage = float(self.sp_spectator_commentary_damage.value())
         if hasattr(self, "sp_spectator_hit_effect_damage"):
@@ -20195,6 +20291,10 @@ class SettingsDialog(QDialog):
 
     def _sync_from_config(self):
         self._suspend_apply = True
+        local_controls = self.__dict__.get("_local_tts_controls")
+        if local_controls is not None:
+            local_controls.cfg = self.cfg
+            local_controls.load(self.cfg)
         self._refresh_monitors()
         if hasattr(self, "cmb_monitor"):
             idx = max(0, self.cmb_monitor.findData(self.cfg.monitor_index))
@@ -21345,7 +21445,9 @@ class MainApp(QObject):
         if kwargs.get("pitch_override") is not None:
             pitch = max(-100, min(100, int(kwargs["pitch_override"])))
         volume = float(getattr(self.cfg, "spectator_commentary_volume", 100.) or 100.)
-        return voice, rate, volume, pitch
+        packet = pack_prepare_dialogue(self.cfg, role, kwargs.get("_dialogue"),
+                                       narration_only=(kwargs.get("_timing") or {}).get("kind") != "report")
+        return pack_usage_voice(self.cfg, role, voice, kwargs.get("_timing"), packet), rate, volume, pitch
 
     def _restore_commentary_handoff_volume(self) -> None:
         fade = self.__dict__.get("_commentary_handoff_fade")
@@ -21410,10 +21512,10 @@ class MainApp(QObject):
         def _worker():
             result = ""
             try:
-                if time.monotonic() < deadline and self.action_runner._ensure_tts_ready():
+                if time.monotonic() < deadline and (is_local_voice(voice) or self.action_runner._ensure_tts_ready()):
                     ok = self.action_runner._edge_save_cli(text, path, voice,
                         self.action_runner._edge_rate(rate), self.action_runner._edge_volume(volume),
-                        self.action_runner._edge_pitch(pitch))
+                        self.action_runner._edge_pitch(pitch), **qwen_request_options(voice, deadline=deadline))
                     if ok:
                         result = path
             except Exception:
@@ -21765,6 +21867,8 @@ class MainApp(QObject):
         if now >= timing["expires_at"]:
             logging.info("COMMENTARY_TTS_DROP_DEADLINE role=%s stage=request age=%.2f", role, now-timing["created_at"])
             return
+        _dialogue = pack_prepare_dialogue(self.__dict__.get("cfg"), role, _dialogue,
+                                          narration_only=timing["kind"] != "report")
         pending = self.__dict__.get("_commentary_handoff_pending")
         if not _from_queue and pending and timing["kind"] in ("live", "terminal"):
             old_timing = pending["kwargs"]["_timing"]
@@ -21822,6 +21926,7 @@ class MainApp(QObject):
             voice = str(getattr(self.cfg, "spectator_caster_voice", "ko-KR-InJoonNeural") or "ko-KR-InJoonNeural")
         else:
             voice = str(getattr(self.cfg, "spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
+        voice = pack_usage_voice(self.cfg, role, voice, timing, _dialogue)
         try:
             rate = int(getattr(self.cfg, "spectator_commentary_rate", 200) or 200)
         except Exception:
@@ -21858,6 +21963,7 @@ class MainApp(QObject):
         if deliveries is None:
             deliveries = self._commentary_tts_deliveries = {}
         deliveries[role] = timing
+        timing["voice_identity"] = voice
         generations = self._commentary_tts_generations
         generation = int(generations.get(role, 0)) + 1
         generations[role] = generation
@@ -21878,7 +21984,7 @@ class MainApp(QObject):
         def _worker():
             media_path = ""
             try:
-                if not self.action_runner._ensure_tts_ready():
+                if not is_local_voice(voice) and not self.action_runner._ensure_tts_ready():
                     logging.warning("COMMENTARY_TTS_EDGE_UNAVAILABLE")
                     QMetaObject.invokeMethod(
                         self,
@@ -21896,6 +22002,7 @@ class MainApp(QObject):
                     self.action_runner._edge_rate(rate),
                     self.action_runner._edge_volume(volume),
                     self.action_runner._edge_pitch(pitch),
+                    **qwen_request_options(voice, deadline=timing["expires_at"]),
                 )
                 if not ok:
                     try:
@@ -21961,6 +22068,8 @@ class MainApp(QObject):
 
     def _prewarm_commentary_tts_cache(self):
         try:
+            if getattr(self.cfg, "spectator_tts_engine", "edge") == "qwen3":
+                return  # Optional local GPU must not be filled by startup jobs.
             if not bool(getattr(self.cfg, "spectator_commentary_enabled", False)):
                 return
             analyst_voice = str(getattr(self.cfg, "spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
@@ -22183,6 +22292,9 @@ class MainApp(QObject):
 
     def _prewarm_commentary_emergency_calls(self, names: list) -> None:
         """Four first-event clips at most; yield to live speech and preparation."""
+        if getattr(self.cfg, "spectator_tts_engine", "edge") == "qwen3":
+            # Live pack calls no longer speak player identifiers.
+            return  # On-demand caching only; don't block an incoming live call.
         if not bool(getattr(self.cfg, "spectator_commentary_enabled", False)) or not HAS_QTMULTIMEDIA:
             return
         from commentary_calls import short_call
@@ -22224,6 +22336,13 @@ class MainApp(QObject):
                 logging.info("COMMENTARY_TTS_CANCELLED_GENERATION role=%s generation=%s", role, generation)
                 return
             timing = (getattr(self, "_commentary_tts_deliveries", {}) or {}).get(role)
+            if timing and timing.get("voice_identity"):
+                current_edge = str(getattr(self.cfg, "spectator_caster_voice" if role == "caster" else "spectator_commentary_voice", "") or "")
+                expected_voice = pack_base_voice(pack_usage_voice(self.cfg, role, current_edge, timing))
+                if pack_base_voice(timing["voice_identity"]) != expected_voice:
+                    logging.info("COMMENTARY_TTS_DROP_SETTINGS_CHANGED role=%s", role)
+                    self._clear_commentary_tts_busy(role, generation)
+                    return
             packet = (getattr(self, "_commentary_tts_dialogues", {}) or {}).get(role) or {}
             focus = packet.get("focus")
             if focus and not packet.get("continuation") and not SPOKEN_FOCUS.valid(focus):
@@ -25701,6 +25820,8 @@ class MainApp(QObject):
         replay.  It only writes the normal reusable TTS cache; it never plays
         audio at candidate-selection time.
         """
+        if getattr(self.cfg, "spectator_tts_engine", "edge") == "qwen3":
+            return  # Never send an Edge background request in local mode.
         if not bool(getattr(self.cfg, "potm_announce_enabled", True)):
             return
         side = str(candidate.get("side") or "blue").lower()
@@ -30042,6 +30163,7 @@ class MainApp(QObject):
         # all other main-thread bookkeeping below. The full browser state still
         # updates later; only its duplicate effect-event push is suppressed.
         played_sfx, early_browser_effects = self._emit_urgent_spectator_effects(d)
+        feed_camera_director(self, d)
         # F5 input confirmation has a short timeout, but Unity can write the
         # actual start later. Window cleanup follows that real log independently.
         self._observe_lobby_auto_start_window(d)

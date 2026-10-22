@@ -1,0 +1,5 @@
+# Optional isolated runtime only. Do not install into TimerAuto's release venv.
+# Install torch/torchaudio together using setup_qwen.ps1 first.
+qwen-tts==0.1.1
+soundfile==0.13.1
+numpy>=1.26,<3

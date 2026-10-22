@@ -2,6 +2,9 @@
 __pycache__/
 .runtime/
 .venv-release/
+.venv-qwen/
+.qwen_models/
+commentary_voice_packs/
 *.py[cod]
 *.pyo
 

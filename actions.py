@@ -569,6 +569,9 @@ class ActionRunner(QObject):
         )
 
     def _edge_voice_for_mode(self, voice_mode: str, text: str) -> str:
+        from local_tts import is_local_voice
+        if is_local_voice(voice_mode):
+            return str(voice_mode)
         mode = str(voice_mode or "auto").strip().lower()
         raw = str(voice_mode or "").strip()
         if raw and raw.endswith("Neural") and "-" in raw:
@@ -604,8 +607,21 @@ class ActionRunner(QObject):
         hz = max(-100, min(100, hz))
         return f"{hz:+d}Hz"
 
-    def _edge_save_cli(self, text: str, path: str, voice: str, rate: str, volume: str, pitch: str = "+0Hz") -> bool:
+    def _edge_save_cli(self, text: str, path: str, voice: str, rate: str, volume: str, pitch: str = "+0Hz", *, local_timeout: float = 90.) -> bool:
         set_speech_error()
+        from local_tts import is_local_voice, save_local, LocalTTSError, decode_voice
+        if is_local_voice(voice):
+            try:
+                if decode_voice(voice).get("pack"):
+                    from commentary_pack import render
+                    return render(text, path, voice)
+                return save_local(text, path, voice, volume=volume, timeout=local_timeout)
+            except Exception as exc:
+                if not isinstance(exc, LocalTTSError):
+                    exc = LocalTTSError(f"Qwen 로컬 음성 생성 실패({type(exc).__name__}). 서버 창을 확인해 주세요.")
+                message = set_speech_error(exc)
+                logging.warning("TTS_QWEN_SAVE_FAIL kind=%s detail=%s", type(exc).__name__, message)
+                return False
         staged_path = ""
         staged_metadata = ""
         try:
@@ -705,7 +721,8 @@ class ActionRunner(QObject):
 
         try:
             _mci(f'close {alias}')
-            err = _mci(f'open "{path_abs}" type mpegvideo alias {alias}')
+            media_type = "waveaudio" if path_abs.lower().endswith(".wav") else "mpegvideo"
+            err = _mci(f'open "{path_abs}" type {media_type} alias {alias}')
             if err != 0:
                 logging.warning("TTS_MCI_OPEN_FAIL runner=%s code=%s path=%s", self._runner_tag, err, path_abs)
                 return False
@@ -727,7 +744,8 @@ class ActionRunner(QObject):
                 pass
 
     def _speak_edge_tts(self, text: str, rate: int, volume: float, voice_mode: str) -> bool:
-        if not self._ensure_tts_ready():
+        from local_tts import is_local_voice
+        if not is_local_voice(voice_mode) and not self._ensure_tts_ready():
             return False
         src_text = str(text or "").strip()
         if not src_text:
@@ -737,7 +755,7 @@ class ActionRunner(QObject):
         edge_rate = self._edge_rate(rate)
         edge_volume = self._edge_volume(volume)
         edge_pitch = self._edge_pitch(0)
-        fd, media_path = tempfile.mkstemp(prefix="timerauto_tts_", suffix=".mp3")
+        fd, media_path = tempfile.mkstemp(prefix="timerauto_tts_", suffix=".wav" if is_local_voice(voice) else ".mp3")
         os.close(fd)
         try:
             try:
@@ -806,7 +824,7 @@ class ActionRunner(QObject):
                     max(1, int(repeat)),
                     max(0, int(gap_ms)),
                     float(max(0.0, min(100.0, float(volume)))),
-                    str(voice_mode or "auto").strip().lower(),
+                    str(voice_mode or "auto").strip(),
                 )
             )
             try:

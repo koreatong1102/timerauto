@@ -91,6 +91,14 @@ Write-Host "Syncing runtime data into dist..."
 $files = @(
   "HELP.md",
   "SIMPLE_MANUAL.md",
+  "LOCAL_TTS.md",
+  "SPECTATOR_CAMERA.md",
+  "Qwen_환경설치.bat",
+  "Qwen_서버실행.bat",
+  "setup_qwen.ps1",
+  "run_qwen.ps1",
+  "requirements-qwen.txt",
+  "qwen_tts_server.py",
   "timer_ui.qml",
   "cinematic_overlay.qml",
   "timer_controls.qml"

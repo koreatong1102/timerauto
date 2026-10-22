@@ -89,13 +89,15 @@ class ShortCallTests(unittest.TestCase):
         out = self.call(name=name, now=106)
         self.assertIn(out.presentation["turns"][0]["text"], SHORT_CALLS["counter"])
 
-    def test_each_event_has_eight_short_variants_and_exact_combo_count(self):
+    def test_each_event_has_eight_short_variants_without_spoken_combo_counts(self):
         for tag in SHORT_CALLS:
             rows = [short_call(tag, i, name="통", named=False, hits=7, target="왼쪽 눈", count=2) for i in range(8)]
             self.assertEqual(len(set(rows)), 8, tag)
             self.assertLess(max(map(len, rows)), 30, tag)
             if tag in ("combo", "counter_combo"):
-                self.assertTrue(all("7" in line for line in rows))
+                self.assertTrue(all(not any(char.isdigit() for char in line) for line in rows))
+                ordinary = short_call(tag, 0, name="통", named=False, hits=3)
+                self.assertNotIn(ordinary, rows)
 
     def test_context_does_not_invent_a_reversal_without_evidence(self):
         plain = short_call("counter", 0, name="통", named=False)

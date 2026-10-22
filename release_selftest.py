@@ -41,6 +41,9 @@ def _checks(temp):
     from match_event_ledger import MatchEventLedger
     from venue_backgrounds import VENUES
     from commentary_entertainment import bgrade_demo_steps
+    from local_tts import commentary_voice, decode_voice
+    from speech_runtime import commentary_cache_path
+    from tts_settings import TtsEngineControls  # import-only: no UI or model download
 
     app = QGuiApplication.instance() or QGuiApplication([])
     qml_engine = QQmlEngine()
@@ -51,6 +54,13 @@ def _checks(temp):
         raise RuntimeError("QML plugin load failed: " + "; ".join(e.toString() for e in component.errors()))
 
     cfg = AppConfig()
+    qwen_cfg = AppConfig()
+    qwen_cfg.spectator_tts_engine = "qwen3"
+    qwen_voice = commentary_voice(qwen_cfg, "caster", "")
+    local_speech = {"default_engine": cfg.spectator_tts_engine, "options": decode_voice(qwen_voice),
+                    "cache_suffix": Path(commentary_cache_path("offline", "caster", qwen_voice, 200, 100, 0)).suffix}
+    if local_speech["default_engine"] != "edge" or local_speech["cache_suffix"] != ".wav":
+        raise AssertionError("Optional local TTS/default Edge regression")
     # Regression gate for the genuine 1.01 -> synthetic 1.00 identity split.
     probe_ledger = MatchEventLedger(str(temp / "identity-probe.db"))
     try:
@@ -116,6 +126,7 @@ def _checks(temp):
         if not cv2.imencode(".png", pixel)[0]:
             raise AssertionError("OpenCV image encoder unavailable")
         return {"schema": 1, "ok": True, "ruleset": engine.ruleset_version(), "verdicts": verdicts,
+                "local_speech_configuration": local_speech,
                 "bgrade_commentary": bgrade_demo_steps(),
                 "report": report_facts, "overlay_sha256": hashlib.sha256(html.encode()).hexdigest(),
                 "assets": assets, "runtime": {"python": sys.version.split()[0], "pyqt": PYQT_VERSION_STR,

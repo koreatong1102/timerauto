@@ -3329,6 +3329,14 @@ html,body{
 .rrInfoGrid{grid-template-columns:repeat(2,minmax(0,1fr))!important;grid-auto-flow:row!important;}
 .rrInfoCard.wide{grid-column:auto!important;min-height:56px!important;padding:8px 13px 8px 15px!important;}
 .rrInfoCard.wide span{font-size:18px!important;}.rrInfoCard.wide b{font-size:27px!important;}
+.rrSideStack.hasComboDetails{grid-template-rows:minmax(0,.75fr) minmax(0,1.25fr)!important;}
+.rrCombatGrid{grid-template-rows:repeat(2,minmax(32px,.8fr)) minmax(38px,1.4fr)!important;}
+.rrComboDetails{grid-column:1/-1;min-width:0;min-height:0;display:flex;flex-direction:column;justify-content:center;gap:5px;padding:3px 10px;border-top:1px solid rgba(255,255,255,.15);box-sizing:border-box;}
+.rrComboSequence{font-family:Arial,sans-serif;font-size:var(--combo-detail-size,18px);line-height:1.24;font-weight:800;color:#e8f5ff;overflow-wrap:anywhere;}
+.rrFighter.red .rrComboSequence{color:#ffe9ed;}
+.rrComboStep{display:inline-block;white-space:nowrap;margin-right:5px;}
+.rrComboArrow{color:#95a8c3;margin-left:5px;}
+.rrComboNotes{font-size:14px;line-height:1.2;color:#c2ccda;}
 .rrCenterMeta .rrScoreLine{display:grid!important;grid-template-columns:1fr auto 1fr;align-items:center;gap:42px;margin-bottom:6px;}
 .rrScoreLine b{font-size:42px!important;font-weight:1000!important;line-height:1!important;}
 .rrScoreLine strong{font-size:24px!important;white-space:nowrap!important;}
@@ -3819,6 +3827,17 @@ function rrVisibleWeakHits(data,s){
   const known=['턱','코','왼쪽 관자놀이','오른쪽 관자놀이','관자놀이','왼쪽 눈','오른쪽 눈','이마','간','명치'];
   return items.filter(item=>{const label=String(item.label||'');return selected.includes(label)||(!known.includes(label)&&selected.includes('기타'));}).slice(0,4);
 }
+function rrV4ComboDetails(data,isFinal){
+  const sequence=Array.isArray(data.maxComboSequence)?data.maxComboSequence:[];
+  if(rrV4Num(data.maxComboHits)<2||sequence.length!==rrV4Num(data.maxComboHits))return '';
+  const line=sequence.map((p,i)=>'<span class="rrComboStep">'+escapeHtml(String(p))+(i<sequence.length-1?'<span class="rrComboArrow">&rarr;</span>':'')+'</span>').join('');
+  const notes=[];
+  if(isFinal&&rrV4Num(data.maxComboRound)>0)notes.push(rrV4Num(data.maxComboRound)+'라운드');
+  if(data.maxComboCounterStart===true)notes.push('카운터 시작');
+  if(data.maxComboDownFinish===true)notes.push('다운 마무리');
+  const size=Math.max(12,18-Math.floor(Math.max(0,sequence.length-8)/4));
+  return '<div class="rrComboDetails" style="--combo-detail-size:'+size+'px"><div class="rrComboSequence">'+line+'</div>'+(notes.length?'<div class="rrComboNotes">'+escapeHtml(notes.join(' · '))+'</div>':'')+'</div>';
+}
 function rrV4Fighter(side,data,opp,s,winner,leader,isFinal,showResult){
   const red=side==='red';
   const name=rrV4Name(side,data,s);
@@ -3864,7 +3883,8 @@ function rrV4Fighter(side,data,opp,s,winner,leader,isFinal,showResult){
   const weak=rrVisibleWeakHits(data,s);
   const weakEnabled=!Array.isArray(s.reportWeakPointParts)||s.reportWeakPointParts.length>0;
   const weakSection=weakEnabled?'<div class="rrSection"><div class="rrSectionTitle">\uC8FC\uC694 \uB54C\uB9B0 \uAE09\uC18C \uBD80\uC704</div><div class="rrInfoGrid">'+rrV4InfoCards(weak,'weak')+'</div></div>':'';
-  return '<section class="rrFighter '+side+(styleVisible?'':' noFightStyle')+'"><div class="rrHead">'+head+'</div>'+styleHtml+'<div class="rrAccent"></div>'+highlight+'<div class="rrSideStack"'+(weakEnabled?'':' style="grid-template-rows:1fr!important"')+'>'+weakSection+'<div class="rrSection"><div class="rrSectionTitle">'+(isFinal?'\uACBD\uAE30 \uC218\uCE58':'\uB77C\uC6B4\uB4DC \uC218\uCE58')+'</div><div class="rrInfoGrid">'+rrV4InfoCards(roundItems,'metric')+'</div></div></div><div class="rrVitalsBox"><div class="rrVitals">'+rrV4Vitals(stamina,health,red)+'</div></div></section>';
+  const comboDetails=rrV4ComboDetails(data,isFinal);
+  return '<section class="rrFighter '+side+(styleVisible?'':' noFightStyle')+'"><div class="rrHead">'+head+'</div>'+styleHtml+'<div class="rrAccent"></div>'+highlight+'<div class="rrSideStack'+(comboDetails?' hasComboDetails':'')+'"'+(weakEnabled?'':' style="grid-template-rows:1fr!important"')+'>'+weakSection+'<div class="rrSection"><div class="rrSectionTitle">'+(isFinal?'\uACBD\uAE30 \uC218\uCE58':'\uB77C\uC6B4\uB4DC \uC218\uCE58')+'</div><div class="rrInfoGrid'+(comboDetails?' rrCombatGrid':'')+'">'+rrV4InfoCards(roundItems,'metric')+comboDetails+'</div></div></div><div class="rrVitalsBox"><div class="rrVitals">'+rrV4Vitals(stamina,health,red)+'</div></div></section>';
 }
 function rrV4Vitals(stamina,health,red){
   const staminaRow='<div class="rrVital rrStamina"><span class="rrVitalLabel">\uC2E4\uC81C\uCCB4\uB825</span><div class="rrBar"><div class="rrBarFill" style="--w:'+stamina+'%"></div></div><b>'+stamina+'%</b></div>';

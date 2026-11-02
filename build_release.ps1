@@ -46,6 +46,8 @@ $python = Join-Path $root ".venv-release\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { throw "Missing release environment. Run setup_release_env.ps1 -Install." }
 & $python (Join-Path $root "release_integrity.py") environment $root
 if ($LASTEXITCODE -ne 0) { throw "Release environment mismatch." }
+& $python -c "from access_client import validate_access_configuration; validate_access_configuration()"
+if ($LASTEXITCODE -ne 0) { throw "Online approval server is not configured. Deploy access_server and set AUTH_SERVER_URL before publishing." }
 & $python -m unittest discover -s tests -p "test_*.py"
 if ($LASTEXITCODE -ne 0) { throw "Release unit tests failed." }
 $sourceCheck = Join-Path $releaseDir "parity-source.json"
@@ -93,6 +95,7 @@ $files = @(
   "SIMPLE_MANUAL.md",
   "LOCAL_TTS.md",
   "SPECTATOR_CAMERA.md",
+  "ONLINE_ACCESS_USER.md",
   "Qwen_환경설치.bat",
   "Qwen_서버실행.bat",
   "setup_qwen.ps1",

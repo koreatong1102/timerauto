@@ -26,6 +26,11 @@ jobs:
         with:
           python-version: "3.12.10"
 
+      - name: Set up authentication server tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Build portable package
         shell: pwsh
         run: |

@@ -36,6 +36,8 @@ Write-Host "Current branch: $branch"
 if (-not $SkipChecks) {
   & (Join-Path $root "setup_release_env.ps1") -Install
   $python = Join-Path $root ".venv-release\Scripts\python.exe"
+  & $python -c "from access_client import validate_access_configuration; validate_access_configuration()"
+  Assert-CommandSuccess "Online approval server configuration (deploy access_server and set AUTH_SERVER_URL first)"
   Write-Host "Running validation..."
   & $python -m unittest discover -s tests -p "test_*.py"
   Assert-CommandSuccess "Unit tests"

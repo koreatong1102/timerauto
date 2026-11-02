@@ -44,6 +44,12 @@ def _checks(temp):
     from local_tts import commentary_voice, decode_voice
     from speech_runtime import commentary_cache_path
     from tts_settings import TtsEngineControls  # import-only: no UI or model download
+    from access_policy import ONLINE_ACCESS_ENABLED, AUTH_SERVER_URL, POLL_SECONDS, CONNECTION_GRACE_SECONDS
+    from access_client import Lease
+    from access_gui import ApprovalDialog, AccessGuard  # frozen inclusion; no instance/network
+    lease_probe = Lease(clock=lambda: 100)
+    if lease_probe.observe(None) or not lease_probe.observe("approved") or lease_probe.observe("revoked"):
+        raise AssertionError("Online access fail-closed regression")
 
     app = QGuiApplication.instance() or QGuiApplication([])
     qml_engine = QQmlEngine()
@@ -126,6 +132,7 @@ def _checks(temp):
         if not cv2.imencode(".png", pixel)[0]:
             raise AssertionError("OpenCV image encoder unavailable")
         return {"schema": 1, "ok": True, "ruleset": engine.ruleset_version(), "verdicts": verdicts,
+                "online_access": {"enabled":ONLINE_ACCESS_ENABLED,"server":AUTH_SERVER_URL,"poll_seconds":POLL_SECONDS,"grace_seconds":CONNECTION_GRACE_SECONDS},
                 "local_speech_configuration": local_speech,
                 "bgrade_commentary": bgrade_demo_steps(),
                 "report": report_facts, "overlay_sha256": hashlib.sha256(html.encode()).hexdigest(),

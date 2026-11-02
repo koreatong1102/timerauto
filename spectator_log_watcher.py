@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from report_combo import classified_combo_rows, combo_details
+
 import logging
 import math
 import os
@@ -4331,6 +4333,7 @@ class SpectatorLogWatcher(QObject):
             power55 = sum(1 for ev in side_events if float((ev or {}).get("damage", 0.0) or 0.0) >= 55.0)
             best_hits = 0
             best_damage = 0.0
+            best_rows = []
             classified_combos = [
                 ev for ev in side_events
                 if int((ev or {}).get("combo_hits", 0) or 0) >= 2
@@ -4345,8 +4348,10 @@ class SpectatorLogWatcher(QObject):
                 )
                 best_hits = int(best_event.get("combo_hits", 0) or 0)
                 best_damage = float(best_event.get("combo_damage", 0.0) or 0.0)
+                best_rows = classified_combo_rows(metric_events, best_event, side)
             combo_hits = 0
             combo_damage = 0.0
+            combo_rows = []
             last_time: Optional[float] = None
             active_round: Optional[int] = None
             for ev in ([] if classified_combos else metric_events):
@@ -4356,6 +4361,7 @@ class SpectatorLogWatcher(QObject):
                     # game clock format (some builds reset that clock each round).
                     combo_hits = 0
                     combo_damage = 0.0
+                    combo_rows = []
                     last_time = None
                 active_round = event_round
                 attacker = str((ev or {}).get("attacker_side") or "").lower()
@@ -4366,6 +4372,7 @@ class SpectatorLogWatcher(QObject):
                     if damage >= float(getattr(self.cfg, "event_combo_break_damage", 20.0) or 20.0):
                         combo_hits = 0
                         combo_damage = 0.0
+                        combo_rows = []
                         last_time = None
                     continue
                 if damage < float(getattr(self.cfg, "event_combo_min_damage", 15.0) or 15.0):
@@ -4376,17 +4383,21 @@ class SpectatorLogWatcher(QObject):
                 ):
                     combo_hits += 1
                     combo_damage += damage
+                    combo_rows.append(ev)
                 else:
                     combo_hits = 1
                     combo_damage = damage
+                    combo_rows = [ev]
                 last_time = event_time
                 if combo_hits >= 2 and (combo_hits > best_hits or (combo_hits == best_hits and combo_damage > best_damage)):
                     best_hits = combo_hits
                     best_damage = combo_damage
+                    best_rows = list(combo_rows)
             return {
                 "powerHits55": int(power55),
                 "maxComboHits": int(best_hits),
                 "maxComboDamage": int(round(best_damage)),
+                **combo_details(best_rows, best_hits, best_damage),
             }
 
         def _official_score(side: str) -> int:

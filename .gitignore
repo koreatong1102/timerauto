@@ -53,3 +53,7 @@ backend_found.txt
 backend_usages.txt
 latest.json
 *.bak
+access_server/node_modules/
+access_server/.wrangler/
+access_server/.dev.vars*
+access_server/.env*

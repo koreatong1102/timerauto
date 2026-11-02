@@ -11978,8 +11978,10 @@ class SettingsDialog(QDialog):
                 "red": {"jab": 9, "cross": 3, "hook": 9, "upper": 4, "over": 2},
             }
             test_metrics = {
-                "blue": {"officialScore": 10, "powerHits55": 1, "maxComboHits": 3, "maxComboDamage": 82},
-                "red": {"officialScore": 8, "powerHits55": 0, "maxComboHits": 2, "maxComboDamage": 46},
+                "blue": {"officialScore": 10, "powerHits55": 1, "maxComboHits": 3, "maxComboDamage": 82,
+                         "maxComboSequence": ["JAB", "CROSS", "L.HOOK"], "maxComboRound": 1, "maxComboCounterStart": True},
+                "red": {"officialScore": 8, "powerHits55": 0, "maxComboHits": 2, "maxComboDamage": 46,
+                        "maxComboSequence": ["JAB", "R.UPPERCUT"], "maxComboRound": 1},
             }
             for side in ("blue", "red"):
                 side_data = payload[side]
@@ -27416,8 +27418,13 @@ class MainApp(QObject):
             logging.exception("SOURCE_RECORD_TIMER_EXIT_CLEANUP_SCHEDULE_FAIL")
 
     def on_app_quit(self):
+        for detector_name in ("watcher", "spectator_watcher"):
+            try:
+                getattr(self, detector_name).stop()
+            except Exception:
+                pass
         try:
-            if self.settings_dlg:
+            if self.settings_dlg and not bool(QApplication.instance().property("access_revoked")):
                 if hasattr(self.settings_dlg, "_apply_timer"):
                     try:
                         self.settings_dlg._apply_timer.stop()
@@ -27456,7 +27463,8 @@ class MainApp(QObject):
         except Exception:
             pass
         try:
-            self._shutdown_source_record_with_timer()
+            if not bool(QApplication.instance().property("access_revoked")):
+                self._shutdown_source_record_with_timer()
         except Exception:
             logging.exception("SOURCE_RECORD_TIMER_EXIT_CLEANUP_FAIL")
         try:
@@ -31118,6 +31126,14 @@ def main():
     cfg_path = resolve_config_path()
     _setup_logging(cfg_path)
     app = QApplication(sys.argv)
+    from access_policy import ONLINE_ACCESS_ENABLED
+    if ONLINE_ACCESS_ENABLED:
+        from access_gui import authorize, AccessGuard
+        access_client = authorize(app)
+        if access_client is None:
+            return
+        # Parent/retain the monitor for the application's entire lifetime.
+        app._access_guard = AccessGuard(app, access_client)
     app.setStyleSheet(
         "QMenuBar { background:#1b1f2a; color:#ffffff; }"
         "QMenuBar::item { background:transparent; color:#ffffff; }"

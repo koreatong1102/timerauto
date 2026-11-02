@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "timerauto-access",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-10-25",
+  "workers_dev": true,
+  "triggers": {"crons": ["17 3 * * *"]},
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "timerauto-access",
+    "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+    "migrations_dir": "migrations"
+  }]
+}

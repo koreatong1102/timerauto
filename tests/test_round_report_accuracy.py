@@ -874,6 +874,7 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertEqual(report["blue"]["powerHits55"], 1)
         self.assertEqual(report["blue"]["maxComboHits"], 2)
         self.assertEqual(report["blue"]["maxComboDamage"], 80)
+        self.assertEqual(report["blue"]["maxComboSequence"], ["L.HOOK", "CROSS"])
 
     def test_final_report_uses_all_round_event_rows_without_cross_round_combo(self):
         """A final card must retain prior-round combos, but a break resets them."""
@@ -912,6 +913,8 @@ class RoundReportAccuracyTests(unittest.TestCase):
         self.assertTrue(report["isFinal"])
         self.assertEqual(report["blue"]["maxComboHits"], 2)
         self.assertEqual(report["blue"]["maxComboDamage"], 85)
+        self.assertEqual(report["blue"]["maxComboSequence"], ["JAB", "CROSS"])
+        self.assertEqual(report["blue"]["maxComboRound"], 2)
         self.assertEqual(report["blue"]["damage"], 1900)
         self.assertEqual(report["red"]["damage"], 2000)
         self.assertEqual(report["blue"]["knockdowns"], 3)

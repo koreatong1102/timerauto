@@ -145,7 +145,7 @@ class CommentaryStoryTests(unittest.TestCase):
             roles.add(out["turns"][0]["role"])
         self.assertGreaterEqual(len(families), 5)
         self.assertEqual(roles, {"caster", "analyst"})
-        self.assertGreaterEqual(sum(word in " ".join(texts) for word in ("씨발", "존나", "미쳤네")), 3)
+        self.assertGreaterEqual(sum(word in " ".join(texts) for word in ("샤갈", "존나", "미쳤네")), 3)
 
     def test_light_and_compact_are_independent_and_round_trip(self):
         story = self.bank().story

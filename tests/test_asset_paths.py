@@ -4,7 +4,35 @@ import tempfile
 import unittest
 
 from app_paths import normalize_builtin_asset_path
-from config_model import AppConfig
+from config_model import AppConfig, DEFAULT_OVERLAY_PRESET
+from pathlib import Path
+
+
+class OverlayDefaultTests(unittest.TestCase):
+    def test_first_run_and_missing_style_default_to_tekken8(self):
+        self.assertEqual(DEFAULT_OVERLAY_PRESET, "tekken8")
+        self.assertEqual(AppConfig().overlay_preset, "tekken8")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/"config.json"
+            self.assertEqual(AppConfig.from_json(str(path)).overlay_preset, "tekken8")
+            for value in ({}, {"overlay_preset":None}, {"overlay_preset":""}, {"overlay_preset":"invalid"}):
+                path.write_text(json.dumps(value),encoding="utf8")
+                self.assertEqual(AppConfig.from_json(str(path)).overlay_preset, "tekken8")
+
+    def test_existing_explicit_style_is_preserved_across_updates_and_save(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/"config.json"
+            for style in ("classic", "tekken8"):
+                path.write_text(json.dumps({"overlay_preset":style}),encoding="utf8")
+                cfg=AppConfig.from_json(str(path))
+                self.assertEqual(cfg.overlay_preset,style)
+                cfg.to_json(str(path))
+                self.assertEqual(AppConfig.from_json(str(path)).overlay_preset,style)
+
+    def test_distributed_first_run_config_explicitly_uses_tekken8(self):
+        build=(Path(__file__).resolve().parents[1]/"build_release.ps1").read_text(encoding="utf8")
+        config=build[build.index("$releaseCfg = [ordered]@{"):build.index("$releaseCfgPath =")]
+        self.assertIn('overlay_preset = "tekken8"',config)
 
 
 class AssetPathCompatibilityTests(unittest.TestCase):

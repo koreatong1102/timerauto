@@ -177,6 +177,7 @@ from app_paths import (
     resolve_player_image_path,
 )
 from config_model import (
+    DEFAULT_OVERLAY_PRESET,
     REPORT_WEAK_POINT_PARTS,
     Rect,
     TriggerConfig,
@@ -3194,7 +3195,7 @@ class TimerBackend(QObject):
         self._overlay_ui_bg_opacity = 0.75
         self._overlay_window_opacity = 1.0
         self._overlay_ui_scale = 1.0
-        self._overlay_preset = "classic"
+        self._overlay_preset = DEFAULT_OVERLAY_PRESET
         self._overlay_player_mask = "square"
         self._overlay_show_round = True
         self._overlay_show_time = True
@@ -3292,7 +3293,7 @@ class TimerBackend(QObject):
 
     @pyqtProperty(str, notify=overlayPresetChanged)
     def overlayPreset(self) -> str:
-        return str(self._overlay_preset or "classic")
+        return str(self._overlay_preset or DEFAULT_OVERLAY_PRESET)
 
     @pyqtProperty(str, notify=overlayPlayerMaskChanged)
     def overlayPlayerMask(self) -> str:
@@ -4119,9 +4120,9 @@ class TimerBackend(QObject):
             self.overlayPlayerMaskChanged.emit()
 
     def set_overlay_preset(self, preset: Optional[str]):
-        v = str(preset or "classic").strip().lower()
+        v = str(preset or DEFAULT_OVERLAY_PRESET).strip().lower()
         if v not in ("classic", "tekken8"):
-            v = "classic"
+            v = DEFAULT_OVERLAY_PRESET
         if v != self._overlay_preset:
             self._overlay_preset = v
             self.overlayPresetChanged.emit()
@@ -4736,7 +4737,7 @@ class QmlTimerWindow(QObject):
         self._blue_image_sig = None
         self._red_image_sig = None
         self._backend.set_overlay_player_mask(getattr(cfg, "overlay_player_mask", "square"))
-        self._backend.set_overlay_preset(getattr(cfg, "overlay_preset", "classic"))
+        self._backend.set_overlay_preset(getattr(cfg, "overlay_preset", DEFAULT_OVERLAY_PRESET))
         self._backend.set_spectator_recent_text_size(getattr(cfg, "spectator_recent_text_size", 23))
         self._backend.set_overlay_visibility(
             round_visible=getattr(cfg, "overlay_show_round", True),
@@ -13613,10 +13614,10 @@ class SettingsDialog(QDialog):
 
     def _overlay_preset_mode_from_ui(self) -> str:
         if not hasattr(self, "cmb_overlay_style_mode"):
-            return str(getattr(self.cfg, "overlay_preset", "classic") or "classic")
+            return str(getattr(self.cfg, "overlay_preset", DEFAULT_OVERLAY_PRESET) or DEFAULT_OVERLAY_PRESET)
         v = self.cmb_overlay_style_mode.currentData()
-        v = str(v or "classic").strip().lower()
-        return v if v in ("classic", "tekken8") else "classic"
+        v = str(v or DEFAULT_OVERLAY_PRESET).strip().lower()
+        return v if v in ("classic", "tekken8") else DEFAULT_OVERLAY_PRESET
 
     def _apply_overlay_preset_mode_live(self):
         if self._suspend_apply:
@@ -13978,7 +13979,7 @@ class SettingsDialog(QDialog):
     def _collect_overlay_preset(self) -> dict:
         bg_color = getattr(self.cfg, "overlay_bg_color", "transparent")
         bg_opacity = float(getattr(self.cfg, "overlay_bg_opacity", 0.0))
-        overlay_preset = str(getattr(self.cfg, "overlay_preset", "classic") or "classic")
+        overlay_preset = str(getattr(self.cfg, "overlay_preset", DEFAULT_OVERLAY_PRESET) or DEFAULT_OVERLAY_PRESET)
         player_mask = getattr(self.cfg, "overlay_player_mask", "square")
         show_round = bool(getattr(self.cfg, "overlay_show_round", True))
         show_time = bool(getattr(self.cfg, "overlay_show_time", True))
@@ -14843,7 +14844,7 @@ class SettingsDialog(QDialog):
         self.cmb_overlay_style_mode = QComboBox()
         self.cmb_overlay_style_mode.addItem("기존 오버레이", "classic")
         self.cmb_overlay_style_mode.addItem("철권8 스타일", "tekken8")
-        current_overlay_preset = str(getattr(self.cfg, "overlay_preset", "classic") or "classic").lower()
+        current_overlay_preset = str(getattr(self.cfg, "overlay_preset", DEFAULT_OVERLAY_PRESET) or DEFAULT_OVERLAY_PRESET).lower()
         idx = self.cmb_overlay_style_mode.findData(current_overlay_preset)
         self.cmb_overlay_style_mode.setCurrentIndex(idx if idx >= 0 else 0)
         _tt(self.cmb_overlay_style_mode, "기존 오버레이를 보존한 채 새 HUD 스타일만 전환합니다.")

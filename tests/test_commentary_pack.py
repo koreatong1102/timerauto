@@ -28,6 +28,14 @@ def audio(path, sample=2, rate=24000):
 
 
 class CommentaryPackTests(unittest.TestCase):
+    def test_changed_wording_has_new_clip_identity_and_no_old_word_in_catalog(self):
+        old="와 씨발. 일단 카운트 봅시다!"
+        new="와 샤갈. 일단 카운트 봅시다!"
+        self.assertNotEqual(clip_path(self.voice,old),clip_path(self.voice,new))
+        texts=[text for _,text in catalog("full")]
+        self.assertTrue(any("샤갈" in text for text in texts))
+        self.assertFalse(any("씨발" in text for text in texts))
+
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
@@ -194,7 +202,7 @@ class CommentaryPackTests(unittest.TestCase):
             render("아무 문장 카운터! 콤보, 통, 카운터!", str(Path(self.folder.name, "bad.wav")), voice)
 
     def test_bare_followup_plays_without_repeating_the_name(self):
-        text = "와 씨발. 일단 카운트 봅시다!"
+        text = "와 샤갈. 일단 카운트 봅시다!"
         self.store(text)
         _, _, voice = self.plan()
         self.assertTrue(render(text, str(Path(self.folder.name, "reply.wav")), voice))

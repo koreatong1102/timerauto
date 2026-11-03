@@ -250,6 +250,7 @@ if (-not $IncludeUserConfig) {
     spectator_caster_voice = "ko-KR-SunHiNeural"
     qml_preview_enabled = $true
     browser_overlay_output_only = $true
+    overlay_preset = "tekken8"
     overlay_ui_bg_opacity = 0.75
     portrait_source_priority = "log"
   }

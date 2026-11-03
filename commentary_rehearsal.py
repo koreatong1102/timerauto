@@ -142,6 +142,6 @@ def rehearse_archive(path, cfg, *, drop_every=0):
                                            if row["completed"] and row["terminal"]),
         "families": dict(Counter(row["family"] for row in transcript)),
         "roles": dict(Counter(turn["role"] for row in transcript for turn in row["turns"])),
-        "profanity": {word: len(re.findall(word, text)) for word in ("씨발", "존나", "미쳤", "돌았", "개같", "좆", "염병")},
+        "profanity": {word: len(re.findall(word, text)) for word in ("샤갈", "존나", "미쳤", "돌았", "개같", "좆", "염병")},
         "invalid_callbacks": sum(not row["valid_callback"] for row in transcript),
         "invalid_subjects": sum(not row["valid_subject"] for row in transcript), "transcript": transcript}

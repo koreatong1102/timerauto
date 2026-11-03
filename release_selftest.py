@@ -134,6 +134,7 @@ def _checks(temp):
         return {"schema": 1, "ok": True, "ruleset": engine.ruleset_version(), "verdicts": verdicts,
                 "online_access": {"enabled":ONLINE_ACCESS_ENABLED,"server":AUTH_SERVER_URL,"poll_seconds":POLL_SECONDS,"grace_seconds":CONNECTION_GRACE_SECONDS},
                 "local_speech_configuration": local_speech,
+                "default_overlay_preset": cfg.overlay_preset,
                 "bgrade_commentary": bgrade_demo_steps(),
                 "report": report_facts, "overlay_sha256": hashlib.sha256(html.encode()).hexdigest(),
                 "assets": assets, "runtime": {"python": sys.version.split()[0], "pyqt": PYQT_VERSION_STR,

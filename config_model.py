@@ -15,6 +15,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional
 
 REPORT_WEAK_POINT_PARTS = ["턱", "코", "왼쪽 관자놀이", "오른쪽 관자놀이", "관자놀이", "왼쪽 눈", "오른쪽 눈", "이마", "간", "명치", "기타"]
+DEFAULT_OVERLAY_PRESET = "tekken8"
 
 from app_paths import app_path, normalize_app_path, normalize_builtin_asset_path, to_app_rel
 
@@ -968,7 +969,7 @@ class AppConfig:
     overlay_round_intro_glow_color: str = "#38BDF8"
     overlay_round_x: int = 0
     overlay_round_y: int = 0
-    overlay_preset: str = "classic"
+    overlay_preset: str = DEFAULT_OVERLAY_PRESET
     overlay_player_mask: str = "square"
     overlay_show_round: bool = True
     overlay_show_time: bool = True
@@ -1586,9 +1587,9 @@ class AppConfig:
             cfg.overlay_round_y = max(-80, min(120, int(raw.get("overlay_round_y", 0) or 0)))
         except Exception:
             cfg.overlay_round_y = 0
-        cfg.overlay_preset = str(raw.get("overlay_preset", "classic") or "classic").strip().lower()
+        cfg.overlay_preset = str(raw.get("overlay_preset", DEFAULT_OVERLAY_PRESET) or DEFAULT_OVERLAY_PRESET).strip().lower()
         if cfg.overlay_preset not in ("classic", "tekken8"):
-            cfg.overlay_preset = "classic"
+            cfg.overlay_preset = DEFAULT_OVERLAY_PRESET
         cfg.overlay_player_mask = _normalize_player_mask(raw.get("overlay_player_mask", "square"))
         cfg.overlay_show_round = bool(raw.get("overlay_show_round", True))
         cfg.overlay_show_time = bool(raw.get("overlay_show_time", True))

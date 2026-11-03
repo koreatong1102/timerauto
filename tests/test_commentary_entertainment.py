@@ -16,6 +16,13 @@ from spectator_log_watcher import SpectatorLogWatcher
 
 
 class EntertainmentStyleTests(unittest.TestCase):
+    def test_authored_bgrade_lines_use_requested_replacement(self):
+        from commentary_entertainment import POOLS, LIVE_REPLIES, LIVE_CALLS
+        # Check every authored pool, not just one randomly selected preview.
+        text=repr((POOLS,LIVE_REPLIES,LIVE_CALLS))
+        self.assertNotIn("씨발",text)
+        self.assertIn("샤갈",text)
+
     def test_old_and_unknown_configs_remain_sports(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root, "config.json")
@@ -39,7 +46,7 @@ class EntertainmentStyleTests(unittest.TestCase):
     def test_profanity_is_uncensored_and_same_sentence_does_not_repeat(self):
         bank = BGradeCommentary()
         first = bank.pick("counter", now=100)
-        self.assertIn("씨발", first)
+        self.assertIn("샤갈", first)
         self.assertEqual(bank.pick("counter", now=101), "")
         second = bank.pick("counter", now=109)
         self.assertNotEqual(first, second)
@@ -74,7 +81,7 @@ class EntertainmentStyleTests(unittest.TestCase):
 
     def test_preview_uses_real_style_bank_and_has_duo(self):
         steps = bgrade_demo_steps()
-        self.assertTrue(any("씨발" in step["text"] + step.get("followup_text", "") for step in steps))
+        self.assertTrue(any("샤갈" in step["text"] + step.get("followup_text", "") for step in steps))
         self.assertTrue(any(step.get("followup_text") for step in steps))
         self.assertEqual({step["role"] for step in steps}, {"caster", "analyst"})
 
@@ -102,14 +109,14 @@ with tempfile.TemporaryDirectory(prefix="rfc_style_ui_") as td:
   recorded=[]
   dlg._start_spectator_commentary_script=lambda name,steps:recorded.append((name,steps))
   dlg._test_spectator_commentary_duo_suite()
-  assert any("씨발" in step["text"]+step.get("followup_text", "") for step in recorded[-1][1])
+  assert any("샤갈" in step["text"]+step.get("followup_text", "") for step in recorded[-1][1])
   combo.setCurrentIndex(0)
   dlg._test_spectator_commentary_duo_suite()
-  assert not any("씨발" in step["text"]+step.get("followup_text", "") for step in recorded[-1][1])
+  assert not any("샤갈" in step["text"]+step.get("followup_text", "") for step in recorded[-1][1])
   combo.setCurrentIndex(1)
   dlg.cmb_spectator_bgrade_swearing.setCurrentIndex(0)
   dlg._test_spectator_commentary_duo_suite()
-  assert not any("씨발" in step["text"]+step.get("followup_text", "") for step in recorded[-1][1])
+  assert not any("샤갈" in step["text"]+step.get("followup_text", "") for step in recorded[-1][1])
   dlg._apply_timer.stop()
   dlg.deleteLater()
  finally:
@@ -185,7 +192,7 @@ class EntertainmentWatcherTests(unittest.TestCase):
                 [{"kind": "knockdown", "side": "red", "round_down_count": 2}], [], 1)
             self.assertEqual(plan["count"], 2)
             self.assertIn("통", plan["text"])
-            self.assertEqual("씨발" in plan["followups"][0]["text"], style == "b_grade")
+            self.assertEqual("샤갈" in plan["followups"][0]["text"], style == "b_grade")
 
     def test_report_style_preserves_factual_text(self):
         w = self.watcher("sports")

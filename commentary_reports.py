@@ -85,7 +85,7 @@ def build_report_narration(report, *, final=False, swearing="strong", callback="
             "다음에는 공격을 내민 뒤 반격을 얼마나 덜 허용하는지 봐야겠어요.",
             {"light": "공격하러 갔는데 돌아올 때 멍이 늘어요.",
              "mixed": "공격하러 갔는데 본인만 존나 억울해져요.",
-             "strong": "씨발, 공격하러 갔는데 맞고 돌아오면 계산이 안 맞죠."}.get(swearing, ""))
+             "strong": "샤갈, 공격하러 갔는데 맞고 돌아오면 계산이 안 맞죠."}.get(swearing, ""))
 
     if max(count(b, "maxComboHits"), count(r, "maxComboHits")) >= 2:
         combo = []

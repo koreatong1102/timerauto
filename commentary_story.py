@@ -93,7 +93,7 @@ def script_key(script):
 # '{setup}' is the factual call selected for THIS hit, never another fighter.
 SCENES = {
     "whiff": (
-        Script("{setup}", "아 씨발, 허공 때린 건데 왜 벌까지 받아요!", "absurd", 2),
+        Script("{setup}", "아 샤갈, 허공 때린 건데 왜 벌까지 받아요!", "absurd", 2),
         Script("{setup}", "때리러 갔는데 맞고 돌아와요. 저는 저 역할 잘합니다.", "self"),
         Script("{setup}", "헛친 다음이 더 무섭네. 주먹 빼는 동안 또 들어옵니다.", "analysis"),
         Script("{setup}", "야, 헛손질 한 번 했다고 존나 엄격하네요!", "dry", 1),
@@ -104,7 +104,7 @@ SCENES = {
     ),
     "graze": (
         Script("{setup}", "살짝 건드렸잖아요. 이렇게까지 할 일입니까!", "absurd"),
-        Script("{setup}", "아 씨발, 받은 만큼만 돌려주라고요!", "reaction", 2),
+        Script("{setup}", "아 샤갈, 받은 만큼만 돌려주라고요!", "reaction", 2),
         Script("{setup}", "이 정도면 먼저 친 쪽도 억울하죠. 내가 더 맞았어!", "contrast"),
         Script("{setup}", "가볍게 맞고 무겁게 칩니다. 손해 보는 건 못 참네요.", "dry"),
         Script("{setup}", "저렇게 돌아오면 다음 주먹은 존나 고민되겠습니다.", "analysis", 1),
@@ -113,7 +113,7 @@ SCENES = {
         Script("{setup}", "미쳤네, 스친 걸로 안 넘어가요. 바로 세게 돌아옵니다!", "reaction", 1),
     ),
     "counter": (
-        Script("{setup}", "아 씨발, 때리러 갔다가 왜 내가 맞아요!", "absurd", 2),
+        Script("{setup}", "아 샤갈, 때리러 갔다가 왜 내가 맞아요!", "absurd", 2),
         Script("{setup}", "저한테 저 타이밍 물어보지 마세요. 저는 맞는 역할입니다.", "self"),
         Script("{setup}", "주먹 내민 쪽만 억울하죠. 나는 공격했는데!", "contrast"),
         Script("{setup}", "타이밍 개같이 잘 맞추네요. 칭찬입니다, 지금!", "reaction", 2),
@@ -123,7 +123,7 @@ SCENES = {
         Script("{setup}", "선빵 친 쪽이 손해 봤습니다. 기분 나쁘죠 이거.", "dry"),
     ),
     "counter_combo": (
-        Script("{setup}", "씨발, 반격 한 대면 됐지 뒤에는 왜 또 와요!", "absurd", 2),
+        Script("{setup}", "샤갈, 반격 한 대면 됐지 뒤에는 왜 또 와요!", "absurd", 2),
         Script("{setup}", "받아치는 걸로 끝낼 생각이 없네요. 뒤가 더 있습니다.", "analysis"),
         Script("{setup}", "카운터도 맞았는데 연타까지 맞아요. 너무하네 진짜!", "reaction"),
         Script("{setup}", "처음엔 공격했는데 지금은 막느라 존나 바쁩니다.", "contrast", 1),
@@ -134,7 +134,7 @@ SCENES = {
     ),
     "combo": (
         Script("{setup}", "한 대씩 얘기합시다. 왜 몰아서 때려요!", "absurd"),
-        Script("{setup}", "끝났나? 안 끝났어요. 씨발, 또 왔어요!", "reaction", 2),
+        Script("{setup}", "끝났나? 안 끝났어요. 샤갈, 또 왔어요!", "reaction", 2),
         Script("{setup}", "맞는 쪽에선 저 사이가 존나 길겠죠.", "contrast", 1),
         Script("{setup}", "첫 타에 걸렸다고 끝까지 데려가네요. 끈질겨요.", "dry"),
         Script("{setup}", "저였으면 두 번째부터 숫자 못 셉니다. 그냥 아픕니다.", "self"),
@@ -143,7 +143,7 @@ SCENES = {
         Script("{setup}", "저희가 세는 동안에도 들어갔습니다. 보는 쪽도 바빠요.", "dry"),
     ),
     "heavy": (
-        Script("{setup}", "와 씨발, 저는 구경하는데 의자에서 엉덩이 떴어요!", "reaction", 2),
+        Script("{setup}", "와 샤갈, 저는 구경하는데 의자에서 엉덩이 떴어요!", "reaction", 2),
         Script("{setup}", "저건 설명하기 전에 소리부터 나옵니다.", "dry"),
         Script("{setup}", "한 대인데 존재감이 존나 커요. 방금 건 확실합니다!", "reaction", 1),
         Script("{setup}", "저 지금 자세 고쳐 앉았습니다. 구경도 똑바로 해야겠어요.", "self"),
@@ -153,7 +153,7 @@ SCENES = {
         Script("{name}, 강타 적중! 와, 저거 봤어요?", "보고 있습니다. 해설도 좀 해 주세요!", "banter", 0, lead_role="analyst"),
     ),
     "weak": (
-        Script("{setup}", "아 씨발, 하필 거길 딱 맞히네요!", "reaction", 2),
+        Script("{setup}", "아 샤갈, 하필 거길 딱 맞히네요!", "reaction", 2),
         Script("{setup}", "때리는 쪽은 좋겠죠. 맞는 쪽은 생각이 다를 겁니다.", "contrast"),
         Script("{setup}", "저였으면 지금 복싱보다 말이 먼저 나옵니다.", "self"),
         Script("{setup}", "아무 데나 맞은 게 아니죠. 급소 적중이 찍혔습니다.", "analysis"),
@@ -165,7 +165,7 @@ SCENES = {
     ),
     "answer_back": (
         Script("{setup}", "둘 다 마지막 한 대는 자기가 쳐야 돼요. 복싱으로 말싸움합니다.", "absurd"),
-        Script("{setup}", "씨발, 맞고 그냥 넘어가는 분들이 아니네요!", "reaction", 2),
+        Script("{setup}", "샤갈, 맞고 그냥 넘어가는 분들이 아니네요!", "reaction", 2),
         Script("{setup}", "이쪽도 돌려줍니다. 한쪽만 치는 교전이 아니에요.", "analysis"),
         Script("{setup}", "둘 다 먼저 그만둘 생각이 없어요. 저희만 존나 바쁩니다.", "banter", 1),
         Script("{setup}", "한 번씩만 하고 끝날 수는 없는 겁니까!", "dry"),
@@ -187,19 +187,19 @@ SCENES = {
         Script("{setup}", "한 대 더 들어가느냐, 여기서 끊느냐입니다.", "analysis"),
     ),
     "knockdown": (
-        Script("{setup}", "와 씨발. 일단 카운트 봅시다!", "reaction", 2),
+        Script("{setup}", "와 샤갈. 일단 카운트 봅시다!", "reaction", 2),
         Script("{setup}", "아, 카운트부터 봐야 됩니다.", "analysis"),
         Script("{setup}", "미쳤네. 방금은 저도 말이 끊겼어요!", "reaction", 1),
         Script("{setup}", "여기선 더 떠들지 말고 카운트 보죠.", "dry"),
     ),
     "tko": (
-        Script("{setup}", "와 씨발, 여기서 끝내 버립니다!", "reaction", 2),
+        Script("{setup}", "와 샤갈, 여기서 끝내 버립니다!", "reaction", 2),
         Script("{setup}", "끝났습니다. 방금 장면부터 다시 봐야겠어요.", "analysis"),
         Script("{setup}", "돌았네. 끝낼 때 이렇게 끝내네요!", "reaction", 1),
         Script("{setup}", "아, 더 갑니까 했는데 여기서 끝났어요!", "contrast"),
     ),
     "repeat_counter": (
-        Script("{setup} 또 받아칩니다!", "아 씨발, 아까도 이쪽 카운터였잖아요!", "reaction", 2),
+        Script("{setup} 또 받아칩니다!", "아 샤갈, 아까도 이쪽 카운터였잖아요!", "reaction", 2),
         Script("{setup}", "이제 주먹 내밀기 전에 허락받아야겠는데요.", "dry", 0, "permission"),
         Script("{setup}", "먼저 들어가는 쪽이 계속 맞아요. 저희는 쉽게 들어가라 못 합니다.", "analysis"),
         Script("{setup}", "뭐만 내밀면 돌아와요. 치는 쪽도 존나 고민됩니다.", "contrast", 1),
@@ -209,36 +209,36 @@ SCENES = {
     "permission_return": (
         Script("{setup}", "네, 허락 안 받고 또 들어갔네요!", "callback"),
         Script("{setup}", "아까 허락 얘기했잖아요. 무단으로 들어가니까 또 맞죠!", "callback", 1),
-        Script("{setup}", "씨발, 허락은 받고 들어가야 된다니까요!", "callback", 2),
+        Script("{setup}", "샤갈, 허락은 받고 들어가야 된다니까요!", "callback", 2),
     ),
     "permission_reverse": (
         Script("{setup} 이번엔 반대쪽 카운터!", "아, 이번엔 허락 안 받고 들어가도 되네요!", "callback"),
         Script("{setup}", "아까 허락받으라던 쪽도 맞습니다. 여기 예외 없어요!", "callback"),
-        Script("{setup}", "씨발, 허락받으라더니 본인도 맞네!", "callback", 2),
+        Script("{setup}", "샤갈, 허락받으라더니 본인도 맞네!", "callback", 2),
     ),
     "reversal": (
         Script("{setup} 이번엔 받아치는 쪽이 바뀝니다!", "당해 보니까 어떻습니까. 아까 그거예요!", "contrast"),
-        Script("{setup}", "아 씨발, 카운터 잘 치던 쪽도 카운터를 맞아요!", "reaction", 2),
+        Script("{setup}", "아 샤갈, 카운터 잘 치던 쪽도 카운터를 맞아요!", "reaction", 2),
         Script("{setup}", "받아치던 손만 있는 줄 알았는데 반대쪽 손도 살아 있습니다.", "analysis"),
         Script("{setup}", "이번엔 반대네요. 저희도 한쪽 얘기만 할 수가 없어요.", "dry"),
     ),
     "target_repeat": (
         Script("{setup} 또 같은 부위예요!", "아까부터 저 자리 적중이 많습니다. 우연 한 번은 아니죠.", "analysis"),
         Script("{setup}", "그 자리만 존나 바쁩니다. 다른 얘기를 할 수가 없어요.", "dry", 1),
-        Script("{setup}", "아 씨발, 같은 데 또 맞으면 기분 더럽죠!", "reaction", 2),
+        Script("{setup}", "아 샤갈, 같은 데 또 맞으면 기분 더럽죠!", "reaction", 2),
         Script("{setup}", "저기 적중이 계속 찍혀요. 일단 저 자리부터 지켜야죠.", "analysis"),
     ),
     "eye_seed": (
         Script("{setup}", "눈사냥꾼 얘기 나올 만합니다. 아까부터 눈 쪽 적중이 많아요.", "dry", 0, "eyes"),
-        Script("{setup}", "아 씨발, 눈 쪽만 벌써 여러 번입니다. 눈사냥꾼이네.", "reaction", 2, "eyes"),
+        Script("{setup}", "아 샤갈, 눈 쪽만 벌써 여러 번입니다. 눈사냥꾼이네.", "reaction", 2, "eyes"),
     ),
     "eye_return": (
         Script("{setup}", "네, 아까 그 눈사냥꾼 맞습니다.", "callback"),
         Script("{setup}", "눈사냥꾼 얘기 괜히 한 게 아니에요. 또 눈입니다.", "callback"),
-        Script("{setup}", "씨발, 눈사냥꾼 또 왔어요. 같은 자리예요!", "callback", 2),
+        Script("{setup}", "샤갈, 눈사냥꾼 또 왔어요. 같은 자리예요!", "callback", 2),
     ),
     "long_combo": (
-        Script("{setup}", "씨발, 저희가 세는 동안에도 안 끝나요!", "reaction", 2),
+        Script("{setup}", "샤갈, 저희가 세는 동안에도 안 끝나요!", "reaction", 2),
         Script("{setup}", "저였으면 두 대부터 숫자 대신 살려 달라 했습니다.", "self"),
         Script("{setup}", "맞는 쪽에선 존나 긴 하루입니다. 아직도 와요!", "contrast", 1),
         Script("{setup}", "연타 끊는 게 먼저죠. 여기에 같이 치면 또 맞습니다.", "analysis"),
@@ -252,7 +252,7 @@ SCENES = {
 # fact. These remain optional reactions and never override the event call.
 SCENES["heavy"] += (
     Script("{setup}", "해설하다가 본인이 먼저 소리 지르셨는데요?", "banter", lead_role="analyst"),
-    Script("{setup}", "아 씨발, 방금은 저도 자세 고쳐 앉았어요!", "reaction", 2, lead_role="analyst"),
+    Script("{setup}", "아 샤갈, 방금은 저도 자세 고쳐 앉았어요!", "reaction", 2, lead_role="analyst"),
     Script("{setup}", "네, 그건 길게 설명 안 하셔도 알겠습니다!", "dry", lead_role="analyst"),
 )
 SCENES["counter"] += (
@@ -262,13 +262,13 @@ SCENES["counter"] += (
 )
 SCENES["combo"] += (
     Script("{setup}", "한 대씩 주고받자고 했지 묶음으로 보내랬습니까!", "absurd"),
-    Script("{setup}", "씨발, 끝났나 싶을 때 한 대가 더 있어요!", "reaction", 2),
+    Script("{setup}", "샤갈, 끝났나 싶을 때 한 대가 더 있어요!", "reaction", 2),
     Script("{setup}", "네, 맞는 쪽은 저 숫자 세고 싶지도 않을 겁니다.", "contrast", lead_role="analyst"),
 )
 SCENES["weak"] += (
     Script("{setup}", "다른 데도 많은데 꼭 아픈 데를 찾네요.", "dry"),
     Script("{setup}", "네, 보는 저도 괜히 거기 손이 갑니다!", "self", lead_role="analyst"),
-    Script("{setup}", "아 씨발, 거기는 맞고 웃어넘기기 힘들죠!", "reaction", 2),
+    Script("{setup}", "아 샤갈, 거기는 맞고 웃어넘기기 힘들죠!", "reaction", 2),
 )
 
 # Different observations and comic premises, not synonyms of "that hurt".
@@ -280,7 +280,7 @@ SCENES["target_repeat"] += (
     Script("{setup}", "단골집도 이렇게 자주 안 가요. 존나 꾸준하네.", "dry", 1, topic="target_regular", intent="humor"),
     Script("{setup}", "맞은 데 또 맞는 건 재방송 아니고 추가 요금이에요.", "absurd", topic="target_extra_charge", intent="humor"),
     Script("{setup}", "여기 주먹 배송지는 변경이 안 됩니까?", "banter", topic="target_address", intent="humor"),
-    Script("{setup}", "아 씨발, 아픈 데 기억해 뒀다가 또 보내네!", "reaction", 2, topic="target_return_visit", intent="reaction"),
+    Script("{setup}", "아 샤갈, 아픈 데 기억해 뒀다가 또 보내네!", "reaction", 2, topic="target_return_visit", intent="reaction"),
     Script("{setup}", "저기만 경기 두 판 뛰는 기분이겠어요.", "contrast", topic="target_overtime", intent="humor"),
 )
 SCENES["weak"] += (
@@ -288,7 +288,7 @@ SCENES["weak"] += (
     Script("{setup}", "정확하게 맞혔어요. 세기 말고 위치도 봐 주세요.", "analysis", topic="target_precision", intent="analysis"),
     Script("{setup}", "저는 마우스로 눌러도 저기 한 번에 못 찍어요.", "self", topic="target_mouse_aim", intent="humor"),
     Script("{setup}", "저 자리까지 찍어 주네. 주먹에 내비 달았어요?", "absurd", topic="target_navigation", intent="humor"),
-    Script("{setup}", "아 씨발, 맞는 자리에 당첨 운을 다 쓰면 어떡해요!", "absurd", 2, topic="target_lottery", intent="humor"),
+    Script("{setup}", "아 샤갈, 맞는 자리에 당첨 운을 다 쓰면 어떡해요!", "absurd", 2, topic="target_lottery", intent="humor"),
     Script("{setup}", "거기 맞는 순간 저는 채팅 칠 손부터 멈춥니다.", "audience", topic="target_chat_freeze", intent="reaction"),
 )
 SCENES["repeat_counter"] += (
@@ -297,25 +297,25 @@ SCENES["repeat_counter"] += (
     Script("{setup}", "공격 버튼 누르면 반품부터 와요. 존나 빠르네.", "absurd", 1, topic="counter_returns", intent="humor"),
     Script("{setup}", "여기 선불이네. 들어가려면 한 대 내고 가야 돼요.", "dry", topic="counter_toll", intent="humor"),
     Script("{setup}", "주먹 보냈는데 수신 확인이 얼굴로 와요.", "absurd", topic="counter_read_receipt", intent="humor"),
-    Script("{setup}", "아 씨발, 공격하는 쪽이 더 긴장되는 경기예요!", "reaction", 2, topic="counter_attacker_tension", intent="reaction"),
+    Script("{setup}", "아 샤갈, 공격하는 쪽이 더 긴장되는 경기예요!", "reaction", 2, topic="counter_attacker_tension", intent="reaction"),
 )
 SCENES["reversal"] += (
     Script("{setup}", "아까 받아치던 쪽이 이번에는 맞았습니다.", "analysis", topic="counter_role_switch", intent="change"),
     Script("{setup}", "이번 반격은 반대편입니다. 한쪽 얘기만 하면 안 되죠.", "analysis", topic="counter_other_side", intent="change"),
     Script("{setup}", "카운터 맛집 사장님도 옆집에서 한 대 드셨네요.", "absurd", topic="counter_owner_customer", intent="humor"),
     Script("{setup}", "반격 치던 분 표정은 몰라도 제 입장은 바뀌었어요.", "self", topic="commentator_reassessment", intent="humor"),
-    Script("{setup}", "씨발, 카운터가 독점 사업은 아니었어요!", "absurd", 2, topic="counter_monopoly", intent="humor"),
+    Script("{setup}", "샤갈, 카운터가 독점 사업은 아니었어요!", "absurd", 2, topic="counter_monopoly", intent="humor"),
 )
 SCENES["combo"] += (
     Script("{setup}", "첫 적중 뒤에 후속타까지 연결했습니다.", "analysis", topic="combo_connection", intent="analysis"),
     Script("{setup}", "주먹은 한 대씩 오는데 결제는 왜 일시불이에요!", "absurd", topic="combo_installment", intent="humor"),
-    Script("{setup}", "아 씨발, 닫기 버튼 누르는데 팝업이 또 떠요!", "absurd", 2, topic="combo_popup", intent="humor"),
+    Script("{setup}", "아 샤갈, 닫기 버튼 누르는데 팝업이 또 떠요!", "absurd", 2, topic="combo_popup", intent="humor"),
     Script("{setup}", "연타 얘기하다 제가 말 더듬었네요. 주먹이 더 빠릅니다.", "banter", topic="combo_commentator_race", intent="humor"),
 )
 SCENES["heavy"] += (
     Script("{setup}", "한 방은 한 방이고, 이걸 연타 숫자로 부르진 않죠.", "analysis", topic="heavy_not_combo", intent="analysis"),
     Script("{setup}", "저 한 대에 제 방송용 침착함이 날아갔어요.", "self", topic="heavy_composure", intent="humor"),
-    Script("{setup}", "씨발, 주먹은 저기서 맞는데 왜 제 어깨가 올라가죠!", "reaction", 2, topic="heavy_shoulder", intent="reaction"),
+    Script("{setup}", "샤갈, 주먹은 저기서 맞는데 왜 제 어깨가 올라가죠!", "reaction", 2, topic="heavy_shoulder", intent="reaction"),
 )
 
 

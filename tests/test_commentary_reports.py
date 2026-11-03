@@ -75,8 +75,8 @@ class ReportNarrationTests(unittest.TestCase):
         data = report()
         for side in ("blue", "red"):
             data[side].pop("damage")
-        self.assertIn("씨발", build_report_narration(data, swearing="strong"))
-        self.assertNotIn("씨발", build_report_narration(data, swearing="light"))
+        self.assertIn("샤갈", build_report_narration(data, swearing="strong"))
+        self.assertNotIn("샤갈", build_report_narration(data, swearing="light"))
         callback = "아까 허락 이야기했죠. 통, 카운터 12번입니다."
         self.assertIn(callback, build_report_narration(data, callback=callback))
 

@@ -111,6 +111,8 @@ class ObsIntegration:
         self._pending_input_mute_requests: Dict[str, Dict[str, Any]] = {}
         self._pending_input_settings_requests: Dict[str, str] = {}
         self._source_record_diagnostic: Dict[str, Any] = {}
+        from source_record_runtime import SourceRecordRuntime
+        self._source_record_runtime = SourceRecordRuntime(self._send_request, self._events.put)
         self._source_record_watch_target = ""
         self._source_record_watch_attempt = 0
         self._source_record_watch_next_at = 0.0
@@ -283,12 +285,8 @@ class ObsIntegration:
         logging.info("OBS_SOURCE_RECORD_SAVE_REQUEST context=%s", hotkey_context)
         self._commands.put(
             {
-                "type": "request",
-                "requestType": "TriggerHotkeyByName",
-                "requestData": {
-                    "hotkeyName": "ReplayBuffer.Save",
-                    "contextName": hotkey_context,
-                },
+                "type": "source_record_save",
+                "source": source_record_source_name(context_name),
                 "reason": str(reason or ""),
                 "context": dict(context or {}),
                 "source_record": True,
@@ -429,6 +427,7 @@ class ObsIntegration:
                 if int(identified.get("op", -1)) != 2:
                     raise RuntimeError("OBS authentication rejected")
                 self._pending_replay_requests.clear()
+                self._source_record_runtime.reset()
                 self._pending_input_settings_requests.clear()
                 self._source_record_watch_request_id = ""
                 self._set_status("connected")
@@ -468,6 +467,12 @@ class ObsIntegration:
                     # Register every base request before any response may finish the query.
                     for request_type in ("GetVersion", "GetStats", "GetStreamStatus", "GetRecordStatus", "GetReplayBufferStatus", "GetCurrentProgramScene", "GetInputList"):
                         await self._send_diagnostic_read(ws, token, request_type)
+                elif kind == "source_record_save":
+                    await self._source_record_runtime.save(ws, command['source'],
+                        dict(command.get('context') or {}), str(command.get('reason') or ''))
+                elif kind == "source_record_health":
+                    if command.get('target') == self._source_record_watch_target:
+                        await self._source_record_runtime.health(ws, command['target'])
                 elif kind == "request":
                     request_type = str(command.get("requestType") or "")
                     request_id = await self._send_request(
@@ -550,11 +555,14 @@ class ObsIntegration:
                         # and third-party filters finish loading.
                         self._source_record_watch_next_at = time.monotonic() + (2.0 if changed else 0.5)
                 elif kind == "source_record_watch_stop":
+                    self._source_record_runtime.reset()
                     self._source_record_watch_target = ""
                     self._source_record_watch_attempt = 0
                     self._source_record_watch_next_at = 0.0
                     self._source_record_watch_request_id = ""
             await self._service_source_record_watch(ws)
+            await self._source_record_runtime.service(ws)
+            self._source_record_runtime.expire()
 
     async def _send_request(
         self,
@@ -610,6 +618,9 @@ class ObsIntegration:
                 await self._handle_diagnostic_response(ws, data)
                 return  # In particular, do NOT auto-start a buffer from a diagnostic read.
             DIAG.record("obs_request_result", request_id=request_id, request_type=request_type, ok=ok, code=status.get("code"), message=status.get("comment", ""))
+            if request_id.startswith("sr-runtime-"):
+                await self._source_record_runtime.response(ws, data)
+                return
             if request_id.startswith("source-record-config-"):
                 configured_target = str(self._pending_source_record_config.pop(request_id, "") or "")
                 self._events.put({
@@ -845,6 +856,7 @@ class ObsIntegration:
         if ok:
             self._source_record_watch_attempt = 0
             self._source_record_watch_next_at = time.monotonic() + 30.0
+            self._commands.put({'type': 'source_record_health', 'target': self._source_record_watch_target})
             logging.info("OBS_SOURCE_RECORD_WATCH_OK target=%s", self._source_record_watch_target)
         else:
             self._source_record_watch_attempt += 1

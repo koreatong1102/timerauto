@@ -142,7 +142,7 @@ from speech_runtime import commentary_cache_path, is_cached_commentary, last_spe
 from local_tts import commentary_voice as select_commentary_voice, is_local_voice, request_options as qwen_request_options
 from tts_settings import TtsEngineControls
 from commentary_pack import usage_voice as pack_usage_voice, base_voice as pack_base_voice, prepare_dialogue as pack_prepare_dialogue, prepare_names as prepare_pack_names
-from spectator_camera import create_camera_panel
+from spectator_camera import create_camera_panel, auto_camera_keeps_window_open
 from camera_director import feed_camera_director
 from commentary_story import SPOKEN_MEMORY
 from commentary_calls import SPOKEN_FOCUS
@@ -886,8 +886,12 @@ def _activate_window_reliably(hwnd: int, *, restore: bool = False) -> Tuple[bool
         # window, not that the target should remain minimized.  A minimized
         # window can still become GetForegroundWindow(), which used to make
         # the diagnostics report success while nothing appeared on screen.
-        # Always surface the requested window before activating it.
-        user32.ShowWindow(wintypes.HWND(hwnd), 9)  # SW_RESTORE
+        # SW_RESTORE also unmaximizes an already visible window. Only use it
+        # for minimized windows; otherwise preserve placement and show state.
+        if user32.IsIconic(wintypes.HWND(hwnd)):
+            user32.ShowWindow(wintypes.HWND(hwnd), 9)  # SW_RESTORE
+        elif not user32.IsWindowVisible(wintypes.HWND(hwnd)):
+            user32.ShowWindow(wintypes.HWND(hwnd), 5)  # SW_SHOW, current show state
         user32.BringWindowToTop(wintypes.HWND(hwnd))
         user32.SetActiveWindow(wintypes.HWND(hwnd))
         user32.SetForegroundWindow(wintypes.HWND(hwnd))
@@ -988,7 +992,7 @@ def press_vk_for_window_title(
     finally:
         if minimize_target_after:
             try:
-                user32.ShowWindow(wintypes.HWND(hwnd), 6)  # SW_MINIMIZE
+                _minimize_spectator_window(hwnd)  # SW_MINIMIZE
             except Exception:
                 pass
         if restore_previous and prev and prev != hwnd:
@@ -998,7 +1002,27 @@ def press_vk_for_window_title(
                 pass
 
 
-def toggle_file_camera_once(title_part: str, *, vk: int = 0x75) -> Tuple[bool, str]:
+def _minimize_spectator_window(hwnd: int) -> bool:
+    if auto_camera_keeps_window_open():
+        logging.info('SPECTATOR_MINIMIZE_SKIPPED reason=auto_camera target=%s',hwnd)
+        return False
+    ctypes.windll.user32.ShowWindow(wintypes.HWND(hwnd),6)
+    return True
+
+
+def keep_spectator_window_visible(title_part: str) -> bool:
+    """Restore a minimized tool without taking focus from the user's app."""
+    if os.name!='nt':return False
+    hwnd=int(_find_window_by_title_contains(str(title_part or '')) or 0)
+    if not hwnd:return False
+    user=ctypes.windll.user32
+    if user.IsIconic(wintypes.HWND(hwnd)):
+        user.ShowWindow(wintypes.HWND(hwnd),4)  # SW_SHOWNOACTIVATE
+        logging.info('SPECTATOR_AUTO_CAMERA_WINDOW_RESTORED target=%s',hwnd)
+    return True
+
+
+def toggle_file_camera_once(title_part: str, *, vk: int = 0x75, guard=None) -> Tuple[bool, str]:
     """Single F6/F4 attempt. Never fallback/retry a non-idempotent toggle."""
     if vk not in (0x75,0x73):
         return False, "카메라 F6/F4 키만 허용됩니다."
@@ -1017,12 +1041,14 @@ def toggle_file_camera_once(title_part: str, *, vk: int = 0x75) -> Tuple[bool, s
         time.sleep(.12)
         if int(user32.GetForegroundWindow()) != int(hwnd):
             return False, "관전툴 활성화 확인 실패"
+        if guard is not None and not guard():
+            return False, 'camera_entry_cancelled'
         ok, detail = _press_vk_sendinput_held(vk, hold_sec=.08)
         time.sleep(.08)
         return bool(ok), str(detail or ("single F6 sent; camera log confirmation required" if vk == 0x75 else "single F4 sent; native auto-director state is not exposed"))
     finally:
         if minimized:
-            user32.ShowWindow(wintypes.HWND(hwnd), 6)
+            _minimize_spectator_window(hwnd)
         if previous and previous != hwnd:
             _activate_window_reliably(previous, restore=True)
 
@@ -1095,7 +1121,7 @@ def kick_lobby_slots_for_window_title(
     finally:
         if minimize_target_after:
             try:
-                user32.ShowWindow(wintypes.HWND(hwnd), 6)  # SW_MINIMIZE
+                _minimize_spectator_window(hwnd)  # SW_MINIMIZE
             except Exception:
                 pass
         if restore_previous and previous_hwnd and previous_hwnd != hwnd:
@@ -1257,7 +1283,7 @@ def click_window_client_point(
 
     def _abort_after_restore(message: str) -> Tuple[bool, str]:
         if should_minimize_after:
-            user32.ShowWindow(wintypes.HWND(hwnd), 6)  # SW_MINIMIZE
+            _minimize_spectator_window(hwnd)  # SW_MINIMIZE
         if restore_focus and previous_hwnd and previous_hwnd != hwnd:
             _activate_window_reliably(previous_hwnd, restore=True)
         return False, message
@@ -1303,7 +1329,7 @@ def click_window_client_point(
                 pass
         if should_minimize_after:
             try:
-                user32.ShowWindow(wintypes.HWND(hwnd), 6)  # SW_MINIMIZE
+                _minimize_spectator_window(hwnd)  # SW_MINIMIZE
                 logging.info("LOBBY_AUTO_START_TARGET_MINIMIZED hwnd=%s", hwnd)
             except Exception:
                 logging.exception("LOBBY_AUTO_START_TARGET_MINIMIZE_FAIL")
@@ -6640,6 +6666,10 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.tab_logs, "로그 감지")
         self.tabs.addTab(create_camera_panel(cfg, self, toggle=lambda: toggle_file_camera_once(
             str(getattr(cfg, "spectator_lobby_auto_start_target_title", "The Thrill of the Fight 2") or "")),
+            toggle_guarded=lambda guard: toggle_file_camera_once(str(getattr(cfg,
+                "spectator_lobby_auto_start_target_title","The Thrill of the Fight 2") or ""),guard=guard),
+            ensure_window_visible=lambda: keep_spectator_window_visible(str(getattr(cfg,
+                "spectator_lobby_auto_start_target_title","The Thrill of the Fight 2") or "")),
             on_return=lambda: toggle_file_camera_once(str(getattr(cfg,"spectator_lobby_auto_start_target_title","The Thrill of the Fight 2") or ""),vk=0x73)), "선수 시점")
         self.tabs.addTab(self.tab_log_records, "기록")
         self.tabs.addTab(self.tab_obs, "OBS / 하이라이트")
@@ -8668,7 +8698,7 @@ class SettingsDialog(QDialog):
             bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False))
         )
         self.chk_spectator_lobby_auto_start_minimize_target.setToolTip(
-            "실제 경기 시작 로그를 확인한 뒤 최소화합니다. 관전툴의 자체 전체화면 설정과는 별개입니다."
+            "실제 경기 시작 로그를 확인한 뒤 최소화합니다. 단, 자동 선수시점 연출이 켜져 있으면 최소화하지 않습니다. 관전툴의 자체 전체화면 설정과는 별개입니다."
         )
         auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_minimize_target, 6, 0, 1, 2)
         auto_start_lay.addWidget(self.chk_spectator_lobby_auto_start_restore_focus, 6, 2, 1, 3)
@@ -25234,15 +25264,23 @@ class MainApp(QObject):
                 ok = bool(event.get("ok", False))
                 message = str(event.get("message") or "").strip()
                 if ok:
-                    logging.info("OBS_SOURCE_RECORD_SAVE_OK")
+                    logging.info("OBS_SOURCE_RECORD_SAVE_ACCEPTED context=%s", event.get("context"))
                 else:
+                    if not event.get("uncertain", False):
+                        self._discard_failed_source_record_clip(dict(event.get("context") or {}))
                     logging.warning("OBS_SOURCE_RECORD_SAVE_FAIL detail=%s", message)
                     self._obs_status_detail = message or "Source Record 리플레이 버퍼가 켜져 있는지 확인하세요"
+            elif kind == "source_record_buffer_recovered":
+                self._obs_status_detail = (
+                    "Source Record 버퍼 복구됨 — 영상 축적 중 (%s초)" % event.get("warmup_sec", 10)
+                    if event.get("ok") else "Source Record 복구 실패: " + str(event.get("message") or "플러그인 상태 확인 필요")
+                )
+                logging.info("OBS_SOURCE_RECORD_BUFFER_RECOVERY %s", event)
             elif kind == "source_record_filter_enabled":
                 if bool(event.get("ok", False)):
                     logging.info("OBS_SOURCE_RECORD_AUTO_ENABLE_OK")
                     if bool(event.get("watchdog", False)):
-                        self._obs_status_detail = "Source Record 자동 유지 정상"
+                        self._obs_status_detail = "Source Record 필터 켜짐 — 버퍼 상태 점검"
                 else:
                     message = str(event.get("message") or "")
                     logging.warning("OBS_SOURCE_RECORD_AUTO_ENABLE_FAIL detail=%s", message)
@@ -25459,6 +25497,17 @@ class MainApp(QObject):
         clean = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", str(value or "").strip())
         clean = re.sub(r"\s+", " ", clean).strip(" ._")
         return clean[:80] or fallback
+
+    def _discard_failed_source_record_clip(self, context: dict) -> None:
+        """Remove only this failed capture, not the next player's metadata."""
+        if not context:
+            return
+        pending = getattr(self, "_source_record_pending", deque())
+        for item in list(pending):
+            if dict(item.get("context") or {}) == context:
+                pending.remove(item)
+                logging.warning("SOURCE_RECORD_FAILED_CAPTURE_REMOVED context=%s", context)
+                break
 
     def _queue_source_record_clip(self, reason: str, context: dict) -> None:
         """Remember metadata until Source Record finishes writing its separate file."""
@@ -26571,6 +26620,8 @@ class MainApp(QObject):
             try:
                 size = int(os.path.getsize(path))
             except OSError:
+                continue
+            if size <= 0:
                 continue
             previous = self._source_record_file_sizes.get(key)
             self._source_record_file_sizes[key] = size
@@ -29451,13 +29502,20 @@ class MainApp(QObject):
             return "waiting"
         root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
         state = watcher._normalize_round_state(watcher._read_text(os.path.join(root, "match", "round_state.txt")))
+        lobby = watcher._read_lobby_info(root)
+        recovery = getattr(watcher, 'lobby_auto_start_recovery_context', None)
+        if callable(recovery):
+            recovered = recovery(root, lobby)
+            if recovered in ('ready', 'waiting', 'cancelled'):
+                if players and [str(s.get('name') or '').casefold() for s in SpectatorLogWatcher._lobby_fighter_slots(lobby)] != [str(name).casefold() for name in players] and lobby:
+                    return 'cancelled'
+                return recovered
         if not state:
             return "waiting"
         if state in ("intro", "fight", "break", "knockdown", "foul"):
             return "started"
         if not bool(getattr(self.cfg, "spectator_lobby_auto_start_enabled", False)):
             return "cancelled"
-        lobby = watcher._read_lobby_info(root)
         if not lobby:
             # A non-atomic rewrite is neither a start confirmation nor permission to send F5.
             return "waiting"
@@ -29484,14 +29542,16 @@ class MainApp(QObject):
             if os.name != "nt":
                 return
             time.sleep(0.35)
-            if pending["minimize"] and bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False)):
+            if (pending["minimize"] and bool(getattr(self.cfg, "spectator_lobby_auto_start_minimize_target", False))
+                    and not auto_camera_keeps_window_open()):
                 try:
                     minimized, hwnd = False, 0
                     for _ in range(2):
                         hwnd = int(_find_window_by_title_contains(pending["title"]) or pending["target"])
                         if not hwnd:
                             break
-                        ctypes.windll.user32.ShowWindow(wintypes.HWND(hwnd), 6)
+                        if not _minimize_spectator_window(hwnd):
+                            break
                         time.sleep(0.15)
                         minimized = bool(ctypes.windll.user32.IsIconic(wintypes.HWND(hwnd)))
                         if minimized:
@@ -29520,6 +29580,8 @@ class MainApp(QObject):
             return
         if str(update.get("spectator_round_state") or "").lower() not in ("intro", "fight"):
             return
+        if self._lobby_auto_start_context(pending['players']) != 'started':
+            return  # Recovered stale RoundFight must not minimize before a new start.
         watcher = getattr(self, "spectator_watcher", None)
         names = [str(watcher._side_raw_name(side) or "").strip().casefold() for side in ("blue", "red")]
         if not all(names):

@@ -44,6 +44,8 @@ ELEMENTS = (
 )
 
 _ELEMENT_BY_ID = {item[0]: item for item in ELEMENTS}
+SIDE_PAIRS = {key[4:]: (key, "red" + key[4:]) for key in _ELEMENT_BY_ID
+              if key.startswith("blue") and "red" + key[4:] in _ELEMENT_BY_ID}
 _NUMERIC_LIMITS = {
     "x": (-1920.0, 1920.0),
     "y": (-1080.0, 1080.0),
@@ -66,13 +68,23 @@ def _number(value: Any, default: float, low: float, high: float) -> float:
 
 
 def default_preset() -> Dict[str, Any]:
-    return {"version": OVERLAY_STUDIO_VERSION, "name": "사용자 오버레이", "elements": {}}
+    return {"version": OVERLAY_STUDIO_VERSION, "name": "사용자 오버레이", "elements": {},
+            "portraitMirror": False, "portraitMirrorMaster": "bluePortrait",
+            "sideMirror": False, "sideMirrorMasters": {}}
 
 
 def sanitize_preset(raw: Any) -> Dict[str, Any]:
     raw = raw if isinstance(raw, dict) else {}
     clean = default_preset()
     clean["name"] = str(raw.get("name") or clean["name"])[:80]
+    clean["portraitMirror"] = raw.get("portraitMirror") is True
+    clean["sideMirror"] = raw.get("sideMirror") is True
+    masters = raw.get("sideMirrorMasters")
+    if isinstance(masters, dict):
+        clean["sideMirrorMasters"] = {key: value for key, value in masters.items()
+                                      if key in SIDE_PAIRS and value in SIDE_PAIRS[key]}
+    if raw.get("portraitMirrorMaster") in ("bluePortrait", "redPortrait"):
+        clean["portraitMirrorMaster"] = raw["portraitMirrorMaster"]
     elements = raw.get("elements") if isinstance(raw.get("elements"), dict) else {}
     for element_id, values in elements.items():
         if element_id not in _ELEMENT_BY_ID or not isinstance(values, dict):
@@ -148,6 +160,38 @@ class OverlayStudioStore:
                     pass
 
 
+def portrait_mirror_js() -> str:
+    """Shared edit semantics and viewport geometry; never flip image contents."""
+    return r'''
+const STUDIO_SIDE_PAIRS=__SIDE_PAIRS__;
+function studioMirrorPairs(preset){
+  if(preset.sideMirror)return Object.values(STUDIO_SIDE_PAIRS).map(pair=>{
+    const master=(preset.sideMirrorMasters||{})[pair[0].slice(4)];
+    return master===pair[1]?[pair[1],pair[0]]:pair;
+  });
+  if(preset.portraitMirror)return preset.portraitMirrorMaster==='redPortrait'?
+    [['redPortrait','bluePortrait']]:[['bluePortrait','redPortrait']];
+  return [];
+}
+function studioMirrorEdit(preset,id){
+  const pair=Object.values(STUDIO_SIDE_PAIRS).find(pair=>pair.includes(id));
+  if(!pair||!(preset.sideMirror||(preset.portraitMirror&&pair[0]==='bluePortrait')))return;
+  if(preset.sideMirror){preset.sideMirrorMasters=preset.sideMirrorMasters||{};preset.sideMirrorMasters[pair[0].slice(4)]=id}
+  else preset.portraitMirrorMaster=id;
+  const source=preset.elements[id]||{},other=pair.find(value=>value!==id);
+  const target=preset.elements[other]||(preset.elements[other]={});
+  for(const key of ['x','y','width','height','scale','rotate','fontSize']){
+    if(source[key]===undefined)delete target[key];
+    else target[key]=(key==='x'||key==='rotate')?-Number(source[key]):source[key];
+  }
+}
+function studioMirrorPosition(master,peer,axis,unit,current){
+  return {x:current.x+(2*axis-master.right-peer.left)/unit,
+          y:current.y+(master.top-peer.top)/unit};
+}
+'''.replace("__SIDE_PAIRS__", json.dumps(SIDE_PAIRS))
+
+
 def studio_html() -> str:
     schema = [
         {"id": item[0], "label": item[1], "selector": item[2], "group": item[3]}
@@ -180,31 +224,69 @@ function val(id,key,def){let p=preset.elements[id]||{};return p[key]===undefined
 async function api(url,opt){let r=await fetch(url,opt);if(!r.ok)throw Error(await r.text());return r.status===204?{}:r.json()}
 async function loadPreset(){let version=++applyVersion,result=await api('/api/studio/preset');if(version!==applyVersion)return;preset=result;history=[];future=[];renderList();renderForm();setTimeout(refreshBoxes,180);toast('저장본을 불러왔습니다')}
 function pushHistory(){history.push(clone(preset));if(history.length>80)history.shift();future=[]}
-function applyLive(){clearTimeout(saveTimer);let version=++applyVersion,payload=JSON.stringify(preset);saveTimer=setTimeout(async()=>{try{let result=await api('/api/studio/preset?persist=0',{method:'POST',headers:{'Content-Type':'application/json'},body:payload});if(version!==applyVersion)return;preset=result;refreshBoxes()}catch(e){if(version===applyVersion)toast('적용 실패: '+e.message,true)}},25)}
-function change(key,value,record=true,rerender=true){if(!selected)return;if(record)pushHistory();let p=ensure(selected);if(value===''||value===null){delete p[key]}else p[key]=value;if(rerender)renderForm(false);applyLive()}
+__PORTRAIT_MIRROR__
+const mirrorControls=document.createElement('div');
+mirrorControls.innerHTML='<label class="checks"><input id="portraitMirror" type="checkbox">블루·레드 좌우 대칭 연동</label><p class="empty" style="font-size:11px;margin:0 0 14px">초상화·체력·SP·생명원·닉네임·총/라운드 데미지·국기·타격 문구·콤보/카운터를 각각 짝지어 위치·크기·글자 크기를 맞춥니다. 사진·글자 방향과 코너 색상은 유지합니다.</p>';
+document.querySelector('aside.right').prepend(mirrorControls);
+function syncMirrorControl(){$('#portraitMirror').checked=!!preset.sideMirror}
+$('#portraitMirror').onchange=e=>{
+  pushHistory();
+  if(!e.target.checked){
+    const doc=overlayDoc(),snapshots=doc&&doc.defaultView.__overlayStudioMirrorSnapshots;
+    for(const snapshot of snapshots||[])Object.assign(ensure(snapshot.id),snapshot.position);
+  }
+  preset.sideMirror=e.target.checked;
+  preset.portraitMirror=false;
+  if(preset.sideMirror)for(const pair of Object.values(STUDIO_SIDE_PAIRS))studioMirrorEdit(preset,pair.includes(selected)?selected:pair[0]);
+  renderForm();applyLive();
+};
+function applyLive(edit=false){syncMirrorControl();if(edit)studioMirrorEdit(preset,selected);clearTimeout(saveTimer);let version=++applyVersion,payload=JSON.stringify(preset);const doc=overlayDoc();if(doc&&doc.defaultView.__overlayStudioApply)doc.defaultView.__overlayStudioApply(preset);saveTimer=setTimeout(async()=>{try{let result=await api('/api/studio/preset?persist=0',{method:'POST',headers:{'Content-Type':'application/json'},body:payload});if(version!==applyVersion)return;preset=result;refreshBoxes()}catch(e){if(version===applyVersion)toast('적용 실패: '+e.message,true)}},25)}
+function change(key,value,record=true,rerender=true){if(!selected)return;if(record)pushHistory();let p=ensure(selected);if(value===''||value===null){delete p[key]}else p[key]=value;if(rerender)renderForm(false);applyLive(true)}
 function renderList(){let q=$('#search').value.trim().toLowerCase(),box=$('#elements'),group='';box.innerHTML='';SCHEMA.filter(e=>!q||e.label.toLowerCase().includes(q)||e.group.toLowerCase().includes(q)).forEach(e=>{if(e.group!==group){group=e.group;let g=document.createElement('div');g.className='group';g.textContent=group;box.appendChild(g)}let n=document.createElement('div');n.className='element'+(selected===e.id?' active':'');n.dataset.id=e.id;n.innerHTML='<i class="eye"></i><span>'+e.label+'</span>';n.onclick=()=>select(e.id);box.appendChild(n)})}
 function field(label,key,type='number',step='1',def=0){let value=val(selected,key,def);return '<div class="field"><label>'+label+'<span>'+value+'</span></label><input data-key="'+key+'" type="'+type+'" step="'+step+'" value="'+value+'"></div>'}
 function renderForm(relist=true){if(relist)renderList();let e=SCHEMA.find(x=>x.id===selected);if(!e){$('#selectedTitle').textContent='요소를 선택하세요';return}$('#selectedTitle').textContent=e.label;$('#form').className='';$('#form').innerHTML='<div class="row2">'+field('X 이동','x')+field('Y 이동','y')+'</div><div class="row2">'+field('가로 크기','width')+field('세로 크기','height')+'</div><div class="row2">'+field('배율','scale','number','.01',1)+field('회전','rotate','number','1',0)+'</div><div class="row2">'+field('투명도','opacity','number','.01',1)+field('레이어','zIndex','number','1',0)+'</div>'+field('글자 크기 (0=원본)','fontSize','number','1',0)+field('글자색 (빈값=원본)','color','text','', '')+'<label class="checks"><input id="visible" type="checkbox" '+(val(selected,'visible',true)?'checked':'')+'>화면에 표시</label><button id="elementReset" class="danger">이 요소만 초기화</button>';
-$('#form').querySelectorAll('input[data-key]').forEach(i=>{i.onfocus=()=>pushHistory();i.oninput=()=>{let k=i.dataset.key,v=i.type==='number'?Number(i.value):i.value.trim(),label=i.parentElement.querySelector('label span');if(label)label.textContent=v;change(k,v,false,false)}});$('#visible').onchange=e=>change('visible',e.target.checked);$('#elementReset').onclick=()=>{pushHistory();delete preset.elements[selected];renderForm();applyLive()}}
-function select(id){selected=id;renderForm();refreshBoxes()}
+$('#form').querySelectorAll('input[data-key]').forEach(i=>{i.onfocus=()=>pushHistory();i.oninput=()=>{let k=i.dataset.key,v=i.type==='number'?Number(i.value):i.value.trim(),label=i.parentElement.querySelector('label span');if(label)label.textContent=v;change(k,v,false,false)}});$('#visible').onchange=e=>change('visible',e.target.checked);$('#elementReset').onclick=()=>{pushHistory();delete preset.elements[selected];renderForm();applyLive(true)}}
+const originalRenderForm=renderForm;renderForm=function(relist=true){syncMirrorControl();return originalRenderForm(relist)};
+function select(id){const doc=overlayDoc(),snapshots=doc&&doc.defaultView.__overlayStudioMirrorSnapshots;const snapshot=(snapshots||[]).find(item=>item.id===id);if(snapshot&&(preset.sideMirror||preset.portraitMirror))Object.assign(ensure(id),snapshot.position);selected=id;renderForm();refreshBoxes()}
 function overlayDoc(){try{return $('#preview').contentDocument}catch(e){return null}}
 function refreshBoxes(){let doc=overlayDoc(),layer=$('#pickLayer'),frame=$('#preview');if(!doc||!doc.body)return;let fw=frame.clientWidth,fh=frame.clientHeight;layer.innerHTML='';SCHEMA.forEach(e=>{let node=doc.querySelector(e.selector);if(!node)return;let r=node.getBoundingClientRect();if(r.width<2||r.height<2)return;let b=document.createElement('div');b.className='pickBox'+(selected===e.id?' active':'');b.dataset.id=e.id;b.dataset.label=e.label;b.style.cssText='left:'+(r.left/doc.defaultView.innerWidth*fw)+'px;top:'+(r.top/doc.defaultView.innerHeight*fh)+'px;width:'+(r.width/doc.defaultView.innerWidth*fw)+'px;height:'+(r.height/doc.defaultView.innerHeight*fh)+'px;';b.innerHTML='<i class="handle"></i>';b.onpointerdown=startDrag;layer.appendChild(b)})}
-function startDrag(ev){ev.preventDefault();let id=ev.currentTarget.dataset.id;if(selected!==id)select(id);let resize=ev.target.classList.contains('handle');pushHistory();drag={id,startX:ev.clientX,startY:ev.clientY,x:val(id,'x',0),y:val(id,'y',0),w:val(id,'width',0),h:val(id,'height',0),resize};ev.currentTarget.setPointerCapture(ev.pointerId)}
-function snapped(v){return Math.round(v/snapSize)*snapSize}window.addEventListener('pointermove',ev=>{if(!drag)return;let scale=1920/$('#preview').clientWidth,dx=(ev.clientX-drag.startX)*scale,dy=(ev.clientY-drag.startY)*scale,p=ensure(drag.id);if(drag.resize){let doc=overlayDoc(),e=SCHEMA.find(x=>x.id===drag.id),node=doc&&doc.querySelector(e.selector),r=node&&node.getBoundingClientRect();let baseW=drag.w||((r?r.width:100)*scale),baseH=drag.h||((r?r.height:50)*scale);p.width=Math.max(1,snapped(baseW+dx));p.height=Math.max(1,snapped(baseH+dy))}else{p.x=snapped(drag.x+dx);p.y=snapped(drag.y+dy)}renderForm(false);applyLive()});window.addEventListener('pointerup',()=>{drag=null;setTimeout(refreshBoxes,80)});
+function startDrag(ev){ev.preventDefault();let id=ev.currentTarget.dataset.id;select(id);let resize=ev.target.classList.contains('handle');pushHistory();drag={id,startX:ev.clientX,startY:ev.clientY,x:val(id,'x',0),y:val(id,'y',0),w:val(id,'width',0),h:val(id,'height',0),resize};ev.currentTarget.setPointerCapture(ev.pointerId)}
+function snapped(v){return Math.round(v/snapSize)*snapSize}window.addEventListener('pointermove',ev=>{if(!drag)return;let scale=1920/$('#preview').clientWidth,dx=(ev.clientX-drag.startX)*scale,dy=(ev.clientY-drag.startY)*scale,p=ensure(drag.id);if(drag.resize){let doc=overlayDoc(),e=SCHEMA.find(x=>x.id===drag.id),node=doc&&doc.querySelector(e.selector),r=node&&node.getBoundingClientRect();let baseW=drag.w||((r?r.width:100)*scale),baseH=drag.h||((r?r.height:50)*scale);p.width=Math.max(1,snapped(baseW+dx));p.height=Math.max(1,snapped(baseH+dy))}else{p.x=snapped(drag.x+dx);p.y=snapped(drag.y+dy)}renderForm(false);applyLive(true)});window.addEventListener('pointerup',()=>{drag=null;setTimeout(refreshBoxes,80)});
 function undo(){if(!history.length)return;future.push(clone(preset));preset=history.pop();renderForm();applyLive()}function redo(){if(!future.length)return;history.push(clone(preset));preset=future.pop();renderForm();applyLive()}
 $('#undo').onclick=undo;$('#redo').onclick=redo;$('#snap').onclick=()=>{snapSize=snapSize===1?10:1;$('#snap').classList.toggle('snapOn',snapSize===10);toast(snapSize===10?'10px 스냅 사용':'자유 이동 사용')};$('#export').onclick=()=>{let blob=new Blob([JSON.stringify(preset,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='TimerAuto_overlay_preset.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);toast('프리셋 파일을 만들었습니다')};$('#import').onclick=()=>$('#importFile').click();$('#importFile').onchange=async e=>{let file=e.target.files&&e.target.files[0];if(!file)return;try{let raw=JSON.parse(await file.text());pushHistory();preset=await api('/api/studio/preset?persist=0',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(raw)});renderForm();setTimeout(refreshBoxes,80);toast('프리셋을 불러왔습니다. 저장하면 확정됩니다')}catch(err){toast('가져오기 실패: '+err.message,true)}finally{e.target.value=''}};$('#reload').onclick=loadPreset;$('#save').onclick=async()=>{try{preset=await api('/api/studio/preset?persist=1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(preset)});toast('프리셋을 저장했습니다')}catch(e){toast('저장 실패: '+e.message,true)}};$('#reset').onclick=async()=>{if(!confirm('모든 스튜디오 변경을 기본값으로 되돌릴까요?'))return;pushHistory();preset={version:1,name:'사용자 오버레이',elements:{}};renderForm();applyLive();toast('기본값으로 복원했습니다. 저장 버튼을 누르면 확정됩니다')};$('#search').oninput=renderList;
 document.querySelectorAll('[data-preview]').forEach(b=>b.onclick=async()=>{try{await api('/api/studio/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:b.dataset.preview})});toast('미리보기 실행')}catch(e){toast('미리보기 실패',true)}});
-window.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();undo();return}if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='y'){e.preventDefault();redo();return}if(!selected||!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key))return;e.preventDefault();pushHistory();let p=ensure(selected),d=e.shiftKey?10:snapSize;p.x=Number(p.x||0)+(e.key==='ArrowLeft'?-d:e.key==='ArrowRight'?d:0);p.y=Number(p.y||0)+(e.key==='ArrowUp'?-d:e.key==='ArrowDown'?d:0);renderForm(false);applyLive()});
-$('#preview').onload=()=>setTimeout(refreshBoxes,700);window.addEventListener('resize',()=>setTimeout(refreshBoxes,80));setInterval(refreshBoxes,1200);loadPreset();</script></body></html>'''.replace("__SCHEMA__", schema_json)
+window.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();undo();return}if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='y'){e.preventDefault();redo();return}if(!selected||!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key))return;e.preventDefault();pushHistory();let p=ensure(selected),d=e.shiftKey?10:snapSize;p.x=Number(p.x||0)+(e.key==='ArrowLeft'?-d:e.key==='ArrowRight'?d:0);p.y=Number(p.y||0)+(e.key==='ArrowUp'?-d:e.key==='ArrowDown'?d:0);renderForm(false);applyLive(true)});
+$('#preview').onload=()=>setTimeout(refreshBoxes,700);window.addEventListener('resize',()=>setTimeout(refreshBoxes,80));setInterval(refreshBoxes,1200);loadPreset();</script></body></html>'''.replace("__SCHEMA__", schema_json).replace("__PORTRAIT_MIRROR__", portrait_mirror_js())
 
 
 def runtime_js() -> str:
     selectors = {item[0]: item[2] for item in ELEMENTS}
     selectors_json = json.dumps(selectors, ensure_ascii=False, separators=(",", ":"))
     return r'''(()=>{const SELECTORS=__SELECTORS__;let signature='';if(new URLSearchParams(location.search).get('studio')==='1')document.documentElement.style.background='repeating-conic-gradient(#202b39 0 25%,#18212d 0 50%) 50%/32px 32px';
+__PORTRAIT_MIRROR__
+function mirrorPortraits(raw){
+  window.__overlayStudioMirrorSnapshot=null;
+  window.__overlayStudioMirrorSnapshots=[];
+  const hud=document.querySelector('.hud');
+  if(!hud||!hud.offsetWidth)return;
+  const unit=hud.getBoundingClientRect().width/hud.offsetWidth;
+  if(!Number.isFinite(unit)||unit<=0)return;
+  for(const [masterId,peerId] of studioMirrorPairs(raw)){
+  const master=document.querySelector(SELECTORS[masterId]),peer=document.querySelector(SELECTORS[peerId]);
+  if(!master||!peer)continue;
+  const p=(raw.elements||{})[peerId]||{},current=peer.style.getPropertyValue('translate').split(' ').map(parseFloat);
+  const a=master.getBoundingClientRect(),b=peer.getBoundingClientRect();
+  if(a.width<=0||b.width<=0)continue;
+  const position=studioMirrorPosition(a,b,innerWidth/2,unit,
+                                     {x:Number.isFinite(current[0])?current[0]:Number(p.x)||0,y:Number.isFinite(current[1])?current[1]:Number(p.y)||0});
+  set(peer,'translate',position.x+'px '+position.y+'px');
+  window.__overlayStudioMirrorSnapshot={id:peerId,position};
+  window.__overlayStudioMirrorSnapshots.push({id:peerId,position});
+  }
+}
 function clear(el){for(const key of ['translate','scale','rotate','width','height','opacity','font-size','color','z-index','visibility'])el.style.removeProperty(key)}
-function set(el,key,value){el.style.setProperty(key,String(value),'important')}function apply(raw){raw=raw&&typeof raw==='object'?raw:{};let next='';try{next=JSON.stringify(raw)}catch(e){}if(next===signature)return;signature=next;let items=raw.elements&&typeof raw.elements==='object'?raw.elements:{};Object.keys(SELECTORS).forEach(id=>document.querySelectorAll(SELECTORS[id]).forEach(el=>{clear(el);let p=items[id];if(!p||typeof p!=='object')return;let x=Number(p.x)||0,y=Number(p.y)||0,scale=Number(p.scale),rotate=Number(p.rotate),width=Number(p.width),height=Number(p.height),fontSize=Number(p.fontSize),zIndex=Number(p.zIndex);set(el,'translate',x+'px '+y+'px');if(isFinite(scale)&&scale>0)set(el,'scale',scale);if(isFinite(rotate)&&rotate)set(el,'rotate',rotate+'deg');if(isFinite(width)&&width>0)set(el,'width',width+'px');if(isFinite(height)&&height>0)set(el,'height',height+'px');if(isFinite(fontSize)&&fontSize>0)set(el,'font-size',fontSize+'px');if(isFinite(zIndex))set(el,'z-index',Math.round(zIndex));if(p.opacity!==undefined)set(el,'opacity',Math.max(0,Math.min(1,Number(p.opacity))));if(p.color)set(el,'color',p.color);if(p.visible===false)set(el,'visibility','hidden')}))}
+function set(el,key,value){el.style.setProperty(key,String(value),'important')}function apply(raw){raw=raw&&typeof raw==='object'?raw:{};let next='';try{next=JSON.stringify(raw)}catch(e){}if(next===signature){mirrorPortraits(raw);return;}signature=next;if(raw.portraitMirror||raw.sideMirror){raw=JSON.parse(JSON.stringify(raw));raw.elements=raw.elements||{};for(const [masterId] of studioMirrorPairs(raw))studioMirrorEdit(raw,masterId)}let items=raw.elements&&typeof raw.elements==='object'?raw.elements:{};Object.keys(SELECTORS).forEach(id=>document.querySelectorAll(SELECTORS[id]).forEach(el=>{clear(el);let p=items[id];if(!p||typeof p!=='object')return;let x=Number(p.x)||0,y=Number(p.y)||0,scale=Number(p.scale),rotate=Number(p.rotate),width=Number(p.width),height=Number(p.height),fontSize=Number(p.fontSize),zIndex=Number(p.zIndex);set(el,'translate',x+'px '+y+'px');if(isFinite(scale)&&scale>0)set(el,'scale',scale);if(isFinite(rotate)&&rotate)set(el,'rotate',rotate+'deg');if(isFinite(width)&&width>0)set(el,'width',width+'px');if(isFinite(height)&&height>0)set(el,'height',height+'px');if(isFinite(fontSize)&&fontSize>0)set(el,'font-size',fontSize+'px');if(isFinite(zIndex))set(el,'z-index',Math.round(zIndex));if(p.opacity!==undefined)set(el,'opacity',Math.max(0,Math.min(1,Number(p.opacity))));if(p.color)set(el,'color',p.color);if(p.visible===false)set(el,'visibility','hidden')}));mirrorPortraits(raw)}
 window.__overlayStudioApply=apply;const baseRender=window.render;if(typeof baseRender==='function'){window.render=function(state){let result=baseRender(state);apply(state&&state.studioPreset);return result}}
 fetch('/state?studio=1',{cache:'no-store'}).then(r=>r.json()).then(s=>apply(s&&s.studioPreset)).catch(()=>{});
 window.addEventListener('resize',()=>{signature='';fetch('/state?studio=resize',{cache:'no-store'}).then(r=>r.json()).then(s=>apply(s&&s.studioPreset)).catch(()=>{})});
-})();'''.replace("__SELECTORS__", selectors_json)
+})();'''.replace("__SELECTORS__", selectors_json).replace("__PORTRAIT_MIRROR__", portrait_mirror_js())

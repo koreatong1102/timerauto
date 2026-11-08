@@ -71,6 +71,19 @@ class RealtimeTests(unittest.TestCase):
             self.assertTrue(self.wait_for(lambda: camera.writes > 1))
             camera.freeze()
 
+    def test_initial_partial_sample_can_start_pipeline_before_first_publication(self):
+        source=self.root/'blue/head_position.txt'
+        source.write_text('')
+        camera=HeadCamera()
+        self.addCleanup(camera.stop)
+        camera.start(self.root,'blue',realtime=True,position_ms=20,rotation_ms=40)
+        self.assertIsNone(camera.last_output)
+        self.assertIsNotNone(camera.pipeline)
+        source.write_text('0 0 1.4 2 3 0 0 0 1')
+        self.assertTrue(self.wait_for(lambda:camera.last_output is not None))
+        self.assertIsNone(camera.pipeline.error)
+        self.assertGreater(camera.writes,0)
+
     def test_transient_write_denial_drops_frame_and_recovers(self):
         camera = HeadCamera()
         camera.start(self.root,"blue",position_ms=20,rotation_ms=40)

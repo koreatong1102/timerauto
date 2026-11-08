@@ -35,7 +35,7 @@ _SECRET_KEY_RE = re.compile(r"(token|secret|password|passwd|api[_-]?key|auth|coo
 _USER_PATH_RE = re.compile(r"([A-Za-z]:[\\/]+Users[\\/]+)[^\\/]+", re.I)
 _HOME_PATH_RE = re.compile(r"/home/[^/]+")
 _SECRET_TEXT_RE = re.compile(r'(?<![A-Za-z0-9_])((?:password|passwd|token|secret|api[_-]?key|authorization|cookie)["\x27]?\s*[=:]\s*)("[^"]*"|\x27[^\x27]*\x27|[^\s,;}]+)', re.I)
-_CRITICAL_PREFIXES = ("app_", "error", "incident", "diagnostic", "obs_", "replay_", "potm_", "report_", "commentary_", "lobby_", "latency_", "spectator_watcher")
+_CRITICAL_PREFIXES = ("app_", "error", "incident", "diagnostic", "obs_", "replay_", "potm_", "report_", "commentary_", "lobby_", "latency_", "spectator_watcher", "camera_director_")
 
 
 def _is_secret_key(key: str) -> bool:

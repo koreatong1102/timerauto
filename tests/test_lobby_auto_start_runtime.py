@@ -230,6 +230,15 @@ class LobbyAutoStartRuntimeTests(unittest.TestCase):
         self.assertEqual(self.user32.ShowWindow.call_count, 2)
         self.assertEqual(self.user32.IsIconic.call_count, 2)
 
+    def test_auto_camera_prevents_post_start_minimize_but_restores_previous_focus(self):
+        def send(*a,**k):
+            self._write(self.state_path,'MatchIntro')
+            return True,'sent'
+        with patch('timerauto.auto_camera_keeps_window_open',return_value=True):
+            _,restore=self._run(send)
+        self.user32.ShowWindow.assert_not_called()
+        restore.assert_called_once_with(800,restore=True)
+
     def test_missing_state_is_not_a_start_or_permission_to_send(self):
         self._write(self.state_path, "")
         self.assertEqual(self.app._lobby_auto_start_context(["BLUE", "RED"]), "waiting")
@@ -239,6 +248,32 @@ class LobbyAutoStartRuntimeTests(unittest.TestCase):
         self.assertFalse(self.watcher._apply_lobby_auto_start_edge(
             self.watcher._read_lobby_info(self.root), out, state="fight"))
         self.assertNotIn("spectator_lobby_auto_start", out)
+
+    def test_verified_return_does_not_treat_old_fight_as_new_start(self):
+        self._write(self.state_path, 'RoundFight')
+        self.watcher._lobby_recovery_match_sig = self.watcher._lobby_start_match_signature(self.root)
+        self.assertEqual(self.app._lobby_auto_start_context(['BLUE', 'RED']), 'ready')
+        self.app._lobby_auto_start_window_pending = {
+            'request_id':'recovered','until':float('inf'),'players':['BLUE','RED']}
+        for side, name in (('blue','BLUE'),('red','RED')):
+            os.makedirs(os.path.join(self.root,side),exist_ok=True)
+            self._write(os.path.join(self.root,side,'name.txt'),name)
+        with patch.object(timerauto.threading,'Thread') as thread:
+            self.app._observe_lobby_auto_start_window({'spectator_round_state':'fight'})
+            thread.assert_not_called()
+        self.assertIsNotNone(self.app._lobby_auto_start_window_pending)
+        self._write(self.state_path, 'MatchIntro')
+        self.assertEqual(self.app._lobby_auto_start_context(['BLUE','RED']), 'started')
+
+    def test_f5_is_sent_after_verified_return_then_confirms_only_fresh_match_state(self):
+        self._write(self.state_path, 'RoundFight')
+        self.watcher._lobby_recovery_match_sig = self.watcher._lobby_start_match_signature(self.root)
+        def send(*a, **k):
+            self._write(self.state_path,'MatchIntro')
+            return True,'sent'
+        press,_ = self._run(send)
+        self.assertEqual(press.call_count,1)
+        self.assertTrue(self.signal.emit.call_args.args[0])
 
     def test_old_failure_ack_cannot_rearm_a_different_pair(self):
         original = self._request()

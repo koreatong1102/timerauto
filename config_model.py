@@ -14,6 +14,7 @@ import os
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional
 from hud_layout import hud_settings
+from camera_direction_policy import camera_settings
 
 REPORT_WEAK_POINT_PARTS = ["턱", "코", "왼쪽 관자놀이", "오른쪽 관자놀이", "관자놀이", "왼쪽 눈", "오른쪽 눈", "이마", "간", "명치", "기타"]
 DEFAULT_OVERLAY_PRESET = "tekken8"
@@ -968,6 +969,16 @@ class AppConfig:
     overlay_hud_portrait_pct: float = 100
     overlay_hud_dock: str = 'top'
     overlay_hud_bottom_margin_pct: float = 3
+    camera_director_profile: str = 'balanced'
+    camera_director_pressure_enabled: bool = True
+    camera_director_counter_enabled: bool = True
+    camera_director_duration: float = 2
+    camera_director_max_duration: float = 3
+    camera_director_cooldown: float = 12
+    camera_director_min_hits: int = 3
+    camera_director_broadcast_enabled: bool = True
+    camera_director_target_pct: float = 18
+    camera_director_idle_sec: float = 12
     overlay_timer_font_size: int = 54
     overlay_timer_x: int = 0
     overlay_timer_y: int = 0
@@ -1063,6 +1074,8 @@ class AppConfig:
 
         cfg = AppConfig()
         for key,value in hud_settings(raw).items():
+            setattr(cfg,key,value)
+        for key,value in camera_settings(raw).items():
             setattr(cfg,key,value)
         cfg.monitor_index = int(raw.get("monitor_index", 1))
         cfg.trigger_monitor_index = int(raw.get("trigger_monitor_index", cfg.monitor_index))
@@ -2123,6 +2136,7 @@ class AppConfig:
             "overlay_window_opacity": self.overlay_window_opacity,
             "overlay_ui_scale": self.overlay_ui_scale,
             **hud_settings(self),
+            **camera_settings(self),
             "portrait_source_priority": self.portrait_source_priority,
             "overlay_timer_font_size": int(self.overlay_timer_font_size or 54),
             "overlay_timer_x": int(self.overlay_timer_x or 0),

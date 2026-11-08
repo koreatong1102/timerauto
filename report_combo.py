@@ -48,7 +48,7 @@ def classified_combo_rows(events, best_event, side):
 
 
 def combo_clock(rows, round_events, duration):
-    """Convert verified clock direction to elapsed time, without a live-clock guess.
+    """Show the round countdown at the combo's start, not elapsed time.
 
     Modern docs specify elapsed; older recordings actually count down. Use
     append order inside this round, not the current round_time mode for a
@@ -65,13 +65,13 @@ def combo_clock(rows, round_events, duration):
         increasing = any(delta>0 for delta in differences)
         decreasing = any(delta<0 for delta in differences)
         if increasing and not decreasing:
-            basis = "elapsed"
-        elif decreasing and not increasing:
             length = float(duration)
             if not math.isfinite(length) or length <= 0 or max(values)>length+.05:
                 return empty
             start,end = max(0,length-start),max(0,length-end)
-            basis = "converted_remaining"
+            basis = "converted_elapsed"
+        elif decreasing and not increasing:
+            basis = "remaining"
         else:
             return empty
         seconds = int(start)

@@ -73,6 +73,7 @@ class CameraPipeline:
         self.write_failures = 0
         self.same_frames = 0
         self.last_write_error = ""
+        self.last_read_error = ""
 
     def start(self):
         self.collector.start()
@@ -163,7 +164,9 @@ class CameraPipeline:
                         last_stamp, last_timeline, replay_jump = stamp[:-1],timeline,False
                         self.ready.set()
                     failed_at = None
-                except (OSError,ValueError):
+                    self.last_read_error = ''
+                except (OSError,ValueError) as exc:
+                    self.last_read_error = repr(exc)
                     now = time.monotonic()
                     if failed_at is None:
                         failed_at = now

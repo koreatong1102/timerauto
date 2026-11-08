@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "name": "사용자 오버레이",
+  "elements": {
+    "bluePortrait": {
+      "x": -130.0,
+      "y": 47.0,
+      "scale": 0.69
+    },
+    "redPortrait": {
+      "x": 130.0,
+      "y": 47.0,
+      "scale": 0.69
+    },
+    "blueDamage": {
+      "x": -133.0,
+      "y": 22.0
+    },
+    "redDamage": {
+      "x": 133.0,
+      "y": 22.0
+    },
+    "blueRecent": {
+      "x": 0.0,
+      "y": 0.0
+    },
+    "redRecent": {
+      "x": 0.0,
+      "y": 0.0
+    },
+    "blueCombo": {
+      "y": 27.0
+    },
+    "redCombo": {
+      "y": 27.0
+    }
+  },
+  "portraitMirror": false,
+  "portraitMirrorMaster": "bluePortrait",
+  "sideMirror": true,
+  "sideMirrorMasters": {
+    "Portrait": "redPortrait",
+    "Total": "blueTotal",
+    "Hp": "blueHp",
+    "Sp": "blueSp",
+    "Lives": "blueLives",
+    "Name": "blueName",
+    "Damage": "blueDamage",
+    "Flag": "blueFlag",
+    "Recent": "blueRecent",
+    "Combo": "blueCombo"
+  }
+}

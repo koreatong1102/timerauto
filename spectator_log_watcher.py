@@ -169,6 +169,15 @@ class SpectatorLogWatcher(QObject):
         self._lobby_auto_start_request_id = ""
         self._lobby_auto_start_retry_at = 0.0
         self._lobby_auto_start_deadline = 0.0
+        self._lobby_cycle_seen_match = False
+        self._lobby_cycle_absent_since = None
+        self._lobby_cycle_departed = False
+        self._lobby_cycle_match_sig = None
+        self._lobby_cycle_quiet_since = 0.0
+        self._lobby_return_candidate = None
+        self._lobby_return_since = 0.0
+        self._lobby_recovery_match_sig = None
+        self._lobby_recovery_players = tuple()
         self._last_lobby_rounds: Optional[int] = None
         self._last_lobby_round_duration: Optional[int] = None
         self._last_lobby_break_duration: Optional[int] = None
@@ -753,6 +762,10 @@ class SpectatorLogWatcher(QObject):
             pass
 
         state = self._normalize_round_state(state_raw)
+        lobby_recovered = self._observe_lobby_auto_start_cycle(
+            lobby_info, state=state, lobby_sig=lobby_sig,
+            match_sig=self._lobby_start_match_signature(root, dmg_sig=dmg_sig),
+        )
         prev_round_state = self._last_round_state
         pair_key = self._match_pair_key(blue_name_raw, red_name_raw)
         pair_ready = bool(pair_key[0] and pair_key[1])
@@ -1216,7 +1229,7 @@ class SpectatorLogWatcher(QObject):
                         self._post_match_lobby_return_armed = False
                         self._post_match_lobby_return_session_id = ""
                         logging.info("SPECTATORLOG_LOBBY_RETURN_AFTER_MATCH slots=%s", slots)
-                self._apply_lobby_auto_start_edge(lobby_info, out, state=state)
+                self._apply_lobby_auto_start_edge(lobby_info, out, state='' if lobby_recovered else state)
                 lobby_key = (lobby_sig, tuple((int((x or {}).get("slot", 0) or 0), str((x or {}).get("name") or ""), bool((x or {}).get("ready", False)), bool((x or {}).get("occupied", False))) for x in list(lobby_info.get("slots") or [])))
                 if baseline_read:
                     self._last_lobby_sig = lobby_key
@@ -1310,6 +1323,7 @@ class SpectatorLogWatcher(QObject):
         elif (not damage_update and not player_payload_due
               and "blue_player_img" not in out and "red_player_img" not in out
               and "commentary_tts_text" not in out
+              and "spectator_lobby_auto_start" not in out
               and "round_intro_event" not in out and "vs_intro_event" not in out):
             # Nothing meaningful changed for the overlay/UI.  Still allow a low-rate
             # pass for punishment/HP values so the HUD does not feel stale.
@@ -2601,6 +2615,86 @@ class SpectatorLogWatcher(QObject):
             )
             logging.info("SPECTATOR_LOBBY_AUTO_START_RESULT request=%s ok=%s attempts=%s retry=%s",
                          request_id, ok, self._lobby_auto_start_attempts, bool(self._lobby_auto_start_retry_at))
+
+    def _lobby_start_match_signature(self, root, *, dmg_sig=None):
+        match = os.path.join(root, 'match')
+        return (self._file_sig(os.path.join(match, 'round_state.txt')),
+                self._file_sig(os.path.join(match, 'round_time.txt')),
+                self._file_sig(os.path.join(match, 'damage_events.txt')) if dmg_sig is None else dmg_sig)
+
+    def _observe_lobby_auto_start_cycle(self, lobby, *, state, lobby_sig, match_sig, now=None):
+        """Rearm once on stable return, never merely because lobby.txt vanished.
+
+        A stale active round state needs stronger proof: lobby disappeared for
+        >=.75s, then a newer ready lobby persisted for >=1s while match files
+        stopped progressing. Ordinary terminal/cancel returns also debounce.
+        """
+        now = time.monotonic() if now is None else now
+        active = state in ('intro', 'fight', 'break', 'knockdown', 'foul')
+        if match_sig != self._lobby_cycle_match_sig:
+            self._lobby_cycle_match_sig = match_sig
+            self._lobby_cycle_quiet_since = now
+            if self._lobby_recovery_match_sig is not None:
+                self._lobby_recovery_match_sig = None
+                self._lobby_recovery_players = tuple()
+                self._lobby_cycle_departed = False
+        if self._lobby_recovery_match_sig is not None:
+            return bool(lobby)  # Same returned lobby; do not rearm again per poll.
+        if active:
+            self._lobby_cycle_seen_match = True
+        if not lobby:
+            self._lobby_return_candidate = None
+            if active:
+                if self._lobby_cycle_absent_since is None:
+                    self._lobby_cycle_absent_since = now
+                if now-self._lobby_cycle_absent_since >= .75:
+                    self._lobby_cycle_departed = True
+            return False
+        if self._lobby_cycle_absent_since is not None:
+            self._lobby_cycle_departed |= now-self._lobby_cycle_absent_since >= .75
+            self._lobby_cycle_absent_since = None
+        slots = list(lobby.get('slots') or [])
+        if not slots:  # Reject half-written/empty lobby data.
+            self._lobby_return_candidate = None
+            return False
+        key = tuple((s.get('slot'), s.get('type'), s.get('name'), bool(s.get('occupied')), bool(s.get('ready'))) for s in slots)
+        if key != self._lobby_return_candidate:
+            self._lobby_return_candidate = key
+            self._lobby_return_since = now
+        if not self._lobby_cycle_seen_match or now-self._lobby_return_since < 1:
+            return False
+        if active:
+            newest_match = max(sig[0] for sig in match_sig)
+            if not (self._lobby_cycle_departed and lobby_sig[0] > newest_match
+                    and now-self._lobby_cycle_quiet_since >= 1
+                    and bool(lobby.get('ready_to_start'))):
+                return False
+        with self._lobby_auto_start_state_lock:
+            self._lobby_ready_latched = False
+            self._lobby_auto_start_attempts = 0
+            self._lobby_auto_start_request_id = ''
+            self._lobby_auto_start_retry_at = 0.0
+            self._lobby_auto_start_deadline = 0.0
+            self._lobby_recovery_match_sig = match_sig
+            self._lobby_recovery_players = tuple(str(s.get('name') or '').casefold() for s in self._lobby_fighter_slots(lobby))
+            self._lobby_cycle_seen_match = False
+            self._lobby_cycle_departed = False
+        logging.info('SPECTATOR_LOBBY_AUTO_START_RETURN_REARM state=%s stale_active=%s', state, active)
+        DIAG.record('lobby_auto_start_return_rearm', state=state, stale_active=active,
+                    players=list(self._lobby_recovery_players))
+        return True
+
+    def lobby_auto_start_recovery_context(self, root, lobby):
+        """A recovered old RoundFight is not confirmation of the *new* start."""
+        saved = self._lobby_recovery_match_sig
+        if saved is None or self._lobby_start_match_signature(root) != saved:
+            return None
+        if not lobby or not lobby.get('slots'):
+            return 'waiting'
+        fighters = self._lobby_fighter_slots(lobby)
+        if len(fighters) != 2 or not all(s.get('ready') for s in fighters):
+            return 'cancelled'
+        return 'ready'
 
     def _apply_lobby_auto_start_edge(self, lobby_info: dict, out: Dict[str, Any], *, state: str = "") -> bool:
         occupied_slots = [

@@ -18,17 +18,33 @@ class ComboDetailTests(unittest.TestCase):
     def test_combo_start_time_handles_elapsed_and_old_remaining_clocks(self):
         elapsed=[{"time":72.34},{"time":73.02}]
         value=combo_clock(elapsed,elapsed,180)
-        self.assertEqual(value["maxComboStartTimeText"],"1:12")
-        self.assertEqual(value["maxComboStartSeconds"],72.34)
-        self.assertEqual(value["maxComboTimeBasis"],"elapsed")
+        self.assertEqual(value["maxComboStartTimeText"],"1:47")
+        self.assertEqual(value["maxComboStartSeconds"],107.66)
+        self.assertEqual(value["maxComboEndSeconds"],106.98)
+        self.assertEqual(value["maxComboTimeBasis"],"converted_elapsed")
         countdown=[{"time":107.66},{"time":106.98}]
         value=combo_clock(countdown,countdown,180)
-        self.assertEqual(value["maxComboStartTimeText"],"1:12")
-        self.assertEqual(value["maxComboStartSeconds"],72.34)
-        self.assertEqual(value["maxComboTimeBasis"],"converted_remaining")
+        self.assertEqual(value["maxComboStartTimeText"],"1:47")
+        self.assertEqual(value["maxComboStartSeconds"],107.66)
+        self.assertEqual(value["maxComboTimeBasis"],"remaining")
         for events in ([{"time":5},{"time":5}],[{"time":float('nan')},{"time":5}],[{"time":5},{"time":4},{"time":6}]):
             self.assertEqual(combo_clock(events,events,180)["maxComboStartTimeText"],"")
-        self.assertEqual(combo_clock(countdown,countdown,None)["maxComboStartTimeText"],"")
+        self.assertEqual(combo_clock(elapsed,elapsed,None)["maxComboStartTimeText"],"")
+        self.assertEqual(combo_clock(countdown,countdown,None)["maxComboStartTimeText"],"1:47")
+
+    def test_countdown_matches_live_timer_and_uses_actual_round_length(self):
+        watcher=SpectatorLogWatcher(SimpleNamespace(timer_round_sec=120))
+        for length in (120,180,300):
+            watcher._last_lobby_round_duration=length
+            for clock in (0,12.34,length-0.1):
+                rows=[{'time':clock},{'time':clock+0.05}]
+                result=combo_clock(rows,rows,length)
+                watcher._last_round_time_value=clock-0.1
+                watcher._last_round_time_state='fight'
+                watcher._last_round_time_round=1
+                remaining,_=watcher._seconds_left_from_round_time(clock,state='fight',round_no=1)
+                self.assertEqual(result['maxComboStartSeconds'],round(length-clock,2))
+                self.assertEqual(result['maxComboStartTimeText'],f'{remaining//60}:{remaining%60:02d}')
 
     def hit(self, clock, punch='Jab', hand='left', damage=30, side='blue', **extra):
         return dict(time=clock, punch=punch, hand=hand, damage=damage,
@@ -97,8 +113,8 @@ class ComboDetailTests(unittest.TestCase):
             self.assertEqual(final['maxComboDamage'],95)
             self.assertEqual(final['maxComboSequence'],['JAB','CROSS','L.HOOK','R.HOOK'])
             self.assertEqual(final['maxComboRound'],1)
-            self.assertEqual(final['maxComboStartTimeText'],'1:20')
-            self.assertEqual(current['maxComboStartTimeText'],'1:20')
+            self.assertEqual(final['maxComboStartTimeText'],'1:40')
+            self.assertEqual(current['maxComboStartTimeText'],'1:40')
             self.assertTrue(final['maxComboCounterStart'])
             self.assertTrue(final['maxComboDownFinish'])
 
@@ -116,7 +132,7 @@ let text=rrV4ComboDetails(data,true);
 assert(text.includes('JAB'));assert(text.includes('CROSS'));assert(text.includes('2라운드'));
 assert(text.includes('카운터 시작'));assert(text.includes('다운 마무리'));
 assert(rrV4ComboDetails(data,false).includes('2라운드'));
-assert(text.includes('시작 1:12 (경과)'));
+assert(text.includes('시작 1:12'));assert(!text.includes('경과'));
 assert.equal(rrV4ComboDetails({maxComboHits:4,maxComboSequence:['JAB']},false),'');
 assert(!rrV4ComboDetails({maxComboHits:2,maxComboSequence:['<img>','JAB']},false).includes('<img>'));
 '''

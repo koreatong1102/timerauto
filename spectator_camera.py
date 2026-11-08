@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import time
 import threading
+from camera_direction_policy import camera_settings, direction_selftest
 
 
 def replace_camera_file(staged, target, *, timeout=.15):
@@ -146,6 +147,7 @@ class HeadCamera:
         self.last_write_ms = 0
         self.replay_previous = None
         self.pending_reset = False
+        self.last_prepare_error = ''
 
     def start(self, root, side, *, realtime=False, **options):
         self.stop()
@@ -184,6 +186,7 @@ class HeadCamera:
         self.last_input_at = None
         self.replay_previous = None
         self.pending_reset = False
+        self.last_prepare_error = ''
 
     def freeze(self):
         """Join publishers before releasing head flags or handing off ownership."""
@@ -205,10 +208,12 @@ class HeadCamera:
         try:
             result = self._tick_once()
             self.invalid_since = None
+            self.last_prepare_error = ''
             return result
         except StaleCameraLog:
             raise
         except (OSError, ValueError) as exc:
+            self.last_prepare_error = repr(exc)
             # The game truncates/re-writes its output files. Retain the last
             # complete camera frame while a transient partial read is retried.
             now = time.monotonic()
@@ -405,9 +410,20 @@ class CameraWorker:
         self.thread.start()
 
 
-def create_camera_panel(cfg, parent=None, toggle=None, on_return=None):
+def auto_camera_keeps_window_open():
+    """Runtime state, not a saved checkbox; includes ordered exit/cleanup."""
+    from PyQt6.QtWidgets import QApplication
+    app=QApplication.instance()
+    service=getattr(app,'_rfc_head_camera',None)
+    director=getattr(service,'director',None)
+    thread=getattr(director,'thread',None)
+    return bool(thread is not None and thread.is_alive())
+
+
+def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_guarded=None,
+                        ensure_window_visible=None):
     from PyQt6.QtCore import QObject, QTimer, pyqtSignal
-    from PyQt6.QtWidgets import QApplication, QWidget, QFormLayout, QLabel, QDoubleSpinBox, QPushButton, QHBoxLayout, QComboBox, QCheckBox
+    from PyQt6.QtWidgets import QApplication, QWidget, QFormLayout, QLabel, QDoubleSpinBox, QPushButton, QHBoxLayout, QComboBox, QCheckBox, QMessageBox
     app = QApplication.instance()
     # One writer per app; it survives closing/reopening Settings.
     service = getattr(app, "_rfc_head_camera", None)
@@ -479,7 +495,9 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None):
     layout = QFormLayout(panel)
     from camera_director import AutoCameraDirector
     if service.director is None and toggle is not None:
-        service.director = AutoCameraDirector(service.report,toggle,on_return=on_return)
+        service.director = AutoCameraDirector(service.report,toggle,on_return=on_return,
+                                             toggle_guarded=toggle_guarded,
+                                             ensure_window_visible=ensure_window_visible)
     note = QLabel("① 경기 또는 관전툴 세션 리플레이 열기 → ② 블루/레드 추적 시작 → ③ 관전툴 창에서 F6으로 파일 카메라 켜기\n"
                   "종료: 먼저 추적 중지 → 머리 표시 복구 확인 → F6 끄기. 이미 일반 카메라로 돌아왔다면 ‘머리 표시 복구’ 후 F6을 잠깐 켰다가 끄세요.\n"
                   "설정창을 닫아도 추적은 계속됩니다. 타이머를 종료하면 값 전달이 중지됩니다.\n"
@@ -546,26 +564,86 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None):
     restore_button.clicked.connect(restore)
     layout.addRow(restore_button)
     layout.addRow(buttons)
-    auto_note = QLabel("자동 연출(시험): F6 파일 카메라를 먼저 끄고 시작하세요. 연타 중 안정된 거리/방향에서만 잠깐 선수 시점으로 전환합니다.\n"
+    auto_note = QLabel("상황별 자동 연출: F6 파일 카메라를 먼저 끄고 시작하세요. 공격 흐름·카운터 후속타와 시야 안정성을 함께 평가합니다.\n"
+                       "방송 카메라 모드를 켜면 짧은 연타 보조 후보와 좋은 구도 연출을 추가합니다. 단발 카운터는 여전히 후속타를 기다립니다.\n"
+                       "전환이 확인된 뒤 기본 유지시간을 채웁니다. 공격 중단·일반 반격만으로 일찍 복귀하지 않습니다. 좋은 흐름은 최대 유지시간 안에서 연장합니다.\n"
+                       "다운·스턴·리포트·라운드 종료·추적 이상·위험한 시야에서는 유지시간 전에도 복귀하거나 안전 중지합니다.\n"
+                       "재생 중 순간적인 글러브 가림·빠른 원본 좌표 변화만으로 끊지 않습니다. 실제 카메라의 심한 움직임·큰 좌표 도약·추적 중단은 별도 검사합니다.\n"
+                       "신중 모드는 좋은 컷만, 균형은 기본, 적극은 기준을 완화합니다. 회피역습·맞교환은 아직 발동 유형에 포함하지 않습니다.\n"
+                       "조건 변경은 다음 ‘자동 연출 시작’부터 적용됩니다. 글러브 가림은 위치 로그 기반 추정입니다.\n"
                        "일반 카메라 복귀가 관측되면 F4를 한 번 누릅니다. F4는 토글이며 켜짐 상태를 직접 확인할 수는 없습니다.\n"
                        "F6 기본 키가 관전툴에 설정되어 있어야 합니다. 전환 때 관전툴 창을 잠깐 활성화하고 원래 창으로 돌아옵니다.\n"
+                       "자동 연출이 켜져 있는 동안 관전툴은 최소화하지 않습니다. 다른 창으로 작업하는 것은 가능합니다.\n"
                        "자동 연출 중 F6/카메라를 수동 변경하지 마세요. 실제 카메라 로그로 전환을 관측하지만 내부 모드의 확정 신호는 아닙니다.\n"
                        "확인 실패 시 토글을 반복하지 않고 중지합니다. 머리 표시/F6 상태를 직접 확인해야 할 수 있습니다. 앱 재시작 시 자동으로 켜지지 않습니다.")
     auto_note.setWordWrap(True)
     layout.addRow(auto_note)
+    saved=camera_settings(cfg)
+    profile=QComboBox()
+    profile.setObjectName('cameraDirectorProfile')
+    for label,key in (('신중 · 좋은 컷만','cautious'),('균형 · 기본','balanced'),('적극 · 더 자주','active')):
+        profile.addItem(label,key)
+    profile.setCurrentIndex(max(0,profile.findData(saved['camera_director_profile'])))
+    layout.addRow('자동 연출 성향',profile)
+    pressure=QCheckBox('공격 흐름 · 상대 반격 없이 이어지는 중앙엔진 콤보')
+    counter=QCheckBox('카운터 후속타 · 카운터 뒤 실제 공격이 이어질 때')
+    pressure.setObjectName('cameraDirectorPressure');counter.setObjectName('cameraDirectorCounter')
+    pressure.setChecked(saved['camera_director_pressure_enabled'])
+    counter.setChecked(saved['camera_director_counter_enabled'])
+    layout.addRow(pressure);layout.addRow(counter)
+    broadcast=QCheckBox('방송 카메라 모드 · 짧은 연타 + 좋은 구도 자동 연출')
+    broadcast.setObjectName('cameraDirectorBroadcast')
+    broadcast.setChecked(saved['camera_director_broadcast_enabled'])
+    layout.addRow(broadcast)
+    broadcast_note=QLabel('목표 비중은 최근 경기 진행시간 기준의 조절 목표이며 보장 횟수가 아닙니다.\n'
+                         '구도 대기시간이 지나면 안전한 공방 시점을 추가합니다. 절반이 지나면 짧은 연타도 후보로 허용합니다.\n'
+                         '신중 모드는 보조 후보도 최소 3연타입니다. 색다른 선수 시점을 우선하며 안전 조건은 완화하지 않습니다.')
+    broadcast_note.setWordWrap(True);layout.addRow(broadcast_note)
     auto_controls = {}
-    for key,label,lo,hi,default in (("duration","1인칭 유지(초)",1,3,2), ("cooldown","복귀 후 최소 간격(초) · 0은 대기 없음",0,120,12), ("min_hits","발동 최소 연타 수",2,10,2)):
+    for key,label,lo,hi,default in (("duration","기본 1인칭 유지(초)",1,3,2),
+                                  ('max_duration','좋은 공격 흐름 · 최대 유지(초)',1,3,3),
+                                  ("cooldown","복귀 후 최소 간격(초) · 0은 대기 없음",0,120,12),
+                                  ("min_hits","기본 공격 최소 연타 · 방송 모드 보조 후보는 별도",3,10,3),
+                                  ('target_pct','방송 모드 · 선수 시점 목표 비중(%)',5,35,18),
+                                  ('idle_sec','방송 모드 · 좋은 구도 연출 대기(초)',6,60,12)):
         spin = QDoubleSpinBox()
-        spin.setDecimals(1 if key == "duration" else 0)
-        spin.setRange(lo,hi); spin.setValue(default)
+        spin.setDecimals(1 if key in ('duration','max_duration') else 0)
+        spin.setObjectName('cameraDirector_'+key)
+        spin.setRange(lo,hi); spin.setValue(saved['camera_director_'+key])
         auto_controls[key] = spin
         layout.addRow(label,spin)
+    auto_controls['max_duration'].setMinimum(auto_controls['duration'].value())
+    def save_direction(*_args):
+        auto_controls['max_duration'].setMinimum(auto_controls['duration'].value())
+        cfg.camera_director_profile=profile.currentData()
+        cfg.camera_director_pressure_enabled=pressure.isChecked()
+        cfg.camera_director_counter_enabled=counter.isChecked()
+        cfg.camera_director_broadcast_enabled=broadcast.isChecked()
+        for key,spin in auto_controls.items():setattr(cfg,'camera_director_'+key,spin.value())
+        changed=getattr(parent,'_schedule_apply',None)
+        if callable(changed):changed()
+    profile.currentIndexChanged.connect(save_direction)
+    pressure.toggled.connect(save_direction);counter.toggled.connect(save_direction)
+    broadcast.toggled.connect(save_direction)
+    for spin in auto_controls.values():spin.valueChanged.connect(save_direction)
+    rehearsal=QPushButton('조건 모의 테스트 · 실제 카메라 전환 없음')
+    rehearsal.setObjectName('cameraDirectorSelfTest')
+    def test_direction():
+        try:
+            QMessageBox.information(panel,'자동 연출 기본 판정 시험','\n'.join(direction_selftest())+
+                                    '\n\n실제 시야 안정성·게임의 F6/F4 작동 성공을 확인하는 시험은 아닙니다.')
+        except Exception as exc:service.report('자동 연출 조건 시험 실패: '+str(exc))
+    rehearsal.clicked.connect(test_direction)
+    layout.addRow(rehearsal)
     confirmation = QCheckBox("F6 파일 카메라가 꺼져 있고 일반 카메라인 것을 확인했습니다")
     layout.addRow(confirmation)
     auto_buttons = QHBoxLayout()
     arm = QPushButton("자동 연출 시작")
     disarm = QPushButton("자동 연출 중지 / 복귀")
     def arm_auto():
+        if not pressure.isChecked() and not counter.isChecked() and not broadcast.isChecked():
+            service.report('공격 흐름·카운터 후속타·방송 카메라 모드 중 하나 이상 선택하세요.')
+            return
         if not confirmation.isChecked():
             service.report("먼저 관전툴 F6 파일 카메라를 끄고 확인 체크를 켜주세요.")
             return
@@ -579,6 +657,8 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None):
             service.worker.stop()
             service.director.start(getattr(cfg,"spectatorlog_path",""),
                                    {k:v.value() for k,v in controls.items()},
+                                   profile=profile.currentData(),pressure=pressure.isChecked(),counter=counter.isChecked(),
+                                   broadcast_enabled=broadcast.isChecked(),
                                    **{k:v.value() for k,v in auto_controls.items()})
             service.timer.start()
             confirmation.setChecked(False)

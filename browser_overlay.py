@@ -3838,7 +3838,7 @@ function rrV4ComboDetails(data,isFinal){
   const notes=[];
   if(rrV4Num(data.maxComboRound)>0)notes.push(rrV4Num(data.maxComboRound)+'라운드');
   const start=String(data.maxComboStartTimeText||'');
-  if(/^\d+:[0-5]\d$/.test(start))notes.push('시작 '+start+' (경과)');
+  if(/^\d+:[0-5]\d$/.test(start))notes.push('시작 '+start);
   if(data.maxComboCounterStart===true)notes.push('카운터 시작');
   if(data.maxComboDownFinish===true)notes.push('다운 마무리');
   const size=Math.max(12,18-Math.floor(Math.max(0,sequence.length-8)/4));

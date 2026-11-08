@@ -20,6 +20,7 @@ from PyQt6.QtGui import QImage
 from browser_hit_effects import HIT_EFFECT_CSS, HIT_EFFECT_HTML, HIT_EFFECT_JS
 from browser_player_identity import add_player_identity_layout
 from venue_backgrounds import VENUES, add_venue_background_layout
+from hud_layout import add_hud_layout
 from app_paths import app_path, normalize_builtin_asset_path
 from diagnostics import diagnostics as DIAG
 from overlay_studio import OverlayStudioStore, runtime_js, studio_html
@@ -122,6 +123,9 @@ class BrowserOverlayServer:
             "overlayUiScale": 1.0,
             "browserOverlayScale": 1.0,
             "overlayTopPad": 40,
+            "hudLeftMargin": 0,
+            "hudRightMargin": 0,
+            "hudOffsetY": 0,
             "overlayTimerX": 0,
             "overlayRoundX": 0,
             "replayLabelX": 0,
@@ -3832,7 +3836,9 @@ function rrV4ComboDetails(data,isFinal){
   if(rrV4Num(data.maxComboHits)<2||sequence.length!==rrV4Num(data.maxComboHits))return '';
   const line=sequence.map((p,i)=>'<span class="rrComboStep">'+escapeHtml(String(p))+(i<sequence.length-1?'<span class="rrComboArrow">&rarr;</span>':'')+'</span>').join('');
   const notes=[];
-  if(isFinal&&rrV4Num(data.maxComboRound)>0)notes.push(rrV4Num(data.maxComboRound)+'라운드');
+  if(rrV4Num(data.maxComboRound)>0)notes.push(rrV4Num(data.maxComboRound)+'라운드');
+  const start=String(data.maxComboStartTimeText||'');
+  if(/^\d+:[0-5]\d$/.test(start))notes.push('시작 '+start+' (경과)');
   if(data.maxComboCounterStart===true)notes.push('카운터 시작');
   if(data.maxComboDownFinish===true)notes.push('다운 마무리');
   const size=Math.max(12,18-Math.floor(Math.max(0,sequence.length-8)/4));
@@ -4270,6 +4276,7 @@ if(potmReplayAudioVideo)potmReplayAudioVideo.addEventListener('playing',()=>{let
         )
         html = add_player_identity_layout(html)
         html = add_venue_background_layout(html)
+        html = add_hud_layout(html)
         return html.replace(
             "</body>",
             '<svg aria-hidden="true" width="0" height="0" style="position:absolute">'

@@ -47,7 +47,41 @@ def classified_combo_rows(events, best_event, side):
     return []
 
 
-def combo_details(rows, hits, damage):
+def combo_clock(rows, round_events, duration):
+    """Convert verified clock direction to elapsed time, without a live-clock guess.
+
+    Modern docs specify elapsed; older recordings actually count down. Use
+    append order inside this round, not the current round_time mode for a
+    possibly different round. Mixed/unknown direction remains unreported.
+    """
+    empty = {"maxComboStartSeconds":None,"maxComboEndSeconds":None,
+             "maxComboStartTimeText":"","maxComboTimeBasis":"unknown"}
+    try:
+        start,end = float(rows[0]["time"]),float(rows[-1]["time"])
+        values = [float(row["time"]) for row in round_events if "time" in row]
+        if not all(math.isfinite(value) and value >= 0 for value in [start,end]+values):
+            return empty
+        differences = [b-a for a,b in zip(values,values[1:]) if abs(b-a)>.005]
+        increasing = any(delta>0 for delta in differences)
+        decreasing = any(delta<0 for delta in differences)
+        if increasing and not decreasing:
+            basis = "elapsed"
+        elif decreasing and not increasing:
+            length = float(duration)
+            if not math.isfinite(length) or length <= 0 or max(values)>length+.05:
+                return empty
+            start,end = max(0,length-start),max(0,length-end)
+            basis = "converted_remaining"
+        else:
+            return empty
+        seconds = int(start)
+        return {"maxComboStartSeconds":round(start,2),"maxComboEndSeconds":round(end,2),
+                "maxComboStartTimeText":f"{seconds//60}:{seconds%60:02d}","maxComboTimeBasis":basis}
+    except (IndexError,KeyError,TypeError,ValueError,OverflowError):
+        return empty
+
+
+def combo_details(rows, hits, damage, *, round_events=(), duration=None):
     # Detail and displayed total must describe exactly the same selected chain.
     try:
         total = sum(float(row.get("damage", 0) or 0) for row in rows)
@@ -56,7 +90,8 @@ def combo_details(rows, hits, damage):
     complete = hits >= 2 and len(rows) == hits and math.isfinite(total) and math.isclose(total,damage,abs_tol=.05)
     if not complete:
         return {"maxComboSequence": [], "maxComboDetail": "", "maxComboRound": 0,
-                "maxComboCounterStart": False, "maxComboDownFinish": False}
+                "maxComboCounterStart": False, "maxComboDownFinish": False,
+                **combo_clock([],[],duration)}
     sequence = [punch_label(row) for row in rows]
     first, last = rows[0], rows[-1]
     central = first.get("_central_event") or {}
@@ -66,4 +101,5 @@ def combo_details(rows, hits, damage):
     down = effect in ("knockdown","down","ko","tko") or damage_type in ("knockdown","ko","tko")
     return {"maxComboSequence": sequence, "maxComboDetail": " → ".join(sequence),
             "maxComboRound": int(last.get("_report_round",last.get("round",0)) or 0),
-            "maxComboCounterStart": counter, "maxComboDownFinish": down}
+            "maxComboCounterStart": counter, "maxComboDownFinish": down,
+            **combo_clock(rows,round_events or rows,duration)}

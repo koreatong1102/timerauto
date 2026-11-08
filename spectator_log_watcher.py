@@ -4397,7 +4397,9 @@ class SpectatorLogWatcher(QObject):
                 "powerHits55": int(power55),
                 "maxComboHits": int(best_hits),
                 "maxComboDamage": int(round(best_damage)),
-                **combo_details(best_rows, best_hits, best_damage),
+                **combo_details(best_rows, best_hits, best_damage,
+                                round_events=[ev for ev in metric_events if best_rows and ev.get("_report_round") == best_rows[0].get("_report_round")],
+                                duration=self._configured_round_duration()),
             }
 
         def _official_score(side: str) -> int:

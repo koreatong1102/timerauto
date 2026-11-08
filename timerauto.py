@@ -38,6 +38,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from collections import deque
 from venue_backgrounds import venue_from_update
+from hud_layout import create_hud_layout_panel, hud_settings, hud_browser_state
 
 APP_VERSION = "1.0.18"
 UPDATE_FEED_URL = "https://github.com/koreatong1102/timerauto/releases/download/latest/latest.json"
@@ -7383,6 +7384,17 @@ class SettingsDialog(QDialog):
             pass
         self._schedule_apply()
 
+    def _apply_hud_layout_settings(self):
+        if self._suspend_apply:
+            return
+        if self.controller and hasattr(self.controller,"ui_update"):
+            self.controller.ui_update.emit(hud_settings(self.cfg))
+        self._schedule_apply()
+
+    def _open_hud_layout_preview(self):
+        url = str(self.le_browser_overlay_url.text() or "http://127.0.0.1:17872/overlay")
+        QDesktopServices.openUrl(QUrl(url.split("?",1)[0]+"?hudPreview=1"))
+
     # ---- Quick tab ----
     # ---- Quick tab ----
     def _build_diagnostics(self):
@@ -11980,9 +11992,10 @@ class SettingsDialog(QDialog):
             }
             test_metrics = {
                 "blue": {"officialScore": 10, "powerHits55": 1, "maxComboHits": 3, "maxComboDamage": 82,
-                         "maxComboSequence": ["JAB", "CROSS", "L.HOOK"], "maxComboRound": 1, "maxComboCounterStart": True},
+                         "maxComboSequence": ["JAB", "CROSS", "L.HOOK"], "maxComboRound": 1,
+                         "maxComboStartTimeText": "1:12", "maxComboCounterStart": True},
                 "red": {"officialScore": 8, "powerHits55": 0, "maxComboHits": 2, "maxComboDamage": 46,
-                        "maxComboSequence": ["JAB", "R.UPPERCUT"], "maxComboRound": 1},
+                        "maxComboSequence": ["JAB", "R.UPPERCUT"], "maxComboRound": 1,"maxComboStartTimeText":"0:48"},
             }
             for side in ("blue", "red"):
                 side_data = payload[side]
@@ -13847,6 +13860,7 @@ class SettingsDialog(QDialog):
             "overlay_kd_hold_sec": max(0.8, min(10.0, float(_value("sp_overlay_kd_hold", getattr(self.cfg, "overlay_kd_hold_sec", 2.2))))),
             "overlay_tko_hold_sec": max(0.8, min(10.0, float(_value("sp_overlay_tko_hold", getattr(self.cfg, "overlay_tko_hold_sec", 2.6))))),
         }
+        return payload
 
     def _apply_overlay_ko_live(self):
         if self._suspend_apply:
@@ -14056,6 +14070,7 @@ class SettingsDialog(QDialog):
             "overlay_bg_opacity": bg_opacity,
             "overlay_ui_scale": float(getattr(self.cfg, "overlay_ui_scale", 1.0) or 1.0),
             "overlay_preset": overlay_preset,
+            **hud_settings(self.cfg),
             "overlay_player_mask": player_mask,
             "overlay_show_round": show_round,
             "overlay_show_time": show_time,
@@ -14105,6 +14120,11 @@ class SettingsDialog(QDialog):
     def _apply_overlay_preset(self, data: dict):
         if not isinstance(data, dict):
             return
+        if any(key in data for key in hud_settings(self.cfg)):
+            for key,value in hud_settings(self.cfg,data).items():
+                setattr(self.cfg,key,value)
+            if hasattr(self,"hud_layout_panel"):
+                self.hud_layout_panel.reload()
         bg_color = _normalize_hex_color(str(data.get("overlay_bg_color", "transparent")))
         try:
             bg_opacity = float(data.get("overlay_bg_opacity", 0.0))
@@ -15199,6 +15219,9 @@ class SettingsDialog(QDialog):
         _tt(self.chk_browser_overlay_output_only, "Show fullscreen effects only in the OBS browser source, not on the local Qt overlay.")
         _tt(self.chk_qml_preview_enabled, "끄면 로컬 QML HUD 창을 숨기고 OBS 브라우저 오버레이만 렌더링합니다.")
         overlay_lay.addWidget(browser_group)
+        self.hud_layout_panel = create_hud_layout_panel(
+            self.cfg,self._apply_hud_layout_settings,self._open_hud_layout_preview,self)
+        overlay_lay.addWidget(self.hud_layout_panel)
 
         row_preset = QHBoxLayout()
         row_preset.addWidget(QLabel("오버레이 프리셋:"))
@@ -20114,6 +20137,7 @@ class SettingsDialog(QDialog):
                     "overlay_show_flags": self.cfg.overlay_show_flags,
                     "overlay_show_cinematic": self.cfg.overlay_show_cinematic,
                     "browser_round_damage_width": self.cfg.browser_round_damage_width,
+                    **hud_settings(self.cfg),
                     "browser_overlay_output_only": self.cfg.browser_overlay_output_only,
                     "browser_fullscreen_fx_intensity": self.cfg.browser_fullscreen_fx_intensity,
                     "overlay_kd_image_path": self.cfg.overlay_kd_image_path,
@@ -20688,6 +20712,8 @@ class SettingsDialog(QDialog):
             self.sp_overlay_tko_hold.setValue(float(getattr(self.cfg, "overlay_tko_hold_sec", 2.6) or 2.6))
         if hasattr(self, "sp_browser_overlay_scale"):
             self.sp_browser_overlay_scale.setValue(int(float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0) * 100))
+        if hasattr(self, "hud_layout_panel"):
+            self.hud_layout_panel.reload()
         if hasattr(self, "sp_browser_overlay_poll"):
             self.sp_browser_overlay_poll.setValue(max(16, min(1000, int(getattr(self.cfg, "browser_overlay_poll_ms", 50) or 50))))
         if hasattr(self, "chk_browser_overlay_output_only"):
@@ -26822,6 +26848,7 @@ class MainApp(QObject):
                 overlayBgOpacity=max(0.0, min(1.0, float(getattr(self.cfg, "overlay_bg_opacity", 0.0) or 0.0))),
                 overlayUiScale=float(getattr(self.cfg, "overlay_ui_scale", 1.0) or 1.0),
                 browserOverlayScale=float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),
+                **hud_browser_state(self.cfg),
                 browserFullscreenFxIntensity=max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6))),
                 koImageScalePct=int(max(30, min(200, int(getattr(self.cfg, "overlay_ko_image_scale_pct", 100) or 100)))),
                 koImageX=int(max(-800, min(800, int(getattr(self.cfg, "overlay_ko_x", 0) or 0)))),
@@ -28398,6 +28425,7 @@ class MainApp(QObject):
                     "overlayBgOpacity": max(0.0, min(1.0, float(getattr(self.cfg, "overlay_bg_opacity", 0.0) or 0.0))),
                     "overlayUiScale": float(getattr(self.cfg, "overlay_ui_scale", 1.0) or 1.0),
                     "browserOverlayScale": float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),
+                    **hud_browser_state(self.cfg),
                     "browserFullscreenFxIntensity": max(0.0, min(3.0, float(getattr(self.cfg, "browser_fullscreen_fx_intensity", 1.6) or 1.6))),
                     "koImageScalePct": int(max(30, min(200, int(getattr(self.cfg, "overlay_ko_image_scale_pct", 100) or 100)))),
                     "koImageX": int(max(-800, min(800, int(getattr(self.cfg, "overlay_ko_x", 0) or 0)))),
@@ -28727,6 +28755,7 @@ class MainApp(QObject):
                 _push_hit_impacts_fast()
 
             update = {}
+            update.update(hud_browser_state(self.cfg,d))
             if "blue_name" in d:
                 update["blueName"] = str(d.get("blue_name") or "")
             if "red_name" in d:
@@ -30154,6 +30183,9 @@ class MainApp(QObject):
         return played_sfx, early_browser_effects
 
     def apply_ui_update(self, d: dict):
+        if any(key in d for key in ("overlay_hud_left_margin","overlay_hud_right_margin","overlay_hud_y","overlay_hud_link_sides","overlay_hud_portrait_pct")):
+            for key,value in hud_settings(self.cfg,d).items():
+                setattr(self.cfg,key,value)
         try:
             DIAG.record(
                 "ui_update",

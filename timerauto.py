@@ -38,7 +38,8 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from collections import deque
 from venue_backgrounds import venue_from_update
-from hud_layout import create_hud_layout_panel, hud_settings, hud_browser_state
+from hud_layout import HUD_DEFAULTS, create_hud_layout_panel, hud_settings, hud_browser_state
+from shutdown_runtime import finish_shutdown
 
 APP_VERSION = "1.0.18"
 UPDATE_FEED_URL = "https://github.com/koreatong1102/timerauto/releases/download/latest/latest.json"
@@ -7322,7 +7323,7 @@ class SettingsDialog(QDialog):
             widget.installEventFilter(self._wheel_filter)
 
     def _schedule_apply(self):
-        if self._suspend_apply:
+        if self._suspend_apply or bool(getattr(self, '_quitting', False)):
             return
         self._apply_timer.start(150)
 
@@ -19630,7 +19631,8 @@ class SettingsDialog(QDialog):
             self.lst_actions.setFocus()
 
     # ---- Apply / Save ----
-    def apply_only(self, silent: bool = False):
+    def apply_only(self, silent: bool = False, *, save_only: bool = False):
+        save_only = save_only or bool(getattr(self, '_quitting', False))
         self.cfg.monitor_index = int(self.cmb_monitor.currentData())
         if hasattr(self, "edit_trigger_pixel_hotkey"):
             self.cfg.trigger_pixel_hotkey = self.edit_trigger_pixel_hotkey.keySequence().toString()
@@ -20058,7 +20060,7 @@ class SettingsDialog(QDialog):
         if hasattr(self, "sp_browser_overlay_poll"):
             self.cfg.browser_overlay_poll_ms = int(self.sp_browser_overlay_poll.value())
             try:
-                if self.controller and hasattr(self.controller, "_browser_overlay_timer"):
+                if not save_only and self.controller and hasattr(self.controller, "_browser_overlay_timer"):
                     self.controller._browser_overlay_timer.setInterval(max(16, min(1000, self.cfg.browser_overlay_poll_ms)))
             except Exception:
                 pass
@@ -20069,14 +20071,14 @@ class SettingsDialog(QDialog):
         if hasattr(self, "chk_qml_preview_enabled"):
             self.cfg.qml_preview_enabled = bool(self.chk_qml_preview_enabled.isChecked())
             try:
-                if self.controller and getattr(self.controller, "timer_win", None):
+                if not save_only and self.controller and getattr(self.controller, "timer_win", None):
                     self.controller.timer_win.set_qml_preview_enabled(self.cfg.qml_preview_enabled)
             except Exception:
                 pass
         if hasattr(self, "chk_qml_effects_enabled"):
             self.cfg.qml_effects_enabled = bool(self.chk_qml_effects_enabled.isChecked())
             try:
-                if self.controller and getattr(self.controller, "timer_win", None):
+                if not save_only and self.controller and getattr(self.controller, "timer_win", None):
                     self.controller.timer_win.set_qml_effects_enabled(self.cfg.qml_effects_enabled)
             except Exception:
                 pass
@@ -20120,7 +20122,7 @@ class SettingsDialog(QDialog):
             except Exception:
                 pass
         try:
-            if self.controller:
+            if self.controller and not save_only:
                 self.controller.ui_update.emit({
                     "overlay_bg_color": self.cfg.overlay_bg_color,
                     "overlay_bg_opacity": self.cfg.overlay_bg_opacity,
@@ -20178,7 +20180,15 @@ class SettingsDialog(QDialog):
         self._apply_actions()
         self._apply_pixel_rules()
         if hasattr(self, "tab_effects"):
-            self._apply_win_effects_ui(silent=True)
+            if save_only:
+                self.cfg.win_effects = self._collect_win_effects_ui()
+            else:
+                self._apply_win_effects_ui(silent=True)
+
+        if save_only:
+            # Collect pending edits only. Shutdown owns persistence and cleanup;
+            # never restart a detector, OBS, or a media scan from this path.
+            return
 
         # The SpectatorLog checkbox and the timer-window Detect menu must own
         # the exact same runtime watcher.  Previously this checkbox only saved
@@ -20836,8 +20846,7 @@ class MainApp(QObject):
             DIAG.set_options(trace_seconds=float(getattr(self.cfg, "diagnostics_trace_minutes", 10) or 10) * 60)
             DIAG.configure_storage(app_path("diagnostics", "_blackbox"))
             DIAG.record("app_start", app_version=APP_VERSION, cfg_path=cfg_path)
-            if QApplication.instance() is not None:
-                QApplication.instance().aboutToQuit.connect(DIAG.close)
+            # The main shutdown coordinator drains diagnostics off the UI thread.
         except Exception:
             pass
         # Chapter anchor is session-scoped runtime state.
@@ -24172,6 +24181,8 @@ class MainApp(QObject):
             return False
 
     def _start_spectator_watcher_if_enabled(self, *, force_enable: bool = False):
+        if bool(getattr(self, '_shutting_down', False)):
+            return
         if bool(getattr(self, "_log_detector_transition", False)):
             if force_enable:
                 self._log_detector_start_pending = True
@@ -24240,6 +24251,8 @@ class MainApp(QObject):
         self._update_backend_detect_flags()
 
     def _start_log_detector(self):
+        if bool(getattr(self, '_shutting_down', False)):
+            return
         try:
             DIAG.record(
                 "spectator_log_start_request",
@@ -24942,6 +24955,8 @@ class MainApp(QObject):
         return labels.get(status, status) + (f" - {detail}" if detail else "")
 
     def _reconfigure_obs_integration(self) -> None:
+        if bool(getattr(self, '_shutting_down', False)):
+            return
         integration = getattr(self, "obs_integration", None)
         if integration is not None:
             integration.reconfigure(self.cfg)
@@ -27446,30 +27461,33 @@ class MainApp(QObject):
             logging.exception("SOURCE_RECORD_TIMER_EXIT_CLEANUP_SCHEDULE_FAIL")
 
     def on_app_quit(self):
-        for detector_name in ("watcher", "spectator_watcher"):
-            try:
-                getattr(self, detector_name).stop()
-            except Exception:
-                pass
+        if bool(getattr(self, '_shutting_down', False)):
+            return
+        self._shutting_down = True
+        self._log_detector_start_pending = False
+        logging.info('APP_SHUTDOWN_BEGIN')
         try:
             if self.settings_dlg and not bool(QApplication.instance().property("access_revoked")):
+                self.settings_dlg._quitting = True
                 if hasattr(self.settings_dlg, "_apply_timer"):
                     try:
                         self.settings_dlg._apply_timer.stop()
                     except Exception:
                         pass
-                self.settings_dlg.apply_only(silent=True)
+                self.settings_dlg.apply_only(silent=True, save_only=True)
+                self.settings_dlg.setEnabled(False)
+                logging.info('APP_SHUTDOWN_SETTINGS_COLLECTED')
         except Exception:
-            pass
+            logging.exception('APP_SHUTDOWN_SETTINGS_COLLECT_FAIL')
         try:
             if self._global_hotkeys_enabled:
                 self._global_hotkeys.stop()
         except Exception:
             pass
-        try:
-            self.cfg.to_json(self.cfg_path)
-        except Exception:
-            pass
+        # Stop all controller-owned timers, including watchdogs added in future.
+        for timer in self.findChildren(QTimer):
+            timer.stop()
+        logging.info('APP_SHUTDOWN_TIMERS_STOPPED')
         try:
             if self._hotkey_timer:
                 self._hotkey_timer.stop()
@@ -27490,23 +27508,46 @@ class MainApp(QObject):
                 self._obs_poll_timer.stop()
         except Exception:
             pass
-        try:
-            if not bool(QApplication.instance().property("access_revoked")):
-                self._shutdown_source_record_with_timer()
-        except Exception:
-            logging.exception("SOURCE_RECORD_TIMER_EXIT_CLEANUP_FAIL")
-        try:
-            self.obs_integration.stop()
-        except Exception:
-            pass
-        try:
-            self.browser_overlay.stop()
-        except Exception:
-            pass
-        try:
-            self._export_chapter_txt()
-        except Exception:
-            pass
+        revoked = bool(QApplication.instance().property('access_revoked'))
+        logging.info('APP_SHUTDOWN_TASKS_PREPARE')
+
+        def save_records():
+            try:
+                self.cfg.to_json(self.cfg_path)
+            finally:
+                self._export_chapter_txt()
+
+        def stop_obs():
+            try:
+                if not revoked:
+                    self._shutdown_source_record_with_timer()
+            finally:
+                self.obs_integration.stop()
+
+        tasks = [('save_records', save_records), ('obs', stop_obs),
+                 ('browser', self.browser_overlay.stop)]
+
+        def stop_detector(detector):
+            detector.stop()
+            thread = getattr(detector, '_thread', None)
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=3)
+                if thread.is_alive():
+                    logging.warning('APP_SHUTDOWN_DETECTOR_PENDING thread=%s', thread.name)
+
+        for name in ('watcher', 'spectator_watcher'):
+            detector = getattr(self, name, None)
+            if detector is not None:
+                tasks.append((name, lambda item=detector: stop_detector(item)))
+        camera = getattr(QApplication.instance(), '_rfc_head_camera', None)
+        logging.info('APP_SHUTDOWN_CAMERA_PRESENT value=%s', camera is not None)
+        if camera is not None:
+            camera.shutdown()  # Idempotent; also safe if its quit hook ran first.
+            tasks.append(('camera', lambda: camera._shutdown_done.wait(6)))
+        tasks.append(('diagnostics', DIAG.close))
+        logging.info('APP_SHUTDOWN_TASKS_READY')
+        pending = finish_shutdown(tasks, timeout=8)
+        logging.info('APP_SHUTDOWN_END pending=%s', pending)
 
     def check_for_updates(self, silent: bool = False):
         if getattr(self, "_update_check_busy", False):
@@ -30183,7 +30224,9 @@ class MainApp(QObject):
         return played_sfx, early_browser_effects
 
     def apply_ui_update(self, d: dict):
-        if any(key in d for key in ("overlay_hud_left_margin","overlay_hud_right_margin","overlay_hud_y","overlay_hud_link_sides","overlay_hud_portrait_pct")):
+        if bool(getattr(self, '_shutting_down', False)):
+            return
+        if any(key in d for key in HUD_DEFAULTS):
             for key,value in hud_settings(self.cfg,d).items():
                 setattr(self.cfg,key,value)
         try:

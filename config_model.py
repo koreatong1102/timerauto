@@ -966,6 +966,8 @@ class AppConfig:
     overlay_hud_y: int = 0
     overlay_hud_link_sides: bool = True
     overlay_hud_portrait_pct: float = 100
+    overlay_hud_dock: str = 'top'
+    overlay_hud_bottom_margin_pct: float = 3
     overlay_timer_font_size: int = 54
     overlay_timer_x: int = 0
     overlay_timer_y: int = 0

@@ -456,15 +456,23 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None):
                     self.report(("블루" if self.camera.side == "blue" else "레드") +
                                 f" 추적 · 출력 루프 {metrics['tick_hz']:.1f}Hz / 파일 갱신 {metrics['write_hz']:.1f}Hz · 같은 값은 저장 생략")
             def shutdown(self):
+                if hasattr(self, '_shutdown_done'):
+                    return
                 self.timer.stop()
+                self._shutdown_done = threading.Event()
                 if self.director:
                     self.director.stop()
-                    if self.director.thread:
-                        self.director.thread.join(timeout=4.5)
-                try:
-                    self.worker.stop()
-                except RuntimeError:
-                    logging.warning("SPECTATOR_CAMERA_SHUTDOWN_PENDING")
+
+                def finish():
+                    try:
+                        if self.director and self.director.thread:
+                            self.director.thread.join(timeout=4.5)
+                        self.worker.stop()
+                    except RuntimeError:
+                        logging.warning("SPECTATOR_CAMERA_SHUTDOWN_PENDING")
+                    finally:
+                        self._shutdown_done.set()
+                threading.Thread(target=finish, name='camera-shutdown', daemon=True).start()
         service = Service()
         app._rfc_head_camera = service
     panel = QWidget(parent)

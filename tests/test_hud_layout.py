@@ -23,10 +23,12 @@ class HudLayoutTests(unittest.TestCase):
             path=Path(folder)/'config.json'
             cfg=AppConfig();cfg.overlay_hud_link_sides=False
             cfg.overlay_hud_left_margin=400;cfg.overlay_hud_right_margin=350;cfg.overlay_hud_y=25;cfg.overlay_hud_portrait_pct=65
+            cfg.overlay_hud_dock='bottom';cfg.overlay_hud_bottom_margin_pct=5.5
             cfg.to_json(str(path))
             self.assertEqual(hud_settings(AppConfig.from_json(str(path))),hud_settings(cfg))
             self.assertEqual(hud_browser_state(cfg),{'hudLeftMargin':400,'hudRightMargin':350,'hudOffsetY':25,
-                                                   'hudLeftMarginPct':400/19.2,'hudRightMarginPct':350/19.2,'hudPortraitPct':65})
+                                                   'hudLeftMarginPct':400/19.2,'hudRightMarginPct':350/19.2,'hudPortraitPct':65,
+                                                   'hudDock':'bottom','hudBottomMarginPct':5.5})
 
     def test_link_and_invalid_values_are_normalized(self):
         self.assertEqual(hud_settings({'overlay_hud_left_margin':400})['overlay_hud_right_margin'],400)
@@ -36,6 +38,8 @@ class HudLayoutTests(unittest.TestCase):
         self.assertEqual(value['overlay_hud_y'],700)
         self.assertEqual(hud_settings({'overlay_hud_portrait_pct':0})['overlay_hud_portrait_pct'],30)
         self.assertEqual(hud_settings({'overlay_hud_portrait_pct':float('nan')})['overlay_hud_portrait_pct'],100)
+        self.assertEqual(hud_settings({'overlay_hud_dock':'garbage'})['overlay_hud_dock'],'top')
+        self.assertEqual(hud_settings({'overlay_hud_bottom_margin_pct':100})['overlay_hud_bottom_margin_pct'],40)
 
     def test_layout_css_targets_only_hud_and_preview_is_page_local(self):
         html=BrowserOverlayServer()._html()
@@ -64,12 +68,15 @@ class HudLayoutTests(unittest.TestCase):
         app.browser_overlay.snapshot.return_value={}
         app._sync_browser_overlay_player_assets=lambda data:{}
         app._update_pending_browser_vs_intro=lambda data:None
-        app._apply_browser_overlay_direct_update({'overlay_hud_left_margin':405,'overlay_hud_y':30,'overlay_hud_portrait_pct':60})
+        app._apply_browser_overlay_direct_update({'overlay_hud_left_margin':405,'overlay_hud_y':30,'overlay_hud_portrait_pct':60,
+                                                'overlay_hud_dock':'bottom','overlay_hud_bottom_margin_pct':4})
         state=app.browser_overlay.update.call_args.kwargs
         self.assertEqual(state['hudLeftMargin'],405)
         self.assertEqual(state['hudRightMargin'],405)
         self.assertEqual(state['hudOffsetY'],30)
         self.assertEqual(state['hudPortraitPct'],60)
+        self.assertEqual(state['hudDock'],'bottom')
+        self.assertEqual(state['hudBottomMarginPct'],4)
         self.assertNotIn('events',state)
 
     def test_qt_settings_panel_links_resets_and_opens_only_local_preview(self):
@@ -88,6 +95,13 @@ with tempfile.TemporaryDirectory() as folder, chdir(folder):
  cfg=AppConfig();dlg=SettingsDialog(None,cfg,None,None,cfg_path=os.path.join(folder,'config.json'))
  controller=Controller();calls=[];controller.ui_update.connect(calls.append);dlg.controller=controller
  panel=dlg.hud_layout_panel
+ assert panel.dock.currentData()=='top'
+ assert not panel.controls['overlay_hud_bottom_margin_pct'].isEnabled()
+ panel.dock.setCurrentIndex(1)
+ assert cfg.overlay_hud_dock=='bottom' and calls[-1]['overlay_hud_dock']=='bottom'
+ assert not panel.controls['overlay_hud_y'].isEnabled()
+ panel.controls['overlay_hud_bottom_margin_pct'].setValue(5.5)
+ assert cfg.overlay_hud_bottom_margin_pct==5.5
  panel.controls['overlay_hud_portrait_pct'].setValue(60)
  assert cfg.overlay_hud_portrait_pct==60 and calls[-1]['overlay_hud_portrait_pct']==60
  assert panel.controls['overlay_hud_left_margin'].maximum()==45
@@ -107,11 +121,14 @@ with tempfile.TemporaryDirectory() as folder, chdir(folder):
  preset=dlg._collect_overlay_preset()
  assert preset['overlay_hud_left_margin']==384 and preset['overlay_hud_right_margin']==240
  assert preset['overlay_hud_portrait_pct']==60
+ assert preset['overlay_hud_dock']=='bottom' and preset['overlay_hud_bottom_margin_pct']==5.5
  dlg._apply_overlay_preset(dict(preset,overlay_hud_left_margin=350,overlay_hud_right_margin=300))
  assert cfg.overlay_hud_left_margin==350 and cfg.overlay_hud_right_margin==300
  assert panel.controls['overlay_hud_left_margin'].value()==18.23
  panel.reset();assert cfg.overlay_hud_left_margin==cfg.overlay_hud_right_margin==cfg.overlay_hud_y==0
  assert cfg.overlay_hud_portrait_pct==100
+ assert panel.dock.currentData()=='top' and cfg.overlay_hud_bottom_margin_pct==3
+ assert panel.controls['overlay_hud_y'].isEnabled()
  dlg._apply_timer.stop();dlg.deleteLater()
 '''
         result=subprocess.run([sys.executable,'-c',script],cwd=ROOT,capture_output=True,text=True,
@@ -133,6 +150,15 @@ render({hudLeftMargin:400,hudRightMargin:350,hudOffsetY:25,browserOverlayScale:1
 assert.equal(properties['--hud-safe-width'],'1170px');assert.equal(properties['--hud-safe-left'],'400px');
 assert.equal(classes['hud-safe-layout'],true);assert(!Object.keys(properties).some(k=>k.includes('scale')));
 const previous=changes;render(latestState);assert.equal(changes,previous);
+for(const scale of [.75,1,1.5,2]){
+ for(const margin of [0,3,8,40]){
+  const bottom=hudSafeGeometry({hudDock:'bottom',hudBottomMarginPct:margin,browserOverlayScale:scale});
+  assert(Math.abs(40+bottom.y+134*scale-(1080-margin*10.8))<1e-6);
+ }
+}
+assert.equal(hudSafeGeometry({hudDock:'bottom',hudOffsetY:700}).y,hudSafeGeometry({hudDock:'bottom',hudOffsetY:0}).y);
+render({hudDock:'bottom'});assert.equal(classes['hud-safe-layout'],true);
+render({hudDock:'top'});assert.equal(classes['hud-safe-layout'],false);
 geometry=hudSafeGeometry({hudLeftMargin:600,hudRightMargin:600,browserOverlayScale:2});
 assert(geometry.width>=1304);assert(Math.abs(geometry.left-geometry.right)<1e-6);
 for(const width of [280,310,400,510,660,860]){

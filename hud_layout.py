@@ -3,7 +3,8 @@ import math
 
 HUD_DEFAULTS = {"overlay_hud_left_margin":0, "overlay_hud_right_margin":0,
                 "overlay_hud_y":0, "overlay_hud_link_sides":True,
-                "overlay_hud_portrait_pct":100}
+                "overlay_hud_portrait_pct":100,"overlay_hud_dock":"top",
+                "overlay_hud_bottom_margin_pct":3}
 
 
 def hud_settings(source, overrides=None):
@@ -12,6 +13,9 @@ def hud_settings(source, overrides=None):
         value = source.get(key,default) if isinstance(source,dict) else getattr(source,key,default)
         if overrides and key in overrides:
             value = overrides[key]
+        if key == 'overlay_hud_dock':
+            values[key] = value if value in ('top','bottom') else default
+            continue
         if key == "overlay_hud_link_sides":
             values[key] = value if isinstance(value,bool) else default
             continue
@@ -20,7 +24,8 @@ def hud_settings(source, overrides=None):
             if not math.isfinite(value):
                 raise ValueError()
             low, high = ((-40,700) if key == "overlay_hud_y" else
-                         (30,100) if key == "overlay_hud_portrait_pct" else (0,864))
+                         (30,100) if key == "overlay_hud_portrait_pct" else
+                         (0,40) if key == 'overlay_hud_bottom_margin_pct' else (0,864))
             values[key] = max(low,min(high,int(value) if key == 'overlay_hud_y' else round(value,6)))
         except (TypeError,ValueError,OverflowError):
             values[key] = default
@@ -35,11 +40,13 @@ def hud_browser_state(source, overrides=None):
             "hudRightMargin":values["overlay_hud_right_margin"],"hudOffsetY":values["overlay_hud_y"],
             "hudLeftMarginPct":values["overlay_hud_left_margin"]/19.2,
             "hudRightMarginPct":values["overlay_hud_right_margin"]/19.2,
-            "hudPortraitPct":values["overlay_hud_portrait_pct"]}
+            "hudPortraitPct":values["overlay_hud_portrait_pct"],
+            "hudDock":values["overlay_hud_dock"],
+            "hudBottomMarginPct":values["overlay_hud_bottom_margin_pct"]}
 
 
 def create_hud_layout_panel(cfg, changed, preview, parent=None):
-    from PyQt6.QtWidgets import QGroupBox, QGridLayout, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton
+    from PyQt6.QtWidgets import QGroupBox, QGridLayout, QLabel, QSpinBox, QDoubleSpinBox, QCheckBox, QPushButton, QComboBox
     class Panel(QGroupBox):
         def __init__(self):
             super().__init__("관전툴 UI 피하기 · 브라우저 경기 HUD",parent)
@@ -48,6 +55,7 @@ def create_hud_layout_panel(cfg, changed, preview, parent=None):
                                  "초상화 옆 빈틈을 줄이고, 라운드 데미지는 초상화 바로 아래에 표시합니다.\n"
                                  "좌우 여백은 화면 가로폭의 %입니다. 예: 18.23% ≈ 기존 350px 배치.\n"
                                  "카운터·콤보 위치는 유지합니다. 세로 이동만 1920×1080 기준 px입니다.\n"
+                                 "하단 배치를 선택하면 선수 정보와 타이머만 내려가며, 아래 여백은 화면 높이의 %입니다.\n"
                                  "VS·리포트·KO·POTM과 로컬 QML 창에는 적용하지 않습니다.")
             explanation.setWordWrap(True)
             layout.addWidget(explanation,0,0,1,4)
@@ -55,11 +63,13 @@ def create_hud_layout_panel(cfg, changed, preview, parent=None):
             for row,(key,label) in enumerate((("overlay_hud_left_margin","왼쪽 비워둘 폭"),
                                                ("overlay_hud_right_margin","오른쪽 비워둘 폭"),
                                                ("overlay_hud_y","HUD 세로 이동 · + 아래 / − 위"),
-                                               ("overlay_hud_portrait_pct","초상화 크기 · 기존 크기 대비")),1):
+                                               ("overlay_hud_portrait_pct","초상화 크기 · 기존 크기 대비"),
+                                               ("overlay_hud_bottom_margin_pct","하단 배치 · 아래쪽 여백")),1):
                 vertical = key == 'overlay_hud_y'
                 portrait = key == 'overlay_hud_portrait_pct'
+                bottom = key == 'overlay_hud_bottom_margin_pct'
                 spin = QSpinBox() if vertical else QDoubleSpinBox()
-                spin.setRange(*((-40,700) if vertical else (30,100) if portrait else (0,45)))
+                spin.setRange(*((-40,700) if vertical else (30,100) if portrait else (0,40) if bottom else (0,45)))
                 spin.setSuffix(' px' if vertical else ' %')
                 spin.setSingleStep(5 if vertical or portrait else .5)
                 if not vertical:
@@ -69,21 +79,27 @@ def create_hud_layout_panel(cfg, changed, preview, parent=None):
                 layout.addWidget(QLabel(label),row,0,1,2)
                 layout.addWidget(spin,row,2,1,2)
                 spin.valueChanged.connect(lambda value,k=key:self.update_value(k,value))
+            self.dock = QComboBox()
+            self.dock.setObjectName('overlay_hud_dock')
+            self.dock.addItem('상단','top');self.dock.addItem('하단','bottom')
+            self.dock.currentIndexChanged.connect(self.update_dock)
+            layout.addWidget(QLabel('HUD 위치'),6,0,1,2)
+            layout.addWidget(self.dock,6,2,1,2)
             self.link = QCheckBox("좌우 동일하게 조절")
             self.link.setObjectName("overlay_hud_link_sides")
             self.link.toggled.connect(self.update_link)
-            layout.addWidget(self.link,5,0,1,4)
+            layout.addWidget(self.link,7,0,1,4)
             button = QPushButton("경기 없이 HUD 미리보기 열기")
             button.clicked.connect(preview)
-            layout.addWidget(button,6,0,1,2)
+            layout.addWidget(button,8,0,1,2)
             reset = QPushButton("기본 배치 복원")
             reset.clicked.connect(self.reset)
-            layout.addWidget(reset,6,2,1,2)
+            layout.addWidget(reset,8,2,1,2)
             note = QLabel("미리보기는 별도 브라우저 화면에만 테스트 선수를 띄웁니다. 방송 화면이나 경기 기록은 바꾸지 않습니다.\n"
                           "초상화를 줄이면 체력바·닉네임도 가까이 붙고, 가로폭을 더 줄일 수 있습니다.\n"
                           "글자 영역이 최소 폭에 도달하면 여백이 제한됩니다. 스튜디오에서 별도로 바꾼 크기·위치도 확인하세요.")
             note.setWordWrap(True)
-            layout.addWidget(note,7,0,1,4)
+            layout.addWidget(note,9,0,1,4)
             self.reload()
 
         def reload(self):
@@ -92,6 +108,15 @@ def create_hud_layout_panel(cfg, changed, preview, parent=None):
                 spin.blockSignals(True);spin.setValue(values[key]/19.2 if key in ('overlay_hud_left_margin','overlay_hud_right_margin') else values[key]);spin.blockSignals(False)
             self.link.blockSignals(True);self.link.setChecked(values["overlay_hud_link_sides"]);self.link.blockSignals(False)
             self.controls["overlay_hud_right_margin"].setEnabled(not self.link.isChecked())
+            bottom = values['overlay_hud_dock']=='bottom'
+            self.dock.blockSignals(True);self.dock.setCurrentIndex(1 if bottom else 0);self.dock.blockSignals(False)
+            self.controls['overlay_hud_y'].setEnabled(not bottom)
+            self.controls['overlay_hud_bottom_margin_pct'].setEnabled(bottom)
+
+        def update_dock(self,_index):
+            cfg.overlay_hud_dock = self.dock.currentData()
+            self.reload()
+            changed()
 
         def update_value(self,key,value):
             if key in ('overlay_hud_left_margin','overlay_hud_right_margin'):
@@ -203,7 +228,17 @@ function hudSafeGeometry(s){
   const minWidth=2*(hudPortraitSize(s)+204);
   const maxTotal=Math.max(0,1920-Math.min(1920,minWidth*scale));
   if(left+right>maxTotal){const ratio=maxTotal/(left+right);left*=ratio;right*=ratio}
-  return {left,right,width:1920-left-right,y:number(s.hudOffsetY,-40,700)};
+  let y=number(s.hudOffsetY,-40,700);
+  if(s.hudDock==='bottom'){
+    // Keep the same upright layout; only the player panels and timer move.
+    // Account for the HUD's existing top padding and scale, not combat feedback.
+    const pad=Number(s.overlayTopPad??40)||40;
+    const bottom=number(s.hudBottomMarginPct,0,40,3)*10.8;
+    const extent=Math.max(134+number(s.nameBarY,0,100),hudPortraitSize(s)+1,
+                          52+number(s.spBarY,0,100)+number(s.spBarThickness,2,40,10));
+    y=Math.max(24*scale-pad,1080-bottom-extent*scale-pad);
+  }
+  return {left,right,width:1920-left-right,y};
 }
 function hudInnerGeometry(s,width){
   const clamp=(v,a,b,d)=>Number.isFinite(Number(v))?Math.max(a,Math.min(b,Number(v))):d;
@@ -266,8 +301,9 @@ if(typeof applyNameBarLayout==='function')applyNameBarLayout=function(){};
 if(typeof applyRoundDamageLayout==='function')applyRoundDamageLayout=function(){};
 if(typeof applySpBarLayout==='function')applySpBarLayout=function(){};
 function applyHudSafeLayout(s){
+  s=s||{};
   const hud=document.querySelector('#root > .hud');if(!hud)return;
-  const g=hudSafeGeometry(s||{}),active=g.left!==0||g.right!==0||g.y!==0;
+  const g=hudSafeGeometry(s||{}),active=g.left!==0||g.right!==0||g.y!==0||s.hudDock==='bottom';
   const portrait=hudPortraitSize(s||{}),signature=JSON.stringify([g,portrait]);
   if(hud.dataset.safeLayout!==signature){
     hud.dataset.safeLayout=signature;
@@ -297,7 +333,9 @@ function applyHudSafeLayout(s){
   }
   let note=document.getElementById('hudSafePreviewNote');
   if(!note){note=document.createElement('div');note.id='hudSafePreviewNote';root.appendChild(note)}
-  note.textContent='HUD 배치 미리보기 · 실제 경기/방송에 테스트 데이터를 보내지 않습니다. 왼쪽 '+(g.left/19.2).toFixed(2)+'% / 오른쪽 '+(g.right/19.2).toFixed(2)+'% · 라운드 데미지는 초상화 아래에 표시하며 최소 가독 폭에서 여백을 제한합니다.';
+  note.style.top=s.hudDock==='bottom'?'180px':'auto';
+  note.style.bottom=s.hudDock==='bottom'?'auto':'24px';
+  note.textContent='HUD 배치 미리보기 · 실제 경기/방송에 테스트 데이터를 보내지 않습니다. '+(s.hudDock==='bottom'?'하단':'상단')+' 배치 · 왼쪽 '+(g.left/19.2).toFixed(2)+'% / 오른쪽 '+(g.right/19.2).toFixed(2)+'% · 라운드 데미지는 초상화 아래에 표시하며 최소 가독 폭에서 여백을 제한합니다.';
 }
 function hudPreviewState(s){
   const preview=Object.assign({},s,{blueName:'BLUE PLAYER',redName:'RED PLAYER',bluePlayerId:'BLUE_GAME_ID',redPlayerId:'RED_GAME_ID',

@@ -56,7 +56,7 @@ def create_manifest(source, package, version):
         # Mutable user data is deliberately not a release identity.
         if rel == MANIFEST or rel in {"config.json", "profile.json", "profile1.json", "as.json", "test.json", "latest.json"}:
             continue
-        if rel.startswith(("image/", "logs/", "diagnostics/", "MatchLogArchive/", "SpectatorLogArchive/")):
+        if rel.startswith(("image/", "logs/", "diagnostics/", "MatchLogArchive/", "SpectatorLogArchive/", "ReportImages/")):
             continue
         files[rel] = {"sha256": digest(path), "size": path.stat().st_size}
     if "timerauto.exe" not in files:

@@ -15,6 +15,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional
 from hud_layout import hud_settings
 from camera_direction_policy import camera_settings
+from round_highlights import settings as round_highlight_settings
 
 REPORT_WEAK_POINT_PARTS = ["턱", "코", "왼쪽 관자놀이", "오른쪽 관자놀이", "관자놀이", "왼쪽 눈", "오른쪽 눈", "이마", "간", "명치", "기타"]
 DEFAULT_OVERLAY_PRESET = "tekken8"
@@ -754,6 +755,12 @@ class AppConfig:
     obs_highlight_merge_transition_image_path: str = ""
     obs_highlight_merge_transition_image_ms: int = 350
     obs_auto_replay_enabled: bool = True
+    round_highlights_enabled: bool = True
+    round_highlights_report_sec: int = 15
+    round_highlights_clip_sec: int = 8
+    round_highlights_max_clips: int = 5
+    round_highlights_reserve_sec: int = 5
+    round_highlights_capture_source: str = 'auto'
     obs_auto_replay_kd: bool = True
     obs_auto_replay_tko: bool = True
     # KD/TKO browser replay source. Source Record avoids saving a duplicate
@@ -873,6 +880,8 @@ class AppConfig:
     browser_round_damage_width: int = 150
     spectator_fight_style_enabled: bool = True
     report_weak_point_parts: List[str] = field(default_factory=lambda: list(REPORT_WEAK_POINT_PARTS))
+    report_image_enabled: bool = True
+    report_image_dir: str = ''
     spectator_fight_style_min_attempts: int = 20
     spectator_fight_style_min_landed: int = 10
     spectator_commentary_enabled: bool = True
@@ -1078,6 +1087,15 @@ class AppConfig:
             setattr(cfg,key,value)
         for key,value in camera_settings(raw).items():
             setattr(cfg,key,value)
+        for key,value in round_highlight_settings(raw).items():
+            setattr(cfg,key,value)
+        # Upgrade only the original default schedule once. A limit chosen and
+        # saved after this upgrade must continue to be respected, even if 1.
+        if raw.get('round_highlights_schedule_version') != 1:
+            if raw.get('round_highlights_max_clips') == 1:
+                cfg.round_highlights_max_clips = 5
+            if raw.get('round_highlights_report_sec') == 9:
+                cfg.round_highlights_report_sec = 15
         cfg.monitor_index = int(raw.get("monitor_index", 1))
         cfg.trigger_monitor_index = int(raw.get("trigger_monitor_index", cfg.monitor_index))
         cfg.roi_monitors = {str(k): int(v) for k, v in (raw.get("roi_monitors", {}) or {}).items()}
@@ -1332,6 +1350,8 @@ class AppConfig:
             cfg.browser_round_damage_width = 150
         cfg.spectator_fight_style_enabled = bool(raw.get("spectator_fight_style_enabled", True))
         selected_parts = raw.get("report_weak_point_parts", REPORT_WEAK_POINT_PARTS)
+        cfg.report_image_enabled = bool(raw.get('report_image_enabled', True))
+        cfg.report_image_dir = str(raw.get('report_image_dir', '') or '')
         cfg.report_weak_point_parts = [part for part in REPORT_WEAK_POINT_PARTS if part in selected_parts] if isinstance(selected_parts, list) else list(REPORT_WEAK_POINT_PARTS)
         try:
             cfg.spectator_fight_style_min_attempts = max(
@@ -2063,6 +2083,8 @@ class AppConfig:
             "browser_round_damage_width": int(max(80, min(320, self.browser_round_damage_width))),
             "spectator_fight_style_enabled": bool(self.spectator_fight_style_enabled),
             "report_weak_point_parts": list(self.report_weak_point_parts),
+            "report_image_enabled": bool(self.report_image_enabled),
+            "report_image_dir": str(self.report_image_dir or ''),
             "spectator_fight_style_min_attempts": int(
                 max(1, min(500, self.spectator_fight_style_min_attempts))
             ),
@@ -2139,6 +2161,8 @@ class AppConfig:
             "overlay_ui_scale": self.overlay_ui_scale,
             **hud_settings(self),
             **camera_settings(self),
+            **round_highlight_settings(self),
+            "round_highlights_schedule_version": 1,
             "portrait_source_priority": self.portrait_source_priority,
             "overlay_timer_font_size": int(self.overlay_timer_font_size or 54),
             "overlay_timer_x": int(self.overlay_timer_x or 0),

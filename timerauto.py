@@ -7770,6 +7770,9 @@ class SettingsDialog(QDialog):
         report_analysis_lay.setColumnStretch(1, 1)
         report_analysis_lay.setColumnStretch(3, 1)
         record_lay.addWidget(report_analysis_group)
+        from report_images import create_settings_panel as create_report_image_panel
+        record_lay.addWidget(create_report_image_panel(
+            self.cfg, self, self._schedule_apply, self._test_report_image_save))
 
         spectator_group = QGroupBox("ThrillOfTheFight2 SpectatorLog 연동 / 리플레이 / 피격 이펙트")
         spectator_lay = QGridLayout(spectator_group)
@@ -9488,6 +9491,8 @@ class SettingsDialog(QDialog):
         auto_replay.setColumnStretch(1, 1)
         auto_replay.setColumnStretch(3, 1)
         outer.addWidget(auto_replay_group)
+        from round_highlights import create_settings_panel
+        outer.addWidget(create_settings_panel(self.cfg,self,self._schedule_apply))
 
         simple_group = QGroupBox("리플레이 간편 설정 — 처음 사용하면 여기부터")
         simple = QGridLayout(simple_group)
@@ -11330,6 +11335,24 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
         return bool(ok)
 
+    def _test_report_image_save(self):
+        controller = self.controller
+        overlay = getattr(controller, 'browser_overlay', None) if controller else None
+        reports = dict(getattr(controller, '_diagnostic_reports', {}) or {}) if controller else {}
+        report = dict(reports.get('final') or {})
+        if not overlay or not report.get('isFinal'):
+            QMessageBox.information(self, '리포트 이미지', '먼저 경기 종료리포트를 한 번 표시한 뒤 눌러 주세요.')
+            return
+        root = os.path.dirname(os.path.abspath(controller.cfg_path)) if controller.cfg_path else get_app_base_dir()
+        folder = str(getattr(self.cfg, 'report_image_dir', '') or '').strip() or 'ReportImages'
+        if not os.path.isabs(folder):
+            folder = os.path.join(root, folder)
+        report['_reportImage'] = dict(folder=folder, filename='TEST_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S') + '.png')
+        if overlay.report_images.enqueue(report):
+            QMessageBox.information(self, '리포트 이미지', '저장을 요청했습니다. 보통 몇 초 걸립니다.\n저장 폴더: ' + folder + '\n실패하면 진단기록의 report_image_failed에 원인이 남습니다.\n테스트는 방송 경기 번호를 늘리지 않습니다.')
+        else:
+            QMessageBox.warning(self, '리포트 이미지', '이미 저장 중이거나 같은 테스트 파일이 있습니다. 잠시 후 다시 눌러 주세요.')
+
     def _spectator_timer_target(self):
         return self._timer_win or getattr(self.controller, "timer_win", None)
 
@@ -12123,7 +12146,7 @@ class SettingsDialog(QDialog):
                 "spectator_log_info": info,
                 "blue_round_damage_dealt": float(payload["blue"].get("damage", 0) or 0),
                 "red_round_damage_dealt": float(payload["red"].get("damage", 0) or 0),
-                "spectator_round_report": payload,
+                "spectator_round_report": dict(payload, _reportImageTest=True),
             }
             emitted = self._emit_spectator_test_update(update)
             if not emitted:
@@ -21374,6 +21397,7 @@ class MainApp(QObject):
         text = re.sub(r"\s+", " ", str(text or "").strip())
         if not text:
             return
+        text = self._round_highlight_engine().compact_summary(text)
         role = "caster" if str(role or "").lower() == "caster" else "analyst"
         try:
             epoch = getattr(self, "_commentary_followup_epoch", None)
@@ -21914,6 +21938,10 @@ class MainApp(QObject):
             return
         role = "caster" if str(role or "").lower() == "caster" else "analyst"
         DIAG.record("commentary_request", role=role, text=text, from_queue=_from_queue, final_report=hide_round_report_on_complete, allow_during_potm=allow_during_potm)
+        round_engine=self.__dict__.get('_round_highlights')
+        if round_engine and round_engine.active:
+            DIAG.record('commentary_suppressed',reason='round_highlight_active',role=role)
+            return
         if bool(getattr(self, "_potm_presentation_active", False)) and not bool(allow_during_potm):
             DIAG.record("commentary_suppressed", reason="potm_active", role=role, text=text)
             logging.info("COMMENTARY_TTS_SKIP_POTM_ACTIVE role=%s text=%s", role, text)
@@ -22612,6 +22640,16 @@ class MainApp(QObject):
         else:
             base = f"미설정(앱 기준: {datetime.fromtimestamp(self._chapter_fallback_anchor_epoch).strftime('%Y-%m-%d %H:%M:%S')})"
         return f"{base} | 보정 {int(getattr(self.cfg, 'chapter_offset_sec', 0)):+d}s"
+
+    def _report_image_metadata(self, report):
+        from report_images import image_metadata
+        if not bool(getattr(self.cfg, 'report_image_enabled', True)):
+            return None
+        root = os.path.dirname(os.path.abspath(self.cfg_path)) if self.cfg_path else get_app_base_dir()
+        folder = str(getattr(self.cfg, 'report_image_dir', '') or '').strip() or 'ReportImages'
+        if not os.path.isabs(folder):
+            folder = os.path.join(root, folder)
+        return image_metadata(report, list(getattr(self, '_chapter_events', []) or []), folder)
 
     def _chapter_log_dir(self) -> str:
         base_dir = os.path.dirname(os.path.abspath(self.cfg_path)) if self.cfg_path else get_app_base_dir()
@@ -25335,6 +25373,8 @@ class MainApp(QObject):
                     replay_context.get("auto_replay_kind", ""),
                 )
                 self._handle_program_auto_replay_file(replay_path, replay_reason, replay_context)
+                if replay_context.get('round_highlight_id'):
+                    self._round_highlight_engine().attach(replay_path,replay_context,'replay_buffer')
                 self._copy_program_replay_to_player_archive(replay_path, replay_reason, replay_context)
                 if replay_context.get("potm_candidate_id"):
                     self._register_potm_file(replay_path, str(replay_context.get("potm_candidate_id") or ""), capture_source="replay_buffer")
@@ -25611,7 +25651,7 @@ class MainApp(QObject):
                             path = os.path.join(root, name)
                             if os.path.splitext(name)[1].lower() not in allowed:
                                 continue
-                            if protected_potm and os.path.normcase(os.path.abspath(path)) == protected_potm:
+                            if self._round_highlight_pins(path) or protected_potm and os.path.normcase(os.path.abspath(path)) == protected_potm:
                                 continue
                             try:
                                 stat = os.stat(path)
@@ -25912,13 +25952,39 @@ class MainApp(QObject):
         )
         self._prewarm_potm_announcement(candidate)
         old_path = str(previous.get("file") or "")
-        if bool(previous.get("managed", False)) and old_path and os.path.isfile(old_path):
+        if bool(previous.get("managed", False)) and old_path and os.path.isfile(old_path) and not self._round_highlight_pins(old_path):
             try: os.remove(old_path)
             except OSError: pass
         # The caller attaches this id to its existing KD/TKO/highlight save.
         # This produces one clip, not a duplicate ordinary highlight plus a
         # separate POTM capture of the same impact.
         return candidate
+
+    def _round_highlight_engine(self):
+        from round_highlights import RoundHighlights
+        engine=self.__dict__.get('_round_highlights')
+        if engine is None:
+            engine=RoundHighlights(lambda:self.cfg,lambda:getattr(self,'browser_overlay',None),QTimer.singleShot,
+                lambda:any((getattr(self,'_commentary_tts_busy',{}) or {}).values()) or bool(getattr(self,'_potm_presentation_active',False)),
+                release=self._release_round_highlight_files)
+            self._round_highlights=engine
+        return engine
+
+    def _round_highlight_pins(self,path):
+        engine=self.__dict__.get('_round_highlights')
+        return bool(engine and engine.pins(path))
+
+    def _release_round_highlight_files(self,paths):
+        archive=normalize_app_path(str(getattr(self.cfg,'obs_source_record_archive_dir','') or ''))
+        if not archive:return
+        owned=os.path.normcase(os.path.abspath(os.path.join(archive,'_potm_candidates')))
+        current=str((getattr(self,'_potm_best',{}) or {}).get('file') or '')
+        for path in set(paths):
+            if not path or path==current or self._round_highlight_pins(path):continue
+            if os.path.normcase(os.path.dirname(os.path.abspath(path)))!=owned:continue
+            try:
+                if os.path.isfile(path):os.remove(path)
+            except OSError:logging.info('ROUND_HIGHLIGHT_TEMP_RELEASE_PENDING path=%s',path)
 
     def _prewarm_potm_announcement(self, candidate: Dict[str, Any]) -> None:
         """Create the exact POTM announcement before the match ends.
@@ -25973,7 +26039,7 @@ class MainApp(QObject):
         if not path or candidate_id != str((self._potm_best or {}).get("id") or "") or capture_source != expected:
             DIAG.record("potm_file_rejected", candidate_id=candidate_id, selected_id=(self._potm_best or {}).get("id"), capture_source=capture_source, expected_source=expected, path=path)
             try:
-                if managed and path and os.path.isfile(path): os.remove(path)
+                if managed and path and os.path.isfile(path) and not self._round_highlight_pins(path): os.remove(path)
             except OSError: pass
             return
         if self._potm_played:
@@ -26013,6 +26079,7 @@ class MainApp(QObject):
             return
         if session_id == str(getattr(self, "_potm_archive_session_id", "") or "") and archive_dir == str(getattr(self, "_potm_archive_dir", "") or ""):
             return
+        if self.__dict__.get('_round_highlights'):self._round_highlights.reset()
         self._potm_archive_session_id = session_id
         self._potm_archive_dir = archive_dir
         # A brand-new session starts empty; a resumed session can continue
@@ -26143,6 +26210,8 @@ class MainApp(QObject):
     @pyqtSlot(str)
     def _handle_browser_obs_replay_stopped(self, _token: str = "") -> None:
         """Complete replay hand-off on the Qt main thread (QTimer-safe)."""
+        engine=self.__dict__.get('_round_highlights')
+        if engine and engine.ended(_token):return
         # When a POTM BGM file is playing, its end—not the video end—is the
         # requested point for bringing the live OBS music back.
         if not bool(getattr(self, "_potm_bgm_active", False)):
@@ -26666,6 +26735,8 @@ class MainApp(QObject):
                 self._source_record_pending.popleft()
                 logging.info("SOURCE_RECORD_CLIP_ORGANIZED source=%s target=%s", path, target)
                 DIAG.record("replay_archive_copied", capture_source="source_record", source=path, target=target, context=meta)
+                if dict(meta.get('context') or {}).get('round_highlight_id'):
+                    self._round_highlight_engine().attach(target,meta['context'],'source_record')
                 self._play_source_record_auto_replay(target, meta)
                 if meta.get("potm_candidate_id"):
                     self._register_potm_file(
@@ -26758,6 +26829,7 @@ class MainApp(QObject):
         combo_hits: int = 0,
         attacker_side: str = "",
         potm_candidate: Optional[Dict[str, Any]] = None,
+        round_candidate: Optional[Dict[str, Any]] = None,
     ) -> bool:
         integration = getattr(self, "obs_integration", None)
         if integration is None or integration.status != "connected":
@@ -26802,7 +26874,10 @@ class MainApp(QObject):
         potm_capture_source = str(getattr(self.cfg, "potm_capture_source", "source_record") or "source_record")
         potm_requests_replay = bool(potm_candidate_id) and potm_capture_source == "replay_buffer"
         potm_requests_source_record = bool(potm_candidate_id) and potm_capture_source == "source_record"
-        enabled = normal_highlight_enabled or potm_requests_replay or potm_requests_source_record
+        round_candidate=dict(round_candidate or {})
+        round_id=str(round_candidate.get('id') or '')
+        round_source=str(round_candidate.get('source') or '')
+        enabled = normal_highlight_enabled or potm_requests_replay or potm_requests_source_record or bool(round_id)
         if not enabled or not self._remember_obs_highlight_key(event_key):
             return False
         now = time.monotonic()
@@ -26822,7 +26897,7 @@ class MainApp(QObject):
         if auto_replay_source not in ("replay_buffer", "source_record"):
             auto_replay_source = "replay_buffer"
         source_fallback = bool(getattr(self.cfg, "obs_auto_replay_source_fallback", False))
-        if not auto_replay_requested and now - float(self._obs_last_highlight_at or 0.0) < cooldown:
+        if not round_id and not auto_replay_requested and now - float(self._obs_last_highlight_at or 0.0) < cooldown:
             return False
         self._obs_last_highlight_at = now
         context = {
@@ -26855,6 +26930,7 @@ class MainApp(QObject):
                 "potm_label": str(potm_candidate.get("label") or "MATCH HIGHLIGHT"),
                 "potm_qualification": str(potm_candidate.get("qualification") or ""),
             })
+        if round_id:context['round_highlight_id']=round_id
         source_auto_replay = auto_replay_requested and auto_replay_source == "source_record"
         # Archiving is an explicit output request, independent of the source
         # selected for on-air playback. A stale Source Record playback setting
@@ -26868,17 +26944,18 @@ class MainApp(QObject):
             )
         )
         save_program_replay = program_replay_enabled and (
-            potm_requests_replay
+            potm_requests_replay or bool(round_id and round_source=='replay_buffer')
             or archive_requests_replay
             or (
                 normal_highlight_enabled
                 and (not source_auto_replay or source_fallback)
             )
         )
-        save_source_record = source_record_enabled and (normal_highlight_enabled or potm_requests_source_record)
+        save_source_record = source_record_enabled and (normal_highlight_enabled or potm_requests_source_record or bool(round_id and round_source=='source_record'))
         capture_delay = max(0.0, min(15.0, float(getattr(self.cfg, "obs_auto_replay_capture_delay_sec", 1.0) or 0.0)))
         if source_auto_replay:
             capture_delay = max(capture_delay, float(context["replay_post_event_sec"]))
+        if round_id:capture_delay=max(1.0,capture_delay)
         context["replay_capture_delay_sec"] = capture_delay
         DIAG.record("replay_capture_decision", event_id=event_key, match_id=self.__dict__.get("_potm_archive_session_id", ""), kind=normalized, reason=reason, context=context, replay_buffer=save_program_replay, source_record=save_source_record, source_record_target=source_record_context, potm_candidate_id=potm_candidate_id)
         if not save_program_replay and not save_source_record:
@@ -27530,6 +27607,7 @@ class MainApp(QObject):
         if bool(getattr(self, '_shutting_down', False)):
             return
         self._shutting_down = True
+        if self.__dict__.get('_round_highlights'):self._round_highlights.reset()
         self._log_detector_start_pending = False
         logging.info('APP_SHUTDOWN_BEGIN')
         try:
@@ -29415,6 +29493,10 @@ class MainApp(QObject):
                         self._potm_final_report_payload = dict(report_payload)
                         try:
                             self._record_chapter_match_result(report_payload)
+                            metadata = self._report_image_metadata(report_payload)
+                            if metadata:
+                                report_payload['_reportImage'] = metadata
+                                self._potm_final_report_payload = dict(report_payload)
                         except Exception:
                             # Chapter export must never interrupt the final
                             # report/POTM presentation path.
@@ -29460,6 +29542,8 @@ class MainApp(QObject):
                                         "final_report_fallback_complete",
                                     )
                                 QTimer.singleShot(15000, _fallback_final_report)
+                                return
+                            if self._round_highlight_engine().report(payload):
                                 return
                             overlay.push_event("round_report", **payload)
                             if (not bool(payload.get("isFinal", False))
@@ -30304,6 +30388,7 @@ class MainApp(QObject):
     def apply_ui_update(self, d: dict):
         if bool(getattr(self, '_shutting_down', False)):
             return
+        self._round_highlight_engine().observe(d)
         if any(key in d for key in HUD_DEFAULTS):
             for key,value in hud_settings(self.cfg,d).items():
                 setattr(self.cfg,key,value)
@@ -30421,6 +30506,9 @@ class MainApp(QObject):
             ]
             central_combo_available = False
             for event in real_hit_events:
+                round_candidate=self._round_highlight_engine().consider(event,
+                    int(event.get('round') or getattr(self,'_source_record_round',0) or 0),
+                    dict(getattr(self,'_source_record_names',{}) or {}))
                 potm_candidate = self._consider_potm_event(event)
                 effect_kind = str(event.get("effect_kind") or "").lower().strip()
                 damage = float(event.get("damage", 0.0) or 0.0)
@@ -30445,6 +30533,7 @@ class MainApp(QObject):
                     damage=damage,
                     attacker_side=str(event.get("attacker_side") or ""),
                     potm_candidate=potm_candidate,
+                    round_candidate=round_candidate,
                 )
                 combo_hits = int(event.get("combo_hits", 0) or 0)
                 if central_live and "combo_emphasis" in event_tags:

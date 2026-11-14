@@ -24,6 +24,29 @@ class _FakeObsIntegration:
 
 
 class SourceRecordAutoReplayTests(unittest.TestCase):
+    def test_round_and_potm_candidate_share_one_source_record_capture(self):
+        with tempfile.TemporaryDirectory() as root:
+            app=self._app(root,fallback=False)
+            with patch('timerauto.QTimer.singleShot',side_effect=lambda ms,fn:fn()):
+                result=app._maybe_save_obs_highlight('knockdown',event_key='shared-round',attacker_side='blue',
+                    potm_candidate={'id':'potm'},round_candidate={'id':'round','source':'source_record'})
+            self.assertTrue(result)
+            self.assertEqual(len(app.obs_integration.source_saves),1)
+            context=app.obs_integration.source_saves[0][2]
+            self.assertEqual(context['potm_candidate_id'],'potm')
+            self.assertEqual(context['round_highlight_id'],'round')
+            self.assertEqual(app.obs_integration.program_saves,[])
+
+    def test_round_capture_can_work_without_potm_or_live_down_playback(self):
+        with tempfile.TemporaryDirectory() as root:
+            app=self._app(root,fallback=False)
+            app.cfg.obs_auto_replay_enabled=False
+            with patch('timerauto.QTimer.singleShot',side_effect=lambda ms,fn:fn()):
+                self.assertTrue(app._maybe_save_obs_highlight('hit',event_key='round-only',
+                    round_candidate={'id':'round','source':'source_record'}))
+            self.assertEqual(len(app.obs_integration.source_saves),1)
+            self.assertNotIn('potm_candidate_id',app.obs_integration.source_saves[0][2])
+
     def test_native_archive_requests_buffer_even_with_source_playback_selected(self):
         for source_enabled in (False, True):
             with self.subTest(source_enabled=source_enabled), tempfile.TemporaryDirectory() as root:

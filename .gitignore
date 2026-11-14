@@ -21,6 +21,7 @@ logs/
 diagnostics/
 MatchLogArchive/
 SpectatorLogArchive/
+ReportImages/
 
 # Local backups and scratch files
 .git_backup_*/

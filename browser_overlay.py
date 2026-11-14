@@ -24,6 +24,7 @@ from hud_layout import add_hud_layout
 from app_paths import app_path, normalize_builtin_asset_path
 from diagnostics import diagnostics as DIAG
 from overlay_studio import OverlayStudioStore, runtime_js, studio_html
+from report_images import ReportImageExporter
 
 
 _NO_UPDATE_FALLBACK = object()
@@ -206,6 +207,7 @@ class BrowserOverlayServer:
         self._studio_preview_timer: Optional[threading.Timer] = None
         self._cache_dir = os.path.join(tempfile.gettempdir(), "timerauto_browser_overlay")
         os.makedirs(self._cache_dir, exist_ok=True)
+        self.report_images = ReportImageExporter(self)
 
     @property
     def url(self) -> str:
@@ -275,6 +277,18 @@ class BrowserOverlayServer:
                 try:
                     parsed = urlparse(self.path)
                     path = parsed.path or "/"
+                    if path.startswith('/report-image-error/'):
+                        logging.warning('REPORT_IMAGE_BROWSER_ERROR %s', parse_qs(parsed.query).get('error'))
+                        self._send(204, b'', 'text/plain')
+                        return
+                    if path.startswith('/report-image-ready/'):
+                        ok = outer.report_images.mark_ready(path.rsplit('/', 1)[-1])
+                        self._send(204 if ok else 404, b'', 'text/plain')
+                        return
+                    if path.startswith('/report-image/'):
+                        page = outer.report_images.page(path.rsplit('/', 1)[-1])
+                        self._send(200 if page else 404, (page or 'not found').encode('utf-8'), 'text/html; charset=utf-8')
+                        return
                     if path in ("/", "/overlay"):
                         self._send(200, outer._html().encode("utf-8"), "text/html; charset=utf-8")
                         return
@@ -632,6 +646,8 @@ class BrowserOverlayServer:
             self._state["events"] = events[-32:]
             self._state["seq"] = int(self._state.get("seq", 0) or 0) + 1
             self._cond.notify_all()
+        if str(kind or '').lower() == 'round_report' and payload.get('isFinal'):
+            self.report_images.enqueue(payload)
         try:
             logging.info("BROWSER_OVERLAY_EVENT id=%s kind=%s side=%s", ev.get("id"), ev.get("kind"), ev.get("side", ""))
         except Exception:
@@ -785,6 +801,7 @@ class BrowserOverlayServer:
         transition_speed: float = 1.0,
         start_from_end_sec: float = 0.0,
         end_from_end_sec: float = 0.0,
+        replay_caption: str = "",
     ) -> str:
         raw_path = str(path or "").strip()
         resolved = self._path_resolver(raw_path) if raw_path else ""
@@ -797,7 +814,7 @@ class BrowserOverlayServer:
             return os.path.splitext(path_value)[1].lower() in (".mp4", ".webm", ".m4v", ".ogv", ".ogg")
         token = str(time.time_ns())
         replay_kind = str(replay_kind or "").strip().lower()
-        if replay_kind not in ("kd", "tko", "potm"):
+        if replay_kind not in ("kd", "tko", "potm", "round_highlight"):
             replay_kind = ""
         with self._cond:
             self._obs_replay_path = resolved
@@ -807,6 +824,7 @@ class BrowserOverlayServer:
                     "obsReplayToken": token,
                     "obsReplayRev": int(time.time() * 1000),
                     "obsReplayKind": replay_kind,
+                    "obsReplayCaption": str(replay_caption or '')[:240],
                     "obsReplayMuted": bool(muted),
                     "obsReplayVolume": max(0, min(100, int(volume or 0))),
                     "obsReplayFit": "contain" if str(fit or "").lower() == "contain" else "cover",
@@ -3986,7 +4004,7 @@ function stopObsReplayLocal(notify){let host=q('obsReplay'),video=q('obsReplayVi
 function prepareObsReplay(host,video,token,s){if(host)host.classList.add('preparingReplay');try{video.pause()}catch(e){}video.src='/obs-replay/'+encodeURIComponent(token)+'?rev='+encodeURIComponent(s.obsReplayRev||0);video.load();video.playbackRate=Math.max(.25,Math.min(2,Number(s.obsReplaySpeed)||1))}
 function obsReplayWindow(video,s){let duration=Number(video&&video.duration)||0,startFromEnd=Math.max(0,Number((s||{}).obsReplayStartFromEndSec)||0),endFromEnd=Math.max(0,Number((s||{}).obsReplayEndFromEndSec)||0),start=startFromEnd>0?Math.max(0,duration-startFromEnd):0,end=endFromEnd>0?Math.max(start,Math.min(duration,duration-endFromEnd)):duration;return{start:start,end:end}}
 function playObsReplayWindow(video,s){let started=false,begin=()=>{if(started)return;started=true;let window=obsReplayWindow(video,s),play=()=>{video.playbackRate=Math.max(.25,Math.min(2,Number(s.obsReplaySpeed)||1));let p=video.play();if(p&&typeof p.catch==='function')p.catch(()=>{video.muted=true;video.play().catch(()=>stopObsReplayLocal(true))})};if(window.start>0&&Math.abs((Number(video.currentTime)||0)-window.start)>.06){let played=false,afterSeek=()=>{if(played)return;played=true;play()};video.addEventListener('seeked',afterSeek,{once:true});try{video.currentTime=window.start}catch(e){}setTimeout(afterSeek,350)}else play()};if(video.readyState>=1&&Number.isFinite(video.duration))begin();else video.addEventListener('loadedmetadata',begin,{once:true})}
-function syncObsReplay(s){s=s||latestState||{};let host=q('obsReplay'),video=q('obsReplayVideo'),label=q('obsReplayLabel');if(!host||!video)return;let token=String(s.obsReplayToken||''),active=s.obsReplayActive===true&&token!=='';document.documentElement.style.setProperty('--obs-replay-fit',String(s.obsReplayFit||'cover'));document.documentElement.style.setProperty('--obs-replay-fade',Math.max(0,Math.min(2000,Number(s.obsReplayFadeMs)||0))+'ms');video.muted=s.obsReplayMuted!==false;video.volume=Math.max(0,Math.min(1,Number(s.obsReplayVolume||0)/100));video.playbackRate=Math.max(.25,Math.min(2,Number(s.obsReplaySpeed)||1));if(!active){if(obsReplayActive)stopObsReplayLocal(false);return}let key=token+'|'+String(s.obsReplayRev||0),kind=String(s.obsReplayKind||'').toLowerCase(),cinematic=(kind==='potm'?s.idleHighlightCinematicPotmEnabled===true:((kind==='kd'||kind==='tko')&&s.idleHighlightCinematicKdTkoEnabled===true));host.dataset.token=token;host.classList.toggle('cinematic',cinematic);host.classList.remove('tko');if(kind==='tko')host.classList.add('tko');let showLabel=()=>{if(label){let title=kind==='tko'?'T.K.O. REPLAY':(kind==='kd'?'K.D. REPLAY':'');label.textContent=title;label.classList.toggle('show',title!=='')}};host.classList.add('active');document.body.classList.add('obs-replay-active');obsReplayActive=true;if(obsReplayKey!==key){if(label)label.classList.remove('show');host.classList.remove('afterTransition');obsReplayKey=key;obsReplayAfterStarted=false;prepareObsReplay(host,video,token,s);let replayStarted=false,startReplay=()=>{if(replayStarted)return;replayStarted=true;playObsReplayWindow(video,s)},revealReplay=()=>{host.classList.remove('preparingReplay')};if(s.obsReplayTransitionBefore===true)playObsTransition('before',s,()=>{startReplay();revealReplay();showLabel()},{onPreroll:startReplay,onCover:revealReplay});else{startReplay();revealReplay();showLabel()}}}
+function syncObsReplay(s){s=s||latestState||{};let host=q('obsReplay'),video=q('obsReplayVideo'),label=q('obsReplayLabel');if(!host||!video)return;let token=String(s.obsReplayToken||''),active=s.obsReplayActive===true&&token!=='';document.documentElement.style.setProperty('--obs-replay-fit',String(s.obsReplayFit||'cover'));document.documentElement.style.setProperty('--obs-replay-fade',Math.max(0,Math.min(2000,Number(s.obsReplayFadeMs)||0))+'ms');video.muted=s.obsReplayMuted!==false;video.volume=Math.max(0,Math.min(1,Number(s.obsReplayVolume||0)/100));video.playbackRate=Math.max(.25,Math.min(2,Number(s.obsReplaySpeed)||1));if(!active){if(obsReplayActive)stopObsReplayLocal(false);return}let key=token+'|'+String(s.obsReplayRev||0),kind=String(s.obsReplayKind||'').toLowerCase(),cinematic=(kind==='potm'?s.idleHighlightCinematicPotmEnabled===true:((kind==='kd'||kind==='tko')&&s.idleHighlightCinematicKdTkoEnabled===true));host.dataset.token=token;host.classList.toggle('cinematic',cinematic);host.classList.remove('tko');if(kind==='tko')host.classList.add('tko');let showLabel=()=>{if(label){if(kind==='round_highlight')hideRoundReport();let title=kind==='round_highlight'?String(s.obsReplayCaption||'ROUND HIGHLIGHT'):(kind==='tko'?'T.K.O. REPLAY':(kind==='kd'?'K.D. REPLAY':''));label.textContent=title;label.classList.toggle('show',title!=='')}};host.classList.add('active');document.body.classList.add('obs-replay-active');obsReplayActive=true;if(obsReplayKey!==key){if(label)label.classList.remove('show');host.classList.remove('afterTransition');obsReplayKey=key;obsReplayAfterStarted=false;prepareObsReplay(host,video,token,s);let replayStarted=false,startReplay=()=>{if(replayStarted)return;replayStarted=true;playObsReplayWindow(video,s)},revealReplay=()=>{host.classList.remove('preparingReplay')};if(s.obsReplayTransitionBefore===true)playObsTransition('before',s,()=>{startReplay();revealReplay();showLabel()},{onPreroll:startReplay,onCover:revealReplay});else{startReplay();revealReplay();showLabel()}}}
 function startObsReplayAfterTransition(){let s=latestState||{},host=q('obsReplay'),label=q('obsReplayLabel'),token=host?String(host.dataset.token||''):'';if(obsReplayAfterStarted||!obsReplayActive||!token||token!==String(s.obsReplayToken||''))return;clearTimeout(obsReplayAfterTimer);obsReplayAfterStarted=true;playObsTransition('after',s,()=>stopObsReplayLocal(true),{onStart:()=>{if(label)label.classList.remove('show')},onCover:()=>{if(host)host.classList.add('afterTransition')}})}
 function scheduleObsReplayAfterTransition(){let s=latestState||{},video=q('obsReplayVideo');clearTimeout(obsReplayAfterTimer);if(!video||obsReplayAfterStarted||!Number.isFinite(video.duration)||video.duration<=0)return;let replayRate=Math.max(.25,Number(video.playbackRate)||1),stingerRate=Math.max(.25,Math.min(2,Number(s.obsReplayTransitionSpeed)||1)),coverLeadSec=s.obsReplayTransitionAfter===true?.560/stingerRate:0,window=obsReplayWindow(video,s),delay=Math.max(0,((window.end-video.currentTime)/replayRate-coverLeadSec)*1000);obsReplayAfterTimer=setTimeout(startObsReplayAfterTransition,delay)}
 // Browser media events are evidence of playback, unlike a Python play request.

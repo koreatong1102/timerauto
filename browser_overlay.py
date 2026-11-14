@@ -48,6 +48,7 @@ class BrowserOverlayServer:
             "bluePlayerId": "",
             "redPlayerId": "",
             "showPlayerIds": True,
+            "showVsPlayerIds": True,
             "arenaName": "",
             "venueId": None,
             "blueDamageText": "DMG 0",

@@ -91,10 +91,13 @@ class SpectatorEffectLatencyTests(unittest.TestCase):
                 stream.write("2,10,10,20,19,0,0,0,0\n")
             placeholder = watcher._project_hud_damage(scores_path, 2, {"blue": 20, "red": 0})
             self.assertEqual(placeholder["blue"], 55)
+            previous_stat=os.stat(scores_path)
             with open(scores_path, "w", encoding="utf-8") as stream:
                 stream.write("round,blue_score,red_score,blue_total,red_total,blue_damage_taken,red_damage_taken,blue_kds,red_kds\n")
                 stream.write("1,10,9,10,9,0,35,0,0\n")
                 stream.write("2,10,9,20,18,0,25,0,0\n")
+            self.assertEqual(os.path.getsize(scores_path),previous_stat.st_size)
+            os.utime(scores_path,ns=(previous_stat.st_atime_ns,previous_stat.st_mtime_ns))
             watcher._last_round_state = "fight"
             self.assertEqual(watcher._project_hud_damage(scores_path, 2, {"blue": 20, "red": 0})["blue"], 55)
             watcher._last_round_state = "break"
@@ -104,6 +107,22 @@ class SpectatorEffectLatencyTests(unittest.TestCase):
             watcher._last_round_state = "results"
             watcher._total_damage_dealt["blue"] = 55
             self.assertEqual(watcher._project_hud_damage(scores_path, 2, {"blue": 25, "red": 0})["blue"], 60)
+
+    def test_same_phase_same_signature_score_rewrite_refreshes_with_bounded_delay(self):
+        watcher=SpectatorLogWatcher(SimpleNamespace())
+        watcher._last_round_state='break'
+        header='round,blue_score,red_score,blue_total,red_total,blue_damage_taken,red_damage_taken,blue_kds,red_kds\n'
+        with tempfile.TemporaryDirectory() as root:
+            path=Path(root)/'scores.csv'
+            path.write_text(header+'1,10,9,10,9,0,25,0,0\n',encoding='utf8')
+            stat=path.stat()
+            with patch('spectator_log_watcher.time.monotonic',return_value=100):
+                watcher._project_hud_damage(str(path),1,{'blue':25,'red':0})
+            path.write_text(header+'1,10,9,10,9,0,35,0,0\n',encoding='utf8')
+            os.utime(path,ns=(stat.st_atime_ns,stat.st_mtime_ns))
+            with patch('spectator_log_watcher.time.monotonic',return_value=100.3):
+                watcher._project_hud_damage(str(path),1,{'blue':25,'red':0})
+            self.assertEqual(watcher._hud_official_round_damage(1)['blue'],35)
 
     def test_browser_round_damage_uses_official_display_without_changing_live_metric(self):
         app = timerauto.MainApp.__new__(timerauto.MainApp)

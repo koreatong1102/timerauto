@@ -107,11 +107,14 @@ assert '추적 중지' in service.message
         camera.start(self.root, "blue")
         original = self.target.read_bytes()
         source = self.root / "blue" / "head_position.txt"
+        original_stamp=source.stat().st_mtime_ns
         source.write_text("")
+        os.utime(source,ns=(original_stamp,original_stamp))
         self.assertFalse(camera.tick())
         self.assertEqual(camera.side, "blue")
         self.assertEqual(original, self.target.read_bytes())
         source.write_text("0 0 4 5 6 0 0 0 1")
+        os.utime(source,ns=(original_stamp,original_stamp))
         self.assertTrue(camera.tick())
         self.assertIsNone(camera.invalid_since)
         self.assertTrue(self.target.read_text().startswith("4.000 5.000 6.000"))

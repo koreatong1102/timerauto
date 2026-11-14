@@ -1001,6 +1001,7 @@ class AppConfig:
     overlay_show_arena_name: bool = True
     overlay_show_flags: bool = True
     overlay_show_player_ids: bool = True
+    overlay_vs_show_player_ids: bool = True
     overlay_show_cinematic: bool = True
     overlay_vs_bg_path: str = ""
     overlay_vs_bg_opacity: float = 1.0
@@ -1625,6 +1626,7 @@ class AppConfig:
         cfg.overlay_show_arena_name = bool(raw.get("overlay_show_arena_name", True))
         cfg.overlay_show_flags = bool(raw.get("overlay_show_flags", True))
         cfg.overlay_show_player_ids = bool(raw.get("overlay_show_player_ids", True))
+        cfg.overlay_vs_show_player_ids = bool(raw.get("overlay_vs_show_player_ids", cfg.overlay_show_player_ids))
         cfg.overlay_show_cinematic = bool(raw.get("overlay_show_cinematic", True))
         cfg.overlay_vs_bg_path = str(raw.get("overlay_vs_bg_path", "") or "")
         try:
@@ -2159,6 +2161,7 @@ class AppConfig:
             "overlay_show_arena_name": self.overlay_show_arena_name,
             "overlay_show_flags": self.overlay_show_flags,
             "overlay_show_player_ids": self.overlay_show_player_ids,
+            "overlay_vs_show_player_ids": self.overlay_vs_show_player_ids,
             "overlay_show_cinematic": self.overlay_show_cinematic,
             "overlay_vs_bg_path": to_app_rel(str(self.overlay_vs_bg_path or "")),
             "overlay_vs_bg_opacity": float(self.overlay_vs_bg_opacity if self.overlay_vs_bg_opacity is not None else 1.0),

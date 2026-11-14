@@ -352,7 +352,9 @@ class DirectorStateTests(unittest.TestCase):
     def test_fresh_stationary_pose_stamps_still_advance_motion_sample_time(self):
         self.assertTrue(self.director._geometry('blue',0))
         path=self.root/'blue/head_position.txt'
+        previous=path.stat().st_mtime_ns
         path.write_text('0 0 0 1.7 0 0 0 0 1')
+        os.utime(path,ns=(path.stat().st_atime_ns,previous+1_000_000))
         self.assertTrue(self.director._geometry('blue',.2))
         self.assertEqual(self.director.previous['blue'][0],.2)
 

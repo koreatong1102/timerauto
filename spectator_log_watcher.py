@@ -2394,11 +2394,16 @@ class SpectatorLogWatcher(QObject):
         the HUD during a fight.
         """
         sig = self._file_sig(scores_path)
-        if sig != self._hud_official_rows_sig:
+        state = str(self._last_round_state or "fight").lower()
+        phase=(state,int(round_no or 0))
+        now=time.monotonic()
+        if (sig != self._hud_official_rows_sig or phase!=getattr(self,'_hud_official_rows_phase',None)
+                or now-getattr(self,'_hud_official_rows_checked_at',-100) >= .25):
             self._hud_official_rows = self._read_official_scores(scores_path) if sig != (0, 0) else []
             self._hud_official_rows_sig = sig
+            self._hud_official_rows_phase=phase
+            self._hud_official_rows_checked_at=now
         raw_total = dict(self._total_damage_dealt or {})
-        state = str(self._last_round_state or "fight").lower()
         completed = self._filter_completed_score_rows(
             self._hud_official_rows, state=state, round_no=round_no,
         )

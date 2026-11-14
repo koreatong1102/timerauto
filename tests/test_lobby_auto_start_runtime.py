@@ -60,8 +60,13 @@ class LobbyAutoStartRuntimeTests(unittest.TestCase):
 
     @staticmethod
     def _write(path, value):
+        previous=os.stat(path).st_mtime_ns if os.path.exists(path) else 0
         with open(path, "w", encoding="utf-8") as stream:
             stream.write(value)
+        # This fixture represents distinct game updates, not two writes inside
+        # one Windows clock tick. Avoid sleeps and explicit real-file races.
+        stat=os.stat(path)
+        os.utime(path,ns=(stat.st_atime_ns,max(stat.st_mtime_ns,previous+1_000_000)))
 
     def _lobby(self, *, red="RED", red_ready=True):
         self._write(self.lobby_path,

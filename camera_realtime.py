@@ -117,7 +117,7 @@ class CameraPipeline:
                     if options.get("look_opponent"):
                         other = root/("red" if side == "blue" else "blue")/"head_position.txt"
                         other_stat = other.stat()
-                        other_stamp = other_stat.st_mtime_ns
+                        other_stamp = (other_stat.st_mtime_ns,other_stat.st_size)
                         oldest = min(oldest,other_stat.st_mtime)
                     if time.time()-oldest > 3:
                         raise RuntimeError("머리 로그가 3초 이상 갱신되지 않아 전달을 중지합니다.")
@@ -138,7 +138,7 @@ class CameraPipeline:
                                 replay_jump |= delta < -.05 or delta > max(.5,(now-replay_previous[1])*4+.25)
                             replay_previous = (replay_time,now)
                         timeline_checked = now
-                    stamp = (stat.st_mtime_ns,other_stamp,tuple(sorted(options.items())),timeline)
+                    stamp = (stat.st_mtime_ns,stat.st_size,other_stamp,tuple(sorted(options.items())),timeline)
                     if stamp != last_stamp or replay_jump:
                         params = {k:v for k,v in options.items() if k not in ("look_opponent","position_ms","rotation_ms","comfort")}
                         if other is not None:
@@ -166,6 +166,7 @@ class CameraPipeline:
                     failed_at = None
                     self.last_read_error = ''
                 except (OSError,ValueError) as exc:
+                    last_stamp = None
                     self.last_read_error = repr(exc)
                     now = time.monotonic()
                     if failed_at is None:

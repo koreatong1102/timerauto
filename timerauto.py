@@ -13722,6 +13722,8 @@ class SettingsDialog(QDialog):
             self.cfg.overlay_show_flags = bool(self.chk_overlay_flags.isChecked())
         if hasattr(self, "chk_overlay_player_ids"):
             self.cfg.overlay_show_player_ids = bool(self.chk_overlay_player_ids.isChecked())
+        if hasattr(self, "chk_overlay_vs_player_ids"):
+            self.cfg.overlay_vs_show_player_ids = bool(self.chk_overlay_vs_player_ids.isChecked())
         if hasattr(self, "chk_overlay_cinematic"):
             self.cfg.overlay_show_cinematic = bool(self.chk_overlay_cinematic.isChecked())
         if hasattr(self, "sp_browser_overlay_scale"):
@@ -13755,6 +13757,7 @@ class SettingsDialog(QDialog):
                     "overlay_show_arena_name": self.cfg.overlay_show_arena_name,
                     "overlay_show_flags": self.cfg.overlay_show_flags,
                     "overlay_show_player_ids": self.cfg.overlay_show_player_ids,
+                    "overlay_vs_show_player_ids": bool(getattr(self.cfg, "overlay_vs_show_player_ids", self.cfg.overlay_show_player_ids)),
                     "overlay_show_cinematic": self.cfg.overlay_show_cinematic,
                     "overlay_timer_font_size": int(getattr(self.cfg, "overlay_timer_font_size", 54) or 54),
                     "overlay_timer_x": int(getattr(self.cfg, "overlay_timer_x", 0) or 0),
@@ -14112,6 +14115,7 @@ class SettingsDialog(QDialog):
             "overlay_show_arena_name": show_arena_name,
             "overlay_show_flags": show_flags,
             "overlay_show_player_ids": bool(getattr(self.cfg, "overlay_show_player_ids", True)),
+            "overlay_vs_show_player_ids": bool(getattr(self.cfg, "overlay_vs_show_player_ids", getattr(self.cfg, "overlay_show_player_ids", True))),
             "overlay_show_cinematic": show_cinematic,
             "browser_overlay_scale": float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),
             "browser_overlay_output_only": bool(getattr(self.cfg, "browser_overlay_output_only", True)),
@@ -14272,6 +14276,9 @@ class SettingsDialog(QDialog):
         self.cfg.overlay_show_player_ids = bool(data.get("overlay_show_player_ids", getattr(self.cfg, "overlay_show_player_ids", True)))
         if hasattr(self, "chk_overlay_player_ids"):
             self.chk_overlay_player_ids.setChecked(self.cfg.overlay_show_player_ids)
+        self.cfg.overlay_vs_show_player_ids = bool(data.get("overlay_vs_show_player_ids", data.get("overlay_show_player_ids", getattr(self.cfg, "overlay_vs_show_player_ids", True))))
+        if hasattr(self, "chk_overlay_vs_player_ids"):
+            self.chk_overlay_vs_player_ids.setChecked(self.cfg.overlay_vs_show_player_ids)
         if hasattr(self, "chk_overlay_cinematic"):
             self.chk_overlay_cinematic.setChecked(show_cinematic)
         if hasattr(self, "sp_browser_overlay_scale"):
@@ -14975,11 +14982,16 @@ class SettingsDialog(QDialog):
         row_bg4.addStretch(1)
         overlay_lay.addLayout(row_bg4)
 
-        self.chk_overlay_player_ids = QCheckBox("닉네임 아래 게임 ID 표시 (체력바 / VS)")
+        self.chk_overlay_player_ids = QCheckBox("인게임 HUD · 닉네임 아래 게임 ID 표시")
         self.chk_overlay_player_ids.setChecked(bool(getattr(self.cfg, "overlay_show_player_ids", True)))
-        self.chk_overlay_player_ids.setToolTip("등록 닉네임 아래에 게임 ID를 작은 글씨로 표시합니다. 경기 중 체력바와 경기 시작 전 전체화면 VS에 함께 적용됩니다.")
+        self.chk_overlay_player_ids.setToolTip("경기 중 체력바 HUD의 게임 ID만 표시합니다. 전체화면 VS 화면과는 별도 설정입니다.")
         self.chk_overlay_player_ids.stateChanged.connect(lambda _s: self._apply_overlay_elements_live())
         overlay_lay.addWidget(self.chk_overlay_player_ids)
+        self.chk_overlay_vs_player_ids = QCheckBox("경기 시작 전 전체화면 VS · 닉네임 아래 게임 ID 표시")
+        self.chk_overlay_vs_player_ids.setChecked(bool(getattr(self.cfg, "overlay_vs_show_player_ids", getattr(self.cfg, "overlay_show_player_ids", True))))
+        self.chk_overlay_vs_player_ids.setToolTip("전체화면 선수 소개 VS 화면의 게임 ID만 표시합니다. 인게임 HUD 설정과는 서로 영향을 주지 않습니다.")
+        self.chk_overlay_vs_player_ids.stateChanged.connect(lambda _s: self._apply_overlay_elements_live())
+        overlay_lay.addWidget(self.chk_overlay_vs_player_ids)
 
         vs_bg_group = QGroupBox("철권8 VS 오버레이 배경")
         vs_bg_lay = QGridLayout(vs_bg_group)
@@ -20723,6 +20735,8 @@ class SettingsDialog(QDialog):
             self.chk_overlay_flags.setChecked(bool(getattr(self.cfg, "overlay_show_flags", True)))
         if hasattr(self, "chk_overlay_player_ids"):
             self.chk_overlay_player_ids.setChecked(bool(getattr(self.cfg, "overlay_show_player_ids", True)))
+        if hasattr(self, "chk_overlay_vs_player_ids"):
+            self.chk_overlay_vs_player_ids.setChecked(bool(getattr(self.cfg, "overlay_vs_show_player_ids", getattr(self.cfg, "overlay_show_player_ids", True))))
         if hasattr(self, "chk_overlay_cinematic"):
             self.chk_overlay_cinematic.setChecked(bool(getattr(self.cfg, "overlay_show_cinematic", True)))
         if hasattr(self, "le_overlay_vs_bg"):
@@ -26963,6 +26977,7 @@ class MainApp(QObject):
                 showArenaName=bool(getattr(self.cfg, "overlay_show_arena_name", True)),
                 showFlags=bool(getattr(self.cfg, "overlay_show_flags", True)),
                 showPlayerIds=bool(getattr(self.cfg, "overlay_show_player_ids", True)),
+                showVsPlayerIds=bool(getattr(self.cfg, "overlay_vs_show_player_ids", getattr(self.cfg, "overlay_show_player_ids", True))),
                 showCinematic=bool(getattr(self.cfg, "overlay_show_cinematic", True)),
                 vsBgOpacity=max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))),
                 overlayVsHoldMs=int(max(500, min(15000, float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85) * 1000))),
@@ -29064,6 +29079,7 @@ class MainApp(QObject):
                 "overlay_show_arena_name": "showArenaName",
                 "overlay_show_flags": "showFlags",
                 "overlay_show_player_ids": "showPlayerIds",
+                "overlay_vs_show_player_ids": "showVsPlayerIds",
                 "overlay_show_cinematic": "showCinematic",
                 "overlay_bg_color": "overlayBgColor",
                 "overlay_bg_opacity": "overlayBgOpacity",

@@ -214,6 +214,7 @@ class HeadCamera:
             raise
         except (OSError, ValueError) as exc:
             self.last_prepare_error = repr(exc)
+            self.last_stamp = None  # Reparse recovery even if mtime/size collide.
             # The game truncates/re-writes its output files. Retain the last
             # complete camera frame while a transient partial read is retried.
             now = time.monotonic()
@@ -243,10 +244,10 @@ class HeadCamera:
             other = opponent.stat()
             if time.time() - other.st_mtime > 3.0:
                 raise StaleCameraLog("상대 머리 로그가 3초 이상 갱신되지 않았습니다.")
-            other_stamp = other.st_mtime_ns
+            other_stamp = (other.st_mtime_ns,other.st_size)
             options["target_text"] = opponent.read_text(encoding="utf-8-sig")
         target_stamp = target.stat().st_mtime_ns
-        stamp = (stat.st_mtime_ns, other_stamp, tuple(sorted(self.options.items())))
+        stamp = (stat.st_mtime_ns, stat.st_size, other_stamp, tuple(sorted(self.options.items())))
         now = time.monotonic()
         # Round/replay command changes invalidate the previous smoothing goal.
         round_file = self.root / "match" / "round_number.txt"

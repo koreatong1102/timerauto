@@ -1,6 +1,8 @@
 import json
 import tempfile
 import unittest
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -10,6 +12,7 @@ from PyQt6.QtCore import QObject
 from browser_overlay import BrowserOverlayServer
 from config_model import AppConfig
 from timerauto import MainApp
+from browser_player_identity import PLAYER_ID_JS
 
 
 class PlayerIdentityLayoutTests(unittest.TestCase):
@@ -23,7 +26,7 @@ class PlayerIdentityLayoutTests(unittest.TestCase):
         self.assertNotIn("setText('vsBlue',s.blueName", html)
         self.assertIn("syncPlayerIdentities(s);syncVsImages(s);", html)
         self.assertIn("if(label.textContent!==id)label.textContent=id", html)
-        self.assertIn("s.showPlayerIds!==false&&id.length>0", html)
+        self.assertIn("prefix===side?s.showPlayerIds!==false:s.showVsPlayerIds!==false", html)
         self.assertIn(".vsName.hasPlayerId{top:650px", html)
         self.assertIn(".name.hasPlayerId{min-height:48px", html)
 
@@ -40,6 +43,43 @@ class PlayerIdentityLayoutTests(unittest.TestCase):
         self.assertEqual("", state["bluePlayerId"])
         self.assertEqual("", state["redPlayerId"])
         self.assertTrue(state["showPlayerIds"])
+        self.assertTrue(state["showVsPlayerIds"])
+
+    @unittest.skipUnless(shutil.which('node'),'Node needed for render logic test')
+    def test_all_hud_vs_visibility_combinations_are_independent(self):
+        script=r'''
+const assert=require('node:assert/strict'),nodes={};
+const q=id=>nodes[id];
+for(const prefix of ['blue','red','vsBlue','vsRed']){
+ const hud=prefix==='blue'||prefix==='red';
+ nodes[hud?prefix+'Name':prefix]={classList:{toggle:(key,value)=>nodes[prefix+'GameId'].shown=value}};
+ nodes[prefix+'GameId']={style:{},textContent:''};
+}
+'''+PLAYER_ID_JS+r'''
+for(const hud of [false,true])for(const vs of [false,true]){
+ syncPlayerIdentities({showPlayerIds:hud,showVsPlayerIds:vs,bluePlayerId:'BLUE_ID',redPlayerId:'RED_ID'});
+ for(const side of ['blue','red'])assert.equal(nodes[side+'GameId'].style.display,hud?'block':'none');
+ for(const side of ['vsBlue','vsRed'])assert.equal(nodes[side+'GameId'].style.display,vs?'block':'none');
+}
+syncPlayerIdentities({showPlayerIds:true,showVsPlayerIds:true});
+for(const prefix of ['blue','red','vsBlue','vsRed'])assert.equal(nodes[prefix+'GameId'].style.display,'none');
+'''
+        result=subprocess.run(['node','-e',script],capture_output=True,text=True,encoding='utf8',timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_separate_settings_roundtrip_and_legacy_visibility_migrates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=str(Path(directory)/'config.json')
+            for old in (False,True):
+                Path(path).write_text(json.dumps({'overlay_show_player_ids':old}),encoding='utf8')
+                migrated=AppConfig.from_json(path)
+                self.assertEqual(migrated.overlay_vs_show_player_ids,old)
+            for hud in (False,True):
+                for vs in (False,True):
+                    cfg=AppConfig();cfg.overlay_show_player_ids=hud;cfg.overlay_vs_show_player_ids=vs
+                    cfg.to_json(path)
+                    saved=AppConfig.from_json(path)
+                    self.assertEqual((saved.overlay_show_player_ids,saved.overlay_vs_show_player_ids),(hud,vs))
 
     def test_visibility_setting_round_trips_and_old_config_defaults_on(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -78,6 +118,14 @@ class PlayerIdentityStateTests(unittest.TestCase):
         app._apply_browser_overlay_direct_update({"seconds_left": 90})
         self.assertNotIn("bluePlayerId", app.browser_overlay.update.call_args.kwargs)
         self.assertNotIn("redPlayerId", app.browser_overlay.update.call_args.kwargs)
+
+    def test_hud_toggle_does_not_touch_vs_and_vs_toggle_does_not_touch_hud(self):
+        app=self.app()
+        app._apply_browser_overlay_direct_update({'overlay_show_player_ids':False})
+        self.assertNotIn('showVsPlayerIds',app.browser_overlay.update.call_args.kwargs)
+        app._apply_browser_overlay_direct_update({'overlay_vs_show_player_ids':True})
+        self.assertTrue(app.browser_overlay.update.call_args.kwargs['showVsPlayerIds'])
+        self.assertNotIn('showPlayerIds',app.browser_overlay.update.call_args.kwargs)
 
 
 if __name__ == "__main__":

@@ -24,7 +24,8 @@ function syncPlayerIdentities(s){
       const host=q(prefix==='blue'||prefix==='red'?prefix+'Name':prefix);
       const label=q(prefix+'GameId');
       if(!host||!label)continue;
-      const shown=s.showPlayerIds!==false&&id.length>0;
+      const enabled=prefix===side?s.showPlayerIds!==false:s.showVsPlayerIds!==false;
+      const shown=enabled&&id.length>0;
       if(label.textContent!==id)label.textContent=id;
       label.title=id;
       label.style.display=shown?'block':'none';

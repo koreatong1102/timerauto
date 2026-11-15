@@ -59,16 +59,17 @@ def _josa(text: Any, pair: str) -> str:
 
 
 def detect_stoppage(events: Iterable[dict], round_no: Optional[int] = None) -> Dict[str, Any]:
-    """Find a terminal TKO directly from damage events.
+    """Find an explicit KO/TKO directly from damage events, regardless of KD count.
 
     This intentionally does not depend on throw-to-impact matching. A terminal
     event is authoritative even when punches_thrown.txt is late or incomplete.
     """
+    from stoppage_rules import official_stoppage_kind
     candidates: List[Dict[str, Any]] = []
     for raw in events or []:
         event = dict(raw or {})
-        token = _normalized_token(event.get("damage_type"))
-        if token != "tko" and "technicalknockout" not in token:
+        kind = official_stoppage_kind(event.get("damage_type"))
+        if not kind:
             continue
         winner = str(event.get("attacker_side") or "").lower().strip()
         loser = str(event.get("receiver_side") or "").lower().strip()
@@ -78,7 +79,7 @@ def detect_stoppage(events: Iterable[dict], round_no: Optional[int] = None) -> D
             "winner": winner,
             "loser": loser,
             "round": max(1, _count(round_no or event.get("round") or 1)),
-            "method": "TKO",
+            "method": kind.upper(),
             "eventTime": _number(event.get("time")),
             "source": "damage_events",
         })
@@ -96,7 +97,7 @@ def resolve_match_result(
 ) -> Dict[str, Any]:
     """Resolve a result with explicit source priority.
 
-    winner.txt is official. A terminal damage event or three-down stoppage is
+    winner.txt is official. An explicit terminal damage event is
     next. Point totals are used only for normal result/end states, never to
     guess a TKO winner while winner.txt is still being written.
     """
@@ -107,7 +108,7 @@ def resolve_match_result(
         stoppage_winner = str(stoppage_data.get("winner") or "").lower().strip()
         stoppage_method = str(stoppage_data.get("method") or "").strip()
         method = stoppage_method if winner == stoppage_winner and stoppage_method else str(
-            winner_data.get("method") or "판정"
+            winner_data.get("method") or ('KO/TKO' if _normalized_token(state)=='knockout' else '판정')
         )
         return {
             "winner": winner,
@@ -874,7 +875,9 @@ def build_match_commentary(report: Optional[dict]) -> str:
     if winner in ("blue", "red"):
         winner_name = names[winner]
         method_token = _normalized_token(method)
-        if "tko" in method_token or "technicalknockout" in method_token:
+        if method_token=='kotko':
+            lines.append(f"{_josa(winner_name, '이/가')} 경기 중단으로 승리를 확정합니다.")
+        elif "tko" in method_token or "technicalknockout" in method_token:
             lines.append(f"{_josa(winner_name, '이/가')} 끝까지 압박을 이어가며 테크니컬 녹아웃으로 경기를 마무리합니다.")
         elif "knockout" in method_token or method_token == "ko":
             lines.append(f"{_josa(winner_name, '이/가')} 결정적인 한 방으로 녹아웃 승리를 완성합니다.")

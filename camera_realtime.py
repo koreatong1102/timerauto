@@ -93,7 +93,7 @@ class CameraPipeline:
         self.cancel.set()
 
     def _collect(self):
-        from spectator_camera import pose_to_camera
+        from camera_hybrid import needs_opponent
         pacer = FramePacer(120)
         last_stamp = None
         last_timeline = None
@@ -114,7 +114,7 @@ class CameraPipeline:
                     oldest = stat.st_mtime
                     other_stamp, other_text = None,None
                     other = None
-                    if options.get("look_opponent"):
+                    if needs_opponent(options):
                         other = root/("red" if side == "blue" else "blue")/"head_position.txt"
                         other_stat = other.stat()
                         other_stamp = (other_stat.st_mtime_ns,other_stat.st_size)
@@ -140,13 +140,14 @@ class CameraPipeline:
                         timeline_checked = now
                     stamp = (stat.st_mtime_ns,stat.st_size,other_stamp,tuple(sorted(options.items())),timeline)
                     if stamp != last_stamp or replay_jump:
-                        params = {k:v for k,v in options.items() if k not in ("look_opponent","position_ms","rotation_ms","comfort")}
+                        reset = timeline != last_timeline or replay_jump
+                        other_text=None
                         if other is not None:
-                            params["target_text"] = other.read_text(encoding="utf-8-sig")
-                        output = pose_to_camera(source.read_text(encoding="utf-8-sig"),side,**params)
+                            other_text=other.read_text(encoding="utf-8-sig")
+                        output = c.pose_output(source.read_text(encoding="utf-8-sig"),side,options,
+                                               target_text=other_text,reset=reset)
                         fields = output.split("\t")
                         pose = tuple(float(v) for v in (fields[0]+" "+fields[1]).split())
-                        reset = timeline != last_timeline or replay_jump
                         if reset:
                             epoch += 1
                         # Keep discontinuity generation in every later packet;
@@ -181,6 +182,7 @@ class CameraPipeline:
 
     def _publish(self):
         from spectator_camera import CameraMotion
+        from camera_hybrid import view_mode, level_rotation
         motion = CameraMotion()
         pacer = FramePacer(60)
         self.timer_backend = "windows_high_resolution" if pacer.handle else "event_wait"
@@ -198,6 +200,8 @@ class CameraPipeline:
                         motion.aim(pose,arrived_at,reset=reset or (last_stamp is not None and stamp[-1] != last_stamp[-1]),comfort=options.get("comfort",False))
                         last_stamp = stamp
                     current = motion.sample(now,options.get("position_ms",20),options.get("rotation_ms",40),comfort=options.get("comfort",False))
+                    if view_mode(options)=='hybrid':
+                        current=list(current);current[3:7]=level_rotation(current[3:7])
                     c = self.camera
                     output = c.separator.join((" ".join(f"{v:.3f}" for v in current[:3]),
                                                " ".join(f"{v:.6f}" for v in current[3:7]),

@@ -7,6 +7,7 @@ import tempfile
 import time
 import threading
 from camera_direction_policy import camera_settings, direction_selftest
+from camera_hybrid import HybridView, needs_opponent, view_mode, level_rotation
 
 
 def replace_camera_file(staged, target, *, timeout=.15):
@@ -134,6 +135,8 @@ class HeadCamera:
         self.last_stamp = None
         self.writes = 0
         self.options = {}
+        self.hybrid = HybridView()
+        self.view_key = None
         self.separator = "\t"
         self.invalid_since = None
         self.motion = CameraMotion()
@@ -187,6 +190,22 @@ class HeadCamera:
         self.replay_previous = None
         self.pending_reset = False
         self.last_prepare_error = ''
+        self.hybrid.reset();self.view_key=None
+
+    def pose_output(self,text,side,options,target_text=None,*,reset=False,separator='\t'):
+        options=dict(options)
+        mode=view_mode(options)
+        key=(mode,options.pop('hybrid_recalibrate',0))
+        if reset or key!=self.view_key:self.hybrid.reset()
+        self.view_key=key
+        weight=options.pop('hybrid_player_pct',80)
+        for name in ('view_mode','look_opponent','position_ms','rotation_ms','comfort'):
+            options.pop(name,None)
+        if mode=='hybrid':
+            text=self.hybrid.pose(text,target_text,weight,options.pop('yaw',0),options.pop('pitch',0))
+            target_text=None
+        elif mode=='raw':target_text=None
+        return pose_to_camera(text,side,separator=separator,target_text=target_text,**options)
 
     def freeze(self):
         """Join publishers before releasing head flags or handing off ownership."""
@@ -239,7 +258,7 @@ class HeadCamera:
         look_opponent = options.pop("look_opponent", False)
         comfort = options.pop("comfort", False)
         other_stamp = None
-        if look_opponent:
+        if needs_opponent(self.options):
             opponent = self.root / ("red" if self.side == "blue" else "blue") / "head_position.txt"
             other = opponent.stat()
             if time.time() - other.st_mtime > 3.0:
@@ -268,8 +287,10 @@ class HeadCamera:
         else:
             self.replay_previous = None
         if stamp != self.last_stamp or timeline != self.timeline or self.pending_reset:
-            output = pose_to_camera(source.read_text(encoding="utf-8-sig"), self.side,
-                                    separator=self.separator, **options)
+            other_text=options.pop('target_text',None)
+            output = self.pose_output(source.read_text(encoding="utf-8-sig"), self.side,
+                                     self.options,target_text=other_text,separator=self.separator,
+                                     reset=timeline!=self.timeline or self.pending_reset)
             fields = output.replace("\\t", "\t").split("\t")
             pose = [float(v) for v in (fields[0]+" "+fields[1]).split()]
             self.motion.aim(pose, now, reset=timeline != self.timeline or self.pending_reset, comfort=comfort)
@@ -282,6 +303,8 @@ class HeadCamera:
             self.last_input_at = now
             self.last_stamp, self.timeline = stamp, timeline
         pose = self.motion.sample(now, position_ms, rotation_ms, comfort=comfort)
+        if view_mode(self.options)=='hybrid':
+            pose=list(pose);pose[3:7]=level_rotation(pose[3:7])
         output = self.separator.join((" ".join(f"{v:.3f}" for v in pose[:3]),
                                       " ".join(f"{v:.6f}" for v in pose[3:7]),
                                       f"{float(options.get('fov',75)):.2f}", str(self.side == "blue"), str(self.side == "red")))
@@ -506,11 +529,55 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
     note.setWordWrap(True)
     layout.addRow(note)
     mode = QComboBox()
-    mode.addItem("상대 바라보기 · 수평 유지 (기본)", True)
-    mode.addItem("머리 회전 원본 · 방향 보정 필요할 수 있음", False)
-    mode.setCurrentIndex(0 if service.worker.options.get("look_opponent", True) else 1)
-    mode.currentIndexChanged.connect(lambda _: service.worker.configure(look_opponent=mode.currentData()))
+    mode.setObjectName('cameraViewMode')
+    mode.addItem("상대 바라보기 · 수평 유지 (기본)", 'opponent')
+    mode.addItem("머리 회전 원본 · 방향 보정 필요할 수 있음", 'raw')
+    mode.addItem("혼합 · 머리 방향 + 상대 보조 · 수평 유지", 'hybrid')
+    view_saved=camera_settings(cfg)
+    mode.setCurrentIndex(max(0,mode.findData(view_saved['camera_view_mode'])))
     layout.addRow("시선 방식", mode)
+    mix=QDoubleSpinBox();mix.setObjectName('cameraHybridPlayerPct');mix.setRange(0,100)
+    mix.setValue(view_saved['camera_hybrid_player_pct']);mix.setSuffix(' %')
+    layout.addRow('혼합 · 선수 방향 비중 (나머지는 상대 보조)',mix)
+    hybrid_note=QLabel('혼합은 추적 시작/각 자동 연출 진입/라운드 변경·리플레이 이동 시, 상대 정면을 본다고 가정해 머리 축을 보정합니다.\n'
+                      '정확한 보정은 선수가 상대를 정면으로 보는 순간 아래 재보정 버튼을 누르세요.\n'
+                      '기본 선수 80%·상대 보조 20%. 크게 고개를 돌리면 보조가 약해집니다. 눈동자/실제 헤드셋 시선 복제는 아닙니다.\n'
+                      '자동 연출에서도 혼합을 사용할 수 있습니다. 원본 회전 모드의 자동 연출은 기존처럼 상대 주시를 사용합니다.')
+    hybrid_note.setWordWrap(True);layout.addRow(hybrid_note)
+    def save_view(*_):
+        cfg.camera_view_mode=mode.currentData();cfg.camera_hybrid_player_pct=mix.value()
+        mix.setEnabled(mode.currentData()=='hybrid')
+        options=dict(view_mode=mode.currentData(),hybrid_player_pct=mix.value())
+        service.worker.configure(**options)
+        director=service.director
+        if director and director.thread and director.thread.is_alive():
+            # Switching between the existing and hybrid geometry-safe views
+            # must also reach the independent collector, not just Settings.
+            auto=dict(options)
+            if auto['view_mode']!='hybrid':auto['view_mode']='opponent'
+            director.options=dict(director.options,**auto)
+            director.camera.options=dict(director.camera.options,**auto)
+        changed=getattr(parent,'_schedule_apply',None)
+        if callable(changed):changed()
+    mode.currentIndexChanged.connect(save_view);mix.valueChanged.connect(save_view)
+    mix.setEnabled(mode.currentData()=='hybrid')
+    recalibrate=QPushButton('혼합 · 지금 상대 정면 기준으로 재보정')
+    recalibrate.setObjectName('cameraHybridRecalibrate')
+    def reset_hybrid():
+        if mode.currentData()!='hybrid':
+            service.report('먼저 시선 방식을 혼합으로 선택하세요.');return
+        nonce=time.monotonic_ns()
+        director=service.director
+        if director and director.thread and director.thread.is_alive():
+            if not director.camera.side:
+                service.report('선수 시점이 실제로 나오는 동안 정면을 보고 재보정하세요.');return
+            director.camera.options=dict(director.camera.options,hybrid_recalibrate=nonce)
+        elif service.camera.side:
+            service.worker.configure(hybrid_recalibrate=nonce)
+        else:
+            service.report('추적을 시작한 뒤 선수가 상대를 정면으로 보는 순간 눌러주세요.');return
+        service.report('다음 정상 머리 로그를 상대 정면 기준으로 재보정합니다.')
+    recalibrate.clicked.connect(reset_hybrid);layout.addRow(recalibrate)
     explanation = QLabel("기본 모드는 내 머리 위치에서 상대 머리를 바라봅니다. 실제 헤드셋 시선 복제는 아닙니다.\n"
                          "시청자 안정화 적용: 상하 흔들림 완화 · 이동/회전 속도 제한. 빠른 움직임에는 약간의 추적 지연이 생깁니다.\n"
                          "파일을 쓰는 순간 잠깐 비면 마지막 정상 화면을 유지하며 재시도합니다. 초기 값이 없으면 로그를 기다립니다.")
@@ -537,7 +604,7 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
             return
         try:
             service.worker.start(getattr(cfg, "spectatorlog_path", ""), side,
-                                 look_opponent=mode.currentData(), comfort=True,
+                                 view_mode=mode.currentData(),hybrid_player_pct=mix.value(),comfort=True,
                                  **{k: v.value() for k, v in controls.items()})
             service.timer.start()
         except Exception as exc:
@@ -657,7 +724,7 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
         try:
             service.worker.stop()
             service.director.start(getattr(cfg,"spectatorlog_path",""),
-                                   {k:v.value() for k,v in controls.items()},
+                                   dict({k:v.value() for k,v in controls.items()},view_mode=mode.currentData(),hybrid_player_pct=mix.value()),
                                    profile=profile.currentData(),pressure=pressure.isChecked(),counter=counter.isChecked(),
                                    broadcast_enabled=broadcast.isChecked(),
                                    **{k:v.value() for k,v in auto_controls.items()})

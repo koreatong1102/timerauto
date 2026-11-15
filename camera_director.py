@@ -60,6 +60,9 @@ class AutoCameraDirector:
         if self.root.name.lower() == "match":
             self.root = self.root.parent
         self.options = dict(options,look_opponent=True)
+        # Preserve the old geometry-safe automatic mode unless the new hybrid
+        # view is explicitly selected. Raw bone mode remains a manual test mode.
+        if self.options.get('view_mode')!='hybrid':self.options['view_mode']='opponent'
         # Off-camera axes offsets are disabled for the geometry-safe auto view.
         self.options.update(yaw=0,pitch=0,comfort=True)
         self.duration = max(1,min(3,float(duration)))
@@ -276,7 +279,8 @@ class AutoCameraDirector:
             self.geometry_reason = "too_close" if distance < self.profile['near'] else "too_far"
             return False
         # Reject fast translation and sudden look-direction changes.
-        opts = {k:v for k,v in self.options.items() if k not in ("look_opponent","position_ms","rotation_ms","comfort")}
+        opts = {k:v for k,v in self.options.items() if k not in ("look_opponent","position_ms","rotation_ms","comfort",
+                    "view_mode","hybrid_player_pct","hybrid_recalibrate")}
         view = camera_pose(pose_to_camera(" ".join(map(str,values[0])),side,
                           target_text=" ".join(map(str,values[1])),**opts))
         previous = self.previous.get(side)

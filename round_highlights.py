@@ -2,6 +2,7 @@
 import os
 import copy
 import re
+import math
 import time
 import uuid
 from diagnostics import diagnostics as DIAG
@@ -9,6 +10,7 @@ from diagnostics import diagnostics as DIAG
 
 DEFAULTS={'round_highlights_enabled':True,'round_highlights_report_sec':15,
           'round_highlights_clip_sec':8,'round_highlights_max_clips':5,
+          'round_highlights_volume':70,
           'round_highlights_reserve_sec':5,'round_highlights_capture_source':'auto'}
 
 
@@ -16,7 +18,7 @@ def settings(raw):
     get=raw.get if isinstance(raw,dict) else lambda k,d:getattr(raw,k,d)
     out={k:get(k,v) for k,v in DEFAULTS.items()}
     out['round_highlights_enabled']=out['round_highlights_enabled'] is True
-    for key,lo,hi in (('report_sec',5,20),('clip_sec',4,12),('max_clips',1,5),('reserve_sec',4,10)):
+    for key,lo,hi in (('report_sec',5,20),('clip_sec',4,12),('max_clips',1,5),('reserve_sec',4,10),('volume',0,100)):
         name='round_highlights_'+key
         try:out[name]=max(lo,min(hi,int(out[name])))
         except (ValueError,TypeError,OverflowError):out[name]=DEFAULTS[name]
@@ -34,12 +36,14 @@ class RoundHighlights:
         self.release=release or (lambda paths:None)
         self.wait_reason=''
         self.last_report=None;self.played=False;self.report_restored=False
+        self.order=0
 
     def reset(self):
         files=[x['file'] for rows in self.pool.values() for x in rows if x['file']]
         self.cancel();self.pool.clear();self.seen.clear();self.planned.clear()
         self.last_capture=-100;self.terminal=False;self.mode=''
         self.last_report=None;self.played=False;self.report_restored=False
+        self.order=0
         self.release(files)
 
     def observe(self,data):
@@ -92,11 +96,20 @@ class RoundHighlights:
             source=str(getattr(cfg,'potm_capture_source',getattr(cfg,'obs_auto_replay_source','source_record')) or 'source_record')
             if source=='source_record' and not getattr(cfg,'obs_source_record_enabled',False) and getattr(cfg,'obs_replay_buffer_enabled',False):source='replay_buffer'
             if source=='replay_buffer' and not getattr(cfg,'obs_replay_buffer_enabled',False) and getattr(cfg,'obs_source_record_enabled',False):source='source_record'
-        row=dict(id=uuid.uuid4().hex,round=int(round_no),side=side,score=score,at=now,
+        remaining=event.get('round_remaining_seconds')
+        try:
+            remaining=float(remaining)
+            if not math.isfinite(remaining) or remaining<0:remaining=None
+        except (ValueError,TypeError,OverflowError):remaining=None
+        self.order+=1
+        row=dict(id=uuid.uuid4().hex,round=int(round_no),side=side,score=score,at=now,order=self.order,
+                 event_remaining_seconds=remaining,
+                 event_time_basis=str(event.get('round_event_time_basis') or 'unknown'),
                  label=('COUNTER COMBO' if counter else 'CLEAN COMBO' if hits>=3 else 'KNOCKDOWN')+(' · DOWN' if down and hits>=3 else ''),
                  nickname=str(names.get(side) or side.upper()),file='',source=source)
         rows.append(row)
-        DIAG.record('replay_round_candidate',round=round_no,candidate_id=row['id'],label=row['label'],score=score)
+        DIAG.record('replay_round_candidate',round=round_no,candidate_id=row['id'],label=row['label'],score=score,
+                    event_remaining_seconds=remaining,event_time_basis=row['event_time_basis'])
         retired=[]
         if len(rows)>10:
             lowest=min(range(len(rows)),key=lambda index:rows[index]['score'])
@@ -182,6 +195,11 @@ class RoundHighlights:
             if self.pending or self.active:DIAG.record('replay_round_skip',reason='reserve_reached',waiting_for=self.wait_reason)
             self.cancel();self._restore_report();return
         if self.active:
+            if getattr(self,'playing_volume',None)!=cfg['round_highlights_volume']:
+                state=overlay.snapshot()
+                if state.get('obsReplayToken')==self.token and state.get('obsReplayKind')=='round_highlight':
+                    overlay.update(obsReplayVolume=cfg['round_highlights_volume'],obsReplayMuted=cfg['round_highlights_volume']==0)
+                self.playing_volume=cfg['round_highlights_volume']
             if now-self.started>cfg['round_highlights_clip_sec']+3:
                 token=self.token
                 self.active=False;self.token=''
@@ -196,8 +214,18 @@ class RoundHighlights:
                     DIAG.record('replay_round_wait',reason=reason,round=self.pending[0],remaining_sec=self.until-now)
                 self._arm();return
             r=self.pending[0];self.pending=None
-            self.remaining=self.ready(r)[:cfg['round_highlights_max_clips']]
-            if not self.remaining:DIAG.record('replay_round_skip',round=r,reason='capture_not_ready_at_due')
+            slots=max(0,int((self.until-now-cfg['round_highlights_reserve_sec'])/cfg['round_highlights_clip_sec']))
+            ranked=self.ready(r)
+            chosen=ranked[:min(cfg['round_highlights_max_clips'],slots)]
+            # Choose quality first, then show that chosen subset in event order.
+            # Countdown descends; never sort it ascending as an elapsed clock.
+            known=all(row.get('event_remaining_seconds') is not None for row in chosen)
+            self.remaining=sorted(chosen,key=(lambda row:(-row['event_remaining_seconds'],row['order']))
+                                  if known else (lambda row:row['order']))
+            DIAG.record('replay_round_order',round=r,candidate_ids=[row['id'] for row in self.remaining],
+                        remaining_seconds=[row.get('event_remaining_seconds') for row in self.remaining])
+            if not self.remaining:DIAG.record('replay_round_skip',round=r,
+                reason='not_enough_time_after_commentary' if ranked and not slots else 'capture_not_ready_at_due')
             self._play()
         if self.active or self.pending:self._arm()
 
@@ -207,12 +235,16 @@ class RoundHighlights:
             if self.remaining:DIAG.record('replay_round_skip',reason='not_enough_time_after_commentary',remaining_sec=self.until-self.clock())
             self.remaining=[];self._restore_report();return
         row=self.remaining.pop(0)
-        caption=f"ROUND {row['round']} HIGHLIGHT · {row['nickname']} · {row['label']}"
-        self.token=overlay.play_obs_replay(row['file'],muted=False,volume=100,replay_kind='round_highlight',
+        seconds=row.get('event_remaining_seconds')
+        clock_text=(f"이벤트 {int(seconds)//60}:{int(seconds)%60:02d}" if seconds is not None else '이벤트 시각 미확인')
+        caption=f"ROUND {row['round']} HIGHLIGHT · {clock_text} · {row['nickname']} · {row['label']}"
+        self.playing_volume=cfg['round_highlights_volume']
+        self.token=overlay.play_obs_replay(row['file'],muted=self.playing_volume==0,volume=self.playing_volume,replay_kind='round_highlight',
                                           replay_caption=caption,start_from_end_sec=cfg['round_highlights_clip_sec'],fade_ms=160)
         self.active=bool(self.token);self.started=self.clock()
         if self.active:self.played=True
-        DIAG.record('replay_round_start',candidate_id=row['id'],round=row['round'],token=self.token)
+        DIAG.record('replay_round_start',candidate_id=row['id'],round=row['round'],token=self.token,
+                    event_remaining_seconds=seconds,event_time_basis=row.get('event_time_basis'))
         overlay.update(roundHighlightActive=self.active)
         if not self.active:
             if self.remaining:self._play()
@@ -266,8 +298,11 @@ def create_settings_panel(cfg,parent,changed):
     source.setObjectName('roundHighlightsSource');source.setCurrentIndex(max(0,source.findData(saved['round_highlights_capture_source'])))
     layout.addRow('영상 저장 방식',source)
     for key,label,lo,hi in [('report_sec','리포트 최소 표시(초)',5,20),('clip_sec','영상당 최대 재생(초)',4,12),
-                          ('max_clips','라운드당 최대 재생 개수',1,5),('reserve_sec','다음 라운드 준비 여유(초)',4,10)]:
+                          ('max_clips','라운드당 최대 재생 개수',1,5),('reserve_sec','다음 라운드 준비 여유(초)',4,10),
+                          ('volume','휴식 하이라이트 음량',0,100)]:
         spin=QSpinBox();spin.setObjectName('roundHighlights_'+key);spin.setRange(lo,hi);spin.setValue(saved['round_highlights_'+key])
+        if key=='volume':
+            spin.setSuffix(' %');spin.setToolTip('휴식 하이라이트 영상 소리만 조절합니다. 0%는 음소거. KD/TKO·POTM·OBS 브금은 바꾸지 않습니다.')
         controls[key]=spin;layout.addRow(label,spin)
     def save(*_):
         cfg.round_highlights_enabled=enabled.isChecked();cfg.round_highlights_capture_source=source.currentData()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from report_combo import classified_combo_rows, combo_details
+from report_combo import classified_combo_rows, combo_details, combo_clock
 
 import logging
 import math
@@ -4277,6 +4277,12 @@ class SpectatorLogWatcher(QObject):
         red_score_total = int(
             (official_scorecard or {}).get("redTotal", (scorecard_total or {}).get("red_total", 0)) or 0
         )
+        if (not stoppage and str((winner_file or {}).get('side') or '') in ('blue','red')
+                and (str(getattr(self,'_last_round_state','') or '')=='knockout'
+                     or bool(getattr(self,'_terminal_count_pending',False)))):
+            official_winner=winner_file['side']
+            stoppage={'winner':official_winner,'loser':'red' if official_winner=='blue' else 'blue',
+                      'round':r,'method':'KO/TKO','source':'round_state.txt+winner.txt'}
         result_resolution = resolve_match_result(
             winner_file,
             stoppage,
@@ -7264,9 +7270,8 @@ class SpectatorLogWatcher(QObject):
 
         damage_events.txt does not include a round number, so the watcher tags
         newly observed rows with the last active fight round.  This lets the
-        final commentary use the user's scoring rule: round damage leader gets
-        the round by one point, knockdowns subtract a point, and 3 knockdowns in
-        one round ends the fight.
+        fallback commentary use round activity without inventing a stoppage
+        from the number of knockdowns. Official scores/winner stay authoritative.
         """
         if not new_events:
             return
@@ -7533,15 +7538,13 @@ class SpectatorLogWatcher(QObject):
             for r in sorted(rounds):
                 stats = dict(rounds.get(r) or {})
                 tkos_for = dict(stats.get("tkos_for") or {})
-                kd_against = dict(stats.get("knockdowns_against") or {})
-                if int(tkos_for.get("blue", 0) or 0) > 0:
+                explicit=detect_stoppage(stats.get('event_rows') or [],r)
+                if explicit:
+                    stoppage=explicit
+                elif int(tkos_for.get("blue", 0) or 0) > 0:
                     stoppage = {"winner": "blue", "loser": "red", "round": r, "method": "TKO"}
                 elif int(tkos_for.get("red", 0) or 0) > 0:
                     stoppage = {"winner": "red", "loser": "blue", "round": r, "method": "TKO"}
-                elif int(kd_against.get("blue", 0) or 0) >= 3:
-                    stoppage = {"winner": "red", "loser": "blue", "round": r, "method": "3다운 TKO"}
-                elif int(kd_against.get("red", 0) or 0) >= 3:
-                    stoppage = {"winner": "blue", "loser": "red", "round": r, "method": "3다운 TKO"}
             if winner_file and str(winner_file.get("side") or "") in ("blue", "red", "draw"):
                 winner = str(winner_file.get("side") or "draw")
             elif stoppage:
@@ -7570,15 +7573,13 @@ class SpectatorLogWatcher(QObject):
             blue_total += int(res.get("blue_score", 0) or 0)
             red_total += int(res.get("red_score", 0) or 0)
             tkos_for = dict(stats.get("tkos_for") or {})
-            kd_against = dict(stats.get("knockdowns_against") or {})
-            if int(tkos_for.get("blue", 0) or 0) > 0:
+            explicit=detect_stoppage(stats.get('event_rows') or [],r)
+            if explicit:
+                stoppage=explicit
+            elif int(tkos_for.get("blue", 0) or 0) > 0:
                 stoppage = {"winner": "blue", "loser": "red", "round": r, "method": "TKO"}
             elif int(tkos_for.get("red", 0) or 0) > 0:
                 stoppage = {"winner": "red", "loser": "blue", "round": r, "method": "TKO"}
-            elif int(kd_against.get("blue", 0) or 0) >= 3:
-                stoppage = {"winner": "red", "loser": "blue", "round": r, "method": "3다운 TKO"}
-            elif int(kd_against.get("red", 0) or 0) >= 3:
-                stoppage = {"winner": "blue", "loser": "red", "round": r, "method": "3다운 TKO"}
         if stoppage:
             winner = str(stoppage.get("winner") or "")
         elif blue_total > red_total:
@@ -7829,14 +7830,17 @@ class SpectatorLogWatcher(QObject):
         self._last_effect_counts = effect_counts
         self._last_stun_counts = {side: int(effect_counts.get(side, {}).get("stun", 0) or 0) for side in ("blue", "red")}
         self._damage_initialized = True
+        explicit_stoppage = detect_stoppage(parsed_events, active_round_no)
+        if explicit_stoppage:
+            # Independent of knockdown count; no invented three-down event.
+            out['spectator_stoppage'] = explicit_stoppage
         if effect_events:
             # Do not make fullscreen KD/stun feedback wait for the slower
             # classification, archive and commentary pass.  The fast pass
             # still hands these events to the full pass for its bookkeeping.
-            if not self._safe_emit_update({
-                "spectator_effect_events": list(effect_events),
-                "_spectator_urgent_fast_emit": True,
-            }):
+            urgent = {"spectator_effect_events": list(effect_events), "_spectator_urgent_fast_emit": True}
+            if explicit_stoppage:urgent['spectator_stoppage']=explicit_stoppage
+            if not self._safe_emit_update(urgent):
                 out["spectator_effect_events"] = effect_events
         new_events: List[dict] = []
         if parsed_events:
@@ -7958,6 +7962,21 @@ class SpectatorLogWatcher(QObject):
         out["blue_round_damage_dealt"] = round(round_dealt["blue"], 2)
         out["red_round_damage_dealt"] = round(round_dealt["red"], 2)
         hit_effect_events = []
+        # Presentation metadata only: infer event-clock direction per round
+        # using the same append-order evidence as report combos. Never label
+        # an elapsed event clock as the round countdown.
+        highlight_clocks={}
+        if new_events:
+            clock_duration=self._configured_round_duration()
+            for clock_round,clock_rows in self._events_by_source_round(parsed_events,active_round_no).items():
+                if clock_rows:
+                    evidence=combo_clock([clock_rows[-1],clock_rows[-1]],clock_rows,clock_duration)
+                    basis=evidence['maxComboTimeBasis']
+                    if basis=='unknown' and len(clock_rows)==1 and clock_round==self._last_round_time_round:
+                        hint=str(getattr(self,'_round_time_mode','') or '')
+                        if hint.endswith('_remaining'):basis='remaining'
+                        elif hint.endswith('_elapsed'):basis='converted_elapsed'
+                    highlight_clocks[clock_round]=(basis,clock_duration)
         # Screen-space hit sparks use damage_events.screen_x/y first because the
         # SpectatorLog format defines them as the actual hit location. Attack glove
         # pose is only a fallback for old/malformed rows without screen coordinates.
@@ -7994,6 +8013,11 @@ class SpectatorLogWatcher(QObject):
                         hit_time = 0.0
                     event_id = "|".join(str(part) for part in self._damage_event_key(ev))
                     hitfx_key = "hitfx|" + event_id
+                    event_round=int(ev.get('round') or active_round_no or 1)
+                    clock_basis,clock_duration=highlight_clocks.get(event_round,('unknown',0))
+                    event_remaining=(hit_time if clock_basis=='remaining' else
+                                     clock_duration-hit_time if clock_basis=='converted_elapsed' else None)
+                    if event_remaining is not None and not (0<=event_remaining<=clock_duration):event_remaining=None
                     hit_effect_events.append({
                         "side": side,
                         "attacker_side": attacker_side,
@@ -8012,6 +8036,8 @@ class SpectatorLogWatcher(QObject):
                         "glove_hand": str((glove or {}).get("hand") or ""),
                         "round": int(ev.get("round") or active_round_no or 1),
                         "event_time": hit_time,
+                        "round_remaining_seconds": event_remaining,
+                        "round_event_time_basis": clock_basis,
                         "hitfx_key": hitfx_key,
                         "event_id": event_id,
                         "event_primary": str(ev.get("event_primary") or ""),

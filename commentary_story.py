@@ -440,6 +440,11 @@ class MatchStory:
     def _pick(self, scripts, *, now):
         heard = [item for item in self.memory.recent(self.scope, now=now)
                  if "content" not in item or len(item["content"]) > 1]
+        # A later interruption does not undo an already audible reply. Calls
+        # alone do not consume the optional script they never actually spoke.
+        heard += [item for item in self.memory.recent_content(self.scope, now=now)
+                  if item.get("intent") != "call"]
+        heard.sort(key=lambda item: item.get("completed_at", -1e9))
         recent = [item for item in self._selected if 0 <= now - item["at"] < 8]
         used_ids = {item.get("script") for item in recent} | {item.get("script") for item in heard}
         last_use = {}

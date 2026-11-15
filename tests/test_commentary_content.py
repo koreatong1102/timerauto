@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from commentary_content import plan, subject
-from commentary_story import MatchStory, Script, SpokenMemory, SCENES
+from commentary_story import MatchStory, Script, SpokenMemory, SCENES, script_key
 from tests import test_commentary_tts_queue as queue_tests
 
 
@@ -38,6 +38,23 @@ class ContentDirectionTests(unittest.TestCase):
             pending=[], now=1020, density="full")
         self.assertFalse(pool)
         self.assertEqual(reason, "topics_rested")
+
+    def test_completed_reply_avoids_repeat_even_without_completed_story(self):
+        pool = SCENES["knockdown"]
+        first = self.story._pick(pool, now=1000)
+        story = {"scope": self.story.scope, "id": "interrupted", "script": script_key(first),
+                 "family": first.family, "content": [{"intent": "call"}, {"intent": "reaction"}]}
+        self.memory.complete_turn(story, 1, now=1001)
+        self.assertFalse(self.memory.recent(self.story.scope, now=1010))
+        self.assertNotEqual(self.story._pick(pool, now=1010), first)
+
+    def test_call_alone_does_not_consume_unheard_reply(self):
+        pool = SCENES["knockdown"]
+        first = self.story._pick(pool, now=1000)
+        story = {"scope": self.story.scope, "id": "call-only", "script": script_key(first),
+                 "family": first.family, "content": [{"intent": "call"}, {"intent": "reaction"}]}
+        self.memory.complete_turn(story, 0, now=1001)
+        self.assertEqual(self.story._pick(pool, now=1010), first)
 
     def test_selected_failed_content_only_reserves_eight_seconds(self):
         out = self.compose()

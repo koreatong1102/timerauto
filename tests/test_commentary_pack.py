@@ -213,6 +213,46 @@ class CommentaryPackTests(unittest.TestCase):
         self.cfg.spectator_tts_engine = "edge"
         self.assertEqual(usage_voice(self.cfg, "caster", "edge", {"kind": "live"}), "edge")
 
+    def test_missing_live_pack_lines_never_switch_to_edge_or_synthesize(self):
+        for text in ("1라운드 시작합니다", "경기 계속됩니다!", "통 대 현선호 경기, 곧 시작합니다",
+                     "와 샤갈. 일단 카운트 봅시다!"):
+            with self.subTest(text=text), patch("commentary_pack.save_local") as synth:
+                voice = usage_voice(self.cfg, "analyst", "edge", {"kind": "live"}, text=text)
+                self.assertIn("pack", decode_voice(voice))
+                with self.assertRaises(LocalTTSError):
+                    render(text, str(Path(self.folder.name, "missing.wav")), voice)
+                synth.assert_not_called()
+
+    def test_invalid_pack_does_not_fall_back(self):
+        path = self.store("카운터!")
+        voice = usage_voice(self.cfg, "caster", "edge", {"kind": "live"}, text="카운터!")
+        self.assertIn("pack", decode_voice(voice))
+        path.write_bytes(b"corrupt")
+        voice = usage_voice(self.cfg, "caster", "edge", {"kind": "live"}, text="카운터!")
+        self.assertIn("pack", decode_voice(voice))
+        with self.assertRaises(LocalTTSError):
+            render("카운터!", str(Path(self.folder.name, "invalid.wav")), voice)
+
+    def test_narration_preflight_uses_bare_clip_without_requiring_name(self):
+        self.store("카운터!")
+        _, packet, _ = self.plan()
+        packet = prepare_dialogue(self.cfg, "caster", packet, narration_only=True)
+        voice = usage_voice(self.cfg, "caster", "edge", {"kind": "live"}, packet, text="통, 카운터!")
+        self.assertIn("pack", decode_voice(voice))
+        app = queue_tests.CommentaryTtsQueueTests()._app()
+        app.cfg = self.cfg
+        prepared = app._handoff_voice_settings("caster", {"_timing": {"kind": "live"}, "_dialogue": packet}, text="통, 카운터!")[0]
+        self.assertEqual(voice, prepared)
+
+    def test_name_free_narration_keeps_pack_voice_when_clip_is_missing(self):
+        from commentary_pack import narration_text
+        _, packet, _ = self.plan()
+        packet = prepare_dialogue(self.cfg, "caster", packet, narration_only=True)
+        text = narration_text("통, 카운터!", packet)
+        self.assertEqual(text, "카운터!")
+        self.assertIn("pack", decode_voice(usage_voice(self.cfg, "caster", "edge", {"kind": "live"}, packet, text=text)))
+        self.assertEqual(narration_text("통, 카운터!", None), "통, 카운터!")
+
     def test_handoff_and_playback_use_the_same_pack_identity(self):
         app = queue_tests.CommentaryTtsQueueTests()._app()
         app.cfg = self.cfg

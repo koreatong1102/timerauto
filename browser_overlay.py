@@ -70,6 +70,8 @@ class BrowserOverlayServer:
             "studioPreset": self._studio_store.get(),
             "blueRoundKnockdowns": 0,
             "redRoundKnockdowns": 0,
+            "blueLivesDepleted": False,
+            "redLivesDepleted": False,
             "blueComboHitText": "",
             "blueComboDamageText": "",
             "redComboHitText": "",
@@ -4301,6 +4303,9 @@ if(potmReplayAudioVideo)potmReplayAudioVideo.addEventListener('playing',()=>{let
         html = add_player_identity_layout(html)
         html = add_venue_background_layout(html)
         html = add_hud_layout(html)
+        # Exhaust the life icons without fabricating extra knockdowns in stats.
+        html = html.replace('function lives(id,kd){',
+            "function lives(id,kd){if(latestState[(id.indexOf('red')===0?'red':'blue')+'LivesDepleted']===true)kd=3;")
         return html.replace(
             "</body>",
             '<svg aria-hidden="true" width="0" height="0" style="position:absolute">'

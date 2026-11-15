@@ -78,7 +78,18 @@ def prepare_dialogue(cfg, role, dialogue, *, narration_only=False):
     return packet
 
 
-def usage_voice(cfg, role, edge_voice, timing=None, dialogue=None):
+def narration_text(text, dialogue):
+    """Honor name-free live calls on both pack and Edge playback paths."""
+    packet = dialogue or {}
+    focus = packet.get("pack_requested_focus") or {}
+    name = str(focus.get("name") or "")
+    prefix = name + ", "
+    if packet.get("pack_narration_only") and focus.get("named") and name and str(text).startswith(prefix):
+        return str(text)[len(prefix):]
+    return text
+
+
+def usage_voice(cfg, role, edge_voice, timing=None, dialogue=None, *, text=None):
     if (timing or {}).get("kind") == "report":
         return edge_voice
     voice = commentary_voice(cfg, role, edge_voice)
@@ -93,7 +104,22 @@ def usage_voice(cfg, role, edge_voice, timing=None, dialogue=None):
                        "focus": {key: requested.get(key) for key in ("name", "named", "side")},
                        "prefix": str(actual.get("name") or "") + "!" if requested.get("named") else ""}
     options["pack"]["narration_only"] = bool(packet.get("pack_narration_only"))
+    # Pack mode is intentionally pack-only for live commentary. A missing clip
+    # must never silently switch the broadcaster's voices to Edge or live Qwen.
     return PREFIX + base64.urlsafe_b64encode(json.dumps(options, sort_keys=True, ensure_ascii=False).encode()).decode("ascii")
+
+
+def _sentence_parts(voice, text, plan):
+    directory = Path(plan["directory"])
+    focus = plan.get("focus") or {}
+    name = str(focus.get("name") or "")
+    prefix = name + ", "
+    if focus.get("named") and name and text.startswith(prefix):
+        parts = [clip_path(voice, text[len(prefix):], directory=directory)]
+        if not plan.get("narration_only"):
+            parts.insert(0, clip_path(voice, plan["prefix"], directory=directory))
+        return parts
+    return [clip_path(voice, text, directory=directory)]
 
 
 def render(text, path, voice):
@@ -104,17 +130,7 @@ def render(text, path, voice):
     # Only app-owned pack roots, never user-controlled paths in a descriptor.
     if directory.resolve() != root().resolve():
         raise LocalTTSError("해설팩 경로가 현재 프로그램과 다릅니다.")
-    focus = plan.get("focus") or {}
-    name = str(focus.get("name") or "")
-    prefix = name + ", "
-    parts = []
-    if focus.get("named") and name and str(text).startswith(prefix):
-        bare = str(text)[len(prefix):]
-        parts = [clip_path(voice, bare, directory=directory)]
-        if not plan.get("narration_only"):
-            parts.insert(0, clip_path(voice, plan["prefix"], directory=directory))
-    else:
-        parts = [clip_path(voice, text, directory=directory)]
+    parts = _sentence_parts(voice, str(text), plan)
     if not all(ready(part) for part in parts):
         raise LocalTTSError("해설팩에 준비되지 않은 멘트입니다. 실시간 합성을 기다리지 않고 생략합니다. 팩 생성/이어 만들기를 실행해 주세요.")
     staged = ""

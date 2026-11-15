@@ -60,6 +60,96 @@ class RoundHighlightTests(unittest.TestCase):
         self.assertEqual(kwargs['replay_kind'],'round_highlight')
         self.assertIn('PLAYER',kwargs['replay_caption'])
         self.assertEqual(kwargs['start_from_end_sec'],8)
+        self.assertEqual(kwargs['volume'],70)
+
+    def test_high_quality_subset_is_selected_before_chronological_sort(self):
+        self.cfg.round_highlights_max_clips=5
+        first=self.event('early',round_remaining_seconds=150)
+        self.engine.attach(self.path,{'round_highlight_id':first['id']},'source_record')
+        self.now=10;middle=self.event('middle',is_counter=True,round_remaining_seconds=120)
+        self.engine.attach(self.path,{'round_highlight_id':middle['id']},'source_record')
+        self.now=20;last=self.event('last',effect_kind='knockdown',round_remaining_seconds=90)
+        self.engine.attach(self.path,{'round_highlight_id':last['id']},'source_record')
+        self.engine.observe({'spectator_round_state':'break','seconds_left':30})
+        self.engine.report({'round':1});self.now=29;self.engine.tick()
+        caption=self.overlay.play_obs_replay.call_args.kwargs['replay_caption']
+        self.assertIn('이벤트 2:00',caption)
+        self.assertIn('COUNTER COMBO',caption)
+        self.assertEqual([row['id'] for row in self.engine.remaining],[last['id']])
+        self.assertEqual([row['id'] for row in self.engine.ready(1)],[last['id'],middle['id'],first['id']])
+
+    def test_countdown_not_arrival_order_controls_known_scene_chronology(self):
+        self.cfg.round_highlights_max_clips=2
+        first=self.event('late-clock',round_remaining_seconds=40)
+        self.engine.attach(self.path,{'round_highlight_id':first['id']},'source_record')
+        self.now=10;second=self.event('early-clock',is_counter=True,round_remaining_seconds=100)
+        self.engine.attach(self.path,{'round_highlight_id':second['id']},'source_record')
+        self.engine.observe({'spectator_round_state':'break','seconds_left':60});self.engine.report({'round':1})
+        self.now=20;self.engine.tick()
+        self.assertIn('이벤트 1:40',self.overlay.play_obs_replay.call_args.kwargs['replay_caption'])
+        self.engine.ended('clip-token')
+        self.assertIn('이벤트 0:40',self.overlay.play_obs_replay.call_args.kwargs['replay_caption'])
+
+    def test_unknown_clock_uses_event_order_without_inventing_zero_time(self):
+        self.cfg.round_highlights_max_clips=2
+        first=self.event('one',event_time=10)
+        self.engine.attach(self.path,{'round_highlight_id':first['id']},'source_record')
+        self.now=10;second=self.event('two',is_counter=True)
+        self.engine.attach(self.path,{'round_highlight_id':second['id']},'source_record')
+        self.engine.observe({'spectator_round_state':'break','seconds_left':60});self.engine.report({'round':1})
+        self.now=20;self.engine.tick()
+        caption=self.overlay.play_obs_replay.call_args.kwargs['replay_caption']
+        self.assertIn('시각 미확인',caption);self.assertIn('CLEAN COMBO',caption)
+        self.assertNotIn('0:00',caption);self.assertNotIn('0:10',caption)
+
+    def test_zero_clock_is_valid_and_nonfinite_clock_is_unknown(self):
+        for value,label in ((0,'이벤트 0:00'),(float('nan'),'시각 미확인'),(-2,'시각 미확인')):
+            self.engine.reset();self.now=0
+            candidate=self.event('clock',round_remaining_seconds=value)
+            self.engine.attach(self.path,{'round_highlight_id':candidate['id']},'source_record')
+            self.engine.observe({'spectator_round_state':'break','seconds_left':60});self.engine.report({'round':1})
+            self.now=10;self.engine.tick()
+            self.assertIn(label,self.overlay.play_obs_replay.call_args.kwargs['replay_caption'])
+
+    def test_watcher_emits_countdown_for_elapsed_and_remaining_event_formats(self):
+        from spectator_log_watcher import SpectatorLogWatcher
+        for prefix,first,last,basis in (('1\t',30,40,'converted_elapsed'),('',150,140,'remaining')):
+            with self.subTest(basis=basis),tempfile.TemporaryDirectory() as temp:
+                watcher=SpectatorLogWatcher(SimpleNamespace(timer_round_sec=180))
+                path=Path(temp,'damage_events.txt')
+                suffix='\t10\t1.0\tred\tleft\t.4\t.4\t0\t0\t0\tJab\tHit\tChin\n'
+                baseline=prefix+str(first)+suffix
+                path.write_text(baseline,encoding='utf-8');watcher._read_damage_update(str(path),fast_only=True)
+                path.write_text(baseline+prefix+str(last)+suffix,encoding='utf-8')
+                update=watcher._read_damage_update(str(path),fast_only=True)
+                hit=update['spectator_hit_effect_events'][0]
+                self.assertEqual(hit['round_remaining_seconds'],140)
+                self.assertEqual(hit['round_event_time_basis'],basis)
+
+    def test_round_volume_zero_mutes_and_other_replay_settings_are_untouched(self):
+        self.cfg.round_highlights_volume=0
+        self.cfg.obs_auto_replay_volume=95;self.cfg.potm_bgm_volume=83
+        self.start()
+        kwargs=self.overlay.play_obs_replay.call_args.kwargs
+        self.assertEqual(kwargs['volume'],0);self.assertTrue(kwargs['muted'])
+        self.assertEqual(self.cfg.obs_auto_replay_volume,95);self.assertEqual(self.cfg.potm_bgm_volume,83)
+
+    def test_live_volume_change_only_updates_the_owned_round_replay(self):
+        self.start();self.now=10
+        self.overlay.snapshot.return_value={'obsReplayToken':'clip-token','obsReplayKind':'round_highlight'}
+        self.overlay.update.reset_mock();self.cfg.round_highlights_volume=45;self.engine.tick()
+        self.overlay.update.assert_called_once_with(obsReplayVolume=45,obsReplayMuted=False)
+        self.overlay.snapshot.return_value={'obsReplayToken':'another-token','obsReplayKind':'potm'}
+        self.overlay.update.reset_mock();self.cfg.round_highlights_volume=0;self.engine.tick()
+        self.overlay.update.assert_not_called()
+
+    def test_volume_limits_and_config_persistence(self):
+        self.assertEqual(settings({'round_highlights_volume':-1})['round_highlights_volume'],0)
+        self.assertEqual(settings({'round_highlights_volume':999})['round_highlights_volume'],100)
+        self.assertEqual(settings({'round_highlights_volume':'bad'})['round_highlights_volume'],70)
+        cfg=AppConfig();cfg.round_highlights_volume=0
+        path=str(Path(self.tmp.name,'volume.json'));cfg.to_json(path)
+        self.assertEqual(AppConfig.from_json(path).round_highlights_volume,0)
 
     def test_final_round_never_schedules_break_highlight(self):
         self.ready();self.engine.observe({'spectator_round_state':'break','seconds_left':60})
@@ -291,9 +381,11 @@ app=QApplication([]);cfg=AppConfig();changed=Mock()
 panel=create_settings_panel(cfg,None,changed)
 panel.findChild(QCheckBox,'roundHighlightsEnabled').setChecked(False)
 panel.findChild(QSpinBox,'roundHighlights_max_clips').setValue(5)
+panel.findChild(QSpinBox,'roundHighlights_volume').setValue(55)
 panel.findChild(QComboBox,'roundHighlightsSource').setCurrentIndex(2)
 assert not cfg.round_highlights_enabled and cfg.round_highlights_max_clips==5
 assert cfg.round_highlights_capture_source=='replay_buffer' and changed.called
+assert cfg.round_highlights_volume==55
 '''
         result=subprocess.run([sys.executable,'-c',code],capture_output=True,text=True,
             env={**os.environ,'QT_QPA_PLATFORM':'offscreen'},timeout=15)

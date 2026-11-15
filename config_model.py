@@ -761,6 +761,7 @@ class AppConfig:
     round_highlights_max_clips: int = 5
     round_highlights_reserve_sec: int = 5
     round_highlights_capture_source: str = 'auto'
+    round_highlights_volume: int = 70
     obs_auto_replay_kd: bool = True
     obs_auto_replay_tko: bool = True
     # KD/TKO browser replay source. Source Record avoids saving a duplicate
@@ -978,6 +979,8 @@ class AppConfig:
     overlay_hud_portrait_pct: float = 100
     overlay_hud_dock: str = 'top'
     overlay_hud_bottom_margin_pct: float = 3
+    camera_view_mode: str = 'opponent'
+    camera_hybrid_player_pct: float = 80
     camera_director_profile: str = 'balanced'
     camera_director_pressure_enabled: bool = True
     camera_director_counter_enabled: bool = True

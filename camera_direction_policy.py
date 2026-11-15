@@ -5,6 +5,7 @@ import threading
 import time
 
 CAMERA_DEFAULTS = {
+    'camera_view_mode':'opponent','camera_hybrid_player_pct':80,
     'camera_director_profile':'balanced', 'camera_director_pressure_enabled':True,
     'camera_director_counter_enabled':True, 'camera_director_duration':2.0,
     'camera_director_max_duration':3.0, 'camera_director_cooldown':12.0,
@@ -25,7 +26,15 @@ def camera_settings(source):
               'target_pct':(5,35),'idle_sec':(6,60)}
     for key, default in CAMERA_DEFAULTS.items():
         value = source.get(key, default) if isinstance(source,dict) else getattr(source,key,default)
-        if key.endswith('_profile'):
+        if key=='camera_view_mode':
+            value=value if value in ('opponent','raw','hybrid') else default
+        elif key=='camera_hybrid_player_pct':
+            try:
+                value=float(value)
+                if not math.isfinite(value):raise ValueError()
+                value=max(0,min(100,value))
+            except (ValueError,TypeError,OverflowError):value=default
+        elif key.endswith('_profile'):
             value = value if isinstance(value,str) and value in PROFILES else default
         elif key.endswith('_enabled'):
             value = value if isinstance(value,bool) else default

@@ -3109,6 +3109,8 @@ class TimerBackend(QObject):
     redSpRatioChanged = pyqtSignal()
     blueRoundKnockdownsChanged = pyqtSignal()
     redRoundKnockdownsChanged = pyqtSignal()
+    blueLivesDepletedChanged = pyqtSignal()
+    redLivesDepletedChanged = pyqtSignal()
     blueLogMetaTextChanged = pyqtSignal()
     redLogMetaTextChanged = pyqtSignal()
     cameraTextChanged = pyqtSignal()
@@ -3206,6 +3208,8 @@ class TimerBackend(QObject):
         self._sp_recovery_delay = {"blue": 0.0, "red": 0.0}
         self._blue_round_knockdowns = 0
         self._red_round_knockdowns = 0
+        self._blue_lives_depleted = False
+        self._red_lives_depleted = False
         self._knockdown_round_key = None
         self._blue_log_meta_text = ""
         self._red_log_meta_text = ""
@@ -3569,6 +3573,14 @@ class TimerBackend(QObject):
     def redRoundKnockdowns(self) -> int:
         return int(self._red_round_knockdowns or 0)
 
+    @pyqtProperty(bool, notify=blueLivesDepletedChanged)
+    def blueLivesDepleted(self) -> bool:
+        return bool(self._blue_lives_depleted)
+
+    @pyqtProperty(bool, notify=redLivesDepletedChanged)
+    def redLivesDepleted(self) -> bool:
+        return bool(self._red_lives_depleted)
+
     @pyqtProperty(str, notify=blueLogMetaTextChanged)
     def blueLogMetaText(self) -> str:
         return str(self._blue_log_meta_text or "")
@@ -3705,6 +3717,8 @@ class TimerBackend(QObject):
             prev_key = self._knockdown_round_key
             next_key = (next_round, int(self.total_rounds or 0))
             if prev_key is not None and next_key != prev_key:
+                self._set_lives_depleted('blue',False)
+                self._set_lives_depleted('red',False)
                 if int(self._blue_round_knockdowns or 0) != 0:
                     self._blue_round_knockdowns = 0
                     self.blueRoundKnockdownsChanged.emit()
@@ -3973,8 +3987,17 @@ class TimerBackend(QObject):
         if side in ("blue", "red"):
             self.hitImpactRequested.emit(side, max(0.0, dmg))
 
+    def _set_lives_depleted(self,side,value):
+        attr='_'+side+'_lives_depleted'
+        if bool(getattr(self,attr,False))!=bool(value):
+            setattr(self,attr,bool(value))
+            getattr(self,side+'LivesDepletedChanged').emit()
+
     def set_spectator_log_info(self, info: Optional[dict]):
         info = dict(info or {})
+        for side in ('blue','red'):
+            if side+'_lives_depleted' in info:
+                self._set_lives_depleted(side,info[side+'_lives_depleted'])
 
         def set_text(attr: str, signal, value: object):
             text = str(value or "")
@@ -21544,7 +21567,7 @@ class MainApp(QObject):
                 "category": category, "scene": dict(update.get("commentary_tts_story") or {}).get("scene", ""),
                 "expires_at": created + (5.0 if terminal else 3.2)}
 
-    def _handoff_voice_settings(self, role: str, kwargs: dict) -> tuple:
+    def _handoff_voice_settings(self, role: str, kwargs: dict, text=None) -> tuple:
         default_voice = "ko-KR-InJoonNeural" if role == "caster" else "ko-KR-SunHiNeural"
         voice = str(getattr(self.cfg, "spectator_caster_voice" if role == "caster" else "spectator_commentary_voice", default_voice) or default_voice)
         rate = int(getattr(self.cfg, "spectator_commentary_rate", 200) or 200)
@@ -21556,7 +21579,7 @@ class MainApp(QObject):
         volume = float(getattr(self.cfg, "spectator_commentary_volume", 100.) or 100.)
         packet = pack_prepare_dialogue(self.cfg, role, kwargs.get("_dialogue"),
                                        narration_only=(kwargs.get("_timing") or {}).get("kind") != "report")
-        return pack_usage_voice(self.cfg, role, voice, kwargs.get("_timing"), packet), rate, volume, pitch
+        return pack_usage_voice(self.cfg, role, voice, kwargs.get("_timing"), packet, text=text), rate, volume, pitch
 
     def _restore_commentary_handoff_volume(self) -> None:
         fade = self.__dict__.get("_commentary_handoff_fade")
@@ -21585,7 +21608,7 @@ class MainApp(QObject):
         self._cancel_commentary_handoff("replaced")
         token = int(self.__dict__.get("_commentary_handoff_counter", 0)) + 1
         self._commentary_handoff_counter = token
-        settings = self._handoff_voice_settings(role, kwargs)
+        settings = self._handoff_voice_settings(role, kwargs, text=text)
         path = self._commentary_tts_cache_path(text, role, *settings)
         if not path:
             return
@@ -21656,7 +21679,7 @@ class MainApp(QObject):
         if (time.monotonic() >= timing["expires_at"] or self._potm_presentation_active
                 or pending["epochs"] != dict(self._commentary_followup_epoch)):
             return False
-        if pending["settings"] != self._handoff_voice_settings(pending["role"], pending["kwargs"]):
+        if pending["settings"] != self._handoff_voice_settings(pending["role"], pending["kwargs"], text=pending["text"]):
             return False
         packet = pending["kwargs"].get("_dialogue") or {}
         if packet.get("focus") and not SPOKEN_FOCUS.valid(packet["focus"]):
@@ -21982,6 +22005,8 @@ class MainApp(QObject):
             return
         _dialogue = pack_prepare_dialogue(self.__dict__.get("cfg"), role, _dialogue,
                                           narration_only=timing["kind"] != "report")
+        from commentary_pack import narration_text
+        text = narration_text(text, _dialogue)
         pending = self.__dict__.get("_commentary_handoff_pending")
         if not _from_queue and pending and timing["kind"] in ("live", "terminal"):
             old_timing = pending["kwargs"]["_timing"]
@@ -22039,7 +22064,7 @@ class MainApp(QObject):
             voice = str(getattr(self.cfg, "spectator_caster_voice", "ko-KR-InJoonNeural") or "ko-KR-InJoonNeural")
         else:
             voice = str(getattr(self.cfg, "spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
-        voice = pack_usage_voice(self.cfg, role, voice, timing, _dialogue)
+        voice = pack_usage_voice(self.cfg, role, voice, timing, _dialogue, text=text)
         try:
             rate = int(getattr(self.cfg, "spectator_commentary_rate", 200) or 200)
         except Exception:
@@ -23466,6 +23491,7 @@ class MainApp(QObject):
     @staticmethod
     def _chapter_result_method_text(method: str) -> str:
         raw = str(method or "").strip()
+        if raw.upper().replace(' ','')=='KO/TKO':return 'KO/TKO'
         token = raw.upper().replace(" ", "").replace("_", "")
         if "TKO" in token:
             return "TKO"
@@ -27308,7 +27334,13 @@ class MainApp(QObject):
             "redSpRatio": float(ratios.get("red", 1.0)),
         }
 
-    def _browser_overlay_lives_update(self, d: dict, state: dict) -> Dict[str, int]:
+    def _hud_life_flags(self,d):
+        from stoppage_rules import update_life_flags
+        eliminated,round_key=update_life_flags(d,getattr(self,'_hud_lives_depleted',()),getattr(self,'_hud_lives_round',None))
+        self._hud_lives_depleted=eliminated;self._hud_lives_round=round_key
+        return {side:side in eliminated for side in ('blue','red')}
+
+    def _browser_overlay_lives_update(self, d: dict, state: dict) -> Dict[str, Any]:
         counts = dict(getattr(self, "_browser_round_knockdowns", {}) or {})
         for side in ("blue", "red"):
             try:
@@ -27345,12 +27377,15 @@ class MainApp(QObject):
             side = str(ev.get("side") or "").lower()
             kind = str(ev.get("kind") or "").lower()
             if side in ("blue", "red") and kind in ("knockdown", "tko"):
-                counts[side] = max(0, min(3, int(counts.get(side, 0) or 0) + 1))
+                if side+'_round_knockdowns' not in info:
+                    counts[side] = max(0, min(3, int(counts.get(side, 0) or 0) + 1))
 
         self._browser_round_knockdowns = counts
         return {
             "blueRoundKnockdowns": int(counts.get("blue", 0) or 0),
             "redRoundKnockdowns": int(counts.get("red", 0) or 0),
+            "blueLivesDepleted": 'blue' in getattr(self,'_hud_lives_depleted',()),
+            "redLivesDepleted": 'red' in getattr(self,'_hud_lives_depleted',()),
         }
 
     def _start_spectator_replay_from_overlay(self):
@@ -29130,6 +29165,7 @@ class MainApp(QObject):
                     self._browser_final_vitals = last_fight_vitals
 
             if ("spectator_effect_events" in d or "spectator_log_info" in d
+                    or "spectator_lives_depleted" in d
                     or "round_current" in d
                     or bool(d.get("spectator_match_stats_reset", False))
                     or bool(d.get("spectator_match_clear", False))):
@@ -30391,6 +30427,15 @@ class MainApp(QObject):
     def apply_ui_update(self, d: dict):
         if bool(getattr(self, '_shutting_down', False)):
             return
+        previous_lives=set(getattr(self,'_hud_lives_depleted',()))
+        life_flags=self._hud_life_flags(d)
+        if previous_lives!=self._hud_lives_depleted or 'spectator_log_info' in d:
+            d=dict(d)
+            d['spectator_lives_depleted']=life_flags
+            if 'spectator_log_info' in d:
+                info=dict(d.get('spectator_log_info') or {})
+                info.update({side+'_lives_depleted':value for side,value in life_flags.items()})
+                d['spectator_log_info']=info
         self._round_highlight_engine().observe(d)
         if any(key in d for key in HUD_DEFAULTS):
             for key,value in hud_settings(self.cfg,d).items():
@@ -30829,6 +30874,14 @@ class MainApp(QObject):
                     self.timer_win.set_spectator_log_info(dict(d.get("spectator_log_info") or {}))
             except Exception:
                 pass
+        if 'spectator_lives_depleted' in d and qml_visuals:
+            try:
+                backend=getattr(self.timer_win,'_backend',None)
+                if backend is not None:
+                    for side,value in d['spectator_lives_depleted'].items():
+                        backend._set_lives_depleted(side,value)
+            except Exception:
+                logging.exception('SPECTATORLOG_LIVES_DISPLAY_UPDATE_FAIL')
         if "round_intro_event" in d:
             try:
                 show_round_intro = bool(getattr(self.cfg, "overlay_show_round", True))

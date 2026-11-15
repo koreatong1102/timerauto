@@ -2647,7 +2647,7 @@ ApplicationWindow {
                     Item {
                         width: 22
                         height: 22
-                        property bool filled: backend && index >= Math.min(3, backend.blueRoundKnockdowns)
+                        property bool filled: backend && !backend.blueLivesDepleted && index >= Math.min(3, backend.blueRoundKnockdowns)
                         layer.enabled: true
                         layer.smooth: true
                         layer.samples: 4
@@ -2680,7 +2680,7 @@ ApplicationWindow {
                                 ctx.beginPath(); ctx.arc(cx, cy, r - 0.6, 0, Math.PI * 2); ctx.stroke()
                                 ctx.restore()
                             }
-                            Connections { target: backend; function onBlueRoundKnockdownsChanged() { tekkenBlueKdDot.requestPaint() } }
+                            Connections { target: backend; function onBlueRoundKnockdownsChanged() { tekkenBlueKdDot.requestPaint() } function onBlueLivesDepletedChanged() { tekkenBlueKdDot.requestPaint() } }
                             Component.onCompleted: requestPaint()
                         }
                     }
@@ -2888,7 +2888,7 @@ ApplicationWindow {
                     Item {
                         width: 22
                         height: 22
-                        property bool filled: backend && index >= Math.min(3, backend.redRoundKnockdowns)
+                        property bool filled: backend && !backend.redLivesDepleted && index >= Math.min(3, backend.redRoundKnockdowns)
                         layer.enabled: true
                         layer.smooth: true
                         layer.samples: 4
@@ -2921,7 +2921,7 @@ ApplicationWindow {
                                 ctx.beginPath(); ctx.arc(cx, cy, r - 0.6, 0, Math.PI * 2); ctx.stroke()
                                 ctx.restore()
                             }
-                            Connections { target: backend; function onRedRoundKnockdownsChanged() { tekkenRedKdDot.requestPaint() } }
+                            Connections { target: backend; function onRedRoundKnockdownsChanged() { tekkenRedKdDot.requestPaint() } function onRedLivesDepletedChanged() { tekkenRedKdDot.requestPaint() } }
                             Component.onCompleted: requestPaint()
                         }
                     }
@@ -5569,7 +5569,7 @@ ApplicationWindow {
                     property real displaySize: Math.max(13, Math.min(19, bluePunishmentBadge.height * 0.92))
                     width: displaySize
                     height: displaySize
-                    property bool filled: backend && index >= Math.min(3, backend.blueRoundKnockdowns)
+                    property bool filled: backend && !backend.blueLivesDepleted && index >= Math.min(3, backend.blueRoundKnockdowns)
                     onFilledChanged: blueKnockdownDotCanvas.requestPaint()
                     onDisplaySizeChanged: blueKnockdownDotCanvas.requestPaint()
                     Canvas {
@@ -5665,6 +5665,7 @@ ApplicationWindow {
                     Connections {
                         target: backend
                         function onBlueRoundKnockdownsChanged() { blueKnockdownDotCanvas.requestPaint() }
+                        function onBlueLivesDepletedChanged() { blueKnockdownDotCanvas.requestPaint() }
                     }
                 }
             }
@@ -7584,7 +7585,7 @@ ApplicationWindow {
                     property real displaySize: Math.max(13, Math.min(19, redPunishmentBadge.height * 0.92))
                     width: displaySize
                     height: displaySize
-                    property bool filled: backend && index < Math.max(0, 3 - backend.redRoundKnockdowns)
+                    property bool filled: backend && !backend.redLivesDepleted && index < Math.max(0, 3 - backend.redRoundKnockdowns)
                     onFilledChanged: redKnockdownDotCanvas.requestPaint()
                     onDisplaySizeChanged: redKnockdownDotCanvas.requestPaint()
                     Canvas {
@@ -7680,6 +7681,7 @@ ApplicationWindow {
                     Connections {
                         target: backend
                         function onRedRoundKnockdownsChanged() { redKnockdownDotCanvas.requestPaint() }
+                        function onRedLivesDepletedChanged() { redKnockdownDotCanvas.requestPaint() }
                     }
                 }
             }

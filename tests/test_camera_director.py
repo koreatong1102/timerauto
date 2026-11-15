@@ -130,6 +130,17 @@ class DirectorStateTests(unittest.TestCase):
         self.step(3)
         self.assertEqual(self.director.state,"idle")
 
+    def test_hybrid_selection_reaches_auto_camera_without_raw_axis_tilt(self):
+        self.director.options.update(view_mode='hybrid',hybrid_player_pct=80)
+        (self.root/'blue/head_position.txt').write_text('0 0 0 1.7 0 .6111 -.6504 .0333 -.4500')
+        self.active()
+        self.assertIsNotNone(self.director.camera.hybrid.correction)
+        values=self.director.camera.last_output.split('\t')[1].split()
+        self.assertAlmostEqual(float(values[0]),0,places=4)
+        self.assertAlmostEqual(float(values[1]),0,places=4)
+        self.assertAlmostEqual(float(values[2]),0,places=4)
+        self.assertAlmostEqual(abs(float(values[3])),1,places=4)
+
     def test_cancel_and_priority_content_exit_instead_of_finishing_duration(self):
         self.active()
         self.step(.7,busy=True)

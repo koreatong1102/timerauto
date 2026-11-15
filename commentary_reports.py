@@ -35,7 +35,8 @@ def build_report_narration(report, *, final=False, swearing="strong", callback="
     method = str(data.get("resultMethod") or dict(data.get("matchResult") or {}).get("method") or "").lower()
     if final:
         if winner in SIDES:
-            result = ("TKO승" if "tko" in method or "technical" in method else
+            result = ("경기 중단 승리" if method.replace(' ','')=='ko/tko' else
+                      "TKO승" if "tko" in method or "technical" in method else
                       "KO승" if method == "ko" or "knockout" in method else
                       "기권승" if any(x in method for x in ("forfeit", "surrender", "retire", "기권")) else
                       "판정승" if any(x in method for x in ("decision", "point", "판정")) else "승리")

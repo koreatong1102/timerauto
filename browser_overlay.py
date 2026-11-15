@@ -25,6 +25,7 @@ from app_paths import app_path, normalize_builtin_asset_path
 from diagnostics import diagnostics as DIAG
 from overlay_studio import OverlayStudioStore, runtime_js, studio_html
 from report_images import ReportImageExporter
+from video_formats import VIDEO_EXTENSIONS
 
 
 _NO_UPDATE_FALLBACK = object()
@@ -381,7 +382,8 @@ class BrowserOverlayServer:
                             index = -1
                         video_path = outer.highlight_path(index)
                         if video_path and os.path.isfile(video_path):
-                            ctype = mimetypes.guess_type(video_path)[0] or "video/mp4"
+                            ctype = ('video/x-matroska' if os.path.splitext(video_path)[1].lower() == '.mkv'
+                                     else mimetypes.guess_type(video_path)[0] or "video/mp4")
                             self._send_file(video_path, ctype)
                             return
                         self._send(404, b"", "text/plain")
@@ -761,7 +763,7 @@ class BrowserOverlayServer:
             return str(self._asset_paths.get(str(name or "").lower(), "") or "")
 
     def set_highlight_playlist(self, paths: Any) -> None:
-        allowed = {".mp4", ".webm", ".mov", ".m4v", ".avi"}
+        allowed = VIDEO_EXTENSIONS
         normalized = []
         for value in list(paths or []):
             raw = str(value or "").strip()
@@ -4055,7 +4057,7 @@ function loadIdleHighlight(s,advance=false){
   let video=q('idleHighlightVideo'),count=Math.max(0,Number((s&&s.idleHighlightCount)||0)|0);if(!video||!count)return;
   let index=pickIdleHighlight(s,advance),key=index+'|'+String((s&&s.idleHighlightRev)||0);idleHighlightIndex=index;
   if(idleHighlightKey!==key){idleHighlightKey=key;video.src='/highlight/'+index+'?rev='+encodeURIComponent((s&&s.idleHighlightRev)||0);video.load()}
-  let play=video.play();if(play&&typeof play.catch==='function')play.catch(()=>{})
+  let play=video.play();if(play&&typeof play.catch==='function')play.catch(e=>idleVideoErrorBeacon('idle_play_rejected',e&&e.name))
 }
 function syncIdleHighlight(s){
   s=s||latestState||{};let host=q('idleHighlight'),video=q('idleHighlightVideo');if(!host||!video)return;
@@ -4076,7 +4078,10 @@ function syncIdleHighlight(s){
 }
 function advanceIdleHighlight(){if(!idleHighlightActive||!canPlayIdleHighlight(latestState)){syncIdleHighlight(latestState);return}loadIdleHighlight(latestState,true)}
 q('idleHighlightVideo').addEventListener('ended',advanceIdleHighlight);
-q('idleHighlightVideo').addEventListener('error',()=>{if(idleHighlightActive)setTimeout(advanceIdleHighlight,250)});
+let idleVideoErrorAt=0;
+function idleVideoErrorBeacon(event,code){let now=Date.now();if(now-idleVideoErrorAt<5000)return;idleVideoErrorAt=now;let v=q('idleHighlightVideo');overlayBeacon(event,{key:idleHighlightKey,browserMs:now,position:v.currentTime,duration:v.duration,muted:v.muted,errorCode:code||(v.error?v.error.code:0)})}
+q('idleHighlightVideo').addEventListener('playing',()=>{let v=q('idleHighlightVideo');overlayBeacon('idle_video_playing',{key:idleHighlightKey,browserMs:Date.now(),position:v.currentTime,duration:v.duration,muted:v.muted})});
+q('idleHighlightVideo').addEventListener('error',()=>{idleVideoErrorBeacon('idle_video_error');if(idleHighlightActive)setTimeout(advanceIdleHighlight,250)});
 setInterval(()=>{syncReplayLabelPosition(latestState);syncIdleHighlight(latestState)},250);
 // The compact renderer used to pass an empty string unconditionally, which
 // made every weak-point label disappear even though the state was correct.

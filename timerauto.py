@@ -170,6 +170,7 @@ from player_utils import (
     player_similarity_for_match as _player_similarity_for_match,
 )
 
+from video_formats import VIDEO_EXTENSIONS, VIDEO_FILE_FILTER
 from app_paths import (
     get_app_base_dir,
     app_path,
@@ -9550,6 +9551,7 @@ class SettingsDialog(QDialog):
         self.chk_idle_highlight.setChecked(bool(getattr(self.cfg, "idle_highlight_enabled", False)))
         self.le_idle_highlight_path = QLineEdit(str(getattr(self.cfg, "idle_highlight_path", "") or ""))
         self.le_idle_highlight_path.setPlaceholderText("영상 파일 또는 영상 폴더")
+        self.le_idle_highlight_path.setToolTip('MP4 / MKV / WebM / MOV / M4V / AVI · 선택한 폴더의 하위 폴더도 검색합니다. 영상 내부 코덱은 OBS 브라우저가 지원해야 합니다.')
         self.btn_idle_highlight_file = QPushButton("파일")
         self.btn_idle_highlight_folder = QPushButton("폴더")
         self.btn_idle_highlight_file.clicked.connect(self._pick_idle_highlight_file)
@@ -9561,6 +9563,7 @@ class SettingsDialog(QDialog):
         self.sp_idle_highlight_volume = QSpinBox()
         self.sp_idle_highlight_volume.setRange(0, 100)
         self.sp_idle_highlight_volume.setSuffix(" %")
+        self.sp_idle_highlight_volume.setToolTip('0%이면 영상 음소거 체크를 해제해도 소리가 나지 않습니다.')
         self.sp_idle_highlight_volume.setValue(int(getattr(self.cfg, "idle_highlight_volume", 0) or 0))
         self.cmb_idle_highlight_fit = QComboBox()
         self.cmb_idle_highlight_fit.addItem("화면 채우기", "cover")
@@ -9643,7 +9646,7 @@ class SettingsDialog(QDialog):
             start = os.path.dirname(start) if start else get_app_base_dir()
         path, _ = QFileDialog.getOpenFileName(
             self, "하이라이트 영상 선택", start,
-            "Video Files (*.mp4 *.webm *.mov *.m4v);;All Files (*)",
+            VIDEO_FILE_FILTER,
         )
         if path:
             self.le_idle_highlight_path.setText(path)
@@ -24939,7 +24942,7 @@ class MainApp(QObject):
         if not raw:
             return []
         path = normalize_app_path(raw)
-        allowed = {".mp4", ".webm", ".mov", ".m4v", ".avi"}
+        allowed = VIDEO_EXTENSIONS
         if os.path.isfile(path):
             return [path] if os.path.splitext(path)[1].lower() in allowed else []
         if not os.path.isdir(path):

@@ -498,7 +498,7 @@ class DiagnosticRecorder:
             zf.writestr("media_metadata.json", json.dumps(_evidence_json(media, mask), ensure_ascii=False, indent=2))
             zf.writestr("build_fingerprints.json", json.dumps(self._build_fingerprints(app_base or os.getcwd()), indent=2))
             zf.writestr("evidence_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-            findings = self._findings(context, media, reproduction)
+            findings = self._findings(context, media, reproduction, overlay=overlay_safe)
             zf.writestr("findings.json", json.dumps(_evidence_json(findings, mask), ensure_ascii=False, indent=2))
             summary = self._analysis_summary(app_state_safe, cfg_safe, context, snap, manifest, media)
             summary += "\n\n[자동 점검 항목]\n" + "\n".join(f"{item['certainty']}: {item['message']} (근거: {item['evidence']})" for item in findings)
@@ -641,11 +641,17 @@ class DiagnosticRecorder:
                     manifest.append({"entry": prefix + "ledger", "status": "read_failed", "error": _mask_string(str(exc))})
 
     @staticmethod
-    def _findings(context, media, reproduction):
+    def _findings(context, media, reproduction, *, overlay=None):
         findings = []
         def add(certainty, message, evidence):
             findings.append({"certainty": certainty, "message": message, "evidence": evidence})
         runtime = context.get("runtime", {})
+        idle = overlay or {}
+        if idle.get('idleHighlightEnabled') is True:
+            if idle.get('idleHighlightCount') == 0:
+                add('확정', '대기영상 사용은 켜져 있지만 재생목록이 0개입니다. 선택 폴더·파일 확장자·파일 존재 여부를 확인하세요. 경기 상태나 인터넷 속도와 별개로 재생할 항목이 없습니다.', 'overlay_snapshot.json:idleHighlightCount')
+            if idle.get('idleHighlightMuted') is False and idle.get('idleHighlightVolume') == 0:
+                add('확정', '대기영상 음소거는 해제돼 있지만 음량이 0%입니다. 화면 재생 여부와 별개로 소리가 나지 않는 설정입니다.', 'overlay_snapshot.json:idleHighlightVolume')
         candidate = runtime.get("potm_candidate", {})
         if candidate.get("file_source") and candidate.get("capture_source") and candidate["file_source"] != candidate["capture_source"]:
             add("확정", "후보의 선택 저장 방식과 연결된 영상 방식이 다릅니다.", "runtime_evidence.json:potm_candidate")

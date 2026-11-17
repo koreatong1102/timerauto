@@ -649,9 +649,10 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
     saved=camera_settings(cfg)
     profile=QComboBox()
     profile.setObjectName('cameraDirectorProfile')
-    for label,key in (('신중 · 좋은 컷만','cautious'),('균형 · 기본','balanced'),('적극 · 더 자주','active')):
+    for label,key in (('신중 · 좋은 컷만','cautious'),('균형 · 기본','balanced'),('적극 · 더 자주','active'),('로테이션 · 블루 10초 → 레드 10초 → 일반 10초','rotation')):
         profile.addItem(label,key)
     profile.setCurrentIndex(max(0,profile.findData(saved['camera_director_profile'])))
+    profile.setToolTip('로테이션은 경기 중 블루 10초 → 레드 10초 → 일반 카메라 10초를 반복합니다. 아래 기본/최대 유지시간 대신 고정 10초를 사용합니다. 다운·리포트·추적 이상은 우선 복귀하며, 전환 확인에 짧은 시간이 추가될 수 있습니다.')
     layout.addRow('자동 연출 성향',profile)
     pressure=QCheckBox('공격 흐름 · 상대 반격 없이 이어지는 중앙엔진 콤보')
     counter=QCheckBox('카운터 후속타 · 카운터 뒤 실제 공격이 이어질 때')
@@ -709,7 +710,7 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
     arm = QPushButton("자동 연출 시작")
     disarm = QPushButton("자동 연출 중지 / 복귀")
     def arm_auto():
-        if not pressure.isChecked() and not counter.isChecked() and not broadcast.isChecked():
+        if profile.currentData()!='rotation' and not pressure.isChecked() and not counter.isChecked() and not broadcast.isChecked():
             service.report('공격 흐름·카운터 후속타·방송 카메라 모드 중 하나 이상 선택하세요.')
             return
         if not confirmation.isChecked():

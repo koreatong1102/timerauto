@@ -91,6 +91,8 @@ class EntertainmentStyleTests(unittest.TestCase):
         script = '''
 import os,tempfile
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QCoreApplication,QEvent
+from PyQt6 import sip
 from config_model import AppConfig
 from timerauto import SettingsDialog
 app=QApplication([])
@@ -117,16 +119,20 @@ with tempfile.TemporaryDirectory(prefix="rfc_style_ui_") as td:
   dlg.cmb_spectator_bgrade_swearing.setCurrentIndex(0)
   dlg._test_spectator_commentary_duo_suite()
   assert not any("샤갈" in step["text"]+step.get("followup_text", "") for step in recorded[-1][1])
+  dlg._quitting=True
   dlg._apply_timer.stop()
   dlg.deleteLater()
+  QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+  app.processEvents()
+  assert sip.isdeleted(dlg)
  finally:
   os.chdir(previous)
 print("STYLE_UI_OK")
 '''
-        result = subprocess.run([sys.executable, "-c", script],
+        result = subprocess.run([sys.executable, '-X', 'faulthandler', "-c", script],
             cwd=str(Path(__file__).resolve().parents[1]),
-            env={**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONIOENCODING": "utf-8"},
-            capture_output=True, text=True, encoding="utf-8", timeout=40)
+            env={**os.environ, "QT_QPA_PLATFORM": "offscreen", 'PYTHONUTF8': '1', "PYTHONIOENCODING": "utf-8"},
+            capture_output=True, text=True, encoding="utf-8", errors='backslashreplace', timeout=40)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("STYLE_UI_OK", result.stdout)
 
@@ -151,7 +157,8 @@ class EntertainmentWatcherTests(unittest.TestCase):
         self.assertEqual(w._direct_live_commentary(**kwargs).text, candidate.text)
         w.cfg.spectator_commentary_style = "b_grade"
         result = w._direct_live_commentary(**kwargs)
-        self.assertIn("헛친", result.text)
+        from commentary_calls import SHORT_CALLS
+        self.assertTrue(any(line in result.presentation["turns"][0]["text"] for line in SHORT_CALLS["whiff"]))
         self.assertEqual(len(result.presentation["turns"]), 2)
         self.assertEqual(result.category, "counter")
         self.assertFalse(result.text.startswith(candidate.text))

@@ -84,7 +84,8 @@ class HudLayoutTests(unittest.TestCase):
 import os,tempfile
 from contextlib import chdir
 from PyQt6.QtWidgets import QApplication,QPushButton
-from PyQt6.QtCore import QObject,pyqtSignal
+from PyQt6.QtCore import QObject,pyqtSignal,QCoreApplication,QEvent
+from PyQt6 import sip
 from unittest.mock import patch
 from config_model import AppConfig
 from timerauto import SettingsDialog
@@ -129,11 +130,16 @@ with tempfile.TemporaryDirectory() as folder, chdir(folder):
  assert cfg.overlay_hud_portrait_pct==100
  assert panel.dock.currentData()=='top' and cfg.overlay_hud_bottom_margin_pct==3
  assert panel.controls['overlay_hud_y'].isEnabled()
+ dlg._quitting=True
  dlg._apply_timer.stop();dlg.deleteLater()
+ QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+ app.processEvents()
+ assert sip.isdeleted(dlg) # Finish native widget disposal before Python finalizes.
 '''
-        result=subprocess.run([sys.executable,'-c',script],cwd=ROOT,capture_output=True,text=True,
-                              env={**os.environ,'QT_QPA_PLATFORM':'offscreen'},timeout=20)
-        self.assertEqual(result.returncode,0,result.stderr)
+        result=subprocess.run([sys.executable,'-X','faulthandler','-c',script],cwd=ROOT,capture_output=True,text=True,
+                              encoding='utf-8',errors='backslashreplace',
+                              env={**os.environ,'QT_QPA_PLATFORM':'offscreen','PYTHONUTF8':'1','PYTHONIOENCODING':'utf-8'},timeout=20)
+        self.assertEqual(result.returncode,0,(result.stdout or '')+(result.stderr or ''))
 
     @unittest.skipUnless(shutil.which('node'),'Node required for geometry tests')
     def test_browser_geometry_keeps_size_and_fullscreen_siblings(self):

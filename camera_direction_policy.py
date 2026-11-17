@@ -17,6 +17,7 @@ PROFILES = {
     'cautious':dict(hits=4, score=82, stability=.22, speed=2, turn=100, near=.8, far=2.8),
     'balanced':dict(hits=3, score=72, stability=.15, speed=2.5, turn=120, near=.7, far=3.2),
     'active':dict(hits=3, score=65, stability=.10, speed=3, turn=150, near=.65, far=3.5),
+    'rotation':dict(hits=3, score=72, stability=.15, speed=2.5, turn=120, near=.7, far=3.2),
 }
 
 
@@ -60,6 +61,7 @@ class DirectorFeed:
         self.latest = None
         self.blocked_until = self.at = 0
         self.busy = False
+        self.live = None
         self.seen = collections.OrderedDict()
         self.flows = {}
         self.serial = 0
@@ -71,6 +73,8 @@ class DirectorFeed:
         now = time.monotonic() if now is None else now
         with self.lock:
             self.at,self.busy = now,busy
+            if 'spectator_round_state' in data:
+                self.live = str(data['spectator_round_state'] or '').lower() in ('fight','roundfight')
             try:
                 observed=float(data.get('commentary_tts_observed_at',now))
                 late=math.isfinite(observed) and now-observed>.9
@@ -129,7 +133,7 @@ class DirectorFeed:
 
     def snapshot(self,now):
         with self.lock:
-            valid=now-self.at<=1 and not self.busy and now>=self.blocked_until
+            valid=now-self.at<=1 and not self.busy and now>=self.blocked_until and self.live is not False
             candidate=dict(self.latest) if self.latest and now-self.latest['at']<=.9 else None
             if candidate is None and now-self.last_event_at>.9:self.reason='no_fresh_combo'
             return valid,candidate

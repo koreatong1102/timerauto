@@ -8,6 +8,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
@@ -90,6 +92,23 @@ if (-not (Test-Path $dist)) {
 }
 
 Write-Host "Syncing runtime data into dist..."
+# The optional Qwen process is a separate Python interpreter: it cannot import
+# modules hidden inside the executable's PYZ. Ship its small, reviewed source
+# dependency closure beside the executable, without weights or local voices.
+$qwenRuntimeFiles = @(
+  "qwen_duo_builder.py",
+  "qwen_duo_setup.py",
+  "qwen_duo_launch.ps1",
+  "app_paths.py",
+  "local_tts.py",
+  "commentary_pack.py",
+  "commentary_calls.py",
+  "commentary_story.py",
+  "commentary_content.py",
+  "commentary_material.py",
+  "commentary_flow.py",
+  "commentary_audio.py"
+)
 $files = @(
   "HELP.md",
   "SIMPLE_MANUAL.md",
@@ -106,6 +125,7 @@ $files = @(
   "cinematic_overlay.qml",
   "timer_controls.qml"
 )
+$files += $qwenRuntimeFiles
 if ($IncludeUserConfig) {
   $files += @(
     "config.json",
@@ -274,6 +294,7 @@ $requiredReleaseFiles = @(
   "assets/images/venues/memorial_hall.png",
   "assets/images/venues/philly_parkway.jpg"
 )
+$requiredReleaseFiles += $qwenRuntimeFiles
 foreach ($required in $requiredReleaseFiles) {
   $requiredPath = Join-Path $dist $required
   if (-not (Test-Path $requiredPath)) {

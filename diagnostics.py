@@ -425,6 +425,21 @@ class DiagnosticRecorder:
         overlay_safe = _evidence_json(overlay_snapshot or {}, mask)
         format_detected = self._detect_spectator_format(spectator_root)
         context = dict(context or {})
+        # Discovery is disk I/O, not UI-owned state. Do it on the export worker.
+        base = context.get("match_archive_base")
+        if base:
+            folders = list(context.get("match_dirs") or [])
+            try:
+                recent = sorted((p for p in Path(base).iterdir() if p.is_dir() and not p.is_symlink()),
+                                key=lambda p:p.stat().st_mtime, reverse=True)
+                for folder in recent[:5]:
+                    if str(folder) not in folders:
+                        folders.append(str(folder))
+                    if len(folders) >= 2:
+                        break
+            except OSError:
+                pass
+            context["match_dirs"] = folders[:2]
         if obs_provider is not None:
             try:
                 context.setdefault("runtime", {}).setdefault("obs", {})["live_query"] = obs_provider.diagnostic_snapshot(timeout=2.0)

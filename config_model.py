@@ -708,6 +708,7 @@ class AppConfig:
     # Empty means the current Windows default output.  A selected device such
     # as "CABLE Input" lets POTM audio reach OBS without local speakers.
     potm_audio_output_device: str = ""
+    app_audio_output_device: str = ""
     potm_test_video_path: str = ""
     potm_name_color: str = "#FFC62B"
     potm_title_text: str = "PLAY OF THE MATCH"
@@ -792,6 +793,9 @@ class AppConfig:
     obs_replay_transition_speed: float = 1.0
     obs_auto_replay_stop_on_round: bool = True
     idle_highlight_enabled: bool = False
+    idle_highlight_stop_on_player: bool = False
+    idle_highlight_delay_enabled: bool = False
+    idle_highlight_after_match_sec: int = 300
     idle_highlight_path: str = ""
     idle_highlight_random: bool = True
     idle_highlight_muted: bool = True
@@ -921,6 +925,8 @@ class AppConfig:
     spectator_tts_pack_enabled: bool = False
     spectator_tts_pack_auto_names: bool = True
     spectator_qwen_model: str = "1.7B"
+    spectator_qwen_duo_profile: str = ""
+    spectator_qwen_duo_revision: str = ""
     spectator_qwen_port: int = 8768
     spectator_qwen_language: str = "Korean"
     spectator_qwen_speed: float = 1.0
@@ -1182,6 +1188,7 @@ class AppConfig:
         cfg.potm_bgm_path = str(raw.get("potm_bgm_path", "") or "").strip()
         cfg.potm_bgm_volume = max(0, min(100, int(raw.get("potm_bgm_volume", 75) or 0)))
         cfg.potm_audio_output_device = str(raw.get("potm_audio_output_device", "") or "").strip()
+        cfg.app_audio_output_device = str(raw.get("app_audio_output_device", "") or "").strip()
         cfg.potm_test_video_path = str(raw.get("potm_test_video_path", "") or "").strip()
         cfg.potm_name_color = _normalize_hex_color(raw.get("potm_name_color", "#FFC62B"))
         cfg.potm_title_text = str(raw.get("potm_title_text", "PLAY OF THE MATCH") or "PLAY OF THE MATCH").strip()[:80]
@@ -1243,6 +1250,9 @@ class AppConfig:
         cfg.obs_replay_transition_speed = max(0.25, min(2.0, float(raw.get("obs_replay_transition_speed", 1.0) or 1.0)))
         cfg.obs_auto_replay_stop_on_round = bool(raw.get("obs_auto_replay_stop_on_round", True))
         cfg.idle_highlight_enabled = bool(raw.get("idle_highlight_enabled", False))
+        cfg.idle_highlight_stop_on_player = bool(raw.get("idle_highlight_stop_on_player", False))
+        cfg.idle_highlight_delay_enabled = bool(raw.get("idle_highlight_delay_enabled", False))
+        cfg.idle_highlight_after_match_sec = max(0, min(3600, int(raw.get("idle_highlight_after_match_sec", 300))))
         cfg.idle_highlight_path = str(raw.get("idle_highlight_path", "") or "")
         cfg.idle_highlight_random = bool(raw.get("idle_highlight_random", True))
         cfg.idle_highlight_muted = bool(raw.get("idle_highlight_muted", True))
@@ -1386,6 +1396,9 @@ class AppConfig:
         cfg.spectator_tts_pack_enabled = bool(raw.get("spectator_tts_pack_enabled", False))
         cfg.spectator_tts_pack_auto_names = bool(raw.get("spectator_tts_pack_auto_names", True))
         cfg.spectator_qwen_model = raw.get("spectator_qwen_model") if raw.get("spectator_qwen_model") in ("0.6B", "1.7B") else "1.7B"
+        cfg.spectator_qwen_duo_profile = "ko_sports_duo_v1" if raw.get("spectator_qwen_duo_profile") == "ko_sports_duo_v1" else ""
+        revision = str(raw.get("spectator_qwen_duo_revision") or "")
+        cfg.spectator_qwen_duo_revision = revision if len(revision) == 64 and all(c in "0123456789abcdef" for c in revision) else ""
         try:
             cfg.spectator_qwen_port = max(1024, min(65535, int(raw.get("spectator_qwen_port", 8768))))
             cfg.spectator_qwen_speed = max(.7, min(1.5, float(raw.get("spectator_qwen_speed", 1.))))
@@ -1934,6 +1947,7 @@ class AppConfig:
             "potm_bgm_path": to_app_rel(str(self.potm_bgm_path or "")),
             "potm_bgm_volume": int(max(0, min(100, self.potm_bgm_volume))),
             "potm_audio_output_device": str(self.potm_audio_output_device or ""),
+            "app_audio_output_device": str(self.app_audio_output_device or ""),
             "potm_test_video_path": to_app_rel(str(self.potm_test_video_path or "")),
             "potm_name_color": _normalize_hex_color(self.potm_name_color),
             "potm_title_text": str(self.potm_title_text or "PLAY OF THE MATCH")[:80],
@@ -1998,6 +2012,9 @@ class AppConfig:
             "obs_replay_transition_speed": float(max(0.25, min(2.0, self.obs_replay_transition_speed))),
             "obs_auto_replay_stop_on_round": bool(self.obs_auto_replay_stop_on_round),
             "idle_highlight_enabled": bool(self.idle_highlight_enabled),
+            "idle_highlight_stop_on_player": bool(self.idle_highlight_stop_on_player),
+            "idle_highlight_delay_enabled": bool(self.idle_highlight_delay_enabled),
+            "idle_highlight_after_match_sec": int(self.idle_highlight_after_match_sec),
             "idle_highlight_path": to_app_rel(str(self.idle_highlight_path or "")),
             "idle_highlight_random": bool(self.idle_highlight_random),
             "idle_highlight_muted": bool(self.idle_highlight_muted),
@@ -2130,7 +2147,8 @@ class AppConfig:
             **{key: getattr(self, key) for key in (
                 "spectator_tts_engine", "spectator_tts_pack_enabled", "spectator_tts_pack_auto_names", "spectator_qwen_model", "spectator_qwen_port", "spectator_qwen_language",
                 "spectator_qwen_speed", "spectator_qwen_caster_speaker", "spectator_qwen_analyst_speaker",
-                "spectator_qwen_caster_instruction", "spectator_qwen_analyst_instruction")},
+                "spectator_qwen_caster_instruction", "spectator_qwen_analyst_instruction",
+                "spectator_qwen_duo_profile", "spectator_qwen_duo_revision")},
             "spectator_commentary_rate": int(self.spectator_commentary_rate or 200),
             "spectator_commentary_volume": float(self.spectator_commentary_volume if self.spectator_commentary_volume is not None else 100.0),
             "spectator_commentary_pitch": int(self.spectator_commentary_pitch or 0),

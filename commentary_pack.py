@@ -6,6 +6,9 @@ joined. No regex stripping, fabricated values, or arbitrary fragment assembly.
 import copy
 import hashlib
 import json
+import logging
+import math
+from functools import lru_cache
 import os
 from pathlib import Path
 import tempfile
@@ -14,11 +17,23 @@ import wave
 
 from app_paths import app_path
 from local_tts import commentary_voice, decode_voice, save_local, LocalTTSError, PREFIX
+from commentary_audio import wav_info, write_delivery
 
 _BUILD = threading.Lock()
 _NAMES = threading.Lock()
 _names_pending = []
 _names_worker = False
+
+# Pack-mode announcements deliberately use fixed, name-free sentences. The
+# watcher may retain numbered/named announcements outside prepared-pack mode.
+PACK_ANNOUNCEMENTS = (
+    "곧 경기가 시작합니다", "라운드 시작합니다", "마지막 라운드 시작합니다",
+    "라운드 종료, 휴식 시간입니다", "마지막 라운드 종료, 경기 결과를 기다립니다",
+    "마지막 라운드 종료, 경기 결과를 확인합니다", "경기 종료, 결과를 확인합니다",
+    "마지막 라운드 종료, 경기 종료입니다", "경기 종료입니다", "경기가 중단됩니다",
+    "다시 일어납니다!", "경기는 계속됩니다!", "하지만 위험합니다.", "수비가 먼저입니다.",
+    "경기 계속됩니다!", "위기를 넘깁니다!", "다시 싸웁니다!", "일어났습니다!",
+)
 
 
 def enabled(cfg):
@@ -54,6 +69,80 @@ def ready(path):
                     and Path(path).stat().st_size >= 44 + stream.getnframes() * 2)
     except (OSError, wave.Error, EOFError):
         return False
+
+
+def reply_seconds(cfg, role, text):
+    """Actual prepared audio length, or None. No synthesis/network fallback."""
+    if role not in ("caster", "analyst"):
+        return None
+    try:
+        path = clip_path(commentary_voice(cfg, role, ""), text)
+        info = wav_info(path)
+        return info["duration_seconds"] if info else None
+    except (LocalTTSError, OSError, ValueError, TypeError):
+        return None
+
+
+def available_reply(cfg, role, text, *, max_seconds=None):
+    """Admit only a ready, on-time pack line; ordinary non-pack TTS is untouched."""
+    if not enabled(cfg):
+        return True
+    seconds = reply_seconds(cfg, role, text)
+    if seconds is None:
+        return False
+    if max_seconds is None:
+        return True
+    try:
+        budget = float(max_seconds)
+        return math.isfinite(budget) and budget > 0 and seconds <= budget
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _delivery_sidecar(path, role="", text=""):
+    try:
+        write_delivery(path, role=role, delivery=line_delivery(role, text))
+    except (OSError, ValueError, wave.Error, EOFError):
+        # Optional timing metadata must not destroy otherwise valid old packs.
+        logging.warning("COMMENTARY_PACK_DELIVERY_METADATA_SKIP path=%s", path)
+
+
+@lru_cache(maxsize=1)
+def _line_deliveries():
+    """Authored intent for exact prepared text, not keyword parsing of names."""
+    import commentary_calls as calls
+    from commentary_calls import SHORT_CALLS, LONG_COMBO, REPEATED_COUNTER, REVERSAL
+    from commentary_story import SCENES, IDLE_SCENES, LATE_SCENES
+    output = {}
+    for scripts in SCENES.values():
+        for script in scripts:
+            role = "caster" if script.lead_role == "analyst" else "analyst"
+            output[role, script.reply] = getattr(script, "delivery", "neutral")
+    for script in IDLE_SCENES + LATE_SCENES:
+        output["caster", script.lead] = "neutral"
+        output["analyst", script.reply] = "dry" if script.family in ("dry", "self", "banter") else "neutral"
+    targets = ("급소", "왼쪽 눈", "오른쪽 눈", "턱", "코", "왼쪽 관자놀이", "오른쪽 관자놀이", "간", "명치", "이마")
+    for role in ("caster", "analyst"):
+        for tag, lines in SHORT_CALLS.items():
+            delivery = "excited" if tag in ("stun", "knockdown", "tko", "heavy", "combo", "counter_combo") else "surprised" if tag in ("counter", "whiff", "graze", "answer_back") else "neutral"
+            for line in lines:
+                for target in targets if tag == "weak" else ("급소",):
+                    for count in ("첫 번째", "두 번째", "세 번째") if tag == "knockdown" else ("첫 번째",):
+                        output[role, line.format(hits=3, target=target, count_label=count)] = delivery
+        for lines in LONG_COMBO.values():
+            for line in lines:
+                output[role, line] = "excited"
+        for line in REPEATED_COUNTER + REVERSAL:
+            output[role, line] = "surprised"
+        for scene, lines in getattr(calls, "CONTEXT_CALLS", {}).items():
+            for line in lines:
+                output[role, line] = "excited" if scene == "counter_release" else "surprised" if scene == "exchange_return" else "neutral"
+    return output
+
+
+def line_delivery(role, text):
+    value = _line_deliveries().get((role, text), "neutral")
+    return value if value in ("neutral", "dry", "excited", "surprised") else "neutral"
 
 
 def prepare_dialogue(cfg, role, dialogue, *, narration_only=False):
@@ -155,6 +244,7 @@ def render(text, path, voice):
                     output.writeframes(source.readframes(source.getnframes()))
         os.replace(staged, path)
         staged = ""
+        _delivery_sidecar(path, str(plan.get("role") or ""), str(text))
         return True
     finally:
         if staged:
@@ -165,6 +255,7 @@ def render(text, path, voice):
 
 
 def catalog(scope="full"):
+    import commentary_calls as calls
     from commentary_calls import SHORT_CALLS, REPEATED_COUNTER, REVERSAL, LONG_COMBO
     from commentary_story import SCENES, IDLE_SCENES, LATE_SCENES
     targets = ("급소", "왼쪽 눈", "오른쪽 눈", "턱", "코", "왼쪽 관자놀이", "오른쪽 관자놀이", "간", "명치", "이마")
@@ -181,7 +272,7 @@ def catalog(scope="full"):
                 lines = lines[:1]
             elif scope == "calls" and role == "analyst":
                 continue
-            elif role == "analyst" and tag not in ("counter", "combo", "heavy", "weak", "hit"):
+            elif scope != "full" and role == "analyst" and tag not in ("counter", "combo", "heavy", "weak", "hit"):
                 continue
             hits = (3,)
             places = targets if tag == "weak" else ("급소",)
@@ -194,13 +285,19 @@ def catalog(scope="full"):
             if tag in LONG_COMBO:
                 for line in LONG_COMBO[tag]:
                     add(role, line)
-        if scope != "sample" and role == "caster":
+        if scope != "sample" and (role == "caster" or scope == "full"):
             for text in REPEATED_COUNTER + REVERSAL:
                 add(role, text)
     if scope == "sample":
         script = next(s for s in SCENES["counter"] if s.lead.startswith("{setup}") and s.lead_role == "caster")
         add("analyst", script.reply)
     if scope == "full":
+        for text in PACK_ANNOUNCEMENTS:
+            add("caster", text)
+        for lines in getattr(calls, "CONTEXT_CALLS", {}).values():
+            for text in lines:
+                for role in ("caster", "analyst"):
+                    add(role, text)
         for tag, scripts in SCENES.items():
             if tag == "hit":
                 continue  # Ordinary hits never play the old optional replies.
@@ -276,6 +373,7 @@ def build(cfg, scope="full", *, names=(), cancel=None, progress=None, renderer=N
                 if not ready(path):
                     raise LocalTTSError("해설팩 파일 검증에 실패했습니다. 완성된 파일은 남겨 두고 제작을 중단합니다.")
                 generated += 1
+            _delivery_sidecar(path, role, text)
             completed += 1
             if progress:
                 progress(completed, len(rows), role, text)

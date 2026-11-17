@@ -4,6 +4,7 @@ __pycache__/
 .venv-release/
 .venv-qwen/
 .qwen_models/
+.qwen_duo_profiles/
 commentary_voice_packs/
 *.py[cod]
 *.pyo

@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from source_record_capture import live_replay_expired
 from diagnostics import diagnostics as DIAG
 from typing import Any, Callable, Dict, Optional
 
@@ -56,6 +57,9 @@ class ObsAutoReplayController:
             return False
 
         delay_sec = max(0.0, min(15.0, float(getattr(cfg, "obs_auto_replay_delay_sec", 2.0) or 0.0)))
+        if live_replay_expired(context, self._clock(), delay_sec):
+            logging.warning('OBS_AUTO_REPLAY_EXPIRED kind=%s stage=schedule event=%s', kind, context.get('event_key'))
+            return False
         target_at = (triggered_at if triggered_at > 0.0 else self._clock()) + delay_sec
         remaining_ms = max(0, int(round((target_at - self._clock()) * 1000.0)))
         self._generation += 1
@@ -77,6 +81,9 @@ class ObsAutoReplayController:
         cfg = self._config_getter()
         context = dict(context or {})
         if generation != self._generation or not self._kind_enabled(cfg, kind):
+            return False
+        if live_replay_expired(context, self._clock(), float(getattr(cfg, 'obs_auto_replay_delay_sec', 2.0) or 0.0)):
+            logging.warning('OBS_AUTO_REPLAY_EXPIRED kind=%s stage=start event=%s', kind, context.get('event_key'))
             return False
         if not os.path.isfile(path):
             logging.warning("OBS_AUTO_REPLAY_FILE_MISSING_AT_START kind=%s path=%s", kind, path)

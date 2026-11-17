@@ -13,8 +13,8 @@ def subject(script, scene):
         "analysis" if script.family == "analysis" else
         "reaction" if script.family == "reaction" else "humor")
     group = ("counter" if scene in ("counter", "whiff", "graze", "repeat_counter") else
-             "combo" if scene in ("combo", "counter_combo", "long_combo") else
-             "target" if scene in ("weak", "target_repeat", "eye_seed", "eye_return") else scene)
+             "combo" if scene in ("combo", "counter_combo", "long_combo", "counter_release") else
+             "target" if scene in ("weak", "target_repeat", "eye_seed", "eye_return", "target_switch") else scene)
     topic = script.topic or (
         "self_incompetence" if script.family == "self" else
         "commentators_bickering" if script.family == "banter" else
@@ -35,7 +35,7 @@ def topic_key(meta, side, round_no):
             round_no if meta.get("evidence") else 0)
 
 
-def plan(scripts, *, scene, side, round_no, heard, pending, now, density, terminal=False):
+def plan(scripts, *, scene, side, round_no, heard, pending, now, density, terminal=False, change=False):
     """Choose an intent BEFORE choosing wording. Empty pool means call only.
 
     Actual audio gets a 75-second topic rest. In-flight selection only reserves
@@ -48,7 +48,9 @@ def plan(scripts, *, scene, side, round_no, heard, pending, now, density, termin
     latest = max([item.get("completed_at", item.get("at", -1e9)) for item in recent_reply] or [-1e9])
     # Pattern changes may deserve an explanation, but not another two-voice
     # exchange six seconds after the last one. Keep the factual call intact.
-    gap = 18 if density == "full" else 24
+    # A confirmed change earns a short explanation sooner, not unlimited duo
+    # chatter. Ordinary repeats still leave space for the action itself.
+    gap = (6 if density == "full" else 10) if change else (12 if density == "full" else 20)
     if not terminal and now - latest < gap:
         return [], "recent_reply"
     used = {topic_key(item, item.get("side", ""), item.get("round", 1))
@@ -62,7 +64,7 @@ def plan(scripts, *, scene, side, round_no, heard, pending, now, density, termin
     # Different material, not a fixed every-third-call counter. Evidence-based
     # changes get first refusal, then alternate interpretation and entertainment.
     last = spoken[-1] if spoken else {}
-    if scene in ("reversal", "permission_reverse"):
+    if scene in ("reversal", "permission_reverse", "counter_release", "exchange_return", "target_switch"):
         order = ("change", "humor", "reaction", "analysis", "pattern")
     elif scene in ("repeat_counter", "target_repeat", "eye_seed", "eye_return", "permission_return") and last.get("intent") != "pattern":
         order = ("pattern", "humor", "reaction", "analysis", "change")

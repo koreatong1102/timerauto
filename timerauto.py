@@ -103,6 +103,8 @@ except Exception:
     QAudioOutput = None
     QMediaDevices = None
     HAS_QTMULTIMEDIA = False
+if HAS_QTMULTIMEDIA:
+    import audio_routing  # Load before settings/tests can change the working directory.
 try:
     from PyQt6.QtQuickControls2 import QQuickStyle  # type: ignore[reportMissingImports]
     HAS_QQUICKSTYLE = True
@@ -212,6 +214,9 @@ from update_manager import _parse_version, _download_file, _file_sha256, _write_
 from diagnostics import diagnostics as DIAG
 from diagnostic_context import prepare_diagnostic_export
 from ai_project_snapshot import export_project_snapshot
+from export_jobs import BackgroundExportJob
+from portrait_identity import PortraitOwnership
+from source_record_capture import file_matches_capture, live_replay_expired, result_wait
 
 _MP_SELFIE = None
 _MP_LOCK = threading.Lock()
@@ -251,6 +256,8 @@ def _ensure_std_streams():
 
 
 def _play_win_effect_sfx(path: str) -> bool:
+    if HAS_QTMULTIMEDIA and audio_routing.requested_device():
+        return False  # winsound cannot honor an explicit per-app output device.
     if not path:
         return False
     if winsound is None:
@@ -1173,14 +1180,8 @@ def _refresh_default_audio_device(player) -> None:
     """Bind playback to the current Windows default output device."""
     if QMediaDevices is None or player is None:
         return
-    try:
-        audio_output = player.audioOutput()
-        if audio_output is not None:
-            device = QMediaDevices.defaultAudioOutput()
-            if audio_output.device() != device:
-                audio_output.setDevice(device)
-    except Exception:
-        logging.debug("AUDIO_DEFAULT_DEVICE_REFRESH_FAIL", exc_info=True)
+    from audio_routing import prepare
+    prepare(player)
 
 
 def _set_media_audio_device(player, requested_name: str = "") -> str:
@@ -7577,12 +7578,13 @@ class SettingsDialog(QDialog):
         try:
             owner = getattr(self._diagnostic_export_zip, "__self__", None)
             if owner is not None and hasattr(owner, "_diagnostic_prepare_export"):
-                if getattr(self, "_diagnostic_export_job", None) is not None:
+                if getattr(self, "_diagnostic_export_job", None) is not None or getattr(self, '_project_snapshot_job', None) is not None:
                     return
                 # Capture Qt-owned values here; compression/OBS read waits run off UI.
                 kwargs = owner._diagnostic_prepare_export()
                 self._diagnostic_export_job = DIAG.start_export(**kwargs)
                 self.btn_diag_export.setEnabled(False)
+                self.btn_project_snapshot.setEnabled(False)
                 self.lbl_diag_status.setText("진단 수집·압축 중… 방송/타이머는 계속 동작합니다.")
                 def poll():
                     job = self._diagnostic_export_job
@@ -7591,17 +7593,20 @@ class SettingsDialog(QDialog):
                     self._diagnostic_export_job = None
                     self._diagnostic_poll_timer.stop()
                     self.btn_diag_export.setEnabled(True)
+                    self.btn_project_snapshot.setEnabled(True)
                     if job.error:
                         self.lbl_diag_status.setText(f"진단 ZIP 생성 실패: {job.error}")
-                        QMessageBox.warning(self, "진단 ZIP 생성 실패", job.error)
                     else:
                         self.lbl_diag_status.setText(f"진단 ZIP 생성 완료: {job.path}")
-                        QMessageBox.information(self, "진단 ZIP 생성", f"진단 ZIP을 만들었습니다.\n\n{job.path}")
                 self._diagnostic_poll_timer = QTimer(self)
                 self._diagnostic_poll_timer.timeout.connect(poll)
                 self._diagnostic_poll_timer.start(200)
                 return
-            path = self._diagnostic_export_zip() if self._diagnostic_export_zip else ""
+            # Unknown callbacks may touch Qt; never invoke them on a worker,
+            # but do not fall back to blocking the UI either.
+            if self._diagnostic_export_zip:
+                raise RuntimeError("이 진단 경로는 비동기 준비 기능이 없습니다. 타이머 본창의 설정에서 실행하세요.")
+            path = ""
             if path:
                 self.lbl_diag_status.setText(f"진단 ZIP 생성 완료: {path}")
                 QMessageBox.information(self, "진단 ZIP 생성", f"진단 ZIP을 만들었습니다.\n\n{path}")
@@ -7609,7 +7614,6 @@ class SettingsDialog(QDialog):
                 self.lbl_diag_status.setText("진단 ZIP 생성 실패: 경로 없음")
         except Exception as e:
             self.lbl_diag_status.setText(f"진단 ZIP 생성 실패: {e}")
-            QMessageBox.warning(self, "진단 ZIP 생성 실패", str(e))
 
     def _diagnostics_copy_clicked(self):
         self._diagnostics_apply_options()
@@ -7623,15 +7627,34 @@ class SettingsDialog(QDialog):
     def _diagnostics_project_snapshot_clicked(self):
         self._diagnostics_apply_options()
         try:
-            path = self._diagnostic_project_snapshot() if self._diagnostic_project_snapshot else ""
-            if path:
-                self.lbl_diag_status.setText(f"프로젝트 스냅샷 생성 완료: {path}")
-                QMessageBox.information(self, "프로젝트 전체 스냅샷 생성", f"AI 인수인계용 프로젝트 스냅샷을 만들었습니다.\n\n{path}")
-            else:
-                self.lbl_diag_status.setText("프로젝트 스냅샷 생성 실패: 경로 없음")
+            if getattr(self, '_project_snapshot_job', None) is not None or getattr(self, '_diagnostic_export_job', None) is not None:
+                return
+            owner = getattr(self._diagnostic_project_snapshot, '__self__', None)
+            if owner is None or not hasattr(owner, '_project_snapshot_prepare_export'):
+                raise RuntimeError('프로젝트 스냅샷의 비동기 준비 경로를 찾지 못했습니다.')
+            from export_jobs import BackgroundExportJob
+            kwargs = owner._project_snapshot_prepare_export()
+            self._project_snapshot_job = BackgroundExportJob(export_project_snapshot, kwargs)
+            self.btn_project_snapshot.setEnabled(False)
+            self.btn_diag_export.setEnabled(False)
+            self.lbl_diag_status.setText('프로젝트 소스 분석·압축 중… 타이머는 계속 동작합니다.')
+            def poll():
+                job = self._project_snapshot_job
+                if not job.done.is_set():
+                    return
+                self._project_snapshot_job = None
+                self._project_snapshot_poll_timer.stop()
+                self.btn_project_snapshot.setEnabled(True)
+                self.btn_diag_export.setEnabled(True)
+                if job.error:
+                    self.lbl_diag_status.setText('프로젝트 스냅샷 생성 실패: ' + job.error)
+                else:
+                    self.lbl_diag_status.setText('프로젝트 스냅샷 생성 완료: ' + job.path)
+            self._project_snapshot_poll_timer = QTimer(self)
+            self._project_snapshot_poll_timer.timeout.connect(poll)
+            self._project_snapshot_poll_timer.start(200)
         except Exception as e:
             self.lbl_diag_status.setText(f"프로젝트 스냅샷 생성 실패: {e}")
-            QMessageBox.warning(self, "프로젝트 스냅샷 생성 실패", str(e))
 
     def _diagnostics_open_clicked(self):
         self._diagnostics_apply_options()
@@ -8381,8 +8404,28 @@ class SettingsDialog(QDialog):
         self._local_tts_controls.rehearsal_requested.connect(
             lambda steps: self._start_spectator_commentary_script("해설팩 종합 테스트", steps))
         self._local_tts_controls.rehearsal_stop_requested.connect(self._stop_spectator_commentary_test_script)
+        self._local_tts_controls.duo_completed.connect(self._apply_completed_duo_pack)
         self._refresh_commentary_engine_controls()
         sound_lay.addWidget(self._local_tts_controls, 18, 0, 1, 6)
+        self.cmb_app_audio_output = QComboBox()
+        self.cmb_app_audio_output.addItem('Windows 기본 출력', '')
+        if QMediaDevices is not None:
+            for device in QMediaDevices.audioOutputs():
+                name = str(device.description())
+                label = name
+                if name.casefold().startswith('cable input('):
+                    label += ' [VB 일반 출력 · 권장]'
+                elif name.casefold().startswith('cable in 16ch('):
+                    label += ' [별도 16채널 장치]'
+                self.cmb_app_audio_output.addItem(label, name)
+        saved = str(getattr(self.cfg, 'app_audio_output_device', '') or '')
+        if saved and self.cmb_app_audio_output.findData(saved) < 0:
+            self.cmb_app_audio_output.addItem(saved + ' (현재 연결 안 됨)', saved)
+        self.cmb_app_audio_output.setCurrentIndex(max(0, self.cmb_app_audio_output.findData(saved)))
+        self.cmb_app_audio_output.setToolTip('해설·스턴·KD/TKO·효과음·해설 테스트에 적용합니다. VB 일반 출력은 CABLE Input입니다. CABLE In 16ch는 이름이 비슷하지만 별도 장치이며 같은 출력이 아닙니다. 선택 장치가 없거나 오류가 나도 스피커로 우회하지 않습니다. POTM의 별도 지정은 유지됩니다.')
+        sound_lay.addWidget(QLabel('타이머 공통 오디오 출력'), 19, 0, 1, 2)
+        sound_lay.addWidget(self.cmb_app_audio_output, 19, 2, 1, 4)
+        self.cmb_app_audio_output.currentIndexChanged.connect(self._schedule_apply)
         self.cmb_spectator_bgrade_density.setToolTip("말하는 빈도와 별개입니다. 간결은 단문 위주, 풍성은 상황에 맞는 두 사람 대화와 앞말 회수를 사용합니다.")
         self.cmb_spectator_bgrade_swearing.setToolTip("단어를 무작위로 바꾸지 않습니다. 선택한 수위 안에서 상황에 맞게 작성된 대화를 고릅니다. 일반 스포츠 모드에는 적용되지 않습니다.")
         spectator_group.setToolTip("위쪽은 SpectatorLog 읽기 설정, 아래쪽은 리플레이 / 피격 이펙트 설정입니다.")
@@ -9610,6 +9653,22 @@ class SettingsDialog(QDialog):
         self.sp_idle_cinematic_sharpen = QSpinBox(); self.sp_idle_cinematic_sharpen.setRange(0, 60); self.sp_idle_cinematic_sharpen.setPrefix("+"); self.sp_idle_cinematic_sharpen.setValue(int(getattr(self.cfg, "idle_highlight_cinematic_sharpen", 35) or 0))
         self.sp_idle_cinematic_vignette = QSpinBox(); self.sp_idle_cinematic_vignette.setRange(0, 60); self.sp_idle_cinematic_vignette.setPrefix("+"); self.sp_idle_cinematic_vignette.setValue(int(getattr(self.cfg, "idle_highlight_cinematic_vignette", 24) or 0))
         idle.addWidget(self.chk_idle_highlight, 0, 0, 1, 4)
+        self.chk_idle_stop_player = QCheckBox("로비에 선수가 있으면 대기 영상 중지")
+        self.chk_idle_stop_player.setToolTip("관전 로그에서 선수 입장을 확인하면 재생 중인 대기 영상도 중지합니다. 관전자·호스트는 제외하며, 선수가 모두 나가면 다시 재생할 수 있습니다. 로그 감지가 켜져 있어야 합니다.")
+        self.chk_idle_stop_player.setChecked(bool(getattr(self.cfg, "idle_highlight_stop_on_player", False)))
+        self.chk_idle_delay = QCheckBox("경기 종료 후 아래 시간이 지나야 대기 영상 재생")
+        self.chk_idle_delay.setToolTip("경기 종료 감지 시점부터 기다립니다. 기본 300초(5분), 0초는 대기 없음입니다. 위 옵션도 켜면 시간이 지나도 로비에 선수가 있는 동안은 재생하지 않습니다. KD·POTM·리포트에는 영향을 주지 않습니다.")
+        self.chk_idle_delay.setChecked(bool(getattr(self.cfg, "idle_highlight_delay_enabled", False)))
+        self.sp_idle_delay = QSpinBox()
+        self.sp_idle_delay.setRange(0, 3600)
+        self.sp_idle_delay.setSuffix(" 초")
+        self.sp_idle_delay.setValue(int(getattr(self.cfg, "idle_highlight_after_match_sec", 300)))
+        idle.addWidget(self.chk_idle_stop_player, 8, 0, 1, 4)
+        idle.addWidget(self.chk_idle_delay, 9, 0, 1, 3)
+        idle.addWidget(self.sp_idle_delay, 9, 3)
+        self.chk_idle_stop_player.stateChanged.connect(self._schedule_apply)
+        self.chk_idle_delay.stateChanged.connect(self._schedule_apply)
+        self.sp_idle_delay.valueChanged.connect(self._schedule_apply)
         idle.addWidget(QLabel("영상 경로"), 1, 0)
         idle.addWidget(self.le_idle_highlight_path, 1, 1)
         idle.addWidget(self.btn_idle_highlight_file, 1, 2)
@@ -10879,6 +10938,11 @@ class SettingsDialog(QDialog):
         self.le_potm_bgm.setText(str(getattr(self.cfg, "potm_bgm_path", "") or ""))
         self.sp_potm_bgm_volume.setValue(int(getattr(self.cfg, "potm_bgm_volume", 75) or 0))
         self.cmb_potm_audio_output.setCurrentIndex(max(0, self.cmb_potm_audio_output.findData(str(getattr(self.cfg, "potm_audio_output_device", "") or ""))))
+        if hasattr(self, 'cmb_app_audio_output'):
+            saved = str(getattr(self.cfg, 'app_audio_output_device', '') or '')
+            if saved and self.cmb_app_audio_output.findData(saved) < 0:
+                self.cmb_app_audio_output.addItem(saved + ' (현재 연결 안 됨)', saved)
+            self.cmb_app_audio_output.setCurrentIndex(max(0, self.cmb_app_audio_output.findData(saved)))
         self.le_potm_test_video.setText(str(getattr(self.cfg, "potm_test_video_path", "") or ""))
         self.le_potm_name_color.setText(str(getattr(self.cfg, "potm_name_color", "#FFC62B") or "#FFC62B"))
         self.le_potm_title.setText(str(getattr(self.cfg, "potm_title_text", "PLAY OF THE MATCH") or "PLAY OF THE MATCH"))
@@ -10944,6 +11008,9 @@ class SettingsDialog(QDialog):
         self.chk_obs_auto_replay_stop_round.setChecked(bool(getattr(self.cfg, "obs_auto_replay_stop_on_round", True)))
         self.chk_idle_highlight.setChecked(bool(getattr(self.cfg, "idle_highlight_enabled", False)))
         self.le_idle_highlight_path.setText(str(getattr(self.cfg, "idle_highlight_path", "") or ""))
+        self.chk_idle_stop_player.setChecked(bool(getattr(self.cfg, "idle_highlight_stop_on_player", False)))
+        self.chk_idle_delay.setChecked(bool(getattr(self.cfg, "idle_highlight_delay_enabled", False)))
+        self.sp_idle_delay.setValue(int(getattr(self.cfg, "idle_highlight_after_match_sec", 300)))
         self.chk_idle_highlight_random.setChecked(bool(getattr(self.cfg, "idle_highlight_random", True)))
         self.chk_idle_highlight_muted.setChecked(bool(getattr(self.cfg, "idle_highlight_muted", True)))
         self.sp_idle_highlight_volume.setValue(int(getattr(self.cfg, "idle_highlight_volume", 0) or 0))
@@ -12708,6 +12775,18 @@ class SettingsDialog(QDialog):
         if hasattr(self, "cmb_spectator_commentary_voice"):
             return str(self.cmb_spectator_commentary_voice.currentData() or "ko-KR-SunHiNeural")
         return str(getattr(self.cfg, "spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
+
+    def _apply_completed_duo_pack(self):
+        """Commit a fully prepared pack, never a partially prepared voice job."""
+        controls = self.__dict__.get("_local_tts_controls")
+        if controls is None:
+            return
+        # The authored pack is the B-grade live call catalog. Switching only
+        # the engine for a sports-mode user would request unprepared sentences.
+        self.cmb_spectator_commentary_style.setCurrentIndex(
+            max(0, self.cmb_spectator_commentary_style.findData("b_grade")))
+        self.chk_spectator_commentary.setChecked(True)
+        self.apply_only(silent=True)
 
     def _refresh_commentary_engine_controls(self):
         controls = self.__dict__.get("_local_tts_controls")
@@ -19802,6 +19881,9 @@ class SettingsDialog(QDialog):
             self.cfg.potm_bgm_path = str(self.le_potm_bgm.text() or "").strip()
             self.cfg.potm_bgm_volume = int(self.sp_potm_bgm_volume.value())
             self.cfg.potm_audio_output_device = str(self.cmb_potm_audio_output.currentData() or "")
+            self.cfg.app_audio_output_device = str(self.cmb_app_audio_output.currentData() or "")
+            if HAS_QTMULTIMEDIA and not save_only:
+                audio_routing.configure(self.cfg.app_audio_output_device)
             self.cfg.potm_test_video_path = str(self.le_potm_test_video.text() or "").strip()
             self.cfg.potm_name_color = _normalize_hex_color(str(self.le_potm_name_color.text() or "#FFC62B").strip() or "#FFC62B")
             self.cfg.potm_title_text = str(self.le_potm_title.text() or "PLAY OF THE MATCH").strip()
@@ -19859,6 +19941,9 @@ class SettingsDialog(QDialog):
             self.cfg.replay_label_y = int(self.sp_replay_label_y.value())
             self.cfg.obs_auto_replay_stop_on_round = bool(self.chk_obs_auto_replay_stop_round.isChecked())
             self.cfg.idle_highlight_enabled = bool(self.chk_idle_highlight.isChecked())
+            self.cfg.idle_highlight_stop_on_player = self.chk_idle_stop_player.isChecked()
+            self.cfg.idle_highlight_delay_enabled = self.chk_idle_delay.isChecked()
+            self.cfg.idle_highlight_after_match_sec = self.sp_idle_delay.value()
             self.cfg.idle_highlight_path = str(self.le_idle_highlight_path.text() or "").strip()
             self.cfg.idle_highlight_random = bool(self.chk_idle_highlight_random.isChecked())
             self.cfg.idle_highlight_muted = bool(self.chk_idle_highlight_muted.isChecked())
@@ -20917,6 +21002,7 @@ class MainApp(QObject):
     # BrowserOverlayServer receives its replay-ended beacon on an HTTP worker
     # thread. Route that event back through Qt before using QTimer/UI state.
     _browser_replay_stopped_ready = pyqtSignal(str)
+    _idle_highlight_scan_ready = pyqtSignal(object)
 
     def __init__(self, cfg_path: str):
         super().__init__()
@@ -20928,6 +21014,8 @@ class MainApp(QObject):
         self._browser_replay_stopped_ready.connect(self._handle_browser_obs_replay_stopped)
         self.cfg_path = cfg_path
         self.cfg = AppConfig.from_json(cfg_path)
+        if HAS_QTMULTIMEDIA:
+            audio_routing.configure(getattr(self.cfg, 'app_audio_output_device', ''))
         self._restore_bundled_replay_transition_paths()
         try:
             DIAG.set_options(
@@ -21084,6 +21172,10 @@ class MainApp(QObject):
         # Highlight folders are user-managed.  Keep a compact signature so new
         # clips can appear without reopening settings or restarting the app.
         self._idle_highlight_playlist_signature: Optional[Tuple[Tuple[str, int, int], ...]] = None
+        self._idle_highlight_playlist_path = None
+        from idle_video_library import IdleVideoScanner
+        self._idle_highlight_library = IdleVideoScanner(self._idle_highlight_scan_ready.emit)
+        self._idle_highlight_scan_ready.connect(self._idle_highlight_scan_finished, Qt.ConnectionType.QueuedConnection)
         self._idle_highlight_scan_timer = QTimer()
         self._idle_highlight_scan_timer.setInterval(5000)
         self._idle_highlight_scan_timer.timeout.connect(self._refresh_idle_highlight_playlist)
@@ -21108,6 +21200,8 @@ class MainApp(QObject):
         self._source_record_round = int(getattr(self.cfg, "timer_current_round", 1) or 1)
         self._source_record_seconds_left = 0
         self._source_record_pending = deque()
+        self._source_record_deferred = None
+        self._source_record_quarantine_until = 0.0
         self._source_record_auto_replays: Dict[str, Dict[str, Any]] = {}
         self._source_record_seen_dir = ""
         self._source_record_seen_files = set()
@@ -21335,7 +21429,7 @@ class MainApp(QObject):
             ok = _play_win_effect_sfx(resolved)
             if ok:
                 return
-        elif ext.endswith(".mp3"):
+        if ext.endswith((".wav", ".mp3")):
             ok = _play_media_sfx(self._burst_player, self._burst_audio_out, resolved)
             if ok:
                 return
@@ -21841,6 +21935,13 @@ class MainApp(QObject):
         continuation["turn_index"] = int(packet.get("turn_index", 0)) + 1
         reply_role = "caster" if line.get("role") == "caster" else "analyst"
         is_report = bool(packet.get("is_report"))
+        budget = dict(packet.get("story") or {}).get("reply_budget_seconds")
+        if not is_report and budget is not None:
+            from commentary_pack import available_reply
+            if not available_reply(self.__dict__.get("cfg"), reply_role, str(line["text"]), max_seconds=budget):
+                DIAG.record("commentary_reply_skipped", reason="missing_or_over_budget_pack",
+                            role=reply_role, budget_seconds=budget)
+                return False
         self._enqueue_commentary_tts(str(line["text"]), reply_role, _priority=90 if is_report else 35,
                                      _dialogue=continuation, allow_slow=is_report,
                                      hide_round_report_on_complete=bool(is_report and packet.get("hide_on_end") and not lines),
@@ -24782,6 +24883,9 @@ class MainApp(QObject):
         return DIAG.export_zip(**self._diagnostic_prepare_export())
 
     def _project_snapshot_export_zip(self) -> str:
+        return export_project_snapshot(**self._project_snapshot_prepare_export())
+
+    def _project_snapshot_prepare_export(self) -> dict:
         try:
             DIAG.set_options(
                 enabled=bool(getattr(self.cfg, "diagnostics_enabled", True)),
@@ -24792,23 +24896,15 @@ class MainApp(QObject):
         except Exception:
             pass
         try:
-            project_root = os.path.dirname(os.path.abspath(__file__))
+            project_root = get_app_base_dir()
         except Exception:
             project_root = os.getcwd()
-        path = export_project_snapshot(
-            project_root,
-            self._diagnostic_folder(),
-            app_state=self._diagnostic_app_state(),
-            cfg_snapshot=getattr(self.cfg, "__dict__", {}),
-            spectator_root=self._diagnostic_spectator_root(),
-            mask_sensitive=bool(getattr(self.cfg, "diagnostics_mask_sensitive", True)),
-            raw_sample_lines=int(getattr(self.cfg, "diagnostics_raw_sample_lines", 120) or 120),
-        )
-        try:
-            self.timer_win.set_status(f"프로젝트 스냅샷 생성: {os.path.basename(path)}")
-        except Exception:
-            pass
-        return path
+        return dict(project_root=project_root, output_dir=self._diagnostic_folder(),
+                    app_state=copy.deepcopy(self._diagnostic_app_state()),
+                    cfg_snapshot=copy.deepcopy(getattr(self.cfg, '__dict__', {})),
+                    spectator_root=self._diagnostic_spectator_root(),
+                    mask_sensitive=bool(getattr(self.cfg, 'diagnostics_mask_sensitive', True)),
+                    raw_sample_lines=int(getattr(self.cfg, 'diagnostics_raw_sample_lines', 120) or 120))
 
     def _diagnostic_open_folder(self) -> str:
         return self._diagnostic_folder()
@@ -24967,36 +25063,8 @@ class MainApp(QObject):
         raw = str(getattr(self.cfg, "idle_highlight_path", "") or "").strip()
         if not raw:
             return []
-        path = normalize_app_path(raw)
-        allowed = VIDEO_EXTENSIONS
-        if os.path.isfile(path):
-            return [path] if os.path.splitext(path)[1].lower() in allowed else []
-        if not os.path.isdir(path):
-            return []
-        try:
-            def _is_playable_video(root: str, name: str) -> bool:
-                if os.path.splitext(name)[1].lower() not in allowed:
-                    return False
-                try:
-                    return os.path.getsize(os.path.join(root, name)) > 0
-                except OSError:
-                    return False
-
-            # Treat the selected folder as a library root.  Streamers commonly
-            # group idle clips by event/date beneath it, so restricting this to
-            # only the top level silently skipped most of the collection.
-            return sorted(
-                os.path.join(root, name)
-                for root, _dirs, names in os.walk(path)
-                for name in names
-                # OBS can leave a zero-byte placeholder while it is still
-                # opening/writing a recording.  Supplying it to the browser
-                # makes the idle player appear broken, so wait for real media.
-                if _is_playable_video(root, name)
-            )
-        except OSError:
-            logging.exception("IDLE_HIGHLIGHT_SCAN_FAIL path=%s", path)
-            return []
+        from idle_video_library import scan_video_library
+        return list(scan_video_library(normalize_app_path(raw)).files)
 
     @staticmethod
     def _idle_highlight_playlist_signature_for(files: List[str]) -> Tuple[Tuple[str, int, int], ...]:
@@ -25012,30 +25080,59 @@ class MainApp(QObject):
         return tuple(signature)
 
     def _refresh_idle_highlight_playlist(self) -> None:
-        """Rescan an enabled highlight folder only when its playlist changed."""
-        if not bool(getattr(self.cfg, "idle_highlight_enabled", False)):
+        """Keep policy immediate; filesystem work never runs on the UI thread."""
+        self._update_idle_highlight_policy({})
+        if bool(getattr(self, "_shutting_down", False)) or not bool(getattr(self.cfg, "idle_highlight_enabled", False)):
             return
-        files = self._idle_highlight_files()
-        signature = self._idle_highlight_playlist_signature_for(files)
-        if signature == self._idle_highlight_playlist_signature:
+        raw = str(getattr(self.cfg, "idle_highlight_path", "") or "").strip()
+        self._idle_highlight_library.request(normalize_app_path(raw) if raw else "")
+
+    def _idle_highlight_scan_finished(self, result):
+        if (bool(getattr(self, "_shutting_down", False))
+                or not bool(getattr(self.cfg, "idle_highlight_enabled", False))
+                or not self._idle_highlight_library.is_current(result)):
             return
-        logging.info("IDLE_HIGHLIGHT_PLAYLIST_CHANGED old=%s new=%s", len(self._idle_highlight_playlist_signature or ()), len(signature))
-        self._sync_idle_highlight_playlist(files=files, signature=signature)
+        raw = str(getattr(self.cfg, "idle_highlight_path", "") or "").strip()
+        if result.path != (normalize_app_path(raw) if raw else ""):
+            return
+        if result.error:
+            logging.warning("IDLE_HIGHLIGHT_SCAN_FAIL detail=%s", result.error)
+            return
+        if result.signature != self._idle_highlight_playlist_signature:
+            self._sync_idle_highlight_playlist(files=list(result.files), signature=result.signature, validated=True)
+
+    def _update_idle_highlight_policy(self, update):
+        overlay = self.__dict__.get("browser_overlay")
+        if overlay is None:
+            return
+        from idle_highlight_policy import IdleHighlightPolicy
+        policy = self.__dict__.get("_idle_highlight_policy")
+        if policy is None:
+            policy = self._idle_highlight_policy = IdleHighlightPolicy()
+        overlay.update(**policy.update(self.cfg, update))
 
     def _sync_idle_highlight_playlist(
         self,
         files: Optional[List[str]] = None,
         signature: Optional[Tuple[Tuple[str, int, int], ...]] = None,
+        validated: bool = False,
     ) -> None:
         overlay = getattr(self, "browser_overlay", None)
         if overlay is None:
             return
+        self._update_idle_highlight_policy({})
         if files is None:
-            files = self._idle_highlight_files()
-        if signature is None:
-            signature = self._idle_highlight_playlist_signature_for(files)
-        self._idle_highlight_playlist_signature = signature
-        overlay.set_highlight_playlist(files)
+            raw = str(getattr(self.cfg, "idle_highlight_path", "") or "").strip()
+            path = normalize_app_path(raw) if raw else ""
+            if path != self.__dict__.get("_idle_highlight_playlist_path"):
+                self._idle_highlight_playlist_path = path
+                self._idle_highlight_playlist_signature = None
+                overlay.set_highlight_playlist([])
+        else:
+            if signature is None:
+                signature = self._idle_highlight_playlist_signature_for(files)
+            self._idle_highlight_playlist_signature = signature
+            overlay.set_highlight_playlist(files, validated=validated)
         overlay.update(
             idleHighlightEnabled=bool(getattr(self.cfg, "idle_highlight_enabled", False)),
             idleHighlightRandom=bool(getattr(self.cfg, "idle_highlight_random", True)),
@@ -25051,7 +25148,10 @@ class MainApp(QObject):
             idleHighlightCinematicPotmEnabled=bool(getattr(self.cfg, "idle_highlight_cinematic_potm_enabled", False)),
             matchActive=bool(getattr(self, "_match_active", False)),
         )
-        logging.info("IDLE_HIGHLIGHT_PLAYLIST enabled=%s count=%s", bool(getattr(self.cfg, "idle_highlight_enabled", False)), len(files))
+        if files is None:
+            self._refresh_idle_highlight_playlist()
+        else:
+            logging.info("IDLE_HIGHLIGHT_PLAYLIST enabled=%s count=%s", bool(getattr(self.cfg, "idle_highlight_enabled", False)), len(files))
 
     def _obs_status_label(self) -> str:
         status = str(getattr(getattr(self, "obs_integration", None), "status", "disabled") or "disabled")
@@ -25425,6 +25525,7 @@ class MainApp(QObject):
 
     def _cancel_obs_auto_replay(self, reason: str = "") -> None:
         self._obs_highlight_capture_generation = int(getattr(self, "_obs_highlight_capture_generation", 0) or 0) + 1
+        self._source_record_deferred = None
         self._obs_auto_replay.cancel(reason)
 
     def _save_obs_highlight_after_capture_delay(
@@ -25456,8 +25557,7 @@ class MainApp(QObject):
             if save_program_replay:
                 integration.save_replay(reason, context=context)
             if source_record_context:
-                self._queue_source_record_clip(reason, context)
-                integration.save_source_record_replay(source_record_context, reason, context=context)
+                self._request_source_record_capture(integration, source_record_context, reason, context)
             logging.info(
                 "OBS_HIGHLIGHT_SAVE_REQUEST_AFTER_DELAY reason=%s delay_ms=%s program=%s source_record=%s",
                 reason,
@@ -25528,6 +25628,10 @@ class MainApp(QObject):
         state = self._source_record_auto_replays.get(str(key or ""))
         if not state or state.get("resolved"):
             return False
+        remaining = float(state.get('deadline') or 0.0) - time.monotonic()
+        if remaining > .001:
+            QTimer.singleShot(max(1, int(remaining * 1000)), lambda: self._run_source_record_fallback(key))
+            return False
         path = str(state.get("fallback_path") or "")
         if not path or not os.path.isfile(path):
             logging.warning("OBS_AUTO_REPLAY_FALLBACK_UNAVAILABLE key=%s", key)
@@ -25544,6 +25648,12 @@ class MainApp(QObject):
         context = dict(meta.get("context") or {})
         if str(context.get("auto_replay_source") or "") != "source_record":
             return False
+        if context.get('auto_replay_kind') not in ('kd', 'tko'):
+            return False
+        capture_generation = context.get('source_record_capture_generation')
+        if capture_generation is not None and capture_generation != self._obs_highlight_capture_generation:
+            logging.info('OBS_AUTO_REPLAY_SOURCE_CANCELLED event=%s', context.get('event_key'))
+            return False
         key = self._source_record_auto_replay_key(context)
         if not key:
             return False
@@ -25558,6 +25668,10 @@ class MainApp(QObject):
                 state.get("resolved"),
                 target,
             )
+            return False
+        if state.get('source_expired') or live_replay_expired(
+                context, time.monotonic(), float(getattr(self.cfg, 'obs_auto_replay_delay_sec', 2.0) or 0.0)):
+            logging.warning('OBS_AUTO_REPLAY_SOURCE_EXPIRED key=%s path=%s', key, target)
             return False
         capture_delay = max(0.0, float(context.get("replay_capture_delay_sec") or 0.0))
         pre_event = max(0.5, float(context.get("replay_pre_event_sec") or 3.0))
@@ -25592,8 +25706,97 @@ class MainApp(QObject):
                 logging.warning("SOURCE_RECORD_FAILED_CAPTURE_REMOVED context=%s", context)
                 break
 
-    def _queue_source_record_clip(self, reason: str, context: dict) -> None:
+    def _expire_source_record_captures(self) -> None:
+        now = time.monotonic()
+        while self._source_record_pending:
+            meta = self._source_record_pending[0]
+            deadline = float(meta.get('expires_at') or (float(meta.get('queued_at') or now) + result_wait(meta.get('context') or {})))
+            if now <= deadline:
+                break
+            self._source_record_pending.popleft()
+            # Let any late output of the failed request arrive without a new
+            # receiver to steal. This is measured from its actual deadline,
+            # not from a much later scan after the application was busy.
+            self._source_record_quarantine_until = max(
+                self.__dict__.get('_source_record_quarantine_until', 0.0), deadline + 2.5)
+            key = self._source_record_auto_replay_key(meta.get('context') or {})
+            if key in self._source_record_auto_replays:
+                self._source_record_auto_replays[key]['source_expired'] = True
+            logging.warning('SOURCE_RECORD_CLIP_EXPIRED capture=%s event=%s', meta.get('capture_id'), meta.get('event'))
+            DIAG.record('source_record_capture_expired', context=meta)
+
+    def _request_source_record_capture(self, integration, source: str, reason: str, context: dict) -> bool:
+        """One outstanding save per file receiver; never build a blind FIFO.
+
+        Low-priority overlapping captures are skipped. A decisive event may wait
+        briefly for the current file, but is never captured tens of seconds later.
+        """
+        if integration is not getattr(self, 'obs_integration', None) or integration.status != 'connected':
+            return False
+        self._expire_source_record_captures()
+        if getattr(self, '_source_record_deferred', None) and not self._source_record_pending:
+            self._flush_deferred_source_record_capture()
+        now = time.monotonic()
+        context = dict(context)
+        if self._source_record_pending or now < self.__dict__.get('_source_record_quarantine_until', 0.0):
+            if context.get('auto_replay_kind') in ('kd', 'tko'):
+                previous = getattr(self, '_source_record_deferred', None)
+                if previous and (now > previous['deadline'] or previous['generation'] != self._obs_highlight_capture_generation):
+                    previous = None
+                    self._source_record_deferred = None
+                if not previous or previous['context'].get('auto_replay_kind') != 'tko' or context.get('auto_replay_kind') == 'tko':
+                    self._source_record_deferred = dict(integration=integration, source=source, reason=reason,
+                        context=context, deadline=now + 2.5, generation=self._obs_highlight_capture_generation)
+                logging.info('SOURCE_RECORD_CAPTURE_DEFERRED event=%s reason=busy', context.get('event_key'))
+                return True
+            logging.info('SOURCE_RECORD_CAPTURE_SKIPPED event=%s reason=busy', context.get('event_key'))
+            return False
+        incoming = normalize_app_path(str(getattr(self.cfg, 'obs_source_record_incoming_dir', '') or ''))
+        # Each transaction owns only files which did not exist at send time.
+        # Forget moved paths too, so a reused filename can be observed again.
+        try:
+            existing = {os.path.normcase(os.path.abspath(os.path.join(incoming, name))) for name in os.listdir(incoming)}
+        except OSError:
+            return False
+        self._source_record_seen_dir = incoming
+        self._source_record_seen_files = existing
+        self._source_record_file_sizes = {}
+        triggered = float(context.get('trigger_monotonic') or now)
+        configured_delay = max(0.0, float(context.get('replay_capture_delay_sec') or 0.0))
+        if now > triggered + configured_delay + 2.5:
+            logging.warning('SOURCE_RECORD_CAPTURE_SKIPPED event=%s reason=late_request', context.get('event_key'))
+            return False
+        context['replay_capture_delay_sec'] = max(configured_delay, now - triggered)
+        context['source_record_capture_id'] = uuid.uuid4().hex
+        context['source_record_capture_generation'] = self._obs_highlight_capture_generation
+        context['capture_requested_monotonic'] = now
+        context['capture_requested_wall'] = time.time()
+        context['auto_replay_deadline_monotonic'] = max(
+            now + result_wait(context), triggered + float(getattr(self.cfg, 'obs_auto_replay_delay_sec', 2.0) or 0.0) + 1.0)
+        if not self._queue_source_record_clip(reason, context):
+            return False
+        try:
+            integration.save_source_record_replay(source, reason, context=context)
+        except Exception:
+            self._discard_failed_source_record_clip(context)
+            raise
+        return True
+
+    def _flush_deferred_source_record_capture(self) -> None:
+        item = getattr(self, '_source_record_deferred', None)
+        if not item or self._source_record_pending or time.monotonic() < self.__dict__.get('_source_record_quarantine_until', 0.0):
+            return
+        self._source_record_deferred = None
+        if time.monotonic() > item['deadline'] or item['generation'] != self._obs_highlight_capture_generation:
+            logging.warning('SOURCE_RECORD_CAPTURE_SKIPPED event=%s reason=deferred_expired', item['context'].get('event_key'))
+            return
+        self._request_source_record_capture(item['integration'], item['source'], item['reason'], item['context'])
+
+    def _queue_source_record_clip(self, reason: str, context: dict) -> bool:
         """Remember metadata until Source Record finishes writing its separate file."""
+        if self._source_record_pending:
+            logging.warning('SOURCE_RECORD_CAPTURE_SKIPPED event=%s reason=receiver_owned', context.get('event_key'))
+            return False
         now = time.monotonic()
         for replay_key, replay_state in list(self._source_record_auto_replays.items()):
             if now - float(replay_state.get("deadline") or now) > 60.0:
@@ -25602,14 +25805,17 @@ class MainApp(QObject):
         archive = normalize_app_path(str(getattr(self.cfg, "obs_source_record_archive_dir", "") or ""))
         if not incoming or not archive:
             logging.warning("SOURCE_RECORD_CLIP_ORGANIZE_SKIPPED missing_folder incoming=%s archive=%s", incoming, archive)
-            return
+            return False
         side = str(context.get("attacker_side") or "").lower().strip()
         names = dict(getattr(self, "_source_record_names", {}) or {})
-        nickname = str(names.get(side) or "").strip()
+        nickname = str(context.get('attacker_name') or names.get(side) or "").strip()
         event = str(reason or context.get("highlight_kind") or "highlight").upper().replace("KNOCKDOWN", "KD")
         self._source_record_pending.append(
             {
                 "queued_at": time.monotonic(),
+                "requested_wall": float(context.get('capture_requested_wall') or time.time()),
+                "expires_at": time.monotonic() + result_wait(context),
+                "capture_id": str(context.get('source_record_capture_id') or ''),
                 "nickname": self._source_record_safe_name(nickname, "UNKNOWN"),
                 "event": self._source_record_safe_name(event, "HIGHLIGHT"),
                 "round": max(0, int(context.get("round") or getattr(self, "_source_record_round", 0) or 0)),
@@ -25621,11 +25827,11 @@ class MainApp(QObject):
         auto_key = self._source_record_auto_replay_key(context)
         if auto_key and str(context.get("auto_replay_source") or "") == "source_record":
             wait_sec = max(1.0, float(context.get("auto_replay_source_wait_sec") or 5.0))
-            self._source_record_auto_replays[auto_key] = {
-                "resolved": "",
-                "deadline": time.monotonic() + wait_sec,
-            }
-        logging.info("SOURCE_RECORD_CLIP_QUEUED nick=%s event=%s", nickname or "UNKNOWN", event)
+            replay_state = self._source_record_auto_replays.setdefault(auto_key, {'resolved': ''})
+            replay_state.update(deadline=time.monotonic() + wait_sec, source_expired=False)
+        logging.info("SOURCE_RECORD_CLIP_QUEUED nick=%s event=%s capture=%s", nickname or "UNKNOWN", event, context.get('source_record_capture_id'))
+        DIAG.record('source_record_capture_queued', capture_id=context.get('source_record_capture_id'), context=context)
+        return True
 
     @staticmethod
     def _source_record_clip_destination(archive: str, meta: dict) -> Tuple[str, bool]:
@@ -25814,6 +26020,9 @@ class MainApp(QObject):
         self._potm_seen_event_ids.clear()
         self._potm_best = {}
         self._potm_terminal_pending = False
+        self._set_potm_ready_fallback({})
+        self._potm_capture_candidates = {}
+        self._potm_video_missing_finalized = None
         self._potm_opening_round_report_shown = False
         self._potm_opening_round_report_display_ms = 0
         self._potm_presentation_active = False
@@ -25970,9 +26179,15 @@ class MainApp(QObject):
             )
             return None
         previous = dict(self._potm_best or {})
+        if previous.get("file") and os.path.isfile(previous["file"]):
+            self._set_potm_ready_fallback(previous)
         candidate["capture_source"] = str(getattr(self.cfg, "potm_capture_source", "source_record") or "source_record")
         candidate["nickname"] = str(dict(getattr(self, "_source_record_names", {}) or {}).get(candidate.get("side")) or candidate.get("side") or "UNKNOWN")
         self._potm_best = candidate
+        known = self.__dict__.setdefault("_potm_capture_candidates", {})
+        known[candidate["id"]] = dict(candidate)
+        while len(known) > 16:
+            known.pop(next(iter(known)))
         DIAG.record("potm_candidate_selected", match_id=self.__dict__.get("_potm_archive_session_id", ""), event_id=event_id, candidate=candidate, previous_id=previous.get("id"))
         self._persist_potm_candidate()
         logging.info(
@@ -25981,13 +26196,20 @@ class MainApp(QObject):
         )
         self._prewarm_potm_announcement(candidate)
         old_path = str(previous.get("file") or "")
-        if bool(previous.get("managed", False)) and old_path and os.path.isfile(old_path) and not self._round_highlight_pins(old_path):
+        if bool(previous.get("managed", False)) and old_path and os.path.isfile(old_path) and not self._round_highlight_pins(old_path) and old_path != str(self.__dict__.get("_potm_ready_fallback", {}).get("file") or ""):
             try: os.remove(old_path)
             except OSError: pass
         # The caller attaches this id to its existing KD/TKO/highlight save.
         # This produces one clip, not a duplicate ordinary highlight plus a
         # separate POTM capture of the same impact.
         return candidate
+
+    def _set_potm_ready_fallback(self, candidate):
+        old_path = str(self.__dict__.get("_potm_ready_fallback", {}).get("file") or "")
+        self._potm_ready_fallback = dict(candidate)
+        # Release only app-owned temporary files, respecting round/POTM pins.
+        # Player archives and original OBS recordings are never removed here.
+        self._release_round_highlight_files([old_path])
 
     def _round_highlight_engine(self):
         from round_highlights import RoundHighlights
@@ -26008,8 +26230,9 @@ class MainApp(QObject):
         if not archive:return
         owned=os.path.normcase(os.path.abspath(os.path.join(archive,'_potm_candidates')))
         current=str((getattr(self,'_potm_best',{}) or {}).get('file') or '')
+        backup=str(self.__dict__.get('_potm_ready_fallback',{}).get('file') or '')
         for path in set(paths):
-            if not path or path==current or self._round_highlight_pins(path):continue
+            if not path or path in (current,backup) or self._round_highlight_pins(path):continue
             if os.path.normcase(os.path.dirname(os.path.abspath(path)))!=owned:continue
             try:
                 if os.path.isfile(path):os.remove(path)
@@ -26064,6 +26287,13 @@ class MainApp(QObject):
         threading.Thread(target=_worker, daemon=True, name="PotmAnnouncementPrewarm").start()
 
     def _register_potm_file(self, path: str, candidate_id: str, *, managed: bool = False, capture_source: str) -> None:
+        old = self.__dict__.get("_potm_capture_candidates", {}).get(candidate_id)
+        if old and candidate_id != str((self._potm_best or {}).get("id") or "") and capture_source == old.get("capture_source") and os.path.isfile(path) and not self._potm_played:
+            fallback = self.__dict__.get("_potm_ready_fallback", {})
+            if int(old.get("score", 0)) >= int(fallback.get("score", -1)):
+                self._set_potm_ready_fallback({**old, "file": path, "file_source": capture_source, "managed": bool(managed)})
+                DIAG.record("potm_ready_backup_attached", candidate_id=candidate_id, path=path)
+                return
         expected = str((self._potm_best or {}).get("capture_source") or getattr(self.cfg, "potm_capture_source", "source_record"))
         if not path or candidate_id != str((self._potm_best or {}).get("id") or "") or capture_source != expected:
             DIAG.record("potm_file_rejected", candidate_id=candidate_id, selected_id=(self._potm_best or {}).get("id"), capture_source=capture_source, expected_source=expected, path=path)
@@ -26110,10 +26340,13 @@ class MainApp(QObject):
             return
         if self.__dict__.get('_round_highlights'):self._round_highlights.reset()
         self._potm_archive_session_id = session_id
+        self._potm_capture_candidates = {}
+        self._potm_video_missing_finalized = None
         self._potm_archive_dir = archive_dir
         # A brand-new session starts empty; a resumed session can continue
         # with the candidate and already-organized Source Record clip.
         self._potm_best = {}
+        self._set_potm_ready_fallback({})
         try:
             with open(os.path.join(archive_dir, "potm_candidate.json"), "r", encoding="utf-8") as stream:
                 candidate = json.load(stream)
@@ -26133,7 +26366,9 @@ class MainApp(QObject):
         except Exception:
             logging.exception("POTM_CANDIDATE_RESUME_FAIL")
 
-    def _maybe_play_potm(self) -> None:
+    def _maybe_play_potm(self, *, allow_ready_fallback=False) -> None:
+        if self.__dict__.get("_potm_video_missing_finalized") == self.__dict__.get("_potm_play_generation", 0):
+            return
         if self._potm_played or not self._potm_terminal_pending:
             return
         # Broadcast order: decisive final-round report -> POTM -> full match
@@ -26144,6 +26379,11 @@ class MainApp(QObject):
             return
         path = str((self._potm_best or {}).get("file") or "")
         if not path or not os.path.isfile(path):
+            backup = self.__dict__.get("_potm_ready_fallback", {})
+            if allow_ready_fallback and backup.get("file") and os.path.isfile(backup["file"]):
+                DIAG.record("potm_ready_backup_selected", missing_id=(self._potm_best or {}).get("id"), candidate_id=backup.get("id"))
+                self._potm_best = dict(backup)
+                return self._maybe_play_potm()
             DIAG.record("potm_wait", candidate_id=(self._potm_best or {}).get("id"), reason="video_missing", path=path)
             return
         self._potm_played = True
@@ -26699,10 +26939,16 @@ class MainApp(QObject):
         # A failed/disabled Source Record request must not steal metadata from
         # a much later clip that happens to be written to the same folder.
         now = time.monotonic()
-        while self._source_record_pending and now - float(self._source_record_pending[0].get("queued_at") or now) > 45.0:
-            expired = self._source_record_pending.popleft()
-            logging.warning("SOURCE_RECORD_CLIP_EXPIRED nick=%s event=%s", expired.get("nickname"), expired.get("event"))
+        self._expire_source_record_captures()
         if incoming != getattr(self, "_source_record_seen_dir", ""):
+            # Changing the receiving folder cannot transfer an old request's
+            # ownership to files from an unrelated capture location.
+            for old in self._source_record_pending:
+                old_key = self._source_record_auto_replay_key(old.get('context') or {})
+                if old_key in self._source_record_auto_replays:
+                    self._source_record_auto_replays[old_key]['source_expired'] = True
+            self._source_record_pending.clear()
+            self._source_record_deferred = None
             self._source_record_seen_dir = incoming
             self._source_record_seen_files = set()
             self._source_record_file_sizes = {}
@@ -26730,15 +26976,17 @@ class MainApp(QObject):
             if key in self._source_record_seen_files:
                 continue
             try:
-                size = int(os.path.getsize(path))
+                stat = os.stat(path)
+                size = int(stat.st_size)
             except OSError:
                 continue
             if size <= 0:
                 continue
+            signature = (size, stat.st_mtime_ns, stat.st_ino)
             previous = self._source_record_file_sizes.get(key)
-            self._source_record_file_sizes[key] = size
+            self._source_record_file_sizes[key] = signature
             # Hybrid MP4 needs a moment to finish its soft-remux; require one stable scan.
-            if previous != size:
+            if previous != signature:
                 continue
             self._source_record_seen_files.add(key)
             self._source_record_file_sizes.pop(key, None)
@@ -26746,6 +26994,10 @@ class MainApp(QObject):
                 logging.info("SOURCE_RECORD_CLIP_UNMATCHED path=%s", path)
                 continue
             meta = self._source_record_pending[0]
+            if not file_matches_capture(meta, stat) or (meta.get('bound_file') and meta['bound_file'] != key):
+                logging.warning('SOURCE_RECORD_CLIP_UNMATCHED path=%s capture=%s reason=capture_window', path, meta.get('capture_id'))
+                continue
+            meta['bound_file'] = key
             try:
                 target_dir, potm_managed = self._source_record_clip_destination(archive, meta)
                 os.makedirs(target_dir, exist_ok=True)
@@ -26780,8 +27032,10 @@ class MainApp(QObject):
                 # Source Record can retain a Hybrid MP4 lock briefly after the
                 # file size stops changing.  Leave both file and metadata for
                 # the next scanner tick instead of losing the association.
-                self._source_record_seen_files.discard(key)
+                if self._source_record_pending and self._source_record_pending[0] is meta:
+                    self._source_record_seen_files.discard(key)
                 logging.exception("SOURCE_RECORD_CLIP_ORGANIZE_FAIL path=%s", path)
+        self._flush_deferred_source_record_capture()
 
     def _schedule_source_record_incoming_clear(self) -> None:
         """After OBS stops, give Source Record time to finalize its last file."""
@@ -27010,8 +27264,7 @@ class MainApp(QObject):
             if save_program_replay:
                 integration.save_replay(reason, context=context)
             if save_source_record:
-                self._queue_source_record_clip(reason, context)
-                integration.save_source_record_replay(source_record_context, reason, context=context)
+                self._request_source_record_capture(integration, source_record_context, reason, context)
         logging.info(
             "OBS_HIGHLIGHT_SAVE_REQUEST kind=%s damage=%.1f combo=%s auto_replay=%s source_record=%s",
             normalized,
@@ -27645,6 +27898,8 @@ class MainApp(QObject):
         if bool(getattr(self, '_shutting_down', False)):
             return
         self._shutting_down = True
+        if self.__dict__.get('_idle_highlight_library'):
+            self._idle_highlight_library.close()
         if self.__dict__.get('_round_highlights'):self._round_highlights.reset()
         self._log_detector_start_pending = False
         logging.info('APP_SHUTDOWN_BEGIN')
@@ -28507,14 +28762,14 @@ class MainApp(QObject):
     def _log_portrait_path_for_side(self, side: str) -> str:
         try:
             root = resolve_spectatorlog_path(str(getattr(self.cfg, "spectatorlog_path", "") or ""))
+            watcher = getattr(self, 'spectator_watcher', None)
+            if watcher is not None:
+                return watcher.portrait_path_for_side(root, side)
             corner_dir = os.path.join(root, str(side or "").lower().strip())
             candidate = os.path.join(corner_dir, "portrait.png")
-            name_path = os.path.join(corner_dir, "name.txt")
-            if not os.path.isfile(candidate):
-                return ""
-            if os.path.isfile(name_path) and os.path.getmtime(candidate) + 0.1 < os.path.getmtime(name_path):
-                return ""
-            return candidate
+            # Before the watcher exists, accept only a newly captured official
+            # file. Once it exists, UI/VS and collection share match receipts.
+            return candidate if PortraitOwnership().candidate(side, candidate) else ''
         except Exception:
             return ""
 
@@ -29570,8 +29825,15 @@ class MainApp(QObject):
                                 def _fallback_final_report() -> None:
                                     if generation != int(getattr(self, "_potm_play_generation", 0) or 0):
                                         return
+                                    if self.__dict__.get("_potm_video_missing_finalized") == generation:
+                                        return
                                     if bool(getattr(self, "_potm_played", False)):
                                         return
+                                    self._maybe_play_potm(allow_ready_fallback=True)
+                                    if self._potm_played:
+                                        return
+                                    self._potm_video_missing_finalized = generation
+                                    self._potm_terminal_pending = False
                                     logging.warning("POTM_FINAL_REPORT_FALLBACK_NO_VIDEO")
                                     DIAG.record("potm_fallback_no_video", candidate=dict(getattr(self, "_potm_best", {}) or {}), generation=generation)
                                     overlay.push_event("round_report", **payload)
@@ -30427,6 +30689,7 @@ class MainApp(QObject):
     def apply_ui_update(self, d: dict):
         if bool(getattr(self, '_shutting_down', False)):
             return
+        self._update_idle_highlight_policy(d)
         previous_lives=set(getattr(self,'_hud_lives_depleted',()))
         life_flags=self._hud_life_flags(d)
         if previous_lives!=self._hud_lives_depleted or 'spectator_log_info' in d:
@@ -30496,7 +30759,7 @@ class MainApp(QObject):
         if isinstance(d.get("spectator_lobby_returned"), dict):
             self._schedule_lobby_post_match_kick(d.get("spectator_lobby_returned"))
         if str(d.get("spectator_round_state", "") or "").strip().lower() in {"results", "end", "knockout", "disqualified", "cancel"}:
-            self._potm_terminal_pending = True
+            self._potm_terminal_pending = self.__dict__.get("_potm_video_missing_finalized") != self._potm_play_generation
             self._maybe_play_potm()
         if ("spectator_match_active" in d or "spectator_round_state" in d
                 or bool(d.get("spectator_match_clear", False))
@@ -30527,6 +30790,10 @@ class MainApp(QObject):
                     # release after the final report/POTM, leaving idle video
                     # permanently blocked.
                     pass
+                elif (d.get("spectator_lobby_confirmed")
+                        and not bool(getattr(self, "_potm_terminal_pending", False))
+                        and not bool(getattr(self, "_potm_presentation_active", False))):
+                    self._match_active = False
                 elif round_state in live_states or bool(d.get("spectator_match_active", False)):
                     # A previous final-report release timer must never be able
                     # to flip the browser back to idle after a new fight (or

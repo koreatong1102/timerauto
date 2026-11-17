@@ -17,6 +17,8 @@ import os
 import platform
 import time
 import zipfile
+import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -36,7 +38,26 @@ except Exception:  # pragma: no cover - diagnostics should never break exports
         return str(value)
 
 
-_SKIP_DIRS = {".git", "__pycache__", "build", "dist", ".venv", "venv", "diagnostics"}
+_SKIP_DIRS = {".git", "__pycache__", "build", "dist", ".venv", "venv", "diagnostics",
+              ".runtime", "_internal", "node_modules", "commentary_voice_packs",
+              "matchlogarchive", "spectatorlogarchive", "reportimages", "logs", "release"}
+
+
+def _include_directory(name):
+    value = name.casefold()
+    return value not in _SKIP_DIRS and not value.startswith(('.venv', 'venv-', '.qwen', '.pytest', '.mypy'))
+
+
+@contextmanager
+def _snapshot_zip(path):
+    temporary = path + '.tmp'
+    try:
+        with zipfile.ZipFile(temporary, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+            yield zf
+        os.replace(temporary, path)
+    finally:
+        if os.path.isfile(temporary):
+            os.remove(temporary)
 _TEXT_EXTS = {".py", ".qml", ".json", ".md", ".txt", ".ps1", ".bat", ".csv", ".html", ".css", ".js"}
 _MANIFEST_EXTS = _TEXT_EXTS | {".png", ".jpg", ".jpeg", ".webp", ".mp3", ".wav", ".ico"}
 
@@ -126,15 +147,23 @@ def _detect_spectator_format(root: str) -> Dict[str, Any]:
 
 def build_code_index(root: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {"root": _mask_string(root), "files": {}}
+    source_bytes = 0
     for dirpath, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        dirs[:] = [d for d in dirs if _include_directory(d) and not os.path.islink(os.path.join(dirpath, d))]
         for fn in sorted(files):
             if not fn.endswith(".py"):
                 continue
+            if len(out['files']) >= 512:
+                out['truncated'] = '512 source file limit'
+                return out
             path = os.path.join(dirpath, fn)
             rel = os.path.relpath(path, root).replace(os.sep, "/")
             try:
                 src = _read_text(path, max_chars=2_000_000)
+                source_bytes += len(src.encode('utf-8'))
+                if source_bytes > 16*1024*1024:
+                    out['truncated'] = '16 MiB source analysis limit'
+                    return out
                 tree = ast.parse(src)
                 classes = []
                 functions = []
@@ -169,20 +198,25 @@ def build_code_index(root: str) -> Dict[str, Any]:
 
 def build_file_manifest(root: str) -> Dict[str, Any]:
     manifest: Dict[str, Any] = {"root": _mask_string(root), "files": []}
+    hashed_bytes = 0
     for dirpath, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        dirs[:] = [d for d in dirs if _include_directory(d) and not os.path.islink(os.path.join(dirpath, d))]
         for fn in sorted(files):
             path = os.path.join(dirpath, fn)
             rel = os.path.relpath(path, root).replace(os.sep, "/")
             ext = os.path.splitext(fn)[1].lower()
             if ext not in _MANIFEST_EXTS:
                 continue
+            if len(manifest['files']) >= 5000:
+                manifest.update(count=len(manifest['files']), truncated='5000 file limit')
+                return manifest
             try:
                 st = os.stat(path)
                 h = ""
-                if st.st_size <= 3 * 1024 * 1024:
+                if st.st_size <= 3 * 1024 * 1024 and hashed_bytes + st.st_size <= 32*1024*1024:
                     with open(path, "rb") as f:
                         h = hashlib.sha256(f.read()).hexdigest()[:16]
+                    hashed_bytes += st.st_size
                 manifest["files"].append({"path": rel, "size": st.st_size, "mtime": int(st.st_mtime), "sha256_16": h})
             except Exception as exc:
                 manifest["files"].append({"path": rel, "error": str(exc)})
@@ -449,7 +483,7 @@ def export_project_snapshot(project_root: str, output_dir: str, *, app_state: Op
     root = os.path.abspath(project_root or os.getcwd())
     os.makedirs(output_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_path = os.path.abspath(os.path.join(output_dir, f"RFC_ProjectSnapshot_{stamp}.zip"))
+    zip_path = os.path.abspath(os.path.join(output_dir, f"RFC_ProjectSnapshot_{stamp}_{uuid.uuid4().hex[:6]}.zip"))
 
     code_index = build_code_index(root)
     file_manifest = build_file_manifest(root)
@@ -465,7 +499,7 @@ def export_project_snapshot(project_root: str, output_dir: str, *, app_state: Op
     except Exception:
         trace_snapshot = {}
 
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with _snapshot_zip(zip_path) as zf:
         zf.writestr("README_FIRST.txt", (
             "RFC Project Snapshot / AI Handoff Package\n"
             "==========================================\n\n"
@@ -479,6 +513,10 @@ def export_project_snapshot(project_root: str, output_dir: str, *, app_state: Op
             "python": platform.python_version(),
             "project_root": _mask_string(root) if mask_sensitive else root,
             "kind": "ai_project_snapshot",
+            "excluded_directories": sorted(_SKIP_DIRS),
+            "excluded_prefixes": [".venv", "venv-", ".qwen", ".pytest", ".mypy"],
+            "limits": {"source_files":512, "source_analysis_bytes":16*1024*1024,
+                       "manifest_files":5000, "hash_bytes":32*1024*1024},
         }, ensure_ascii=False, indent=2))
         for name, body in docs.items():
             zf.writestr(name, body)

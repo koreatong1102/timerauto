@@ -345,10 +345,29 @@ class BGradeCommentary:
         subject = (receiver_side or ("red" if side == "blue" else "blue" if side == "red" else "")) if important else side
         spoken_name = receiver if important else name
         focus = self.story.focus.prepare(self.story.scope, self.story.round, subject, spoken_name, important=important, now=now)
-        setup = short_call(tag, self._live_indices.get(tag, 0), name=spoken_name, named=focus["named"],
-                           context=context, hits=hits, target=target, count=count)
+        context = dict(context or {})
+        start = self._live_indices.get(tag, 0) + (self.story._rotation or 0) % len(pool)
+        heard = {item.get("text") for item in self.story.memory.recent_broadcast(now=now, max_age=75)
+                 if item.get("intent") == "call"}
+        index = start
+        for offset in range(len(pool)):
+            index = start + offset
+            bare = short_call(tag, index, name="", named=False, context=context, hits=hits, target=target, count=count)
+            if bare not in heard:
+                break
+        if self.story.reply_filter and not any(self.story.reply_filter(role, bare, None) for role in ("caster", "analyst")):
+            # New contextual calls may not be in an older installed pack yet.
+            # Keep a prepared, still-factual base call instead of a silent gap.
+            bare = short_call(tag, index, name="", named=False, hits=hits, target=target, count=count)
+            setup = (spoken_name + ", " if focus["named"] else "") + bare
+        else:
+            setup = short_call(tag, index, name=spoken_name, named=focus["named"],
+                               context=context, hits=hits, target=target, count=count)
+        context["_setup_bare"] = bare
         presentation = self.story.compose(tag, setup=setup, name=name, side=side, context=context,
                                           hits=hits, now=now, brief=True)
+        if presentation is None:
+            return None
         presentation["focus"] = focus
         text = " ".join(turn["text"] for turn in presentation["turns"])
         category = {"whiff": "counter", "graze": "counter", "weak": "event_analysis",
@@ -386,6 +405,8 @@ class BGradeCommentary:
         effect = str(row.get("effect_kind") or "").lower()
         if effect in ("tko", "stun"):
             tag = effect
+        elif effect in ("knockdown", "down", "ko"):
+            tag = "knockdown"
         elif counter and hits >= 2:
             tag = "counter_combo"
         elif counter:

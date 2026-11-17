@@ -307,18 +307,21 @@ class DiagnosticUiTests(unittest.TestCase):
         dialog._diagnostics_apply_options = Mock()
         dialog._diagnostic_export_zip = Owner()._diagnostic_export_zip
         dialog.btn_diag_export = timerauto.QPushButton()
+        dialog.btn_project_snapshot = timerauto.QPushButton()
         dialog.lbl_diag_status = timerauto.QLabel()
         job = SimpleNamespace(done=threading.Event(), path="test.zip", error="")
         with patch.object(timerauto.DIAG, "start_export", return_value=job) as start, patch.object(timerauto.QMessageBox, "information") as info:
             dialog._diagnostics_export_clicked()
             self.assertEqual(start.call_args.kwargs["app_state"]["ui_thread"], threading.get_ident())
             self.assertFalse(dialog.btn_diag_export.isEnabled())
+            self.assertFalse(dialog.btn_project_snapshot.isEnabled())
             dialog._diagnostics_export_clicked()
             self.assertEqual(start.call_count, 1)
             job.done.set()
             dialog._diagnostic_poll_timer.timeout.emit()
             self.assertTrue(dialog.btn_diag_export.isEnabled())
-            info.assert_called_once()
+            self.assertTrue(dialog.btn_project_snapshot.isEnabled())
+            info.assert_not_called()  # Completion must not put a modal popup over the broadcast.
             self.assertFalse(dialog._diagnostic_poll_timer.isActive())
         dialog.deleteLater()
 

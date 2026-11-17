@@ -10,6 +10,12 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 MANIFEST = "release_manifest.json"
+# Optional models, designed voices, and generated clips belong to the local
+# user, not a release. Never hash them into an update's replacement roots.
+LOCAL_TTS_DATA_DIRS = frozenset({
+    ".qwen_duo_profiles", ".qwen_models", ".venv-qwen",
+    "commentary_voice_packs", ".runtime",
+})
 
 
 def digest(path):
@@ -53,6 +59,8 @@ def create_manifest(source, package, version):
         if not path.is_file() or path.is_symlink():
             continue
         rel = path.relative_to(package).as_posix()
+        if rel.split("/", 1)[0].lower() in LOCAL_TTS_DATA_DIRS:
+            continue
         # Mutable user data is deliberately not a release identity.
         if rel == MANIFEST or rel in {"config.json", "profile.json", "profile1.json", "as.json", "test.json", "latest.json"}:
             continue

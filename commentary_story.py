@@ -12,6 +12,7 @@ import time
 import uuid
 from commentary_calls import SPOKEN_FOCUS
 from commentary_content import plan as content_plan, subject
+from commentary_flow import ExchangeContext
 
 
 class SpokenMemory:
@@ -19,6 +20,7 @@ class SpokenMemory:
         self._lock = threading.RLock()
         self._scopes = OrderedDict()
         self._turns = OrderedDict()
+        self._broadcast = deque(maxlen=256)
 
     def complete_turn(self, story, index, *, now=None):
         """Audible content is independent from a fully completed callback seed."""
@@ -32,10 +34,12 @@ class SpokenMemory:
             key = (story["id"], index)
             if any(row["key"] == key for row in rows):
                 return
-            rows.append({**content[index], "key": key, "side": story.get("side", ""),
+            row = {**content[index], "key": key, "scope": story["scope"], "side": story.get("side", ""),
                          "round": story.get("round", 1), "script": story.get("script"),
-                         "family": story.get("family"),
-                         "completed_at": time.monotonic() if now is None else now})
+                         "family": story.get("family"), "swear": story.get("swear", 0),
+                         "completed_at": time.monotonic() if now is None else now}
+            rows.append(row)
+            self._broadcast.append(row)
             self._turns.move_to_end(story["scope"])
             while len(self._turns) > 32:
                 self._turns.popitem(last=False)
@@ -45,6 +49,11 @@ class SpokenMemory:
         with self._lock:
             return [dict(row) for row in self._turns.get(scope, ())
                     if 0 <= now - row["completed_at"] <= max_age]
+
+    def recent_broadcast(self, *, now=None, max_age=120):
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            return [dict(row) for row in self._broadcast if 0 <= now - row["completed_at"] <= max_age]
 
     def complete(self, story, *, now=None):
         if not isinstance(story, dict) or not story.get("scope") or not story.get("id"):
@@ -80,12 +89,16 @@ class Script:
     lead_role: str = "caster"
     topic: str = ""
     intent: str = ""
+    length: str = "normal"
+    delivery: str = "neutral"
+    requires_setup: bool = False
 
 
 @lru_cache(maxsize=256)
 def script_key(script):
     text = "\0".join((script.lead, script.reply, script.family, str(script.swear), script.seed,
-                      script.lead_role, script.topic, script.intent))
+                      script.lead_role, script.topic, script.intent, script.length, script.delivery,
+                      str(script.requires_setup)))
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 
@@ -251,7 +264,7 @@ SCENES = {
 # Short lead, different speaker ownership: not two voices repeating the same
 # fact. These remain optional reactions and never override the event call.
 SCENES["heavy"] += (
-    Script("{setup}", "해설하다가 본인이 먼저 소리 지르셨는데요?", "banter", lead_role="analyst"),
+    Script("{setup}", "해설하다가 본인이 먼저 소리 지르셨는데요?", "banter", lead_role="analyst", requires_setup=True),
     Script("{setup}", "아 샤갈, 방금은 저도 자세 고쳐 앉았어요!", "reaction", 2, lead_role="analyst"),
     Script("{setup}", "네, 그건 길게 설명 안 하셔도 알겠습니다!", "dry", lead_role="analyst"),
 )
@@ -348,6 +361,11 @@ def _num(value):
         return 0.0
 
 
+from commentary_material import scene_material
+for _scene, _rows in scene_material().items():
+    SCENES[_scene] = SCENES.get(_scene, ()) + tuple(Script(**row) for row in _rows)
+
+
 def event_key(row, round_no):
     return (int(round_no or 1), str(row.get("event_id") or row.get("raw_line") or
         (row.get("time"), row.get("damage"), row.get("attacker_side"), row.get("receiver_side"), row.get("hand"), row.get("punch"))))
@@ -371,12 +389,18 @@ class MatchStory:
         self._rotation = None
         self._accepted_serial = 0
         self._callback_at = -1e9
+        self._flow = ExchangeContext()
+        self.reply_filter = None
+        self._cfg = None
         self.density, self.swearing = "full", "strong"
 
     def configure(self, cfg):
+        self._cfg = cfg
         self.density = "compact" if getattr(cfg, "spectator_bgrade_density", "full") == "compact" else "full"
         value = getattr(cfg, "spectator_bgrade_swearing", "strong")
         self.swearing = value if value in ("light", "mixed", "strong") else "strong"
+        from commentary_pack import enabled, available_reply
+        self.reply_filter = (lambda role, text, budget: available_reply(cfg, role, text, max_seconds=budget)) if enabled(cfg) else None
 
     def observe(self, round_no, events):
         self.round = max(1, int(round_no or 1))
@@ -402,20 +426,23 @@ class MatchStory:
             weak = str(row.get("weak_point") or "").lower()
             weak = "eyes" if weak in ("eyeleft", "eyeright") else weak
             stamp, damage = _num(row.get("time")), _num(row.get("damage"))
+            flow = self._flow.observe(self.round, row, counter=counter,
+                                      combo_hits=int(verdict.get("combo_hits", row.get("combo_hits", 0)) or 0))
+            clock = flow.get("flow_clock")
             own, other = stats[side], stats[receiver]
-            context = {"side": side, "receiver": receiver, "round": self.round, "weak": weak,
+            context = {**flow, "side": side, "receiver": receiver, "round": self.round, "weak": weak,
                 "counter": own["counter"], "weak_hits": own["weak"].get(weak, 0), "landed": own["landed"],
                 "repeat_counter": counter and own["counter"] >= 2 and own["counter_at"] is not None
-                    and 0 <= own["counter_at"] - stamp <= 25,
+                    and clock is not None and 0 <= clock - own["counter_at"] <= 25,
                 "reversal": counter and other["counter"] >= 3 and other["counter_at"] is not None
                     and self._last_counter.get(self.round) == receiver
-                    and 0 <= other["counter_at"] - stamp <= 35}
+                    and clock is not None and 0 <= clock - other["counter_at"] <= 35}
             self._contexts[key] = context
             while len(self._contexts) > 128:
                 self._contexts.popitem(last=False)
             if counter:
                 own["counter"] += 1
-                own["counter_at"] = stamp
+                own["counter_at"] = clock
                 self._last_counter[self.round] = side
             if damage >= 10:
                 own["landed"] += 1
@@ -437,6 +464,15 @@ class MatchStory:
                 return item["seed"]
         return ""
 
+    def content_memory(self, *, now):
+        current = self.memory.recent_content(self.scope, now=now)
+        # Carry generic joke fatigue across consecutive matches, not a previous
+        # fighter's facts, identity, tactical history, or callback permissions.
+        current += [item for item in self.memory.recent_broadcast(now=now)
+                    if item.get("scope") != self.scope and not item.get("evidence")
+                    and item.get("intent") != "call"]
+        return sorted(current, key=lambda item: item.get("completed_at", -1e9))
+
     def _pick(self, scripts, *, now):
         heard = [item for item in self.memory.recent(self.scope, now=now)
                  if "content" not in item or len(item["content"]) > 1]
@@ -444,6 +480,8 @@ class MatchStory:
         # alone do not consume the optional script they never actually spoke.
         heard += [item for item in self.memory.recent_content(self.scope, now=now)
                   if item.get("intent") != "call"]
+        heard += [item for item in self.memory.recent_broadcast(now=now)
+                  if item.get("scope") != self.scope and item.get("intent") != "call"]
         heard.sort(key=lambda item: item.get("completed_at", -1e9))
         recent = [item for item in self._selected if 0 <= now - item["at"] < 8]
         used_ids = {item.get("script") for item in recent} | {item.get("script") for item in heard}
@@ -478,6 +516,12 @@ class MatchStory:
                 scene = "permission_reverse" if callback_ready and self._heard("permission", ctx.get("receiver"), now=now) else "reversal"
             elif counter and ctx.get("repeat_counter"):
                 scene = "permission_return" if callback_ready and self._heard("permission", side, now=now) else "repeat_counter"
+            elif tag in ("combo", "counter_combo") and ctx.get("counter_release") and hits < 6:
+                scene = "counter_release"
+            elif ctx.get("exchange_return") and not counter:
+                scene = "exchange_return"
+            elif tag == "weak" and ctx.get("target_switch"):
+                scene = "target_switch"
             elif tag == "weak" and ctx.get("weak_hits", 0) >= 3:
                 if ctx.get("weak") == "eyes" and ctx["weak_hits"] >= 5 and (ctx["weak_hits"] + 1) / max(1, ctx.get("landed", 0) + 1) >= .3:
                     active = self._active_seed(side, now=now)
@@ -491,16 +535,39 @@ class MatchStory:
         if brief:
             pool = [script for script in pool if script.lead.startswith("{setup}")] or pool
         maximum = {"light": 0, "mixed": 1, "strong": 2}[self.swearing]
-        pool = [script for script in pool if script.swear <= maximum]
+        pool = [script for script in pool if script.swear <= maximum and not script.requires_setup]
+        terminal = tag in ("stun", "knockdown", "tko")
+        hot = bool(ctx.get("pacing_hot") or (tag in ("combo", "counter_combo") and hits >= 3))
+        change = scene in ("reversal", "permission_reverse", "counter_release", "exchange_return", "target_switch")
+        budget = 2.8 if terminal else 1.8 if hot else 2.2 if self.density == "compact" else 3.5
+        pacing = "terminal_short" if terminal else "fast_exchange" if hot else "compact" if self.density == "compact" else "open_space"
+        if (hot or terminal) and not self.reply_filter:
+            pool = [s for s in pool if s.length == "short" or len(s.reply) <= 18] or pool
+        ready_pool = pool
+        bare = str(ctx.get("_setup_bare") or setup)
+        if self.reply_filter:
+            ready_pool = [s for s in pool if self.reply_filter(s.lead_role, bare, None)
+                          and self.reply_filter("caster" if s.lead_role == "analyst" else "analyst", s.reply, budget)]
+        call_only = not ready_pool
+        pool = ready_pool or pool
         directed, direction = pool, "authored_exchange"
         if brief:
             directed, direction = content_plan(pool, scene=scene, side=side, round_no=self.round,
-                heard=self.memory.recent_content(self.scope, now=now), pending=self._selected,
-                now=now, density=self.density, terminal=tag in ("stun", "knockdown", "tko"))
+                heard=self.content_memory(now=now), pending=self._selected,
+                now=now, density=self.density, terminal=terminal, change=change)
         script = self._pick(directed or pool, now=now)
+        if script is None:
+            return None
+        if call_only and self.reply_filter and not self.reply_filter(script.lead_role, bare, None):
+            if not self.reply_filter("caster", bare, None):
+                return None
+            # A missing optional analyst-led clip cannot silence a prepared
+            # caster call, or silently send it to a different TTS provider.
+            from dataclasses import replace
+            script = replace(script, lead_role="caster")
         turns = [{"role": script.lead_role, "text": setup if brief else script.lead.format(setup=setup, name=name)},
                  {"role": "caster" if script.lead_role == "analyst" else "analyst", "text": script.reply}]
-        if brief and (not directed or tag == "hit"):
+        if call_only or (brief and (not directed or tag == "hit")):
             turns = turns[:1]
         if not brief and self.density == "compact" and not script.seed and script.family != "callback" and self._serial % 3:
             turns = turns[:1]
@@ -508,9 +575,15 @@ class MatchStory:
         story = {"scope": self.scope, "id": f"{self.scope}:{self._serial}", "round": self.round,
             "scene": scene, "side": side, "seed": script.seed if len(turns) > 1 else "", "family": script.family,
             "swear": script.swear if len(turns) > 1 else 0, "script": script_key(script),
+            "reply_budget_seconds": budget, "pacing_reason": pacing,
+            "delivery": script.delivery, "audio_seconds": None,
             "direction": direction, "content": [
-                {"intent": "call", "topic": f"call:{tag}", "evidence": False},
-                *([subject(script, scene)] if len(turns) > 1 else [])]}
+                {"intent": "call", "topic": f"call:{tag}", "evidence": False,
+                 "text": bare, "role": turns[0]["role"]},
+                *([{**subject(script, scene), "text": script.reply, "role": turns[1]["role"]}] if len(turns) > 1 else [])]}
+        if self._cfg is not None and len(turns) > 1:
+            from commentary_pack import reply_seconds
+            story["audio_seconds"] = reply_seconds(self._cfg, turns[1]["role"], turns[1]["text"])
         return {"turns": turns, "story": story, "selected_at": now}
 
     def selected(self, presentation):
@@ -532,8 +605,11 @@ class MatchStory:
             pool = LATE_SCENES
         maximum = {"light": 0, "mixed": 1, "strong": 2}[self.swearing]
         pool = [script for script in pool if script.swear <= maximum]
+        if self.reply_filter:
+            pool = [script for script in pool if self.reply_filter("caster", script.lead, 3.5)
+                    and self.reply_filter("analyst", script.reply, 3.5)]
         pool, direction = content_plan(pool, scene="idle", side="", round_no=self.round,
-            heard=self.memory.recent_content(self.scope, now=now), pending=self._selected,
+            heard=self.content_memory(now=now), pending=self._selected,
             now=now, density=self.density)
         if not pool:
             return None
@@ -541,7 +617,8 @@ class MatchStory:
         self._serial += 1
         story = {"scope": self.scope, "id": f"{self.scope}:{self._serial}", "round": self.round,
             "scene": "idle", "side": "", "seed": "", "family": script.family, "swear": script.swear, "script": script_key(script),
-            "direction": direction, "content": [subject(script, "idle"), subject(script, "idle")]}
+            "direction": direction, "content": [{**subject(script, "idle"), "text": script.lead, "role": "caster"},
+                                                   {**subject(script, "idle"), "text": script.reply, "role": "analyst"}]}
         return {"turns": [{"text": script.lead, "role": "caster"}, {"text": script.reply, "role": "analyst"}],
                 "story": story, "selected_at": now}
 

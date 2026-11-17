@@ -3,6 +3,7 @@ from __future__ import annotations
 from report_combo import classified_combo_rows, combo_details, combo_clock
 
 import logging
+import copy
 import math
 import os
 import re
@@ -28,6 +29,7 @@ from match_analytics import (
 from commentary_director import CommentaryCandidate, CommentaryDirector
 from commentary_entertainment import BGradeCommentary, normalize_style
 from app_paths import app_path
+from portrait_identity import PortraitOwnership
 from match_log_archive import MatchLogArchive
 from spectator_log_blackbox import SpectatorLogBlackboxRecorder
 from event_engine import FightEventEngine, counter_opportunity_id
@@ -100,7 +102,8 @@ class SpectatorLogWatcher(QObject):
         self._stop_event = threading.Event()
         self._running = False
         self._last_signature: Tuple[Any, ...] = tuple()
-        self._image_mtimes: Dict[str, float] = {}
+        self._image_mtimes: Dict[str, Tuple[Any, ...]] = {}
+        self._portrait_ownership = PortraitOwnership()
         self._portrait_locked: Dict[str, bool] = {"blue": False, "red": False}
         self._portrait_lock_name: Dict[str, str] = {"blue": "", "red": ""}
         self._portrait_retry_due: Dict[str, float] = {"blue": 0.0, "red": 0.0}
@@ -551,20 +554,32 @@ class SpectatorLogWatcher(QObject):
         except Exception:
             return ""
 
+    def _portrait_owner_store(self):
+        archive = self._match_archive
+        self._portrait_ownership.bind(
+            str(getattr(archive, 'session_dir', '') or ''),
+            str(getattr(archive, 'session_id', '') or ''),
+        )
+        return self._portrait_ownership
+
+    def portrait_path_for_side(self, root: str, side: str) -> str:
+        if side not in ('blue', 'red'):
+            return ''
+        path = os.path.join(root, side, 'portrait.png')
+        return path if self._portrait_owner_store().candidate(side, path) else ''
+
     def _read_image_if_changed(self, key: str, path: str) -> Tuple[bool, Optional[np.ndarray]]:
-        try:
-            mt = os.path.getmtime(path)
-            name_path = os.path.join(os.path.dirname(path), "name.txt")
-            if os.path.isfile(name_path) and mt + 0.1 < os.path.getmtime(name_path):
-                # TOTF2 can leave the previous fighter's portrait on disk until
-                # the new first-round intro writes the current one.
-                return False, None
-        except Exception:
+        owners = self._portrait_owner_store()
+        candidate = owners.candidate(key, path)
+        if candidate is None:
             return False, None
+        mt = tuple(candidate['signature'])
         if self._image_mtimes.get(key) == mt:
             return False, None
         img = _safe_cv2_imread(path, cv2.IMREAD_UNCHANGED)
         if img is None or getattr(img, "size", 0) == 0:
+            return False, None
+        if not owners.confirm(key, candidate):
             return False, None
         self._image_mtimes[key] = mt
         return True, img
@@ -762,20 +777,33 @@ class SpectatorLogWatcher(QObject):
             pass
 
         state = self._normalize_round_state(state_raw)
+        match_sig = self._lobby_start_match_signature(root, dmg_sig=dmg_sig)
+        authoritative_lobby = self._confirmed_stale_match_lobby(state, lobby_info, lobby_sig, match_sig)
+        if authoritative_lobby:
+            state = "lobby"
         lobby_recovered = self._observe_lobby_auto_start_cycle(
             lobby_info, state=state, lobby_sig=lobby_sig,
-            match_sig=self._lobby_start_match_signature(root, dmg_sig=dmg_sig),
+            match_sig=match_sig,
         )
+        if authoritative_lobby and self._lobby_recovery_match_sig != match_sig:
+            # The input worker must also treat the OLD RoundFight as waiting,
+            # not as successful confirmation before it even sends F5.
+            with self._lobby_auto_start_state_lock:
+                self._lobby_recovery_match_sig = match_sig
+                self._lobby_ready_latched = False
+                self._lobby_auto_start_attempts = 0
+                self._lobby_auto_start_request_id = ""
+                self._lobby_auto_start_deadline = self._lobby_auto_start_retry_at = 0.0
         prev_round_state = self._last_round_state
         pair_key = self._match_pair_key(blue_name_raw, red_name_raw)
         pair_ready = bool(pair_key[0] and pair_key[1])
-        match_intro_transition = self._is_match_intro_state(state_raw) and prev_round_state != "intro"
+        match_intro_transition = state == "intro" and prev_round_state != "intro"
         try:
             round_probe = int(float(round_raw)) if round_raw else None
         except Exception:
             round_probe = None
         intro_pair_change = bool(
-            self._is_match_intro_state(state_raw)
+            state == "intro"
             and pair_ready
             and pair_key != self._last_match_reset_pair
         )
@@ -788,6 +816,8 @@ class SpectatorLogWatcher(QObject):
         player_payload_due = bool(pair_ready and (new_match_boundary or pair_key != self._last_player_payload_pair))
 
         out: Dict[str, Any] = {}
+        if authoritative_lobby:
+            out["spectator_lobby_confirmed"] = True
         out["spectator_round_state"] = str(state or "")
         out["spectator_match_active"] = state in ("intro", "fight", "break", "knockdown", "foul")
         baseline_read = not bool(getattr(self, "_runtime_baseline_ready", False))
@@ -830,7 +860,7 @@ class SpectatorLogWatcher(QObject):
         # the image reader decodes only a changed file and never clears a valid face.
         portrait_result_due = False
         if sync_players and pair_ready and time.time() >= self._portrait_result_check_at:
-            if self._normalize_round_state(state_raw) in (
+            if state in (
                 "results", "end", "knockout", "disqualified", "cancel",
             ) and self._current_match_winner_result(winner_path):
                 portrait_result_due = True
@@ -896,11 +926,9 @@ class SpectatorLogWatcher(QObject):
             round_total_no = self._configured_total_rounds()
         if self._match_archive.active() and round_no is not None and state in ("intro", "fight", "break", "knockdown", "results", "end", "knockout", "disqualified"):
             try:
-                for source_round, throws in self._events_by_source_round(
-                    self._read_punches_thrown_file(os.path.join(match_dir, "punches_thrown.txt")),
-                    max(1, int(round_no or 1)),
-                ).items():
-                    self._match_archive.record_throws(source_round, throws)
+                self._archive_thrown_snapshot(
+                    os.path.join(match_dir, "punches_thrown.txt"), max(1, int(round_no or 1))
+                )
             except Exception:
                 logging.debug("SPECTATORLOG_MATCH_ARCHIVE_THROW_FAIL", exc_info=True)
         # Break/result logs can arrive without a fresh round value.  Keep the
@@ -949,7 +977,7 @@ class SpectatorLogWatcher(QObject):
             self._sp_throw_offset = 0
             self._sp_throw_initialized = False
             self._read_new_punches_thrown(self._sp_throw_path)
-        if self._is_match_intro_state(state_raw) and pair_ready and not baseline_read:
+        if state == "intro" and pair_ready and not baseline_read:
             if pair_key != self._last_active_match_pair and pair_key != self._last_vs_intro_pair:
                 # The UI only needs a truthy value, but the chapter logger
                 # needs this match identity to distinguish a later rematch
@@ -2145,6 +2173,38 @@ class SpectatorLogWatcher(QObject):
         self._annotate_counter_events(events)
         return events, effect_counts
 
+    def _archive_thrown_snapshot(self, path: str, fallback_round: int) -> None:
+        """Skip only a successfully archived, unchanged snapshot of this match.
+
+        This is not an append-only cursor: rewrites, truncations, replacements,
+        round changes and a newly attached archive all trigger a full merge.
+        A failed read/write or a source changing during the read is retried.
+        """
+        archive = self._match_archive
+        def identity():
+            stat = os.stat(path)
+            return (stat.st_mtime_ns, stat.st_size, stat.st_dev, stat.st_ino)
+        try:
+            before = identity()
+        except OSError:
+            self._archived_throws_snapshot = None
+            return
+        key = (id(archive), str(getattr(archive, "session_dir", "")),
+               os.path.abspath(path), int(fallback_round), before)
+        if self.__dict__.get("_archived_throws_snapshot") == key:
+            return
+        events = self._read_punches_thrown_file(path)
+        if not events:
+            return  # Includes incomplete/failed reads; do not latch failure.
+        for source_round, throws in self._events_by_source_round(events, fallback_round).items():
+            if archive.record_throws(source_round, throws) is False:
+                return
+        try:
+            if identity() == before:
+                self._archived_throws_snapshot = key
+        except OSError:
+            pass
+
     def _read_punches_thrown_file(self, path: str) -> List[dict]:
         """Read match/punches_thrown.txt from the new SpectatorLog format."""
         out: List[dict] = []
@@ -2626,6 +2686,38 @@ class SpectatorLogWatcher(QObject):
         return (self._file_sig(os.path.join(match, 'round_state.txt')),
                 self._file_sig(os.path.join(match, 'round_time.txt')),
                 self._file_sig(os.path.join(match, 'damage_events.txt')) if dmg_sig is None else dmg_sig)
+
+    def _confirmed_stale_match_lobby(self, state, lobby, lobby_sig, match_sig):
+        """A confirmed lobby survives joins/readies until match files progress."""
+        saved = self.__dict__.get('_confirmed_lobby_match_sig')
+        if saved != match_sig:
+            self._confirmed_lobby_match_sig = None
+        elif saved is not None:
+            return bool(lobby and lobby.get('slots'))
+        if state not in ('intro','fight','break','knockdown','foul') or not lobby or not lobby.get('slots'):
+            self._fresh_ready_lobby_candidate = None
+            return False
+        stamp = max(sig[0] for sig in match_sig)/1e9
+        if stamp <= 0 or time.time()-stamp <= 30 or lobby_sig[0]/1e9 <= stamp+2:
+            self._fresh_ready_lobby_candidate = None
+            return False
+        fighters = self._lobby_fighter_slots(lobby)
+        if len(fighters) >= 2:
+            # Restarting the app with both players already ready is also valid
+            # evidence, but must persist (not a half-written lobby snapshot).
+            if not lobby.get('ready_to_start') or not all(s.get('ready') for s in fighters):
+                self._fresh_ready_lobby_candidate = None
+                return False
+            key = tuple((s.get('slot'),s.get('name')) for s in fighters)
+            previous = self.__dict__.get('_fresh_ready_lobby_candidate')
+            if not previous or previous[0] != key:
+                self._fresh_ready_lobby_candidate = (key,time.monotonic())
+                return False
+            if time.monotonic()-previous[1] < 1.0:
+                return False
+        self._confirmed_lobby_match_sig = match_sig
+        logging.info('SPECTATOR_LOBBY_CONFIRMED_STALE_MATCH players=%s', [s.get('name') for s in fighters])
+        return True
 
     def _observe_lobby_auto_start_cycle(self, lobby, *, state, lobby_sig, match_sig, now=None):
         """Rearm once on stable return, never merely because lobby.txt vanished.
@@ -3279,6 +3371,9 @@ class SpectatorLogWatcher(QObject):
         return self._short_spoken_id(raw, "블루" if side == "blue" else "레드")
 
     def _build_vs_caster_text(self) -> str:
+        from commentary_pack import enabled as pack_enabled
+        if pack_enabled(self.cfg):
+            return "곧 경기가 시작합니다"
         blue = self._caster_name("blue")
         red = self._caster_name("red")
         if blue and red:
@@ -3294,6 +3389,19 @@ class SpectatorLogWatcher(QObject):
             total = max(1, int(total_rounds or getattr(self.cfg, "timer_total_rounds", 3) or 3))
         except Exception:
             total = 3
+        from commentary_pack import enabled as pack_enabled
+        if pack_enabled(self.cfg):
+            if event == "start":
+                return "마지막 라운드 시작합니다" if r >= total else "라운드 시작합니다"
+            if event == "break":
+                return "마지막 라운드 종료, 경기 결과를 기다립니다" if r >= total else "라운드 종료, 휴식 시간입니다"
+            if event == "results":
+                return "마지막 라운드 종료, 경기 결과를 확인합니다" if r >= total else "경기 종료, 결과를 확인합니다"
+            if event == "end":
+                return "마지막 라운드 종료, 경기 종료입니다" if r >= total else "경기 종료입니다"
+            if event == "cancel":
+                return "경기가 중단됩니다"
+            return ""
         if event == "start":
             if r >= total:
                 return f"마지막 라운드, {r}라운드 시작합니다"
@@ -3578,6 +3686,29 @@ class SpectatorLogWatcher(QObject):
             return fallback
 
     def _build_round_report_payload(self, damage_path: str, round_no: Optional[int], pair_key: Tuple[str, str], break_seconds_left: Optional[float] = None, force_final: Optional[bool] = None) -> dict:
+        # Cache only within this synchronous build, never across reports or
+        # late score/winner updates. Restore on every return/exception.
+        previous = self.__dict__.get("_report_build_cache")
+        self._report_build_cache = {}
+        try:
+            return self._compute_round_report_payload(
+                damage_path, round_no, pair_key, break_seconds_left, force_final
+            )
+        finally:
+            self._report_build_cache = previous
+
+    def _report_archive_records(self):
+        cache = self.__dict__.get("_report_build_cache")
+        if cache is None:
+            return self._match_archive.round_records()
+        if "archive_records" not in cache:
+            records = self._match_archive.round_records()
+            if not records or "classification" not in cache:
+                return records  # Best-effort recovery must remain retryable.
+            cache["archive_records"] = records
+        return copy.deepcopy(cache["archive_records"])
+
+    def _compute_round_report_payload(self, damage_path: str, round_no: Optional[int], pair_key: Tuple[str, str], break_seconds_left: Optional[float] = None, force_final: Optional[bool] = None) -> dict:
         """Build a compact visual break-time report from damage_events.txt.
 
         damage_events.txt rows are landed hits.  The corner column is the boxer
@@ -3594,7 +3725,7 @@ class SpectatorLogWatcher(QObject):
         if archive_source:
             try:
                 self._rebuild_archive_classifications()
-                archive_records = self._match_archive.round_records()
+                archive_records = self._report_archive_records()
                 if archive_final_source:
                     scores_path = self._match_archive.final_scores_path() or scores_path
                     winner_path = self._match_archive.final_winner_path() or winner_path
@@ -6815,9 +6946,17 @@ class SpectatorLogWatcher(QObject):
         if archive is None or not archive.active():
             return {"total": 0, "classified": 0}
         version = self._event_ruleset_version()
+        cache = self.__dict__.get("_report_build_cache")
+        cached = cache.get("classification") if cache is not None else None
+        if not force and cached and cached[:2] == (id(archive), version):
+            return dict(cached[2])
+        if cache is not None:
+            cache.clear()
         status = archive.classification_counts(version)
         if not force and status.get("total", 0) == status.get("classified", -1):
-            archive.reconcile()
+            reconciled = archive.reconcile()
+            if cache is not None and isinstance(reconciled, dict) and reconciled.get("ok"):
+                cache["classification"] = (id(archive), version, dict(status))
             return status
         records = archive.round_records()
         engine = FightEventEngine(self.cfg)
@@ -6870,6 +7009,8 @@ class SpectatorLogWatcher(QObject):
             {"ruleset": version, "processed": total, **status},
         )
         reconciliation = archive.reconcile()
+        if cache is not None and ok and isinstance(reconciliation, dict) and reconciliation.get("ok"):
+            cache["classification"] = (id(archive), version, dict(status))
         logging.info(
             "MATCH_EVENT_LEDGER_CLASSIFIED ruleset=%s processed=%s total=%s classified=%s ok=%s reconcile=%s",
             version,
@@ -6882,6 +7023,18 @@ class SpectatorLogWatcher(QObject):
         return status
 
     def _report_scorecard_rounds(self) -> Dict[int, Dict[str, Any]]:
+        cache = self.__dict__.get("_report_build_cache")
+        if cache is None:
+            return self._compute_report_scorecard_rounds()
+        if "scorecard_rounds" not in cache:
+            # Computing can initialize/clear the other snapshot entries.
+            result = self._compute_report_scorecard_rounds()
+            if "classification" not in cache or "archive_records" not in cache:
+                return result
+            cache["scorecard_rounds"] = result
+        return copy.deepcopy(cache["scorecard_rounds"])
+
+    def _compute_report_scorecard_rounds(self) -> Dict[int, Dict[str, Any]]:
         """Build report stats from the per-match archive when it is available.
 
         Live spectator files are rolling buffers.  A report must never rebuild
@@ -6897,7 +7050,7 @@ class SpectatorLogWatcher(QObject):
         except Exception:
             logging.debug("MATCH_EVENT_LEDGER_REBUILD_DEFERRED", exc_info=True)
         try:
-            archived = self._match_archive.round_records()
+            archived = self._report_archive_records()
         except Exception:
             archived = {}
         if not archived:

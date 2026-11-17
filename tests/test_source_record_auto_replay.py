@@ -184,6 +184,11 @@ class SourceRecordAutoReplayTests(unittest.TestCase):
         app._obs_highlight_capture_generation = 0
         app._obs_last_highlight_at = 0.0
         app._source_record_pending = deque()
+        app._source_record_deferred = None
+        app._source_record_quarantine_until = 0.0
+        app._source_record_seen_dir = ''
+        app._source_record_seen_files = set()
+        app._source_record_file_sizes = {}
         app._source_record_auto_replays = {}
         app._source_record_names = {"blue": "BLUE", "red": "RED"}
         app._source_record_round = 1

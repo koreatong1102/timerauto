@@ -11,9 +11,17 @@ ROOT = Path(__file__).resolve().parents[1]
 class ShutdownTests(unittest.TestCase):
     def run_qt(self, code):
         result = subprocess.run([sys.executable, '-u', '-X', 'faulthandler', '-c', code], cwd=ROOT,
-                                env={**os.environ, 'QT_QPA_PLATFORM': 'offscreen'},
-                                capture_output=True, text=True, timeout=20)
-        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                                env={**os.environ, 'QT_QPA_PLATFORM': 'offscreen',
+                                     'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'},
+                                capture_output=True, text=True, encoding='utf-8',
+                                errors='backslashreplace', timeout=20)
+        self.assertEqual(result.returncode, 0, (result.stdout or '') + (result.stderr or ''))
+        return result
+
+    def test_korean_output_is_captured_without_parent_locale_assumptions(self):
+        result = self.run_qt("import sys; print('한글 표준 출력'); print('한글 오류 출력', file=sys.stderr)")
+        self.assertIn('한글 표준 출력', result.stdout)
+        self.assertIn('한글 오류 출력', result.stderr)
 
     def test_slow_and_failed_cleanup_keeps_event_loop_alive_and_has_deadline(self):
         self.run_qt('''
@@ -43,7 +51,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock,patch
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import QObject,QTimer
+from PyQt6.QtCore import QObject,QTimer,QCoreApplication,QEvent
+from PyQt6 import sip
 from timerauto import MainApp,SettingsDialog
 from config_model import AppConfig
 app=QApplication([])
@@ -88,6 +97,9 @@ with tempfile.TemporaryDirectory() as root,chdir(root):
  main._start_log_detector();main._start_spectator_watcher_if_enabled();main._reconfigure_obs_integration()
  main.apply_ui_update({'overlay_hud_y':500});assert cfg.overlay_hud_y==0
  dlg._apply_timer.stop();dlg.deleteLater()
+ QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
+ app.processEvents()
+ assert sip.isdeleted(dlg)
 ''')
 
 

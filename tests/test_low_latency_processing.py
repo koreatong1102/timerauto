@@ -172,10 +172,12 @@ class FeedbackPriorityTests(unittest.TestCase):
         app._apply_browser_overlay_direct_update.assert_not_called()
 
     def test_same_audio_device_does_not_restart_output_binding(self):
-        player = Mock()
+        import audio_routing
+        player = SimpleNamespace(audioOutput=Mock(), errorOccurred=Mock(), mediaStatusChanged=Mock())
         device = object()
         player.audioOutput.return_value.device.return_value = device
-        with patch.object(timerauto, "QMediaDevices") as devices:
+        with patch.object(audio_routing, "QMediaDevices") as devices, \
+             patch.object(audio_routing, '_requested', ''):
             devices.defaultAudioOutput.return_value = device
             timerauto._refresh_default_audio_device(player)
             player.audioOutput.return_value.setDevice.assert_not_called()

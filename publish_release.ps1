@@ -5,6 +5,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Set before starting Python. Changing PYTHONUTF8 inside an already running
+# interpreter does not change its decoder, only that of its future children.
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 $env:GIT_PAGER = "cat"
 $env:GIT_TERMINAL_PROMPT = "0"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path

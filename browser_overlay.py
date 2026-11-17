@@ -764,10 +764,15 @@ class BrowserOverlayServer:
         with self._lock:
             return str(self._asset_paths.get(str(name or "").lower(), "") or "")
 
-    def set_highlight_playlist(self, paths: Any) -> None:
+    def set_highlight_playlist(self, paths: Any, *, validated: bool = False) -> None:
         allowed = VIDEO_EXTENSIONS
         normalized = []
         for value in list(paths or []):
+            if validated:
+                # Internal background scanner already checked and normalized
+                # each entry. Do not repeat thousands of stat calls on Qt.
+                normalized.append(value)
+                continue
             raw = str(value or "").strip()
             if not raw:
                 continue
@@ -4027,6 +4032,7 @@ q('obsReplayVideo').addEventListener('ended',()=>{if(obsReplayAfterStarted)retur
 function syncReplayLabelPosition(s){s=s||latestState||{};setVar('--replay-label-x',String(Math.max(-800,Math.min(800,Number(s.replayLabelX)||0)))+'px');setVar('--replay-label-y',String(Math.max(-500,Math.min(500,Number(s.replayLabelY)||0)))+'px')}
 function idleHighlightBlocked(s){
   s=s||latestState||{};
+  if(s.idleHighlightPolicyBlocked===true)return true;
   // The watcher can briefly publish an empty round-state while a live file is
   // being rewritten.  matchActive is intentionally latched on the Python
   // side, so it is the authoritative guard against playing an idle clip mid-bout.

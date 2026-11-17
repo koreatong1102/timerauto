@@ -89,6 +89,9 @@ LONG_COMBO = {
     "counter_combo": ("반격까지 섞어서 계속 몰아칩니다!", "카운터 넣고 멈추질 않아요!", "반격에 연타까지 길게 이어져요!", "카운터부터 계속 꽂습니다!", "받아치고 계속 몰아붙여요!", "반격도 맞히고 연타도 이어갑니다!", "긴 연타 속에 카운터까지!", "카운터 섞인 공격이 끊기질 않아요!"),
 }
 
+from commentary_material import call_material
+CONTEXT_CALLS = call_material()
+
 
 def short_call(tag, index, *, name, named=True, context=None, hits=0, target="급소", count=1):
     ctx = dict(context or {})
@@ -100,6 +103,12 @@ def short_call(tag, index, *, name, named=True, context=None, hits=0, target="�
         pool = REVERSAL
     elif counter and ctx.get("repeat_counter"):
         pool = REPEATED_COUNTER
+    elif tag in ("combo", "counter_combo") and ctx.get("counter_release") and hits < 6:
+        pool = CONTEXT_CALLS["counter_release"]
+    elif ctx.get("exchange_return") and not counter:
+        pool = CONTEXT_CALLS["exchange_return"]
+    elif tag == "weak" and ctx.get("target_switch"):
+        pool = CONTEXT_CALLS["target_switch"]
     text = pool[index % len(pool)].format(hits=hits, target=target,
         count_label={1: "첫 번째", 2: "두 번째", 3: "세 번째"}.get(int(count), f"{count}번째"))
     return f"{name}, {text}" if named else text

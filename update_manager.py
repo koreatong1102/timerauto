@@ -93,7 +93,7 @@ def _write_update_script(zip_path: str, app_dir: str, exe_path: str, process_id:
         "$manifest = Assert-Package $extractDir",
         "Write-UpdateLog ('staged package verified commit=' + $manifest.commit)",
         "$protectedFiles = @('config.json','profile.json','profile1.json','as.json','test.json','latest.json')",
-        "$protectedDirs = @('logs','image','ThrillOfTheFight2','TheThrillOfTheFight2','diagnostics','MatchLogArchive','SpectatorLogArchive')",
+        "$protectedDirs = @('logs','image','ThrillOfTheFight2','TheThrillOfTheFight2','diagnostics','MatchLogArchive','SpectatorLogArchive','ReportImages','.qwen_duo_profiles','.venv-qwen','.qwen_models','commentary_voice_packs','.runtime')",
         "$roots = @($manifest.files.PSObject.Properties.Name | ForEach-Object { ($_ -split '/')[0] }) + @('release_manifest.json')",
         "$oldManifest = Join-Path $appDir 'release_manifest.json'",
         "if (Test-Path -LiteralPath $oldManifest) { $old = Get-Content -LiteralPath $oldManifest -Raw -Encoding UTF8 | ConvertFrom-Json; $roots += @($old.files.PSObject.Properties.Name | ForEach-Object { ($_ -split '/')[0] }) }",

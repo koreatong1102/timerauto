@@ -66,6 +66,10 @@ class AutoCameraDirector:
         # Off-camera axes offsets are disabled for the geometry-safe auto view.
         self.options.update(yaw=0,pitch=0,comfort=True)
         self.duration = max(1,min(3,float(duration)))
+        self.rotation = profile == 'rotation'
+        self.rotation_index = 0
+        self.rotation_sequence = 0
+        if self.rotation:self.duration = 10.0
         self.cooldown = max(0,min(120,float(cooldown)))
         self.profile = PROFILES.get(profile,PROFILES['balanced'])
         self.min_hits = max(self.profile['hits'],min(10,int(min_hits)))
@@ -153,6 +157,12 @@ class AutoCameraDirector:
 
     def _opportunity(self,now,valid,live,candidate):
         self.selection_reason=''
+        if getattr(self,'rotation',False):
+            if not live and self.state == 'idle':self.rotation_index=0
+            if not valid or not live:return None
+            side=('blue','red')[self.rotation_index]
+            return dict(id=f'rotation:{self.rotation_sequence}:{side}',flow=f'rotation:{self.rotation_sequence}:{side}',
+                        side=side,kind='scenic',hits=0,score=100,rotation=True)
         if not self.broadcast_enabled or self.state not in ('idle','prepare','probe'):
             return candidate
         if not valid or not live or now<self.next_cut:return None
@@ -510,12 +520,19 @@ class AutoCameraDirector:
                         raise ValueError("일반 카메라 복귀 후 F4 입력 실패. 재시도하지 않습니다: "+str(detail))
                 now = time.monotonic()
                 self.next_cut, self.stable_at = now+self.cooldown, None
+                if getattr(self,'rotation',False):
+                    self._rotation_returned(now)
                 self._state("idle",now)
                 self.notify("자동 연출 대기 · 일반 카메라 복귀 관측 완료" + (" · F4 한 번 전달" if self.on_return is not None else ""))
             elif now-self.since > 1.5:
                 raise ValueError("일반 카메라 복귀를 확인하지 못했습니다. F6을 재입력하지 않고 자동 연출을 중지합니다.")
             return True
         return False
+
+    def _rotation_returned(self, now):
+        self.rotation_index = 1-self.rotation_index
+        self.rotation_sequence += 1
+        self.next_cut = now+(10.0 if self.rotation_index==0 else 0.0)
 
     def _run(self):
         self.notify("자동 연출 대기 · 중앙 판정의 연속 공격과 안전한 시점을 기다립니다.")

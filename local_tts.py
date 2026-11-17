@@ -51,6 +51,16 @@ def settings(cfg, role):
     if speaker not in SPEAKERS:
         speaker = "Sohee" if role == "caster" else "Ryan"
     instruction = str(getattr(cfg, f"spectator_qwen_{role}_instruction", "") or "")[:500]
+    if getattr(cfg, "spectator_qwen_duo_profile", "") == "ko_sports_duo_v1":
+        revision = str(getattr(cfg, "spectator_qwen_duo_revision", "") or "")
+        if len(revision) != 64 or any(c not in "0123456789abcdef" for c in revision):
+            raise LocalTTSError("남성 2인 해설팩이 아직 완성되지 않았습니다. 원클릭 완성을 실행해 주세요.")
+        # Keep the existing descriptor protocol, but never send these synthetic
+        # profile voices to the CustomVoice server. Offline Base generates them.
+        return {"port": port, "model": MODELS["1.7B"],
+                "speaker": "Sohee" if role == "caster" else "Ryan", "language": "Korean",
+                "instruction": "", "speed": 1.0,
+                "duo_profile": "ko_sports_duo_v1", "duo_revision": revision}
     return {"port": port, "model": MODELS[size], "speaker": speaker,
             "language": str(getattr(cfg, "spectator_qwen_language", "Korean")),
             "instruction": instruction if size == "1.7B" else "",
@@ -73,6 +83,10 @@ def decode_voice(voice):
             raise ValueError("model or speaker")
         if not 1024 <= int(value["port"]) <= 65535:
             raise ValueError("port")
+        if "duo_profile" in value:
+            revision = str(value.get("duo_revision") or "")
+            if value["duo_profile"] != "ko_sports_duo_v1" or len(revision) != 64 or any(c not in "0123456789abcdef" for c in revision):
+                raise ValueError("duo profile")
         return value
     except (ValueError, KeyError, TypeError, UnicodeError) as exc:
         raise LocalTTSError("Qwen 음성 설정이 올바르지 않습니다. 설정을 다시 저장해 주세요.") from exc
@@ -109,6 +123,12 @@ def _request(port, path, *, payload=None, timeout=3):
 
 def check_server(cfg):
     options = settings(cfg, "caster")
+    if options.get("duo_profile"):
+        from qwen_duo_setup import profile_ready
+        if not profile_ready(options["duo_profile"], revision=options["duo_revision"]):
+            raise LocalTTSError("남성 2인 해설팩에 빠진 파일이 있습니다. 원클릭 완성으로 이어 만들어 주세요.")
+        return {"service": "rfc-qwen3", "ready": True, "model": options["model"],
+                "device": "완성된 남성 2인 해설팩 · 서버 없이 재생", "pack_only": True}
     try:
         info = json.loads(_request(options["port"], "/health"))
     except (ValueError, UnicodeError) as exc:
@@ -122,6 +142,8 @@ def check_server(cfg):
 
 def save_local(text, path, voice, *, volume="+0%", timeout=90.):
     options = decode_voice(voice)
+    if options.get("duo_profile"):
+        raise LocalTTSError("남성 2인 목소리는 완성된 해설팩으로만 재생합니다. 원클릭 완성으로 팩을 준비해 주세요.")
     if not _LANE.acquire(timeout=.1):
         raise LocalTTSError("Qwen이 이전 음성을 생성 중입니다. 오래된 콜을 쌓지 않고 생략합니다.")
     staged = ""

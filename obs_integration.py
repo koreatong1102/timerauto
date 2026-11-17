@@ -108,6 +108,10 @@ class ObsIntegration:
         self._status_lock = threading.Lock()
         self._status = "disabled" if not self._settings.enabled else "starting"
         self._pending_replay_requests = deque()
+        self._replay_waiting = None
+        self._replay_next_at = 0.0
+        self._replay_seen_paths = deque(maxlen=64)
+        self._replay_quarantine_until = 0.0
         self._pending_input_mute_requests: Dict[str, Dict[str, Any]] = {}
         self._pending_input_settings_requests: Dict[str, str] = {}
         self._source_record_diagnostic: Dict[str, Any] = {}
@@ -427,6 +431,7 @@ class ObsIntegration:
                 if int(identified.get("op", -1)) != 2:
                     raise RuntimeError("OBS authentication rejected")
                 self._pending_replay_requests.clear()
+                self._replay_waiting = None
                 self._source_record_runtime.reset()
                 self._pending_input_settings_requests.clear()
                 self._source_record_watch_request_id = ""
@@ -475,6 +480,9 @@ class ObsIntegration:
                         await self._source_record_runtime.health(ws, command['target'])
                 elif kind == "request":
                     request_type = str(command.get("requestType") or "")
+                    if request_type == "SaveReplayBuffer":
+                        self._queue_replay_save(command)
+                        continue
                     request_id = await self._send_request(
                         ws,
                         request_type,
@@ -482,14 +490,6 @@ class ObsIntegration:
                         request_data=dict(command.get("requestData") or {}),
                     )
                     DIAG.record("obs_request_sent", request_id=request_id, request_type=request_type, reason=command.get("reason"), context=command.get("context") or {})
-                    if request_type == "SaveReplayBuffer" and request_id:
-                        self._pending_replay_requests.append(
-                            {
-                                "request_id": request_id,
-                                "reason": str(command.get("reason") or ""),
-                                "context": dict(command.get("context") or {}),
-                            }
-                        )
                 elif kind == "input_mute_get":
                     input_name = str(command.get("inputName") or "").strip()
                     request_id = await self._send_request(ws, "GetInputMute", request_data={"inputName": input_name})
@@ -560,6 +560,7 @@ class ObsIntegration:
                     self._source_record_watch_attempt = 0
                     self._source_record_watch_next_at = 0.0
                     self._source_record_watch_request_id = ""
+            await self._service_replay_save(ws)
             await self._service_source_record_watch(ws)
             await self._source_record_runtime.service(ws)
             self._source_record_runtime.expire()
@@ -598,8 +599,16 @@ class ObsIntegration:
                     "duration_ms": int(event_data.get("outputDuration", 0) or 0),
                 })
             elif event_type == "ReplayBufferSaved":
+                path = str(event_data.get("savedReplayPath") or "")
+                if path and path in self._replay_seen_paths:
+                    return
+                if path:
+                    self._replay_seen_paths.append(path)
+                if time.monotonic() < self._replay_quarantine_until:
+                    DIAG.record("obs_replay_unassociated", path=path, reason="timeout_quarantine")
+                    return
                 pending = self._pending_replay_requests.popleft() if self._pending_replay_requests else {}
-                DIAG.record("obs_replay_file_received", request_id=pending.get("request_id"), path=event_data.get("savedReplayPath"), context=pending.get("context") or {}, matched_request=bool(pending), association="pending_request_fifo_not_verified")
+                DIAG.record("obs_replay_file_received", request_id=pending.get("request_id"), path=path, context=pending.get("context") or {}, matched_request=bool(pending), association="single_inflight" if pending else "external_unassociated")
                 self._events.put(
                     {
                         "type": "replay_file_saved",
@@ -737,6 +746,48 @@ class ObsIntegration:
                         "ok": True,
                         "inputName": input_name,
                     })
+
+    @staticmethod
+    def _replay_priority(command):
+        ctx = command.get("context") or {}
+        return (3 if ctx.get("auto_replay_kind") in ("kd", "tko") else
+                2 if ctx.get("potm_candidate_id") else 1)
+
+    def _queue_replay_save(self, command):
+        value = {**command, "queued_at": time.monotonic()}
+        old = self._replay_waiting
+        if old is None or self._replay_priority(value) >= self._replay_priority(old):
+            self._replay_waiting = value
+        DIAG.record("obs_replay_admission", reason="latest_priority_slot", priority=self._replay_priority(value))
+
+    async def _service_replay_save(self, ws):
+        now = time.monotonic()
+        if self._pending_replay_requests:
+            active = self._pending_replay_requests[0]
+            if now - active.get("sent_at", now) > 8.0:
+                self._pending_replay_requests.clear()
+                self._replay_waiting = None
+                self._replay_quarantine_until = now + 10.0
+                DIAG.record("obs_replay_timeout", request_id=active.get("request_id"), context=active.get("context"), recovery="reconnect_and_quarantine")
+                self._events.put({"type": "replay_saved", "ok": False, "message": "리플레이 저장 완료 알림이 없어 연결을 재설정합니다. 오래된 요청에 새 파일을 연결하지 않습니다."})
+                raise RuntimeError("Replay save confirmation timeout")
+            return
+        if now < max(self._replay_next_at, self._replay_quarantine_until):
+            return
+        command = self._replay_waiting
+        if not command:
+            return
+        self._replay_waiting = None
+        if now - command["queued_at"] > (5.0 if self._replay_priority(command) == 3 else 3.0):
+            DIAG.record("obs_replay_discarded", reason="stale_before_save", context=command.get("context"))
+            return
+        rid = await self._send_request(ws, "SaveReplayBuffer", reason=str(command.get("reason") or ""),
+                                       request_data=dict(command.get("requestData") or {}))
+        if rid:
+            self._pending_replay_requests.append({"request_id": rid, "reason": str(command.get("reason") or ""),
+                                                  "context": dict(command.get("context") or {}), "sent_at": now})
+            self._replay_next_at = now + 1.25
+            DIAG.record("obs_request_sent", request_id=rid, request_type="SaveReplayBuffer", reason=command.get("reason"), context=command.get("context") or {})
 
     async def _handle_source_record_diagnostic_response(
         self,

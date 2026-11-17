@@ -31,16 +31,23 @@ def sentence_ends(path):
                 end = (float(row["offset"]) + float(row["duration"])) / 10_000
                 if math.isfinite(end) and 0 <= end <= 600_000:
                     ends.append(int(end))
-        return tuple(sorted(set(ends)))
+        if ends:
+            return tuple(sorted(set(ends)))
     except (OSError, ValueError, TypeError, KeyError):
-        return ()
+        pass
+    # Prepared packs have measured PCM quiet gaps, not fabricated word times.
+    # Only explicit preparation writes these sidecars; the live path never
+    # scans a waveform or estimates a sentence boundary from text length.
+    from commentary_audio import pause_boundaries
+    return pause_boundaries(path)
 
 
 def handoff_delay(incoming, current, *, position_ms=0, duration_ms=0, boundaries=()):
     """None = do not interrupt. Zero = ready to fade; >0 = clause wait.
 
     Ordinary hits never interrupt. Reports and the final TKO call are protected.
-    An important exchange may wait at most 550ms for a real sentence boundary;
+    An important exchange may wait at most 550ms for a recorded sentence end
+    or measured PCM quiet gap;
     otherwise let the sentence finish or let the incoming call expire.
     """
     if current.get("kind") == "report" or current.get("category") == "tko":

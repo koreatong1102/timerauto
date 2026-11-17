@@ -154,11 +154,11 @@ class MatchLogArchive:
             self._ledger.upsert_events(round_no, "damage", materialized, ruleset_version=ruleset_version)
         self._append_records("damage_events.jsonl", round_no, materialized, self._seen_damage, "damage")
 
-    def record_throws(self, round_no: int, events: Iterable[dict]) -> None:
+    def record_throws(self, round_no: int, events: Iterable[dict]) -> bool:
         materialized = self._filter_rolling_snapshot(round_no, events, "throw")
         if self._ledger is not None:
             self._ledger.upsert_events(round_no, "throw", materialized)
-        self._append_records("punches_thrown.jsonl", round_no, materialized, self._seen_throws, "throw")
+        return self._append_records("punches_thrown.jsonl", round_no, materialized, self._seen_throws, "throw")
 
     def record_classified(self, round_no: int, events: Iterable[dict], *, ruleset_version: str) -> None:
         """Upsert central verdicts without creating duplicate raw events."""
@@ -543,30 +543,46 @@ class MatchLogArchive:
         ok = bool(details["scores_csv"] and details["winner_txt"])
         self._ledger.audit("official_sources_frozen", ok, details)
 
-    def _append_records(self, filename: str, round_no: int, events: Iterable[dict], seen: set[str], kind: str) -> None:
+    def _append_records(self, filename: str, round_no: int, events: Iterable[dict], seen: set[str], kind: str) -> bool:
         if not self.active():
-            return
+            return False
         archived_round = max(1, int(round_no or 1))
         records = []
+        keys = set()
+        retries = self.__dict__.setdefault("_append_retry_files", set())
+        if filename in retries:
+            seen.update(self._load_seen(filename, kind))
         for event in events or []:
             data = dict(event or {})
             # Round clocks reset, so an otherwise identical punch can legally
             # occur again in a later round. Deduplicate within a round only.
             key = f"{archived_round}:{self._event_key(data, kind)}"
-            if not key or key in seen:
+            if not key or key in seen or key in keys:
                 continue
-            seen.add(key)
+            keys.add(key)
             records.append({"round": archived_round, "event": data})
         if not records:
-            return
+            retries.discard(filename)
+            return True
         path = Path(self.session_dir) / filename
         try:
+            needs_separator = False
+            if filename in retries and path.is_file() and path.stat().st_size:
+                with path.open("rb") as tail:
+                    tail.seek(-1, 2)
+                    needs_separator = tail.read(1) != b"\n"
             with path.open("a", encoding="utf-8") as handle:
+                if needs_separator:
+                    handle.write("\n")  # Separate a previous interrupted JSON row.
                 for item in records:
                     handle.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+            seen.update(keys)
+            retries.discard(filename)
             self._write_manifest((), update_only=True)
+            return True
         except OSError:
-            return
+            retries.add(filename)
+            return False
 
     def _load_seen(self, filename: str, kind: str) -> set[str]:
         seen: set[str] = set()

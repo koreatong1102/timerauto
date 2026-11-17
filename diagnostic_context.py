@@ -17,23 +17,11 @@ def _attr(obj, name, default=None):
 
 
 def _audio_state(player, output):
-    result = {}
-    for obj, methods in ((player, ("playbackState", "mediaStatus", "position", "duration", "errorString")),
-                         (output, ("volume", "isMuted"))):
-        if obj is None:
-            continue
-        for method in methods:
-            try:
-                value = getattr(obj, method)()
-                result[method] = getattr(value, "name", value)
-            except Exception as exc:
-                result[method] = {"unavailable": str(exc)}
-    if output is not None:
-        try:
-            result["device"] = output.device().description()
-        except Exception:
-            result["device"] = "unavailable"
-    return result
+    # Never query the native audio backend from a diagnostic button. A broken
+    # WASAPI/FFmpeg worker can hold its mutex indefinitely, including getters.
+    # Do not move these Qt objects to a Python worker either.
+    return {"player_present": player is not None, "output_present": output is not None,
+            "backend_query": "omitted_to_avoid_blocking_audio_backend"}
 
 
 def prepare_diagnostic_export(owner):
@@ -55,21 +43,13 @@ def prepare_diagnostic_export(owner):
         runtime[name.lstrip("_")] = _attr(owner, name)
     runtime["audio"]["commentary"] = {role: _audio_state(player, dict(_attr(owner, "_commentary_audio_outs", {}) or {}).get(role))
         for role, player in dict(_attr(owner, "_commentary_players", {}) or {}).items()}
+    runtime['audio']['requested_common_device'] = str(_attr(cfg, 'app_audio_output_device', '') or 'Windows default')
+    runtime['audio']['requested_potm_device'] = str(_attr(cfg, 'potm_audio_output_device', '') or 'common output')
     folders = []
     for folder in (_attr(_attr(watcher, "_match_archive"), "session_dir", ""), _attr(owner, "_potm_archive_dir", "")):
         if folder and folder not in folders:
             folders.append(str(folder))
-    # Bounded scan: include the latest archive if no live watcher survived restart.
-    base = Path(normalize_app_path(str(_attr(cfg, "spectator_match_archive_dir", "MatchLogArchive") or "MatchLogArchive")))
-    try:
-        recent = sorted((p for p in base.iterdir() if p.is_dir() and not p.is_symlink()), key=lambda p: p.stat().st_mtime, reverse=True)
-        for folder in recent[:5]:
-            if str(folder) not in folders:
-                folders.append(str(folder))
-            if len(folders) >= 2:
-                break
-    except OSError:
-        pass
+    base = normalize_app_path(str(_attr(cfg, "spectator_match_archive_dir", "MatchLogArchive") or "MatchLogArchive"))
     paths = [best.get("file"), _attr(overlay, "_obs_replay_path", "")]
     ffmpeg = str(_attr(cfg, "obs_highlight_ffmpeg_path", "") or "")
     ffprobe = str(Path(normalize_app_path(ffmpeg)).parent / "ffprobe.exe") if ffmpeg else ""
@@ -79,5 +59,6 @@ def prepare_diagnostic_export(owner):
             "mask_sensitive": bool(_attr(cfg, "diagnostics_mask_sensitive", True)),
             "raw_sample_lines": int(_attr(cfg, "diagnostics_raw_sample_lines", 120) or 120),
             "app_base": get_app_base_dir(),
-            "context": {"runtime": _evidence_json(runtime, False), "match_dirs": folders[:2], "media_paths": [p for p in paths if p], "ffprobe_path": ffprobe},
+            "context": {"runtime": _evidence_json(runtime, False), "match_dirs": folders[:2],
+                        "match_archive_base": base, "media_paths": [p for p in paths if p], "ffprobe_path": ffprobe},
             "obs_provider": integration if callable(_attr(integration, "diagnostic_snapshot")) else None}

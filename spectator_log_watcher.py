@@ -271,6 +271,8 @@ class SpectatorLogWatcher(QObject):
         self._change_thread: Optional[threading.Thread] = None
         self._change_root: str = ""
         self._change_handle: Optional[int] = None
+        self._change_lock = threading.RLock()
+        self._change_generation = 0
         self._blackbox = SpectatorLogBlackboxRecorder(cfg)
         # The live log files can be truncated while a match is in progress.
         # Keep a compact per-match ledger for reports and post-match analysis.
@@ -430,12 +432,12 @@ class SpectatorLogWatcher(QObject):
                     if debounce > 0:
                         stop_event.wait(debounce)
         finally:
-            self._stop_change_notifier()
-            try:
-                self._blackbox.close()
-            except Exception:
-                pass
             if self._thread == threading.current_thread():
+                self._stop_change_notifier()
+                try:
+                    self._blackbox.close()
+                except Exception:
+                    pass
                 self._running = False
 
     def _change_wait_seconds(self, file_watch: bool) -> float:
@@ -454,32 +456,46 @@ class SpectatorLogWatcher(QObject):
             return
         if os.name != "nt" or not root:
             return
-        if self._change_thread and self._change_thread.is_alive() and self._change_root == root:
-            return
-        self._stop_change_notifier()
-        self._change_root = root
-        self._change_event.set()
-        self._change_thread = threading.Thread(
-            target=self._watch_log_directory_changes,
-            args=(root, stop_event),
-            daemon=True,
-        )
-        self._change_thread.start()
+        with self._change_lock:
+            if stop_event.is_set():
+                return
+            if self._change_thread and self._change_thread.is_alive() and self._change_root == root:
+                return
+            self._stop_change_notifier()
+            self._change_root = root
+            self._change_event.set()
+            self._change_thread = threading.Thread(
+                target=self._watch_log_directory_changes,
+                args=(root, stop_event, self._change_generation),
+                daemon=True,
+            )
+            self._change_thread.start()
 
     def _stop_change_notifier(self) -> None:
-        handle = self._change_handle
-        self._change_handle = None
-        self._change_root = ""
-        self._change_event.set()
-        if handle:
-            try:
-                ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
-            except Exception:
-                pass
+        with self._change_lock:
+            self._change_generation += 1
+            handle = self._change_handle
+            self._change_handle = None
+            self._change_root = ""
+            self._change_event.set()
+            if handle:
+                try:
+                    ctypes.windll.kernel32.CancelIoEx(wintypes.HANDLE(handle), None)
+                except Exception:
+                    pass
+                try:
+                    ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
+                except Exception:
+                    pass
 
-    def _watch_log_directory_changes(self, root: str, stop_event: threading.Event) -> None:
+    def _watch_log_directory_changes(self, root: str, stop_event: threading.Event, generation=None) -> None:
         if os.name != "nt":
             return
+        with self._change_lock:
+            if generation is None:
+                generation = self._change_generation
+        handle_value = None
+        published = False
         try:
             kernel32 = ctypes.windll.kernel32
             file_list_directory = 0x0001
@@ -512,10 +528,14 @@ class SpectatorLogWatcher(QObject):
             handle_value = int(handle)
             if handle_value == 0 or handle_value == invalid_handle_value:
                 return
-            self._change_handle = handle_value
+            with self._change_lock:
+                if generation != self._change_generation or self._change_root != root or stop_event.is_set():
+                    return
+                self._change_handle = handle_value
+                published = True
             buf = ctypes.create_string_buffer(16384)
             bytes_returned = wintypes.DWORD(0)
-            while not stop_event.is_set() and self._change_root == root:
+            while not stop_event.is_set() and self._change_root == root and generation == self._change_generation:
                 ok = kernel32.ReadDirectoryChangesW(
                     handle,
                     ctypes.byref(buf),
@@ -526,20 +546,23 @@ class SpectatorLogWatcher(QObject):
                     None,
                     None,
                 )
-                if not ok or stop_event.is_set() or self._change_root != root:
+                if not ok or stop_event.is_set() or self._change_root != root or generation != self._change_generation:
                     break
                 self._change_event.set()
         except Exception:
             logging.debug("SPECTATORLOG_CHANGE_NOTIFIER_STOPPED", exc_info=True)
         finally:
-            handle = self._change_handle
-            if handle:
-                try:
-                    ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
-                except Exception:
-                    pass
-            if self._change_root == root:
-                self._change_handle = None
+            with self._change_lock:
+                # A stopped generation's handle was already closed by stop().
+                # Never read/close a replacement generation's shared handle here.
+                owned = published and generation == self._change_generation and self._change_handle == handle_value
+                if owned:
+                    self._change_handle = None
+                if handle_value not in (None, 0, ctypes.c_void_p(-1).value) and (owned or not published):
+                    try:
+                        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle_value))
+                    except Exception:
+                        pass
 
     def _read_text(self, path: str) -> str:
         try:
@@ -797,13 +820,28 @@ class SpectatorLogWatcher(QObject):
         prev_round_state = self._last_round_state
         pair_key = self._match_pair_key(blue_name_raw, red_name_raw)
         pair_ready = bool(pair_key[0] and pair_key[1])
-        match_intro_transition = state == "intro" and prev_round_state != "intro"
         try:
             round_probe = int(float(round_raw)) if round_raw else None
         except Exception:
             round_probe = None
+        raw_state_key = re.sub(r'[^a-z0-9]+', '', str(state_raw or '').lower())
+        # Keep "intro" for timer/UI compatibility, but never use that lossy
+        # display state as proof of a new bout. RoundIntro occurs every round.
+        match_intro = bool(
+            state == 'intro' and self._is_match_intro_state(state_raw)
+            and (raw_state_key != 'intro' or round_probe in (None, 1))
+        )
+        first_round_fallback = bool(
+            state == 'intro' and raw_state_key == 'roundintro' and round_probe == 1
+            and (not self._match_session_id
+                 or prev_round_state in ('lobby', 'results', 'end', 'knockout', 'disqualified', 'cancel')
+                 or pair_key != self._match_session_pair)
+        )
+        match_intro_transition = bool(
+            (match_intro or first_round_fallback) and prev_round_state != 'intro'
+        )
         intro_pair_change = bool(
-            state == "intro"
+            (match_intro or first_round_fallback)
             and pair_ready
             and pair_key != self._last_match_reset_pair
         )
@@ -812,13 +850,14 @@ class SpectatorLogWatcher(QObject):
             and round_probe == 1
             and prev_round_state in ("results", "end", "knockout", "disqualified", "cancel")
         )
-        new_match_boundary = bool(match_intro_transition or intro_pair_change or fight_after_terminal)
+        new_match_boundary = bool(pair_ready and (match_intro_transition or intro_pair_change or fight_after_terminal))
         player_payload_due = bool(pair_ready and (new_match_boundary or pair_key != self._last_player_payload_pair))
 
         out: Dict[str, Any] = {}
         if authoritative_lobby:
             out["spectator_lobby_confirmed"] = True
         out["spectator_round_state"] = str(state or "")
+        out['spectator_intro_kind'] = ('match' if match_intro else 'round') if state == 'intro' else ''
         out["spectator_match_active"] = state in ("intro", "fight", "break", "knockdown", "foul")
         baseline_read = not bool(getattr(self, "_runtime_baseline_ready", False))
         if baseline_read:
@@ -826,7 +865,8 @@ class SpectatorLogWatcher(QObject):
         sync_players = bool(getattr(self.cfg, "spectatorlog_sync_players", True))
         match_session_started = False
         if new_match_boundary:
-            self._begin_match_session(pair_key, winner_sig)
+            self._begin_match_session(pair_key, winner_sig,
+                allow_resume=baseline_read or not bool(self._match_session_id))
             match_session_started = True
             self._post_match_lobby_return_armed = False
             self._post_match_lobby_return_session_id = ""
@@ -951,6 +991,7 @@ class SpectatorLogWatcher(QObject):
             self._last_round_time_value = None
             self._last_round_time_round = None
             self._last_round_time_state = ""
+            self._last_round_intro_key = (None, '')
             self._break_presentation_active = False
             self._round_time_auto_modes = {}
             self._reset_down_state_machine()
@@ -977,7 +1018,7 @@ class SpectatorLogWatcher(QObject):
             self._sp_throw_offset = 0
             self._sp_throw_initialized = False
             self._read_new_punches_thrown(self._sp_throw_path)
-        if state == "intro" and pair_ready and not baseline_read:
+        if (match_intro or first_round_fallback) and pair_ready and not baseline_read:
             if pair_key != self._last_active_match_pair and pair_key != self._last_vs_intro_pair:
                 # The UI only needs a truthy value, but the chapter logger
                 # needs this match identity to distinguish a later rematch
@@ -1337,6 +1378,7 @@ class SpectatorLogWatcher(QObject):
         state_emit_sig = (
             pair_key,
             state,
+            out.get('spectator_intro_kind', ''),
             int(round_no) if round_no is not None else None,
             int(out.get("seconds_left")) if "seconds_left" in out else None,
             bool(out.get("spectator_rest_mode", False)),
@@ -3092,7 +3134,7 @@ class SpectatorLogWatcher(QObject):
             return "end"
         return s
 
-    def _begin_match_session(self, pair_key: Tuple[str, str], winner_sig: Tuple[int, int]) -> str:
+    def _begin_match_session(self, pair_key: Tuple[str, str], winner_sig: Tuple[int, int], *, allow_resume: bool = True) -> str:
         self._match_session_serial = int(getattr(self, "_match_session_serial", 0) or 0) + 1
         self._match_session_id = f"match-{self._match_session_serial}-{time.time_ns()}"
         self._match_session_pair = tuple(pair_key or ("", ""))
@@ -3125,7 +3167,7 @@ class SpectatorLogWatcher(QObject):
                 300.0,
                 min(86400.0, float(getattr(self.cfg, "spectator_match_archive_resume_sec", 21600.0) or 21600.0)),
             )
-            resumed_dir = archive.resume_latest(self._match_session_pair, max_age_sec=resume_window)
+            resumed_dir = archive.resume_latest(self._match_session_pair, max_age_sec=resume_window) if allow_resume else ''
             if resumed_dir:
                 # Preserve the original match identity across a TimerAuto
                 # restart.  Reports/POTM then keep reading the same ledger.

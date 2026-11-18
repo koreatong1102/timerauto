@@ -182,6 +182,7 @@ from app_paths import (
     resolve_player_image_path,
 )
 from config_model import (
+    number_setting,
     DEFAULT_OVERLAY_PRESET,
     REPORT_WEAK_POINT_PARTS,
     Rect,
@@ -4248,7 +4249,7 @@ class TimerBackend(QObject):
             op = max(0.0, min(1.0, float(opacity)))
         except Exception:
             op = 1.0
-        if abs(op - float(self._overlay_vs_bg_opacity or 0.0)) > 0.001:
+        if abs(op - number_setting(self._overlay_vs_bg_opacity, 0.0)) > 0.001:
             self._overlay_vs_bg_opacity = op
             changed = True
         if changed:
@@ -8156,7 +8157,7 @@ class SettingsDialog(QDialog):
         self.sp_spectator_commentary_volume.setRange(0.0, 100.0)
         self.sp_spectator_commentary_volume.setSingleStep(5.0)
         self.sp_spectator_commentary_volume.setSuffix("%")
-        self.sp_spectator_commentary_volume.setValue(float(getattr(self.cfg, "spectator_commentary_volume", 100.0) or 100.0))
+        self.sp_spectator_commentary_volume.setValue(number_setting(getattr(self.cfg, "spectator_commentary_volume", 100.0), 100.0))
         sound_lay.addWidget(QLabel("해설 볼륨"), 9, 2)
         sound_lay.addWidget(self.sp_spectator_commentary_volume, 9, 3)
         self.sp_spectator_commentary_pitch = QSpinBox()
@@ -8291,7 +8292,7 @@ class SettingsDialog(QDialog):
         self.sp_spectator_hit_fx_fill_opacity.setRange(0.0, 1.5)
         self.sp_spectator_hit_fx_fill_opacity.setSingleStep(0.05)
         self.sp_spectator_hit_fx_fill_opacity.setDecimals(2)
-        self.sp_spectator_hit_fx_fill_opacity.setValue(float(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0) or 1.0))
+        self.sp_spectator_hit_fx_fill_opacity.setValue(number_setting(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0), 1.0))
         spectator_lay.addWidget(QLabel("중앙 채움 강도"), 15, 0)
         spectator_lay.addWidget(self.sp_spectator_hit_fx_fill_opacity, 15, 1)
         self.chk_spectator_hit_fx_show_text = QCheckBox("데미지 숫자 표시")
@@ -9065,7 +9066,7 @@ class SettingsDialog(QDialog):
         self.sp_obs_highlight_cooldown = QDoubleSpinBox()
         self.sp_obs_highlight_cooldown.setRange(0.0, 120.0)
         self.sp_obs_highlight_cooldown.setDecimals(1)
-        self.sp_obs_highlight_cooldown.setValue(float(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0) or 8.0))
+        self.sp_obs_highlight_cooldown.setValue(number_setting(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0), 8.0))
         self.sp_obs_highlight_cooldown.setToolTip(
             "OBS 저장 쿨타임\n"
             "하이라이트 이벤트가 연속으로 발생할 때 중복 저장 요청을 막는 시간입니다.\n"
@@ -10900,7 +10901,7 @@ class SettingsDialog(QDialog):
             (self.chk_obs_highlight_heavy, "obs_highlight_heavy"),
         ):
             widget.setChecked(bool(getattr(self.cfg, attr, True)))
-        self.sp_obs_highlight_cooldown.setValue(float(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0) or 8.0))
+        self.sp_obs_highlight_cooldown.setValue(number_setting(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0), 8.0))
         self.sp_event_heavy_damage.setValue(float(getattr(self.cfg, "event_heavy_damage", 50.0) or 0.0))
         self.sp_event_signature_damage.setValue(float(getattr(self.cfg, "event_signature_damage", 60.0) or 0.0))
         self.sp_event_counter_damage.setValue(float(getattr(self.cfg, "event_counter_min_damage", 40.0) or 0.0))
@@ -11719,6 +11720,7 @@ class SettingsDialog(QDialog):
                     "screenY": 0.5,
                     "weak_point": "Head",
                     "effect_kind": kind,
+                    "is_counter": kind == "counter",
                     "hitfx_key": key,
                     "hitfxKey": key,
                     "event_time": time.time(),
@@ -11735,6 +11737,7 @@ class SettingsDialog(QDialog):
                         punch=str(ev.get("punch") or ""),
                         weakPoint="Head",
                         coordSource="settings_test_center",
+                        isCounter=kind == "counter",
                         gloveHand="",
                         screenX=0.5,
                         screenY=0.5,
@@ -11751,7 +11754,8 @@ class SettingsDialog(QDialog):
                 except Exception:
                     pass
             _impact("red", "blue", dmg, "")
-            QTimer.singleShot(260, lambda: _impact("blue", "red", dmg + 12.0, "stun"))
+            QTimer.singleShot(600, lambda: _impact("blue", "red", dmg + 6.0, "counter"))
+            QTimer.singleShot(1200, lambda: _impact("red", "blue", dmg + 12.0, "stun"))
         except Exception:
             logging.exception("HITFX_SETTINGS_TEST_FAIL")
             QMessageBox.warning(self, "경고", "설정을 확인하세요.")
@@ -12817,7 +12821,7 @@ class SettingsDialog(QDialog):
         try:
             if hasattr(self, "sp_spectator_commentary_volume"):
                 return float(self.sp_spectator_commentary_volume.value())
-            return float(getattr(self.cfg, "spectator_commentary_volume", 100.0) or 100.0)
+            return number_setting(getattr(self.cfg, "spectator_commentary_volume", 100.0), 100.0)
         except Exception:
             return 100.0
 
@@ -14173,7 +14177,7 @@ class SettingsDialog(QDialog):
         style_arena = getattr(self.cfg, "overlay_style_arena", _default_overlay_style_arena())
         layout = dict(getattr(self.cfg, "layout", {}) or {})
         vs_bg_path = str(getattr(self.cfg, "overlay_vs_bg_path", "") or "")
-        vs_bg_opacity = float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0)
+        vs_bg_opacity = number_setting(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0), 1.0)
         vs_bg_map = dict(getattr(self.cfg, "overlay_vs_bg_by_arena", {}) or {})
         vs_hold_sec = float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85)
         ko_settings = self._collect_overlay_ko_settings()
@@ -14310,7 +14314,7 @@ class SettingsDialog(QDialog):
         browser_output_only = bool(data.get("browser_overlay_output_only", True))
         vs_bg_path = str(data.get("overlay_vs_bg_path", "") or "")
         try:
-            vs_bg_opacity = max(0.0, min(1.0, float(data.get("overlay_vs_bg_opacity", 1.0) or 1.0)))
+            vs_bg_opacity = max(0.0, min(1.0, number_setting(data.get("overlay_vs_bg_opacity", 1.0), 1.0)))
         except Exception:
             vs_bg_opacity = 1.0
         vs_bg_map = data.get("overlay_vs_bg_by_arena", {}) or {}
@@ -15135,7 +15139,7 @@ class SettingsDialog(QDialog):
         vs_bg_lay.addWidget(self.btn_overlay_vs_bg_clear, 0, 6)
         self.sl_overlay_vs_bg_opacity = QSlider(Qt.Orientation.Horizontal)
         self.sl_overlay_vs_bg_opacity.setRange(0, 100)
-        self.sl_overlay_vs_bg_opacity.setValue(int(max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))) * 100))
+        self.sl_overlay_vs_bg_opacity.setValue(int(max(0.0, min(1.0, number_setting(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0), 1.0))) * 100))
         self.lbl_overlay_vs_bg_opacity = QLabel(f"{self.sl_overlay_vs_bg_opacity.value()}%")
         self.sl_overlay_vs_bg_opacity.valueChanged.connect(lambda v: self.lbl_overlay_vs_bg_opacity.setText(f"{int(v)}%"))
         vs_bg_lay.addWidget(QLabel(""), 1, 0)
@@ -20771,7 +20775,7 @@ class SettingsDialog(QDialog):
         if hasattr(self, "sp_spectator_hit_fx_glow"):
             self.sp_spectator_hit_fx_glow.setValue(float(getattr(self.cfg, "spectator_hit_effect_glow", 1.0) or 1.0))
         if hasattr(self, "sp_spectator_hit_fx_fill_opacity"):
-            self.sp_spectator_hit_fx_fill_opacity.setValue(float(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0) or 1.0))
+            self.sp_spectator_hit_fx_fill_opacity.setValue(number_setting(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0), 1.0))
         if hasattr(self, "chk_spectator_hit_fx_show_text"):
             self.chk_spectator_hit_fx_show_text.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_show_text", True)))
         if hasattr(self, "sp_spectator_hit_fx_text_scale"):
@@ -20791,7 +20795,7 @@ class SettingsDialog(QDialog):
         if hasattr(self, "sp_spectator_commentary_rate"):
             self.sp_spectator_commentary_rate.setValue(int(getattr(self.cfg, "spectator_commentary_rate", 200) or 200))
         if hasattr(self, "sp_spectator_commentary_volume"):
-            self.sp_spectator_commentary_volume.setValue(float(getattr(self.cfg, "spectator_commentary_volume", 100.0) or 100.0))
+            self.sp_spectator_commentary_volume.setValue(number_setting(getattr(self.cfg, "spectator_commentary_volume", 100.0), 100.0))
         if hasattr(self, "sp_spectator_commentary_pitch"):
             self.sp_spectator_commentary_pitch.setValue(int(getattr(self.cfg, "spectator_commentary_pitch", 0) or 0))
         if hasattr(self, "sp_spectator_replay_speed"):
@@ -20876,7 +20880,7 @@ class SettingsDialog(QDialog):
         if hasattr(self, "le_overlay_vs_bg"):
             self.le_overlay_vs_bg.setText(str(getattr(self.cfg, "overlay_vs_bg_path", "") or ""))
         if hasattr(self, "sl_overlay_vs_bg_opacity"):
-            self.sl_overlay_vs_bg_opacity.setValue(int(max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))) * 100))
+            self.sl_overlay_vs_bg_opacity.setValue(int(max(0.0, min(1.0, number_setting(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0), 1.0))) * 100))
         if hasattr(self, "sp_overlay_vs_hold_sec"):
             self.sp_overlay_vs_hold_sec.setValue(max(0.5, min(15.0, float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85))))
         if hasattr(self, "le_overlay_kd_image"):
@@ -21670,7 +21674,7 @@ class MainApp(QObject):
         pitch = int(getattr(self.cfg, "spectator_commentary_pitch", 0) or 0)
         if kwargs.get("pitch_override") is not None:
             pitch = max(-100, min(100, int(kwargs["pitch_override"])))
-        volume = float(getattr(self.cfg, "spectator_commentary_volume", 100.) or 100.)
+        volume = number_setting(getattr(self.cfg, "spectator_commentary_volume", 100.), 100.)
         packet = pack_prepare_dialogue(self.cfg, role, kwargs.get("_dialogue"),
                                        narration_only=(kwargs.get("_timing") or {}).get("kind") != "report")
         return pack_usage_voice(self.cfg, role, voice, kwargs.get("_timing"), packet, text=text), rate, volume, pitch
@@ -22176,7 +22180,7 @@ class MainApp(QObject):
             except Exception:
                 rate = 200
         try:
-            volume = float(getattr(self.cfg, "spectator_commentary_volume", 100.0) or 100.0)
+            volume = number_setting(getattr(self.cfg, "spectator_commentary_volume", 100.0), 100.0)
         except Exception:
             volume = 100.0
         try:
@@ -22314,7 +22318,7 @@ class MainApp(QObject):
             analyst_voice = str(getattr(self.cfg, "spectator_commentary_voice", "ko-KR-SunHiNeural") or "ko-KR-SunHiNeural")
             caster_voice = str(getattr(self.cfg, "spectator_caster_voice", "ko-KR-InJoonNeural") or "ko-KR-InJoonNeural")
             rate = int(getattr(self.cfg, "spectator_commentary_rate", 200) or 200)
-            volume = float(getattr(self.cfg, "spectator_commentary_volume", 100.0) or 100.0)
+            volume = number_setting(getattr(self.cfg, "spectator_commentary_volume", 100.0), 100.0)
             pitch = int(getattr(self.cfg, "spectator_commentary_pitch", 0) or 0)
             jobs = []
             analyst_lines = (
@@ -22610,7 +22614,7 @@ class MainApp(QObject):
                 timing["boundaries"] = sentence_ends(path)
             player.setSource(QUrl.fromLocalFile(path))
             try:
-                volume = float(getattr(self.cfg, "spectator_commentary_volume", 100.0) or 100.0)
+                volume = number_setting(getattr(self.cfg, "spectator_commentary_volume", 100.0), 100.0)
             except Exception:
                 volume = 100.0
             audio_out.setVolume(max(0.0, min(1.0, volume / 100.0)))
@@ -23692,7 +23696,6 @@ class MainApp(QObject):
             signatures = self._chapter_result_signatures
         if signatures.get(session_id) == signature:
             return False
-        signatures[session_id] = signature
 
         event = {
             "wall_time": datetime.now().isoformat(timespec="seconds"),
@@ -23705,13 +23708,15 @@ class MainApp(QObject):
             "result_signature": signature,
             **result_data,
         }
-        self._chapter_events.append(event)
-        self._ensure_chapter_paths()
         try:
+            self._ensure_chapter_paths()
             with open(self._chapter_jsonl_path, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps(event, ensure_ascii=False) + "\n")
         except Exception:
             logging.exception("Failed to append chapter match result")
+            return False
+        signatures[session_id] = signature
+        self._chapter_events.append(event)
         self._export_chapter_txt()
         return True
 
@@ -26258,7 +26263,7 @@ class MainApp(QObject):
         voice = str(getattr(self.cfg, "spectator_caster_voice" if role == "caster" else "spectator_commentary_voice", "ko-KR-InJoonNeural" if role == "caster" else "ko-KR-SunHiNeural") or "")
         try:
             rate = int(getattr(self.cfg, "spectator_commentary_rate", 200) or 200)
-            volume = float(getattr(self.cfg, "spectator_commentary_volume", 100.0) or 100.0)
+            volume = number_setting(getattr(self.cfg, "spectator_commentary_volume", 100.0), 100.0)
             pitch = int(getattr(self.cfg, "spectator_commentary_pitch", 0) or 0)
         except Exception:
             return
@@ -27164,7 +27169,7 @@ class MainApp(QObject):
         if not enabled or not self._remember_obs_highlight_key(event_key):
             return False
         now = time.monotonic()
-        cooldown = max(0.0, float(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0) or 0.0))
+        cooldown = max(0.0, number_setting(getattr(self.cfg, "obs_highlight_cooldown_sec", 8.0), 0.0))
         auto_replay_kind = ""
         if normalized == "tko":
             auto_replay_kind = "tko"
@@ -27338,7 +27343,7 @@ class MainApp(QObject):
                 showPlayerIds=bool(getattr(self.cfg, "overlay_show_player_ids", True)),
                 showVsPlayerIds=bool(getattr(self.cfg, "overlay_vs_show_player_ids", getattr(self.cfg, "overlay_show_player_ids", True))),
                 showCinematic=bool(getattr(self.cfg, "overlay_show_cinematic", True)),
-                vsBgOpacity=max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))),
+                vsBgOpacity=max(0.0, min(1.0, number_setting(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0), 1.0))),
                 overlayVsHoldMs=int(max(500, min(15000, float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85) * 1000))),
             )
             asset_update = self._sync_browser_overlay_player_assets({})
@@ -28941,7 +28946,7 @@ class MainApp(QObject):
                     "overlayRoundY": int(getattr(self.cfg, "overlay_round_y", 0) or 0),
                     "overlayTimerOpacity": max(0.0, min(1.0, float(style_time.get("text_opacity", 1.0) or 1.0))),
                     "overlayRoundOpacity": max(0.0, min(1.0, float(style_round.get("text_opacity", 1.0) or 1.0))),
-                    "vsBgOpacity": max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))),
+                    "vsBgOpacity": max(0.0, min(1.0, number_setting(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0), 1.0))),
                     "overlayVsHoldMs": int(max(500, min(15000, float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85) * 1000))),
                     "hitFxMinDamage": max(0.0, float(getattr(self.cfg, "spectator_hit_effect_damage", 45.0) or 45.0)),
                     "hitFxColorPreset": str(getattr(self.cfg, "spectator_hit_effect_color_preset", "classic") or "classic"),
@@ -28957,7 +28962,7 @@ class MainApp(QObject):
                     "hitFxRingWidth": int(max(1, min(20, int(getattr(self.cfg, "spectator_hit_effect_ring_width", 4) or 4)))),
                     "hitFxOpacity": float(max(0.05, min(1.5, float(getattr(self.cfg, "spectator_hit_effect_opacity", 1.0) or 1.0)))),
                     "hitFxGlow": float(max(0.0, min(3.0, float(getattr(self.cfg, "spectator_hit_effect_glow", 1.0) or 1.0)))),
-                    "hitFxFillOpacity": float(max(0.0, min(1.5, float(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0) or 1.0)))),
+                    "hitFxFillOpacity": float(max(0.0, min(1.5, number_setting(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0), 1.0)))),
                     "hitFxShowText": bool(getattr(self.cfg, "spectator_hit_effect_show_text", True)),
                     "hitFxTextScale": float(max(0.5, min(2.0, float(getattr(self.cfg, "spectator_hit_effect_text_scale", 1.0) or 1.0)))),
                     "hitFxLatencyLog": bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)),
@@ -28995,6 +29000,17 @@ class MainApp(QObject):
         if started is None:
             return
         state = str(d.get("spectator_round_state") or overlay.snapshot().get("roundState") or "").lower()
+        try:
+            later_round_intro = (str(d.get('spectator_intro_kind') or '') == 'round'
+                                 and int(d.get('round_current') or 0) > 1)
+        except (TypeError, ValueError):
+            later_round_intro = False
+        if later_round_intro:
+            # First-round portraits may legitimately finish the pending match
+            # card. Round 2+ must never finish a delayed card from that bout.
+            self._browser_vs_pending_since = None
+            logging.info('BROWSER_VS_SKIP_LATER_ROUND round=%s', d.get('round_current'))
+            return
         watcher = getattr(self, "spectator_watcher", None)
         locked = getattr(watcher, "_portrait_locked", {})
         # Profile images or the prior match's browser images do not prove that
@@ -29535,7 +29551,7 @@ class MainApp(QObject):
                     pass
             update.setdefault("overlayBgColor", str(getattr(self.cfg, "overlay_bg_color", "transparent") or "transparent"))
             update.setdefault("overlayBgOpacity", max(0.0, min(1.0, float(getattr(self.cfg, "overlay_bg_opacity", 0.0) or 0.0))))
-            update.setdefault("vsBgOpacity", max(0.0, min(1.0, float(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0) or 1.0))))
+            update.setdefault("vsBgOpacity", max(0.0, min(1.0, number_setting(getattr(self.cfg, "overlay_vs_bg_opacity", 1.0), 1.0))))
             update.setdefault("overlayVsHoldMs", int(max(500, min(15000, float(getattr(self.cfg, "overlay_vs_hold_sec", 2.85) or 2.85) * 1000))))
             update.setdefault("showCinematic", bool(getattr(self.cfg, "overlay_show_cinematic", True)))
             update.setdefault("browserOverlayScale", float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0))
@@ -29590,7 +29606,7 @@ class MainApp(QObject):
             update.setdefault("hitFxRingWidth", int(max(1, min(20, int(getattr(self.cfg, "spectator_hit_effect_ring_width", 4) or 4)))))
             update.setdefault("hitFxOpacity", float(max(0.05, min(1.5, float(getattr(self.cfg, "spectator_hit_effect_opacity", 1.0) or 1.0)))))
             update.setdefault("hitFxGlow", float(max(0.0, min(3.0, float(getattr(self.cfg, "spectator_hit_effect_glow", 1.0) or 1.0)))))
-            update.setdefault("hitFxFillOpacity", float(max(0.0, min(1.5, float(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0) or 1.0)))))
+            update.setdefault("hitFxFillOpacity", float(max(0.0, min(1.5, number_setting(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0), 1.0)))))
             update.setdefault("hitFxShowText", bool(getattr(self.cfg, "spectator_hit_effect_show_text", True)))
             update.setdefault("hitFxTextScale", float(max(0.5, min(2.0, float(getattr(self.cfg, "spectator_hit_effect_text_scale", 1.0) or 1.0)))))
             update.setdefault("hitFxLatencyLog", bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)))
@@ -29812,6 +29828,10 @@ class MainApp(QObject):
                                 # payload several times.  Do not let a duplicate
                                 # report replace the first report or interrupt the
                                 # final report → POTM → final report sequence.
+                                # A late official correction must still reach the
+                                # image exporter without reopening the live board.
+                                if int(payload.get("reportRevision", 0) or 0) > 0:
+                                    overlay.report_images.enqueue(payload)
                                 logging.info("POTM_DELAYED_FINAL_REPORT_SKIPPED")
                                 return
                             if (bool(payload.get("isFinal", False))

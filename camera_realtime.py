@@ -199,7 +199,7 @@ class CameraPipeline:
                     if stamp != last_stamp:
                         motion.aim(pose,arrived_at,reset=reset or (last_stamp is not None and stamp[-1] != last_stamp[-1]),comfort=options.get("comfort",False))
                         last_stamp = stamp
-                    current = motion.sample(now,options.get("position_ms",20),options.get("rotation_ms",40),comfort=options.get("comfort",False))
+                    current = motion.sample(now,options.get("position_ms",0),options.get("rotation_ms",0),comfort=options.get("comfort",False))
                     if view_mode(options)=='hybrid':
                         current=list(current);current[3:7]=level_rotation(current[3:7])
                     c = self.camera

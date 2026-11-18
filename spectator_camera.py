@@ -46,7 +46,7 @@ class CameraMotion:
         self.goal = list(pose)
         self.last_input = now
 
-    def sample(self, now, position_ms=20, rotation_ms=40, *, comfort=False):
+    def sample(self, now, position_ms=0, rotation_ms=0, *, comfort=False):
         if self.current is None:
             return None
         dt = min(.1, max(0, now - self.last_step))
@@ -586,8 +586,8 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
     controls = {}
     for key, label, lo, hi, default in (("fov", "시야각", 30, 120, 75), ("forward_cm", "눈 방향 앞뒤 보정(cm)", -30, 30, 0),
                                        ("yaw", "좌우 방향 보정(도)", -180, 180, 0), ("pitch", "위아래 방향 보정(도)", -90, 90, 0),
-                                       ("position_ms", "위치 부드러움(ms) · 낮을수록 빠른 반응", 0, 100, 20),
-                                       ("rotation_ms", "회전 부드러움(ms) · 낮을수록 빠른 반응", 0, 150, 40)):
+                                       ("position_ms", "위치 부드러움(ms) · 낮을수록 빠른 반응", 0, 100, 0),
+                                       ("rotation_ms", "회전 부드러움(ms) · 낮을수록 빠른 반응", 0, 150, 0)):
         spin = QDoubleSpinBox()
         spin.setRange(lo, hi)
         spin.setValue(service.worker.options.get(key, default))
@@ -649,10 +649,10 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
     saved=camera_settings(cfg)
     profile=QComboBox()
     profile.setObjectName('cameraDirectorProfile')
-    for label,key in (('신중 · 좋은 컷만','cautious'),('균형 · 기본','balanced'),('적극 · 더 자주','active'),('로테이션 · 블루 10초 → 레드 10초 → 일반 10초','rotation')):
+    for label,key in (('신중 · 좋은 컷만','cautious'),('균형 · 기본','balanced'),('적극 · 더 자주','active'),('로테이션 · 블루 → 레드 → 일반','rotation')):
         profile.addItem(label,key)
     profile.setCurrentIndex(max(0,profile.findData(saved['camera_director_profile'])))
-    profile.setToolTip('로테이션은 경기 중 블루 10초 → 레드 10초 → 일반 카메라 10초를 반복합니다. 아래 기본/최대 유지시간 대신 고정 10초를 사용합니다. 다운·리포트·추적 이상은 우선 복귀하며, 전환 확인에 짧은 시간이 추가될 수 있습니다.')
+    profile.setToolTip('로테이션은 블루 → 레드 → 일반 순서만 사용합니다. 각각의 유지시간은 아래 로테이션 전용 시간에서 설정합니다. 공격·스턴·다운·거리·구도·방송 비중 조건은 적용하지 않습니다. 휴식/종료에는 대기하고 실제 로그/전환 실패 시 중지합니다.')
     layout.addRow('자동 연출 성향',profile)
     pressure=QCheckBox('공격 흐름 · 상대 반격 없이 이어지는 중앙엔진 콤보')
     counter=QCheckBox('카운터 후속타 · 카운터 뒤 실제 공격이 이어질 때')
@@ -674,14 +674,33 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
                                   ("cooldown","복귀 후 최소 간격(초) · 0은 대기 없음",0,120,12),
                                   ("min_hits","기본 공격 최소 연타 · 방송 모드 보조 후보는 별도",3,10,3),
                                   ('target_pct','방송 모드 · 선수 시점 목표 비중(%)',5,35,18),
-                                  ('idle_sec','방송 모드 · 좋은 구도 연출 대기(초)',6,60,12)):
+                                  ('idle_sec','방송 모드 · 좋은 구도 연출 대기(초)',6,60,12),
+                                  ('rotation_blue_sec','로테이션 · 블루 시점 유지(초)',1,300,10),
+                                  ('rotation_red_sec','로테이션 · 레드 시점 유지(초)',1,300,10),
+                                  ('rotation_normal_sec','로테이션 · 일반 시점 유지(초) · 0은 대기 없음',0,600,10)):
         spin = QDoubleSpinBox()
-        spin.setDecimals(1 if key in ('duration','max_duration') else 0)
+        spin.setDecimals(1 if key in ('duration','max_duration') or key.startswith('rotation_') else 0)
+        if key.startswith('rotation_'):spin.setSingleStep(1.0)
         spin.setObjectName('cameraDirector_'+key)
         spin.setRange(lo,hi); spin.setValue(saved['camera_director_'+key])
         auto_controls[key] = spin
         layout.addRow(label,spin)
     auto_controls['max_duration'].setMinimum(auto_controls['duration'].value())
+    scenario_note = auto_note.text()
+    def refresh_direction_mode():
+        rotation = profile.currentData() == 'rotation'
+        for widget in (pressure, counter, broadcast):
+            widget.setEnabled(not rotation)
+        for key,widget in auto_controls.items():
+            widget.setEnabled(rotation if key.startswith('rotation_') else not rotation)
+        times=' → '.join(f'{label} {auto_controls["rotation_"+key+"_sec"].value():g}초'
+                          for label,key in (('블루','blue'),('레드','red'),('일반','normal')))
+        auto_note.setText('단순 로테이션: '+times+'를 반복합니다.\n'
+                         '블루에서 레드로 직접 전환하며, 공격·스턴·다운·거리·구도·목표 비중 조건은 사용하지 않습니다.\n'
+                         '아래 상황별 연출 옵션은 이 모드에 적용되지 않아 비활성화됩니다.\n'
+                         '라운드 휴식/경기 종료에는 일반 시점으로 대기합니다. 로그·파일 저장·실제 전환에 실패하면 중지합니다.\n'
+                         'F6 파일 카메라가 꺼진 일반 시점인지 확인 후 시작하세요. 변경 내용은 다음 자동 연출 시작부터 적용됩니다.'
+                         if rotation else scenario_note)
     def save_direction(*_args):
         auto_controls['max_duration'].setMinimum(auto_controls['duration'].value())
         cfg.camera_director_profile=profile.currentData()
@@ -689,12 +708,14 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
         cfg.camera_director_counter_enabled=counter.isChecked()
         cfg.camera_director_broadcast_enabled=broadcast.isChecked()
         for key,spin in auto_controls.items():setattr(cfg,'camera_director_'+key,spin.value())
+        refresh_direction_mode()
         changed=getattr(parent,'_schedule_apply',None)
         if callable(changed):changed()
     profile.currentIndexChanged.connect(save_direction)
     pressure.toggled.connect(save_direction);counter.toggled.connect(save_direction)
     broadcast.toggled.connect(save_direction)
     for spin in auto_controls.values():spin.valueChanged.connect(save_direction)
+    refresh_direction_mode()
     rehearsal=QPushButton('조건 모의 테스트 · 실제 카메라 전환 없음')
     rehearsal.setObjectName('cameraDirectorSelfTest')
     def test_direction():

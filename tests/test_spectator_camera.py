@@ -13,12 +13,16 @@ class CameraTests(unittest.TestCase):
     def test_controls_share_one_inactive_service_and_do_not_touch_live_logs(self):
         script = '''
 from types import SimpleNamespace
-from PyQt6.QtWidgets import QApplication, QPushButton
+from PyQt6.QtWidgets import QApplication, QPushButton, QDoubleSpinBox
 from spectator_camera import create_camera_panel
 import time
 app = QApplication([])
 cfg = SimpleNamespace(spectatorlog_path='Z:/missing/rfc-test-path')
 a = create_camera_panel(cfg)
+for title in ('위치 부드러움','회전 부드러움'):
+ spins=[spin for spin in a.findChildren(QDoubleSpinBox)
+        if a.layout().labelForField(spin) is not None and a.layout().labelForField(spin).text().startswith(title)]
+ assert len(spins)==1 and spins[0].value()==0
 service = app._rfc_head_camera
 b = create_camera_panel(cfg)
 assert service is app._rfc_head_camera
@@ -162,6 +166,12 @@ assert '추적 중지' in service.message
         self.assertLess(first, .2)
         self.assertLessEqual(motion.sample(.1,20,40)[0], .2)
         self.assertEqual(motion.goal[0], .2)
+
+    def test_default_smoothing_is_zero_for_position_and_rotation(self):
+        motion=CameraMotion()
+        motion.aim([0,0,0,0,0,0,1],0)
+        motion.aim([.2,.1,0,0,1,0,0],.01)
+        self.assertEqual(motion.sample(.02),[.2,.1,0,0,1,0,0])
 
     def test_quaternion_sign_flip_does_not_spin_and_rotation_stays_normalized(self):
         motion = CameraMotion()

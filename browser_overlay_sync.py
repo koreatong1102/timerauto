@@ -12,7 +12,7 @@ import logging
 import time
 from typing import Callable, Optional, Tuple
 
-from config_model import _normalize_browser_text_styles
+from config_model import _normalize_browser_text_styles, number_setting
 
 
 class BrowserOverlaySync:
@@ -148,7 +148,7 @@ class BrowserOverlaySync:
                 koDropYPx=int(max(0, min(500, int(getattr(self.cfg, "overlay_ko_drop_y_px", 190) or 0)))),
                 koKdHoldMs=int(max(800, min(10000, float(getattr(self.cfg, "overlay_kd_hold_sec", 2.2) or 2.2) * 1000))),
                 koTkoHoldMs=int(max(800, min(10000, float(getattr(self.cfg, "overlay_tko_hold_sec", 2.6) or 2.6) * 1000))),
-                vsBgOpacity=float(max(0.0, min(1.0, float(getattr(b, "_overlay_vs_bg_opacity", 1.0) or 1.0)))),
+                vsBgOpacity=float(max(0.0, min(1.0, number_setting(getattr(b, "_overlay_vs_bg_opacity", 1.0), 1.0)))),
                 overlayVsHoldMs=int(max(500, float(getattr(b, "_overlay_vs_hold_sec", 2.85) or 2.85) * 1000)),
                 overlayUiScale=float(getattr(b, "_overlay_ui_scale", 1.0) or 1.0),
                 browserOverlayScale=float(getattr(self.cfg, "browser_overlay_scale", 1.0) or 1.0),

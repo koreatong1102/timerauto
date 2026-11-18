@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional
@@ -21,6 +22,16 @@ REPORT_WEAK_POINT_PARTS = ["턱", "코", "왼쪽 관자놀이", "오른쪽 관�
 DEFAULT_OVERLAY_PRESET = "tekken8"
 
 from app_paths import app_path, normalize_app_path, normalize_builtin_asset_path, to_app_rel
+
+
+def number_setting(value, default: float) -> float:
+    """Missing/invalid numbers use the default; an explicit zero never does."""
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else float(default)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+
 
 def migrate_action_keys(actions: Dict[str, List[dict]],
                         pixel_rules: List[dict]) -> Dict[str, List[dict]]:
@@ -1144,7 +1155,7 @@ class AppConfig:
         cfg.obs_highlight_counter_damage_min = max(0.0, min(300.0, float(raw.get("obs_highlight_counter_damage_min", 30.0) or 0.0)))
         cfg.obs_highlight_combo_min = max(2, min(20, int(raw.get("obs_highlight_combo_min", 3) or 3)))
         cfg.obs_highlight_damage_min = max(0.0, min(300.0, float(raw.get("obs_highlight_damage_min", 55.0) or 55.0)))
-        cfg.obs_highlight_cooldown_sec = max(0.0, min(120.0, float(raw.get("obs_highlight_cooldown_sec", 8.0) or 8.0)))
+        cfg.obs_highlight_cooldown_sec = max(0.0, min(120.0, number_setting(raw.get("obs_highlight_cooldown_sec", 8.0), 8.0)))
         # The central event engine is now the sole production path.  Keep
         # reading these legacy keys only for old config-file compatibility;
         # they are no longer user-controllable and can never disable or shadow
@@ -1469,10 +1480,10 @@ class AppConfig:
             cfg.spectator_hit_effect_glow = 1.0
         cfg.spectator_hit_effect_glow = max(0.0, min(3.0, float(cfg.spectator_hit_effect_glow or 1.0)))
         try:
-            cfg.spectator_hit_effect_fill_opacity = float(raw.get("spectator_hit_effect_fill_opacity", 1.0) or 1.0)
+            cfg.spectator_hit_effect_fill_opacity = number_setting(raw.get("spectator_hit_effect_fill_opacity", 1.0), 1.0)
         except Exception:
             cfg.spectator_hit_effect_fill_opacity = 1.0
-        cfg.spectator_hit_effect_fill_opacity = max(0.0, min(1.5, float(cfg.spectator_hit_effect_fill_opacity or 1.0)))
+        cfg.spectator_hit_effect_fill_opacity = max(0.0, min(1.5, number_setting(cfg.spectator_hit_effect_fill_opacity, 1.0)))
         cfg.spectator_hit_effect_show_text = bool(raw.get("spectator_hit_effect_show_text", True))
         try:
             cfg.spectator_hit_effect_text_scale = float(raw.get("spectator_hit_effect_text_scale", 1.0) or 1.0)
@@ -1494,7 +1505,7 @@ class AppConfig:
         except Exception:
             cfg.spectator_commentary_rate = 200
         try:
-            cfg.spectator_commentary_volume = max(0.0, min(100.0, float(raw.get("spectator_commentary_volume", 100.0) or 100.0)))
+            cfg.spectator_commentary_volume = max(0.0, min(100.0, number_setting(raw.get("spectator_commentary_volume", 100.0), 100.0)))
         except Exception:
             cfg.spectator_commentary_volume = 100.0
         try:
@@ -1666,7 +1677,7 @@ class AppConfig:
         cfg.overlay_show_cinematic = bool(raw.get("overlay_show_cinematic", True))
         cfg.overlay_vs_bg_path = str(raw.get("overlay_vs_bg_path", "") or "")
         try:
-            cfg.overlay_vs_bg_opacity = max(0.0, min(1.0, float(raw.get("overlay_vs_bg_opacity", 1.0) or 1.0)))
+            cfg.overlay_vs_bg_opacity = max(0.0, min(1.0, number_setting(raw.get("overlay_vs_bg_opacity", 1.0), 1.0)))
         except Exception:
             cfg.overlay_vs_bg_opacity = 1.0
         cfg.overlay_vs_bg_by_arena = {str(k): str(v) for k, v in (raw.get("overlay_vs_bg_by_arena", {}) or {}).items()}
@@ -2132,7 +2143,7 @@ class AppConfig:
             "spectator_hit_effect_ring_width": int(max(1, min(20, int(self.spectator_hit_effect_ring_width or 4)))),
             "spectator_hit_effect_opacity": float(max(0.05, min(1.5, float(self.spectator_hit_effect_opacity or 1.0)))),
             "spectator_hit_effect_glow": float(max(0.0, min(3.0, float(self.spectator_hit_effect_glow or 1.0)))),
-            "spectator_hit_effect_fill_opacity": float(max(0.0, min(1.5, float(self.spectator_hit_effect_fill_opacity or 1.0)))),
+            "spectator_hit_effect_fill_opacity": float(max(0.0, min(1.5, number_setting(self.spectator_hit_effect_fill_opacity, 1.0)))),
             "spectator_hit_effect_show_text": bool(self.spectator_hit_effect_show_text),
             "spectator_hit_effect_text_scale": float(max(0.5, min(2.0, float(self.spectator_hit_effect_text_scale or 1.0)))),
             "spectator_hit_effect_latency_log": bool(self.spectator_hit_effect_latency_log),

@@ -12,6 +12,9 @@ CAMERA_DEFAULTS = {
     'camera_director_min_hits':3,
     'camera_director_broadcast_enabled':True,
     'camera_director_target_pct':18.0,'camera_director_idle_sec':12.0,
+    'camera_director_rotation_blue_sec':10.0,
+    'camera_director_rotation_red_sec':10.0,
+    'camera_director_rotation_normal_sec':10.0,
 }
 PROFILES = {
     'cautious':dict(hits=4, score=82, stability=.22, speed=2, turn=100, near=.8, far=2.8),
@@ -24,7 +27,9 @@ PROFILES = {
 def camera_settings(source):
     out = {}
     limits = {'duration':(1,3), 'max_duration':(1,3), 'cooldown':(0,120), 'min_hits':(3,10),
-              'target_pct':(5,35),'idle_sec':(6,60)}
+              'target_pct':(5,35),'idle_sec':(6,60),
+              'rotation_blue_sec':(1,300),'rotation_red_sec':(1,300),
+              'rotation_normal_sec':(0,600)}
     for key, default in CAMERA_DEFAULTS.items():
         value = source.get(key, default) if isinstance(source,dict) else getattr(source,key,default)
         if key=='camera_view_mode':
@@ -62,6 +67,7 @@ class DirectorFeed:
         self.blocked_until = self.at = 0
         self.busy = False
         self.live = None
+        self.round_state = None
         self.seen = collections.OrderedDict()
         self.flows = {}
         self.serial = 0
@@ -74,7 +80,8 @@ class DirectorFeed:
         with self.lock:
             self.at,self.busy = now,busy
             if 'spectator_round_state' in data:
-                self.live = str(data['spectator_round_state'] or '').lower() in ('fight','roundfight')
+                self.round_state = str(data['spectator_round_state'] or '').lower()
+                self.live = self.round_state in ('fight','roundfight')
             try:
                 observed=float(data.get('commentary_tts_observed_at',now))
                 late=math.isfinite(observed) and now-observed>.9
@@ -130,6 +137,11 @@ class DirectorFeed:
                     self.latest=dict(side=side,at=now,id=key,hits=hits,kind=kind,score=score,flow=flow['key'])
                     self.reason=kind
                 else:self.reason='counter_wait_followup' if event.get('counter') else 'no_fresh_combo'
+
+    def in_lobby(self):
+        """Lifecycle only: distinguish a real lobby from a leftover fight file."""
+        with self.lock:
+            return self.round_state in ('lobby','mainmenu','main_menu','idle')
 
     def snapshot(self,now):
         with self.lock:

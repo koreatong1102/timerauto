@@ -95,11 +95,17 @@ class ReleaseIntegrityTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("powershell.exe"), "Windows updater test")
 class TransactionalUpdateTests(unittest.TestCase):
-    def apply(self, corrupt=False, copy_failure=False):
+    def apply(self, corrupt=False, copy_failure=False, personal_assets=False):
         with tempfile.TemporaryDirectory(prefix="업데이트 검증 ") as directory:
             root = Path(directory)
             package, app = root / "package", root / "app"
             make_package(package)
+            if personal_assets:
+                (package / 'assets').mkdir()
+                (package / 'assets/default.png').write_bytes(b'new background')
+                manifest = json.loads((package / MANIFEST).read_text())
+                manifest['files']['assets/default.png'] = dict(size=14, sha256=digest(package / 'assets/default.png'))
+                (package / MANIFEST).write_text(json.dumps(manifest))
             if corrupt:
                 (package / "_internal/test.dll").write_bytes(b"corrupt")
             app.mkdir()
@@ -110,12 +116,22 @@ class TransactionalUpdateTests(unittest.TestCase):
             (app / "custom.txt").write_bytes(b"personal file")
             (app / "image").mkdir()
             (app / "image/player.png").write_bytes(b"personal portrait")
+            if personal_assets:
+                (app / 'assets/video').mkdir(parents=True)
+                (app / 'assets/video/my_stinger.webm').write_bytes(b'personal stinger')
+                (app / 'assets/default.png').write_bytes(b'old background')
+                (app / 'assets/removed.png').write_bytes(b'obsolete packaged file')
+                old = dict(schema=1, files={'timerauto.exe': {}, '_internal/old.dll': {},
+                                          'assets/default.png': {}, 'assets/removed.png': {}})
+                (app / MANIFEST).write_text(json.dumps(old))
             zip_path = Path(shutil.make_archive(str(root / "update"), "zip", package))
             script = Path(_write_update_script(str(zip_path), str(app), str(app / "timerauto.exe")))
             try:
                 # No actual app launch or sleeps. All writes stay in temp paths.
                 prelude = "function Start-Sleep {}\nfunction Start-Process {}\n"
-                if copy_failure:
+                if copy_failure == 'assets_install':
+                    prelude += "function Copy-Item { param($LiteralPath,$Destination,[switch]$Recurse,[switch]$Force) if ($Recurse -and (Split-Path -Leaf $LiteralPath) -eq 'assets') { throw 'simulated copy failure' }; Microsoft.PowerShell.Management\\Copy-Item @PSBoundParameters }\n"
+                elif copy_failure:
                     prelude += "function Copy-Item { param($LiteralPath,$Destination,[switch]$Recurse,[switch]$Force) throw 'simulated copy failure' }\n"
                 command = prelude + "& '" + str(script).replace("'", "''") + "'"
                 completed = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], capture_output=True, timeout=40)
@@ -124,6 +140,10 @@ class TransactionalUpdateTests(unittest.TestCase):
                 self.assertEqual(b"personal config", (app / "config.json").read_bytes())
                 self.assertEqual(b"personal file", (app / "custom.txt").read_bytes())
                 self.assertEqual(b"personal portrait", (app / "image/player.png").read_bytes())
+                if personal_assets:
+                    self.assertEqual(b'personal stinger', (app / 'assets/video/my_stinger.webm').read_bytes())
+                    self.assertEqual(b'new background' if expected_ok else b'old background', (app / 'assets/default.png').read_bytes())
+                    self.assertEqual(not expected_ok, (app / 'assets/removed.png').exists())
                 self.assertEqual(b"new exe" if expected_ok else b"old exe", (app / "timerauto.exe").read_bytes())
                 if expected_ok:
                     self.assertTrue(verify_package(app)["ok"])
@@ -143,3 +163,12 @@ class TransactionalUpdateTests(unittest.TestCase):
 
     def test_copy_failure_restores_previous_install(self):
         self.apply(copy_failure=True)
+
+    def test_personal_assets_survive_but_owned_obsolete_assets_are_removed(self):
+        self.apply(personal_assets=True)
+
+    def test_preservation_failure_leaves_personal_assets_and_old_install_untouched(self):
+        self.apply(copy_failure=True, personal_assets=True)
+
+    def test_later_install_failure_rolls_back_runtime_and_all_personal_assets(self):
+        self.apply(copy_failure='assets_install', personal_assets=True)

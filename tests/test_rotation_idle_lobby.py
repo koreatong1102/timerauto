@@ -17,25 +17,30 @@ class RotationLobbyTests(unittest.TestCase):
             path=str(Path(folder)/'config.json');cfg.to_json(path)
             self.assertEqual(AppConfig.from_json(path).camera_director_profile,'rotation')
 
-    def test_lobby_feed_blocks_rotation_even_if_game_keeps_old_fight_file(self):
+    def test_lobby_lifecycle_blocks_stale_fight_but_not_knockdown_or_combat_priority(self):
         feed=DirectorFeed()
+        d=AutoCameraDirector(lambda s:None,lambda:(True,'fixture'))
+        d.feed=feed
         feed.update({'spectator_round_state':'lobby'},now=10)
-        self.assertFalse(feed.snapshot(10)[0])
-        feed.update({'spectator_round_state':'fight'},now=11)
-        self.assertTrue(feed.snapshot(11)[0])
+        self.assertFalse(d._rotation_live('roundfight'))
+        feed.update({'spectator_round_state':'knockdown',
+                     'spectator_effect_events':[{'kind':'stun'}]},busy=True,now=11)
+        self.assertTrue(d._rotation_live('roundknockdown'))
+        self.assertFalse(feed.snapshot(11)[0])  # Shot policy still blocks; timer does not.
 
     def test_rotation_selection_and_normal_camera_interval(self):
         d = AutoCameraDirector(lambda s:None, lambda:(True, 'fixture'))
         d.rotation=True;d.rotation_index=0;d.rotation_sequence=0;d.state='idle'
-        first=d._opportunity(0,True,True,None)
+        d.rotation_reset_on_return=False
+        first=d._rotation_candidate()
         self.assertEqual(first['side'],'blue')
-        self.assertIsNone(d._opportunity(1,False,True,None))
-        d._rotation_returned(10)
-        self.assertEqual(d.next_cut,10)
-        self.assertEqual(d._opportunity(10,True,True,None)['side'],'red')
+        # Blue -> red does not return to normal or impose a cooldown.
+        d.rotation_index=1;d.rotation_sequence+=1
+        self.assertEqual(d._rotation_candidate()['side'],'red')
         d._rotation_returned(20)
         self.assertEqual(d.next_cut,30)
-        self.assertNotEqual(first['flow'],d._opportunity(30,True,True,None)['flow'])
+        self.assertEqual(d._rotation_candidate()['side'],'blue')
+        self.assertNotEqual(first['flow'],d._rotation_candidate()['flow'])
 
     def test_new_single_fighter_lobby_overrides_stale_fight_not_live_clock(self):
         with tempfile.TemporaryDirectory() as folder:

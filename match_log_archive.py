@@ -225,7 +225,6 @@ class MatchLogArchive:
         key = f"{int(round_no or 0)}:{'final' if final else 'round'}"
         if self._score_hashes.get(key) == digest:
             return
-        self._score_hashes[key] = digest
         name = "scores_final.csv" if final else f"scores_round_{max(1, int(round_no or 1)):02d}.csv"
         target = Path(self.session_dir) / name
         try:
@@ -236,6 +235,7 @@ class MatchLogArchive:
             self._ledger.snapshot_official(key, "scores", int(round_no or 0), raw)
             if final:
                 self._audit_official_sources()
+        self._score_hashes[key] = digest
         self._write_manifest((), update_only=True)
 
     def snapshot_vitals(self, round_no: int, values: Dict[str, Any], *, final: bool = False) -> None:

@@ -130,9 +130,9 @@ assert test.call_count==1
             report={'isFinal':True,'_reportImage':{'folder':temp,'filename':'report.png'}}
             self.assertTrue(worker.enqueue(report));self.assertFalse(worker.enqueue(report))
             overlay.snapshot.return_value['blueName']='next match'
-            queued=worker.queue.get_nowait()
-            self.assertEqual(queued[1]['blueName'],'original')
-            self.assertEqual(queued[1]['events'],[])
+            queued=worker.latest[worker.queue.get_nowait()]
+            self.assertEqual(queued['state']['blueName'],'original')
+            self.assertEqual(queued['state']['events'],[])
 
     def test_server_only_requests_export_for_final_event(self):
         from browser_overlay import BrowserOverlayServer

@@ -91,3 +91,28 @@ class VsIntroPortraitTests(unittest.TestCase):
         app.spectator_watcher._portrait_locked = {"blue": True, "red": True}
         app._update_pending_browser_vs_intro({"spectator_round_state": "intro"})
         app.browser_overlay.push_event.assert_not_called()
+
+    def test_pending_match_card_can_finish_when_first_round_portraits_arrive(self):
+        app = self._app()
+        app._update_pending_browser_vs_intro({'vs_intro_event': {}, 'spectator_intro_kind': 'match'})
+        app.spectator_watcher._portrait_locked = {'blue': True, 'red': True}
+        app._update_pending_browser_vs_intro({'spectator_round_state': 'intro',
+                                              'spectator_intro_kind': 'round', 'round_current': 1})
+        app.browser_overlay.push_event.assert_called_once_with('vs')
+
+    def test_pending_card_cannot_finish_in_second_or_third_round_intro(self):
+        for round_no in (2, 3):
+            with self.subTest(round=round_no):
+                app = self._app()
+                app._update_pending_browser_vs_intro({'vs_intro_event': {}})
+                app.spectator_watcher._portrait_locked = {'blue': True, 'red': True}
+                app._update_pending_browser_vs_intro({'spectator_round_state': 'intro',
+                    'spectator_intro_kind': 'round', 'round_current': round_no})
+                app.browser_overlay.push_event.assert_not_called()
+                self.assertIsNone(app._browser_vs_pending_since)
+
+    def test_manual_vs_test_is_not_blocked_by_live_round_number(self):
+        app = self._app()
+        app._update_pending_browser_vs_intro({'vs_intro_event': {'source': 'settings_test'},
+                                             'spectator_intro_kind': 'round', 'round_current': 3})
+        app.browser_overlay.push_event.assert_called_once_with('vs')

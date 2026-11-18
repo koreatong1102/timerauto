@@ -1,6 +1,7 @@
 """Save final boards using the same HTML renderer, outside the live UI thread."""
 import base64
 import copy
+import hashlib
 from datetime import datetime
 import json
 import logging
@@ -123,6 +124,10 @@ class ReportImageExporter:
         self.lock = threading.Lock()
         self.queue = queue.Queue(maxsize=4)
         self.worker = None
+        self.latest = {}
+        self.completed = {}
+        self.failures = {}
+        self.max_attempts = 3
 
     def page(self, token):
         with self.lock:
@@ -144,75 +149,154 @@ class ReportImageExporter:
         if not folder or not name.endswith('.png') or os.path.basename(name) != name or '/' in name or '\\' in name:
             return False
         target = os.path.abspath(os.path.join(folder, name))
-        with self.lock:
-            if target in self.pending or os.path.isfile(target):
-                return False
-            self.pending.add(target)
         try:
-            state = copy.deepcopy(self.overlay.snapshot())
-            # Freeze portraits now; the next match may replace their shared cache files.
-            images = {}
-            for side in ('blue', 'red'):
-                path = self.overlay.image_path(side)
-                if path and os.path.isfile(path):
-                    images['/image/' + side] = 'data:image/png;base64,' + base64.b64encode(Path(path).read_bytes()).decode('ascii')
-            state['events'] = []
-            self.queue.put_nowait((copy.deepcopy(report), state, images, target))
+            revision = max(0, int(report.get('reportRevision') or 0))
+            frozen = copy.deepcopy(report)
+            semantic = {key: value for key, value in frozen.items()
+                        if key not in ('id', 'timestamp', 'reportRevision', 'showDelayMs', 'displayMs', '_reportImage')}
+            signature = hashlib.sha256(json.dumps(semantic, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
             with self.lock:
+                previous = self.latest.get(target) or self.failures.get(target) or self.completed.get(target)
+                if previous:
+                    if revision < previous['revision']:
+                        return False
+                    if signature == previous['signature'] and previous is not self.failures.get(target):
+                        previous['revision'] = max(revision, previous['revision'])
+                        return False
+                # An unversioned request must not overwrite an unrelated existing image.
+                # A late official revision can replace the first image after a restart.
+                if not previous and os.path.isfile(target) and not (revision > 0 and report.get('matchSessionId')):
+                    return False
+                original = self.latest.get(target) or self.failures.get(target) or self.completed.get(target)
+                if original:
+                    # A late correction must keep THIS match's frozen portraits, not
+                    # the next match's shared image cache or HUD state.
+                    state, images = original['state'], original['images']
+                else:
+                    state = copy.deepcopy(self.overlay.snapshot())
+                    images = {}
+                    for side in ('blue', 'red'):
+                        path = self.overlay.image_path(side)
+                        if path and os.path.isfile(path):
+                            images['/image/' + side] = 'data:image/png;base64,' + base64.b64encode(Path(path).read_bytes()).decode('ascii')
+                    state['events'] = []
+                job = dict(report=frozen, state=state, images=images, target=target,
+                           revision=revision, signature=signature)
+                if target not in self.pending:
+                    self.queue.put_nowait(target)
+                    self.pending.add(target)
+                self.latest[target] = job
+                self.failures.pop(target, None)
                 if self.worker is None or not self.worker.is_alive():
                     self.worker = threading.Thread(target=self._work, name='report-image-export', daemon=True)
                     self.worker.start()
             return True
         except Exception:
-            with self.lock:
-                self.pending.discard(target)
             logging.exception('REPORT_IMAGE_QUEUE_FAILED')
             return False
 
     def _work(self):
         # One worker per overlay, blocking on its small queue; never blocks UI shutdown.
         while True:
-            report, state, images, target = self.queue.get()
-            token = uuid.uuid4().hex
+            target = self.queue.get()
             try:
-                browser = browser_executable()
-                if not browser:
-                    raise RuntimeError('PNG 저장용 Microsoft Edge 또는 Chrome을 찾지 못했습니다.')
-                page = render_html(self.overlay._html(), report, state, images).replace('__TOKEN__', token)
+                self._process_target(target)
+            except Exception:
+                logging.exception('REPORT_IMAGE_WORKER_FAILED path=%s', target)
                 with self.lock:
-                    self.jobs[token] = page
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                with tempfile.TemporaryDirectory(prefix='timerauto_report_', ignore_cleanup_errors=True) as temp:
-                    shot = os.path.join(temp, 'report.png')
-                    args = [browser, '--headless=new', '--no-first-run', '--no-default-browser-check',
-                            '--disable-extensions', '--hide-scrollbars', '--mute-audio',
-                            '--force-device-scale-factor=1', '--window-size=1920,1080',
-                            '--run-all-compositor-stages-before-draw', '--virtual-time-budget=5000',
-                            '--user-data-dir=' + os.path.join(temp, 'profile'), '--screenshot=' + shot,
-                            f'http://127.0.0.1:{self.overlay.port}/report-image/{token}']
-                    result = subprocess.run(args, capture_output=True, timeout=35,
-                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-                    # Edge's Windows launcher can exit before its isolated child finishes.
-                    deadline = time.monotonic() + 25
-                    while result.returncode == 0 and not os.path.isfile(shot) and time.monotonic() < deadline:
-                        time.sleep(.1)
-                    if result.returncode != 0 or not os.path.isfile(shot):
-                        raise RuntimeError('리포트 PNG 렌더링 실패: ' + str(result.returncode) + ' ' + result.stderr.decode('utf-8', 'replace')[-1800:])
-                    with self.lock:
-                        if token not in self.ready:
-                            raise RuntimeError('리포트 글꼴·초상화 렌더링 완료를 확인하지 못했습니다.')
-                    save_png(shot, target, token)
-                DIAG.record('report_image_saved', path=target, width=1920, height=1080)
-                logging.info('REPORT_IMAGE_SAVED path=%s', target)
-            except Exception as exc:
-                DIAG.record('report_image_failed', path=target, error=str(exc))
-                logging.exception('REPORT_IMAGE_FAILED path=%s', target)
-            finally:
-                with self.lock:
-                    self.jobs.pop(token, None)
-                    self.ready.discard(token)
+                    self.latest.pop(target, None)
                     self.pending.discard(target)
+            finally:
                 self.queue.task_done()
+
+    def _process_target(self, target):
+        active = None
+        attempts = 0
+        while True:
+            with self.lock:
+                job = self.latest.get(target)
+            if job is None:
+                return
+            if job is not active:
+                active, attempts = job, 0
+            attempts += 1
+            try:
+                saved = self._render(job)
+            except Exception as exc:
+                with self.lock:
+                    if self.latest.get(target) is not job:
+                        continue
+                    if attempts >= self.max_attempts:
+                        self.failures[target] = dict(job, error=str(exc), attempts=attempts)
+                        self.latest.pop(target, None)
+                        self.pending.discard(target)
+                        while len(self.failures) > 16:
+                            self.failures.pop(next(iter(self.failures)))
+                        DIAG.record('report_image_failed', path=target, error=str(exc), attempts=attempts)
+                        logging.exception('REPORT_IMAGE_FAILED path=%s attempts=%s', target, attempts)
+                        return
+                DIAG.record('report_image_retry', path=target, attempt=attempts, error=str(exc))
+                logging.warning('REPORT_IMAGE_RETRY path=%s attempt=%s error=%s', target, attempts, exc)
+                time.sleep(0.5 * attempts)  # Only the export worker waits, never the UI.
+                continue
+            with self.lock:
+                if self.latest.get(target) is not job:
+                    continue  # Coalesce to the newest revision instead of dropping it.
+                if not saved:
+                    raise RuntimeError('Report image was not committed')
+                # Keep a small recent cache (including frozen portraits for corrections).
+                self.completed[target] = job
+                while len(self.completed) > 16:
+                    self.completed.pop(next(iter(self.completed)))
+                self.latest.pop(target, None)
+                self.pending.discard(target)
+                self.failures.pop(target, None)
+            DIAG.record('report_image_saved', path=target, width=1920, height=1080, revision=job['revision'])
+            logging.info('REPORT_IMAGE_SAVED path=%s revision=%s', target, job['revision'])
+            return
+
+    def _render(self, job):
+        report, state, images, target = (job[key] for key in ('report', 'state', 'images', 'target'))
+        token = uuid.uuid4().hex
+        candidate = target + '.' + token + '.render.png'
+        try:
+            browser = browser_executable()
+            if not browser:
+                raise RuntimeError('PNG 저장용 Microsoft Edge 또는 Chrome을 찾지 못했습니다.')
+            page = render_html(self.overlay._html(), report, state, images).replace('__TOKEN__', token)
+            with self.lock:
+                self.jobs[token] = page
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='timerauto_report_', ignore_cleanup_errors=True) as temp:
+                shot = os.path.join(temp, 'report.png')
+                args = [browser, '--headless=new', '--no-first-run', '--no-default-browser-check',
+                        '--disable-extensions', '--hide-scrollbars', '--mute-audio',
+                        '--force-device-scale-factor=1', '--window-size=1920,1080',
+                        '--run-all-compositor-stages-before-draw', '--virtual-time-budget=5000',
+                        '--user-data-dir=' + os.path.join(temp, 'profile'), '--screenshot=' + shot,
+                        f'http://127.0.0.1:{self.overlay.port}/report-image/{token}']
+                result = subprocess.run(args, capture_output=True, timeout=35,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                deadline = time.monotonic() + 25
+                while result.returncode == 0 and not os.path.isfile(shot) and time.monotonic() < deadline:
+                    time.sleep(.1)
+                if result.returncode != 0 or not os.path.isfile(shot):
+                    raise RuntimeError('리포트 PNG 렌더링 실패: ' + str(result.returncode) + ' ' + result.stderr.decode('utf-8', 'replace')[-1800:])
+                with self.lock:
+                    if token not in self.ready:
+                        raise RuntimeError('리포트 글꼴·초상화 렌더링 완료를 확인하지 못했습니다.')
+                save_png(shot, candidate, token)
+                with self.lock:
+                    if self.latest.get(target) is not job:
+                        return False
+                    os.replace(candidate, target)
+                return True
+        finally:
+            with self.lock:
+                self.jobs.pop(token, None)
+                self.ready.discard(token)
+            if os.path.isfile(candidate):
+                os.unlink(candidate)
 
 
 def create_settings_panel(cfg, parent, changed, test_callback):

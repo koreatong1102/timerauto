@@ -1,16 +1,19 @@
 """Render a deterministic special-FX contact sheet, without live OBS/app access."""
 import os
+import argparse
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from browser_hit_effects import HIT_EFFECT_JS
 from report_images import browser_executable
 
 
-def render_preview(target, *, rings=True):
+def render_preview(target, *, rings=True, base_size=115):
     browser=browser_executable()
     if not browser:raise RuntimeError('Edge/Chrome is required')
     target=Path(target).resolve();target.parent.mkdir(parents=True,exist_ok=True)
@@ -35,16 +38,28 @@ for(let row=0;row<2;row++)for(let col=0;col<3;col++){
 </script></body></html>'''
     if not rings:
         html=html.replace('hitFxRingEnabled:true','hitFxRingEnabled:false').replace('ring layer enabled','ring layer disabled')
-    with tempfile.TemporaryDirectory(prefix='rfc_fx_preview_') as temp:
+    html=html.replace('hitFxBaseSize:115',f'hitFxBaseSize:{base_size}')
+    with tempfile.TemporaryDirectory(prefix='rfc_fx_preview_',ignore_cleanup_errors=True) as temp:
         page=Path(temp,'preview.html');page.write_text(html,encoding='utf-8')
+        shot=Path(temp,'preview.png')
         result=subprocess.run([browser,'--headless=new','--no-first-run','--no-default-browser-check',
             '--hide-scrollbars','--force-device-scale-factor=1','--window-size=1600,900',
-            '--user-data-dir='+str(Path(temp,'profile')),'--screenshot='+str(target),page.as_uri()],
+            '--user-data-dir='+str(Path(temp,'profile')),'--screenshot='+str(shot),page.as_uri()],
             capture_output=True,timeout=35,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-        if result.returncode or not target.is_file():raise RuntimeError(result.stderr.decode('utf-8','replace'))
+        deadline=time.monotonic()+10
+        while result.returncode==0 and not shot.is_file() and time.monotonic()<deadline:
+            time.sleep(.1)
+        if result.returncode or not shot.is_file():
+            raise RuntimeError(f'Preview screenshot was not created (browser exit {result.returncode}): '
+                               +result.stderr.decode('utf-8','replace'))
+        shutil.copyfile(shot,target)
     print(target)
 
 
 if __name__=='__main__':
-    render_preview(sys.argv[1] if len(sys.argv)>1 else 'diagnostics/hit_effects_preview.png',
-                   rings='--no-rings' not in sys.argv[2:])
+    parser=argparse.ArgumentParser()
+    parser.add_argument('output',nargs='?',default='diagnostics/hit_effects_preview.png')
+    parser.add_argument('--no-rings',action='store_true')
+    parser.add_argument('--base-size',type=int,default=115)
+    args=parser.parse_args()
+    render_preview(args.output,rings=not args.no_rings,base_size=args.base_size)

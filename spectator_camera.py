@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import time
 import threading
-from camera_direction_policy import camera_settings, direction_selftest
+from camera_direction_policy import camera_settings, direction_selftest, ROTATION_SLOT_LIMIT, rotation_custom_slots
 from camera_hybrid import HybridView, needs_opponent, view_mode, level_rotation
 
 
@@ -447,7 +447,7 @@ def auto_camera_keeps_window_open():
 def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_guarded=None,
                         ensure_window_visible=None):
     from PyQt6.QtCore import QObject, QTimer, pyqtSignal
-    from PyQt6.QtWidgets import QApplication, QWidget, QFormLayout, QLabel, QDoubleSpinBox, QPushButton, QHBoxLayout, QComboBox, QCheckBox, QMessageBox
+    from PyQt6.QtWidgets import QApplication, QWidget, QFormLayout, QLabel, QDoubleSpinBox, QSpinBox, QPushButton, QHBoxLayout, QComboBox, QCheckBox, QMessageBox
     app = QApplication.instance()
     # One writer per app; it survives closing/reopening Settings.
     service = getattr(app, "_rfc_head_camera", None)
@@ -649,10 +649,10 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
     saved=camera_settings(cfg)
     profile=QComboBox()
     profile.setObjectName('cameraDirectorProfile')
-    for label,key in (('신중 · 좋은 컷만','cautious'),('균형 · 기본','balanced'),('적극 · 더 자주','active'),('로테이션 · 블루 → 레드 → 일반','rotation')):
+    for label,key in (('신중 · 좋은 컷만','cautious'),('균형 · 기본','balanced'),('적극 · 더 자주','active'),('로테이션 · 시간 순환','rotation')):
         profile.addItem(label,key)
     profile.setCurrentIndex(max(0,profile.findData(saved['camera_director_profile'])))
-    profile.setToolTip('로테이션은 블루 → 레드 → 일반 순서만 사용합니다. 각각의 유지시간은 아래 로테이션 전용 시간에서 설정합니다. 공격·스턴·다운·거리·구도·방송 비중 조건은 적용하지 않습니다. 휴식/종료에는 대기하고 실제 로그/전환 실패 시 중지합니다.')
+    profile.setToolTip('로테이션은 선택한 시점 순서와 시간대로 순환합니다. KD 때는 일반 시점으로 돌아가 재개와 KD 리플레이 종료를 기다립니다.')
     layout.addRow('자동 연출 성향',profile)
     pressure=QCheckBox('공격 흐름 · 상대 반격 없이 이어지는 중앙엔진 콤보')
     counter=QCheckBox('카운터 후속타 · 카운터 뒤 실제 공격이 이어질 때')
@@ -668,6 +668,14 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
                          '구도 대기시간이 지나면 안전한 공방 시점을 추가합니다. 절반이 지나면 짧은 연타도 후보로 허용합니다.\n'
                          '신중 모드는 보조 후보도 최소 3연타입니다. 색다른 선수 시점을 우선하며 안전 조건은 완화하지 않습니다.')
     broadcast_note.setWordWrap(True);layout.addRow(broadcast_note)
+    format_choice=QComboBox()
+    format_choice.setObjectName('cameraRotationLayout')
+    for label,key in (('3슬롯 · 블루 → 레드 → 일반','three'),
+                      ('4슬롯 · 블루 → 일반 1 → 레드 → 일반 2','four'),
+                      ('직접 설정 · 시점과 시간을 슬롯별로 선택','custom')):
+        format_choice.addItem(label,key)
+    format_choice.setCurrentIndex(format_choice.findData(saved['camera_director_rotation_layout']))
+    layout.addRow('로테이션 순서',format_choice)
     auto_controls = {}
     for key,label,lo,hi,default in (("duration","기본 1인칭 유지(초)",1,3,2),
                                   ('max_duration','좋은 공격 흐름 · 최대 유지(초)',1,3,3),
@@ -677,7 +685,9 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
                                   ('idle_sec','방송 모드 · 좋은 구도 연출 대기(초)',6,60,12),
                                   ('rotation_blue_sec','로테이션 · 블루 시점 유지(초)',1,300,10),
                                   ('rotation_red_sec','로테이션 · 레드 시점 유지(초)',1,300,10),
-                                  ('rotation_normal_sec','로테이션 · 일반 시점 유지(초) · 0은 대기 없음',0,600,10)):
+                                  ('rotation_normal_sec','로테이션 · 일반 시점 유지(초) · 0은 대기 없음',0,600,10),
+                                  ('rotation_normal_first_sec','4슬롯 · 일반 1 유지(초)',0,600,3),
+                                  ('rotation_normal_last_sec','4슬롯 · 일반 2 유지(초)',0,600,7)):
         spin = QDoubleSpinBox()
         spin.setDecimals(1 if key in ('duration','max_duration') or key.startswith('rotation_') else 0)
         if key.startswith('rotation_'):spin.setSingleStep(1.0)
@@ -686,17 +696,60 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
         auto_controls[key] = spin
         layout.addRow(label,spin)
     auto_controls['max_duration'].setMinimum(auto_controls['duration'].value())
+    custom_box=QWidget(panel)
+    custom_layout=QFormLayout(custom_box)
+    custom_count=QSpinBox(custom_box)
+    custom_count.setObjectName('cameraRotationSlotCount')
+    custom_count.setRange(1,ROTATION_SLOT_LIMIT)
+    saved_slots=saved['camera_director_rotation_custom']
+    custom_count.setValue(len(saved_slots))
+    custom_layout.addRow('직접 설정 슬롯 수',custom_count)
+    custom_slots=[]
+    labels={'blue':'블루','red':'레드','normal':'일반'}
+    for i in range(ROTATION_SLOT_LIMIT):
+        side,seconds=saved_slots[i] if i<len(saved_slots) else ('normal',5)
+        kind=QComboBox(custom_box)
+        kind.setObjectName(f'cameraRotationSlot{i+1}View')
+        for value,label in labels.items():kind.addItem(label,value)
+        kind.setCurrentIndex(kind.findData(side))
+        length=QDoubleSpinBox(custom_box)
+        length.setObjectName(f'cameraRotationSlot{i+1}Seconds')
+        length.setDecimals(1);length.setSuffix(' 초')
+        length.setRange(0 if side=='normal' else 1,600 if side=='normal' else 300)
+        length.setValue(seconds)
+        row=QHBoxLayout();row.addWidget(kind);row.addWidget(length)
+        custom_layout.addRow(f'{i+1}번 슬롯',row)
+        custom_slots.append((kind,length))
+    layout.addRow(custom_box)
+
+    def chosen_slots():
+        return [(kind.currentData(),length.value()) for kind,length in custom_slots[:custom_count.value()]]
+
     scenario_note = auto_note.text()
     def refresh_direction_mode():
         rotation = profile.currentData() == 'rotation'
+        order=format_choice.currentData()
+        format_choice.setEnabled(rotation)
+        custom_box.setVisible(rotation and order=='custom')
+        for i in range(ROTATION_SLOT_LIMIT):
+            custom_layout.setRowVisible(i+1,i<custom_count.value())
         for widget in (pressure, counter, broadcast):
             widget.setEnabled(not rotation)
         for key,widget in auto_controls.items():
-            widget.setEnabled(rotation if key.startswith('rotation_') else not rotation)
-        times=' → '.join(f'{label} {auto_controls["rotation_"+key+"_sec"].value():g}초'
-                          for label,key in (('블루','blue'),('레드','red'),('일반','normal')))
+            if key.startswith('rotation_'):
+                visible=(order=='three' if key=='rotation_normal_sec' else order=='four'
+                         if key in ('rotation_normal_first_sec','rotation_normal_last_sec') else order!='custom')
+                # Keep the legacy controls accessible in the default layout.
+                layout.setRowVisible(widget,rotation and visible)
+                widget.setEnabled(rotation and visible)
+            else:widget.setEnabled(not rotation)
+        value=lambda suffix:auto_controls['rotation_'+suffix+'_sec'].value()
+        slots=chosen_slots() if order=='custom' else ([('blue',value('blue')),('normal',value('normal_first')),
+                                                      ('red',value('red')),('normal',value('normal_last'))]
+              if order=='four' else [('blue',value('blue')),('red',value('red')),('normal',value('normal'))])
+        times=' → '.join(f'{labels[side]} {seconds:g}초' for side,seconds in slots)
         auto_note.setText('단순 로테이션: '+times+'를 반복합니다.\n'
-                         '블루에서 레드로 직접 전환하며, 공격·스턴·다운·거리·구도·목표 비중 조건은 사용하지 않습니다.\n'
+                         'KD 때는 일반 시점으로 복귀합니다. 경기 재개와 KD 리플레이 종료 후 다음 선수 시점부터 이어갑니다.\n'
                          '아래 상황별 연출 옵션은 이 모드에 적용되지 않아 비활성화됩니다.\n'
                          '라운드 휴식/경기 종료에는 일반 시점으로 대기합니다. 로그·파일 저장·실제 전환에 실패하면 중지합니다.\n'
                          'F6 파일 카메라가 꺼진 일반 시점인지 확인 후 시작하세요. 변경 내용은 다음 자동 연출 시작부터 적용됩니다.'
@@ -708,6 +761,10 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
         cfg.camera_director_counter_enabled=counter.isChecked()
         cfg.camera_director_broadcast_enabled=broadcast.isChecked()
         for key,spin in auto_controls.items():setattr(cfg,'camera_director_'+key,spin.value())
+        cfg.camera_director_rotation_layout=format_choice.currentData()
+        slots=chosen_slots()
+        if any(side!='normal' for side,_ in slots):
+            cfg.camera_director_rotation_custom=rotation_custom_slots(slots)
         refresh_direction_mode()
         changed=getattr(parent,'_schedule_apply',None)
         if callable(changed):changed()
@@ -715,6 +772,15 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
     pressure.toggled.connect(save_direction);counter.toggled.connect(save_direction)
     broadcast.toggled.connect(save_direction)
     for spin in auto_controls.values():spin.valueChanged.connect(save_direction)
+    format_choice.currentIndexChanged.connect(save_direction)
+    custom_count.valueChanged.connect(save_direction)
+    for kind,length in custom_slots:
+        def change_kind(_index,kind=kind,length=length):
+            normal=kind.currentData()=='normal'
+            length.setRange(0 if normal else 1,600 if normal else 300)
+            save_direction()
+        kind.currentIndexChanged.connect(change_kind)
+        length.valueChanged.connect(save_direction)
     refresh_direction_mode()
     rehearsal=QPushButton('조건 모의 테스트 · 실제 카메라 전환 없음')
     rehearsal.setObjectName('cameraDirectorSelfTest')
@@ -744,11 +810,15 @@ def create_camera_panel(cfg, parent=None, toggle=None, on_return=None, toggle_gu
             service.report("이미 자동 연출 중입니다. 먼저 중지/복귀하세요.")
             return
         try:
+            if profile.currentData()=='rotation' and format_choice.currentData()=='custom' and not any(side!='normal' for side,_ in chosen_slots()):
+                service.report('직접 설정에 블루 또는 레드 선수 시점을 한 칸 이상 선택하세요.')
+                return
             service.worker.stop()
             service.director.start(getattr(cfg,"spectatorlog_path",""),
                                    dict({k:v.value() for k,v in controls.items()},view_mode=mode.currentData(),hybrid_player_pct=mix.value()),
                                    profile=profile.currentData(),pressure=pressure.isChecked(),counter=counter.isChecked(),
                                    broadcast_enabled=broadcast.isChecked(),
+                                   rotation_layout=format_choice.currentData(),rotation_custom=chosen_slots(),
                                    **{k:v.value() for k,v in auto_controls.items()})
             service.timer.start()
             confirmation.setChecked(False)

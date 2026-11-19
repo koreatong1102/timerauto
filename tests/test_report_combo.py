@@ -119,6 +119,24 @@ class ComboDetailTests(unittest.TestCase):
             self.assertTrue(final['maxComboDownFinish'])
 
     @unittest.skipUnless(shutil.which('node'),'Node needed for browser function test')
+    def test_overhand_report_row_only_shows_with_a_recorded_attempt_or_hit(self):
+        html=BrowserOverlayServer()._html()
+        functions=html[html.index('function rrV4PunchMaps('):html.index('function rrVisibleWeakHits(')]
+        script="const assert=require('node:assert/strict');const rrV4Num=x=>Math.max(0,Math.round(Number(x)||0));\n"+functions+r'''
+const data=(landed,thrown)=>({punchAccuracyBreakdown:[{key:'over',landed,thrown}]});
+const hasOver=(blue,red)=>rrV4Rows(blue,red).includes('\uC624\uBC84\uD578\uB4DC');
+assert(!hasOver(data(0,0),data(0,0)));
+assert(!hasOver({},{}));
+assert(hasOver(data(0,1),data(0,0)));
+assert(hasOver(data(0,0),data(1,1)));
+assert(hasOver({landedBreakdown:[{key:'over',count:1}]},{}));
+assert(hasOver({},{punchBreakdown:[{key:'over',count:1}]}));
+assert(rrV4Rows(data(0,0),data(0,0)).includes('\uC5B4\uD37C'));
+'''
+        result=subprocess.run(['node'],input=script,capture_output=True,text=True,encoding='utf8',timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    @unittest.skipUnless(shutil.which('node'),'Node needed for browser function test')
     def test_browser_renders_english_sequence_with_korean_notes_and_escapes_content(self):
         html=BrowserOverlayServer()._html()
         function=html[html.index('function rrV4ComboDetails('):html.index('function rrV4Fighter(')]

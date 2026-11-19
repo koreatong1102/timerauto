@@ -37,6 +37,7 @@ class BrowserHitEffectsTests(unittest.TestCase):
             "hitFxRingWidth",
             "hitFxTextScale",
             "hitFxShowText",
+            "hitFxShowSpecialText",
             "hitFxSpriteEnabled",
             "hitFxRingEnabled",
             "hitFxColorPreset",
@@ -52,7 +53,13 @@ class BrowserHitEffectsTests(unittest.TestCase):
     def test_special_effects_execute_classify_and_remain_bounded(self):
         harness = r'''
 const assert=require('assert');let calls=0,clock=100,scheduled=0;
-const ctx=new Proxy({}, {get:(obj,key)=>obj[key]||(()=>{calls++})});
+const drawn=[],positions=[];
+const glowStops=[];let arcCount=0;
+const ctx=new Proxy({measureText:text=>({width:text.length*18}),
+ createRadialGradient:()=>({addColorStop:(...args)=>glowStops.push(args)}),
+ arc:()=>arcCount++,
+ fillText:text=>drawn.push(text),translate:(x,y)=>positions.push([x,y])},
+ {get:(obj,key)=>obj[key]||(()=>{calls++})});
 var latestState={hitFxLatencyLog:false,hitFxRingEnabled:true},lastSeq=0;
 function q(){return {getContext:()=>ctx}}
 var performance={now:()=>clock};function requestAnimationFrame(){scheduled++;return scheduled}
@@ -71,9 +78,36 @@ for(const kind of ['counter','stun']){
  if(kind==='stun')assert.equal(e.label,'STUN');
  assert(e.duration>170&&e.duration<=1200);
  for(const t of [0,.1,.4,.8,1.1])drawScreenImpact(ctx,e,e.started+t*e.duration);
+ if(kind==='stun'){
+  assert(arcCount>0);assert(glowStops.length>0);
+  e.ringOn=false;const previousArcs=arcCount,previousStops=glowStops.length;
+  drawScreenImpact(ctx,e,e.started+30);
+  assert.equal(arcCount,previousArcs);assert(glowStops.length>previousStops);
+  e.ringOn=true;
+ }
  e.spriteOn=false;e.ringOn=false;drawScreenImpact(ctx,e,e.started+30);
- assert.equal(drawScreenImpact(ctx,e,e.started+e.duration+1),false);
+ assert.equal(drawScreenImpact(ctx,e,e.started+Math.max(e.duration,e.caption.duration)+1),false);
 }
+// Special labels work without damage numbers and cannot run off the canvas.
+latestState.hitFxShowText=false;latestState.hitFxShowSpecialText=true;
+for(const [screenX,screenY,kind] of [[0,1,'counter'],[1,0,'stun']]){
+ clock+=100;showScreenImpact({screenX,screenY,effectKind:kind,damage:55});
+ let e=impactState.effects.at(-1);
+ drawn.length=0;positions.length=0;
+ assert(impactSpecialCaption(ctx,e,50));
+ assert.deepEqual(drawn,[kind.toUpperCase()]);
+ const [x,y]=positions.at(-1), inset=e.caption.width*.57+16;
+ assert(x>=inset&&x<=1920-inset&&y>0&&y<1080);
+ assert(!impactSpecialCaption(ctx,e,e.caption.duration));
+}
+latestState.hitFxShowSpecialText=false;latestState.hitFxShowText=true;
+clock+=100;showScreenImpact({screenX:.5,screenY:.5,isCounter:true,damage:55});
+let disabled=impactState.effects.at(-1);
+assert.equal(disabled.caption,null);drawn.length=0;
+drawScreenImpact(ctx,disabled,disabled.started+50);assert.deepEqual(drawn,[]);
+clock+=100;showScreenImpact({screenX:.5,screenY:.5,damage:55});
+let ordinary=impactState.effects.at(-1);
+drawScreenImpact(ctx,ordinary,ordinary.started+50);assert.deepEqual(drawn,['55']);
 // A fast ordinary hit must not suppress the same contact's special upgrade.
 clock+=100;impactState.effects=[];
 showScreenImpact({screenX:.5,screenY:.5,damage:30});
@@ -90,6 +124,21 @@ console.log('special effects executed');
         result=subprocess.run(['node'],input=harness+HIT_EFFECT_JS+checks,text=True,
                               encoding='utf-8',capture_output=True,timeout=15)
         self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_special_text_config_is_independent_of_damage_numbers(self):
+        import tempfile
+        from pathlib import Path
+        from config_model import AppConfig
+        with tempfile.TemporaryDirectory() as folder:
+            path=str(Path(folder)/'config.json')
+            cfg=AppConfig()
+            self.assertTrue(cfg.spectator_hit_effect_show_special_text)
+            for special,numbers in ((True,False),(False,True)):
+                cfg.spectator_hit_effect_show_special_text=special
+                cfg.spectator_hit_effect_show_text=numbers
+                cfg.to_json(path);restored=AppConfig.from_json(path)
+                self.assertEqual(restored.spectator_hit_effect_show_special_text,special)
+                self.assertEqual(restored.spectator_hit_effect_show_text,numbers)
 
     def test_settings_preview_plays_normal_counter_then_stun(self):
         from types import SimpleNamespace

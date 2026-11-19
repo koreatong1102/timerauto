@@ -1,7 +1,7 @@
 import logging
 import os
 import time
-from source_record_capture import live_replay_expired
+from source_record_capture import live_replay_expired, result_wait
 from diagnostics import diagnostics as DIAG
 from typing import Any, Callable, Dict, Optional
 
@@ -23,10 +23,27 @@ class ObsAutoReplayController:
         self._clock = clock
         self._generation = 0
         self._cancel_before = 0.0
+        self._pending_kd_until = 0.0
+        self._kd_capture = (0.0, 0.0)
+
+    def kd_pending(self) -> bool:
+        return self._clock() < max(self._pending_kd_until, self._kd_capture[1])
+
+    def expect_kd_capture(self, context):
+        """Hold through clip delivery, within the same budget as live replay."""
+        if context.get('auto_replay_kind')!='kd' or not self._kind_enabled(self._config_getter(),'kd'):
+            return
+        now=self._clock()
+        triggered=float(context.get('trigger_monotonic') or now)
+        delay=max(0,min(15,float(getattr(self._config_getter(),'obs_auto_replay_delay_sec',2) or 0)))
+        capture=max(0,min(15,float(context.get('replay_capture_delay_sec') or 0)))
+        self._kd_capture=(triggered,triggered+max(capture+result_wait(context),delay+1))
 
     def cancel(self, reason: str = "") -> None:
         DIAG.record("replay_cancel_requested", reason=reason)
         self._generation += 1
+        self._pending_kd_until = 0.0
+        self._kd_capture = (0.0, 0.0)
         self._cancel_before = self._clock()
         overlay = self._overlay_getter()
         if overlay is not None:
@@ -64,9 +81,19 @@ class ObsAutoReplayController:
         remaining_ms = max(0, int(round((target_at - self._clock()) * 1000.0)))
         self._generation += 1
         generation = self._generation
+        self._pending_kd_until = self._clock()+remaining_ms/1000+2 if kind=='kd' else 0.0
+        if kind=='kd' and triggered_at>=self._kd_capture[0]:
+            self._kd_capture=(0.0,0.0)
+
+        def start_pending():
+            try:
+                self._start(generation,replay_path,kind,context)
+            finally:
+                if generation==self._generation:
+                    self._pending_kd_until=0.0
         self._schedule_once(
             remaining_ms,
-            lambda: self._start(generation, replay_path, kind, context),
+            start_pending,
         )
         logging.info(
             "OBS_AUTO_REPLAY_SCHEDULE kind=%s delay_ms=%s path=%s",

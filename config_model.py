@@ -924,6 +924,7 @@ class AppConfig:
     spectator_hit_effect_glow: float = 1.0
     spectator_hit_effect_fill_opacity: float = 1.0
     spectator_hit_effect_show_text: bool = True
+    spectator_hit_effect_show_special_text: bool = True
     spectator_hit_effect_text_scale: float = 1.0
     spectator_hit_effect_latency_log: bool = True
     spectator_hit_effect_fast_emit: bool = True
@@ -1485,6 +1486,7 @@ class AppConfig:
             cfg.spectator_hit_effect_fill_opacity = 1.0
         cfg.spectator_hit_effect_fill_opacity = max(0.0, min(1.5, number_setting(cfg.spectator_hit_effect_fill_opacity, 1.0)))
         cfg.spectator_hit_effect_show_text = bool(raw.get("spectator_hit_effect_show_text", True))
+        cfg.spectator_hit_effect_show_special_text = bool(raw.get("spectator_hit_effect_show_special_text", True))
         try:
             cfg.spectator_hit_effect_text_scale = float(raw.get("spectator_hit_effect_text_scale", 1.0) or 1.0)
         except Exception:
@@ -2145,6 +2147,7 @@ class AppConfig:
             "spectator_hit_effect_glow": float(max(0.0, min(3.0, float(self.spectator_hit_effect_glow or 1.0)))),
             "spectator_hit_effect_fill_opacity": float(max(0.0, min(1.5, number_setting(self.spectator_hit_effect_fill_opacity, 1.0)))),
             "spectator_hit_effect_show_text": bool(self.spectator_hit_effect_show_text),
+            "spectator_hit_effect_show_special_text": bool(self.spectator_hit_effect_show_special_text),
             "spectator_hit_effect_text_scale": float(max(0.5, min(2.0, float(self.spectator_hit_effect_text_scale or 1.0)))),
             "spectator_hit_effect_latency_log": bool(self.spectator_hit_effect_latency_log),
             "spectator_hit_effect_fast_emit": bool(self.spectator_hit_effect_fast_emit),

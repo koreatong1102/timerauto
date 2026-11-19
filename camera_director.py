@@ -52,11 +52,17 @@ class AutoCameraDirector:
         self.realtime = True
         self.rotation = False
         self.rotation_seconds = dict(blue=10.0,red=10.0,normal=10.0)
+        self.rotation_slots = (('blue',10),('red',10),('normal',10))
+        self.rotation_replay_check = None
+        self.rotation_after_exit = None
+        self.rotation_kd_hold = False
 
     def start(self, root, options, duration=2, cooldown=12, min_hits=3, *,
               profile='balanced', pressure=True, counter=True, max_duration=3,
               broadcast_enabled=False,target_pct=18,idle_sec=12,
-              rotation_blue_sec=10,rotation_red_sec=10,rotation_normal_sec=10):
+              rotation_blue_sec=10,rotation_red_sec=10,rotation_normal_sec=10,
+              rotation_layout='three',rotation_normal_first_sec=3,rotation_normal_last_sec=7,
+              rotation_custom=()):
         if self.thread and self.thread.is_alive():
             raise ValueError("자동 연출을 먼저 중지하세요.")
         self.root = Path(root).resolve()
@@ -74,11 +80,27 @@ class AutoCameraDirector:
         self.rotation_sequence = 0
         self.rotation_exit_pose = None
         self.rotation_reset_on_return = False
+        self.rotation_after_exit = None
+        self.rotation_initialized = False
+        self.rotation_kd_hold = False
         normalized=camera_settings(dict(camera_director_rotation_blue_sec=rotation_blue_sec,
                                         camera_director_rotation_red_sec=rotation_red_sec,
-                                        camera_director_rotation_normal_sec=rotation_normal_sec))
+                                        camera_director_rotation_normal_sec=rotation_normal_sec,
+                                        camera_director_rotation_layout=rotation_layout,
+                                        camera_director_rotation_normal_first_sec=rotation_normal_first_sec,
+                                        camera_director_rotation_normal_last_sec=rotation_normal_last_sec,
+                                        camera_director_rotation_custom=rotation_custom))
         self.rotation_seconds={side:normalized['camera_director_rotation_'+side+'_sec']
                                for side in ('blue','red','normal')}
+        layout=normalized['camera_director_rotation_layout']
+        blue,red,normal=(self.rotation_seconds[s] for s in ('blue','red','normal'))
+        if layout=='four':
+            self.rotation_slots=(('blue',blue),('normal',normalized['camera_director_rotation_normal_first_sec']),
+                                 ('red',red),('normal',normalized['camera_director_rotation_normal_last_sec']))
+        elif layout=='custom':
+            self.rotation_slots=normalized['camera_director_rotation_custom']
+        else:
+            self.rotation_slots=(('blue',blue),('red',red),('normal',normal))
         if self.rotation:self.duration = self.rotation_seconds['blue']
         self.cooldown = max(0,min(120,float(cooldown)))
         self.profile = PROFILES.get(profile,PROFILES['balanced'])
@@ -155,7 +177,7 @@ class AutoCameraDirector:
             return False
         try:
             value=(self.root/'match/round_state.txt').read_text().strip().lower()
-            live=self._rotation_live(value) if self.rotation else value in ('roundfight','fight')
+            live=(self._rotation_live(value) and not self._rotation_kd_priority(value)) if self.rotation else value in ('roundfight','fight')
         except OSError:
             self.entry_block_reason='round_unavailable'
             return False
@@ -545,24 +567,45 @@ class AutoCameraDirector:
         return False
 
     def _rotation_returned(self, now):
-        # Blue -> red stays in file-camera mode. Only red -> normal comes here,
-        # unless the round ended or the user stopped the rotation midway.
-        self.rotation_index = 0
         self.rotation_sequence += 1
-        self.next_cut = now+(0.0 if self.rotation_reset_on_return else self.rotation_seconds['normal'])
+        if self.rotation_reset_on_return:
+            self.rotation_index=0
+            self.rotation_initialized=False
+            self.next_cut=now
+        else:
+            start=self.rotation_index+1 if self.rotation_after_exit is None else self.rotation_after_exit
+            self._rotation_select(start,now,skip_normal=self.rotation_kd_hold)
         self.rotation_exit_pose = None
         self.rotation_reset_on_return = False
+        self.rotation_after_exit = None
+
+    def _rotation_select(self, start, now, *, skip_normal=False):
+        """Consecutive normal slots share the same view, so add their durations."""
+        index=start%len(self.rotation_slots)
+        wait=0.0
+        for _ in self.rotation_slots:
+            side,duration=self.rotation_slots[index]
+            if side!='normal':
+                break
+            if not skip_normal:wait+=duration
+            index=(index+1)%len(self.rotation_slots)
+        self.rotation_index=index
+        self.next_cut=now+wait
+        self.rotation_initialized=True
+
+    def _rotation_kd_priority(self, value):
+        return value in ('roundknockdown','knockdown','kd') or bool(
+            self.rotation_replay_check and self.rotation_replay_check())
 
     def _rotation_live(self, value):
-        # A knockdown/foul/KO animation is still the ongoing round. Combat
-        # verdicts, replay/report state and DirectorFeed do not schedule rotation.
-        return value in ('roundfight','fight','roundknockdown','knockdown',
-                         'roundknockout','knockout','roundfoul','foul') and not self.feed.in_lobby()
+        # KD is handled separately so the next slot survives the interruption.
+        return value in ('roundfight','fight','roundknockdown','knockdown','kd',
+                         'roundfoul','foul') and not self.feed.in_lobby()
 
     def _rotation_candidate(self):
-        side=('blue','red')[self.rotation_index]
+        side,duration=self.rotation_slots[self.rotation_index]
         key=f'rotation:{self.rotation_sequence}:{side}'
-        return dict(id=key,flow=key,side=side,kind='scenic',hits=0,score=100,rotation=True)
+        return dict(id=key,flow=key,side=side,duration=duration,kind='scenic',hits=0,score=100,rotation=True)
 
     def _rotation_active(self, now):
         self.confirmed_on = True
@@ -571,14 +614,15 @@ class AutoCameraDirector:
         self.mismatch = 0
         self._state('active',now)
         self.active_started = now
-        duration=self.rotation_seconds[self.camera.side]
+        duration=self.prepared['duration']
         self.active_until = self.hard_until = now+duration
         self.rotation_exit_pose = self.camera.last_output
         DIAG.record('camera_director_rotation',side=self.camera.side,duration=duration)
         self.notify(f'로테이션 · {self.camera.side.upper()} 선수 시점 {duration:g}초')
 
-    def _rotation_exit(self, now, *, reset=False):
+    def _rotation_exit(self, now, *, reset=False, resume_at=None):
         self.rotation_reset_on_return = reset
+        self.rotation_after_exit = resume_at
         # A side hand-off may still be waiting for its first complete output.
         # Restore flags only against the last input actually owned by this app.
         if self.camera.last_output is None:
@@ -586,7 +630,7 @@ class AutoCameraDirector:
         self._begin_exit(now)
 
     def _step_rotation(self, now):
-        """Fixed blue/red/normal timer, deliberately independent of shot policy."""
+        """Timed slots, with a dedicated KD/return-to-fight intermission."""
         try:
             value=(self.root/'match/round_state.txt').read_text().strip().lower()
         except OSError:
@@ -596,10 +640,33 @@ class AutoCameraDirector:
         elif now-self.last_round_at<=.2:
             value=self.last_round_value
         live=self._rotation_live(value)
+        kd=live and self._rotation_kd_priority(value)
+        if kd:
+            self.rotation_kd_hold=True
+        elif not live:
+            self.rotation_kd_hold=False
         if self.state in ('release_write','release','off_wait'):
+            if not live:
+                self.rotation_reset_on_return=True
+            elif kd and not self.rotation_reset_on_return and self.rotation_after_exit is None:
+                self.rotation_after_exit=self.rotation_index+1
             return self._step_return(now)
         if self.state=='idle':
             if self.cancel.is_set():return False
+            if not live:
+                self.rotation_initialized=False
+                self.next_cut=now
+            elif kd:
+                self._rotation_select(self.rotation_index if self.rotation_initialized else 0,now,skip_normal=True)
+                self._decision('rotation_kd_hold')
+                return True
+            elif self.rotation_kd_hold and value in ('roundfight','fight'):
+                self.rotation_kd_hold=False
+                self.next_cut=now
+            elif self.rotation_kd_hold:
+                return True  # A foul/intermediate state is not fight resumption.
+            elif not self.rotation_initialized:
+                self._rotation_select(0,now)
             if not live or now<self.next_cut:
                 self._decision('not_fight' if not live else 'rotation_normal')
                 return True
@@ -609,13 +676,13 @@ class AutoCameraDirector:
             self._state('prepare',now)
             return self._prepare(now,True,True,self.prepared)
         if self.state=='prepare':
-            return self._prepare(now,True,live,self.prepared)
+            return self._prepare(now,True,live and not kd,self.prepared)
         if self.state=='rotation_switch':
-            if self.cancel.is_set() or not live:
-                self._rotation_exit(now,reset=True)
+            if self.cancel.is_set() or not live or kd:
+                self._rotation_exit(now,reset=not kd or self.cancel.is_set(),resume_at=self.rotation_index)
                 return True
             if not self._prepare_started:
-                self.camera.start(self.root,'red',realtime=self.realtime,**self.options)
+                self.camera.start(self.root,self.prepared['side'],realtime=self.realtime,**self.options)
                 self._prepare_started=True
             else:
                 self.camera.tick()
@@ -628,9 +695,12 @@ class AutoCameraDirector:
                     self._rotation_active(now)
                     return True
             if now-self.since>1.5:
-                raise ValueError('레드 선수 시점 전달/전환 확인 실패. F6을 반복하지 않고 중지합니다.')
+                raise ValueError(('블루' if self.prepared['side']=='blue' else '레드')+' 선수 시점 전달/전환 확인 실패. F6을 반복하지 않고 중지합니다.')
             return True
         if self.state not in ('probe','enter','active'):return False
+        if self.state=='probe' and (self.cancel.is_set() or not live or kd):
+            self._cancel_preparation(now,'prepare_cancelled')
+            return not self.cancel.is_set()
         self.camera.tick()
         actual,fresh=self._observe()
         match=pose_matches(actual,self.camera.last_output)
@@ -638,9 +708,6 @@ class AutoCameraDirector:
         if self.state=='probe':
             if self.matches>=2:
                 raise ValueError('파일 카메라가 이미 켜진 것으로 보여 중지합니다. F6을 끄고 다시 시작하세요.')
-            if self.cancel.is_set() or not live:
-                self._cancel_preparation(now,'prepare_cancelled')
-                return not self.cancel.is_set()
             if now-self.since>=.12 and fresh:
                 if not self._entry_allowed():
                     self._cancel_preparation(now,'entry_priority_cancelled')
@@ -656,8 +723,8 @@ class AutoCameraDirector:
         elif self.state=='enter':
             if self.matches>=2:
                 self.confirmed_on=True
-                if self.cancel.is_set() or not live:
-                    self._rotation_exit(now,reset=True)
+                if self.cancel.is_set() or not live or kd:
+                    self._rotation_exit(now,reset=not kd or self.cancel.is_set(),resume_at=self.rotation_index)
                 else:
                     self._rotation_active(now)
             elif now-self.since>1.5:
@@ -667,16 +734,22 @@ class AutoCameraDirector:
             if self.mismatch>=3:
                 self.confirmed_on=False
                 raise ValueError('수동 카메라 변경 또는 추적 이탈 감지. 추가 F6 입력 없이 중지합니다.')
-            if self.cancel.is_set() or not live:
-                self._rotation_exit(now,reset=True)
+            if self.cancel.is_set() or not live or kd:
+                self._rotation_exit(now,reset=not kd or self.cancel.is_set(),resume_at=self.rotation_index+1)
             elif now>=self.active_until:
                 DIAG.record('camera_director_cut',side=self.camera.side,kind='rotation',
                             held_sec=round(now-self.active_started,3),reason='duration_complete')
-                if self.rotation_index==0:
-                    # Keep F6 on: directly publish red's pose/head flags. No
-                    # normal-camera flash, F4 toggle, cooldown or scoring gate.
+                following=(self.rotation_index+1)%len(self.rotation_slots)
+                side,_=self.rotation_slots[following]
+                if side==self.camera.side:
+                    self.rotation_index=following
+                    self.rotation_sequence+=1
+                    self.prepared=self._rotation_candidate()
+                    self._rotation_active(now)
+                elif side!='normal':
+                    # Adjacent player slots switch without touching F6.
                     self.rotation_exit_pose=self.camera.last_output
-                    self.rotation_index=1
+                    self.rotation_index=following
                     self.rotation_sequence+=1
                     self.prepared=self._rotation_candidate()
                     self._prepare_started=False
@@ -686,7 +759,8 @@ class AutoCameraDirector:
         return True
 
     def _run(self):
-        self.notify(('로테이션 대기 · 블루 {blue:g}초 → 레드 {red:g}초 → 일반 {normal:g}초'.format(**self.rotation_seconds)) if self.rotation else
+        labels={'blue':'블루','red':'레드','normal':'일반'}
+        self.notify(('로테이션 대기 · '+' → '.join(f'{labels[side]} {seconds:g}초' for side,seconds in self.rotation_slots)) if self.rotation else
                     "자동 연출 대기 · 중앙 판정의 연속 공격과 안전한 시점을 기다립니다.")
         read_failed_at = None
         metrics_at = time.monotonic()
@@ -733,10 +807,11 @@ class AutoCameraDirector:
             if self.state=='active':
                 return f'로테이션 · {self.camera.side.upper()} 선수 시점 · {max(0,self.active_until-time.monotonic()):.1f}초 남음'
             if self.state=='idle':
+                if self.rotation_kd_hold:return '로테이션 · KD 일반 시점 · 경기 재개/리플레이 종료 대기'
                 remaining=max(0,self.next_cut-time.monotonic())
                 return f'로테이션 · 일반 시점 · {remaining:.1f}초 남음' if remaining else '로테이션 · 경기 시작 대기'
             return '로테이션 · '+{'prepare':'블루 시점 준비','probe':'파일 카메라 확인',
-                    'enter':'블루 전환 확인','rotation_switch':'레드 직접 전환 확인',
+                    'enter':'선수 시점 전환 확인','rotation_switch':'선수 시점 직접 전환 확인',
                     'release_write':'머리 표시 복구','release':'일반 시점 복귀 준비',
                     'off_wait':'일반 시점 복귀 확인'}.get(self.state,self.state)
         labels = {"waiting":"대기", "priority_or_signal":"다운·리포트·리플레이 우선 또는 감지 신호 대기",
@@ -783,8 +858,14 @@ def feed_camera_director(app, data):
     if not director or not director.thread or not director.thread.is_alive():
         return
     if director.rotation:
-        # Rotation needs only the lobby/round lifecycle, not combat candidates,
-        # report/replay priority or periodic heartbeat freshness.
+        if director.rotation_replay_check is None:
+            def kd_replay():
+                controller=app.__dict__.get('_obs_auto_replay')
+                if controller is not None and controller.kd_pending():
+                    return True
+                state=getattr(app.__dict__.get('browser_overlay'),'_state',{})
+                return bool(state.get('obsReplayActive') and state.get('obsReplayKind')=='kd')
+            director.rotation_replay_check=kd_replay
         if 'spectator_round_state' in data:
             director.feed.update({'spectator_round_state':data['spectator_round_state']})
         return

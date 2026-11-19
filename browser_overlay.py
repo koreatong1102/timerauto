@@ -152,6 +152,7 @@ class BrowserOverlayServer:
             "hitFxGlow": 1.0,
             "hitFxFillOpacity": 1.0,
             "hitFxShowText": True,
+            "hitFxShowSpecialText": True,
             "hitFxTextScale": 1.0,
             "hitFxLatencyLog": True,
             "hitFxSpriteEnabled": True,
@@ -3842,6 +3843,8 @@ function rrV4Rows(blue,red){
     const bT=Object.prototype.hasOwnProperty.call(ba,'thrown')?ba.thrown:((bm.thrown[key]||{}).count||0);
     const rL=Object.prototype.hasOwnProperty.call(ra,'landed')?ra.landed:((rm.landed[key]||{}).count||0);
     const rT=Object.prototype.hasOwnProperty.call(ra,'thrown')?ra.thrown:((rm.thrown[key]||{}).count||0);
+    // Avoid an empty overhand row, but retain any recorded attempt or landed hit.
+    if(key==='over' && bL===0 && bT===0 && rL===0 && rT===0)return;
     html+=row(stat(bL,bT),label,stat(rL,rT));
   });
   html+=row(rrV4Num(blue.counterHits),'\uCE74\uC6B4\uD130 \uC131\uACF5',rrV4Num(red.counterHits));

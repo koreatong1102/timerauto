@@ -8673,6 +8673,11 @@ class SettingsDialog(QDialog):
         hit_lay.addWidget(self.chk_spectator_hit_fx_ring_enabled, 5, 5)
         hit_lay.addWidget(self.chk_spectator_hit_fx_fast_emit, 6, 2, 1, 2)
         hit_lay.addWidget(self.chk_spectator_hit_fx_latency_log, 6, 4, 1, 2)
+        self.chk_spectator_hit_fx_show_special_text = QCheckBox("STUN / COUNTER 텍스트 표시")
+        self.chk_spectator_hit_fx_show_special_text.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_show_special_text", True)))
+        self.chk_spectator_hit_fx_show_special_text.setToolTip("스턴·카운터 타격점에 영어 라벨을 표시합니다. 데미지 숫자 표시와 별개입니다.")
+        self.chk_spectator_hit_fx_show_special_text.stateChanged.connect(self._schedule_apply)
+        hit_lay.addWidget(self.chk_spectator_hit_fx_show_special_text, 7, 2, 1, 4)
         for widget in (
             self.sp_spectator_hit_effect_damage,
             self.cb_spectator_hit_fx_color_preset,
@@ -20106,6 +20111,8 @@ class SettingsDialog(QDialog):
             self.cfg.spectator_hit_effect_fill_opacity = float(self.sp_spectator_hit_fx_fill_opacity.value())
         if hasattr(self, "chk_spectator_hit_fx_show_text"):
             self.cfg.spectator_hit_effect_show_text = bool(self.chk_spectator_hit_fx_show_text.isChecked())
+        if hasattr(self, "chk_spectator_hit_fx_show_special_text"):
+            self.cfg.spectator_hit_effect_show_special_text = self.chk_spectator_hit_fx_show_special_text.isChecked()
         if hasattr(self, "sp_spectator_hit_fx_text_scale"):
             self.cfg.spectator_hit_effect_text_scale = float(self.sp_spectator_hit_fx_text_scale.value())
         if hasattr(self, "chk_spectator_hit_fx_fast_emit"):
@@ -20778,6 +20785,8 @@ class SettingsDialog(QDialog):
             self.sp_spectator_hit_fx_fill_opacity.setValue(number_setting(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0), 1.0))
         if hasattr(self, "chk_spectator_hit_fx_show_text"):
             self.chk_spectator_hit_fx_show_text.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_show_text", True)))
+        if hasattr(self, "chk_spectator_hit_fx_show_special_text"):
+            self.chk_spectator_hit_fx_show_special_text.setChecked(bool(getattr(self.cfg, "spectator_hit_effect_show_special_text", True)))
         if hasattr(self, "sp_spectator_hit_fx_text_scale"):
             self.sp_spectator_hit_fx_text_scale.setValue(float(getattr(self.cfg, "spectator_hit_effect_text_scale", 1.0) or 1.0))
         if hasattr(self, "chk_spectator_hit_fx_fast_emit"):
@@ -27270,6 +27279,10 @@ class MainApp(QObject):
                 integration.save_replay(reason, context=context)
             if save_source_record:
                 self._request_source_record_capture(integration, source_record_context, reason, context)
+        if auto_replay_requested and auto_replay_kind=="kd":
+            controller=self.__dict__.get("_obs_auto_replay")
+            if controller is not None:
+                controller.expect_kd_capture(context)
         logging.info(
             "OBS_HIGHLIGHT_SAVE_REQUEST kind=%s damage=%.1f combo=%s auto_replay=%s source_record=%s",
             normalized,
@@ -28964,6 +28977,7 @@ class MainApp(QObject):
                     "hitFxGlow": float(max(0.0, min(3.0, float(getattr(self.cfg, "spectator_hit_effect_glow", 1.0) or 1.0)))),
                     "hitFxFillOpacity": float(max(0.0, min(1.5, number_setting(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0), 1.0)))),
                     "hitFxShowText": bool(getattr(self.cfg, "spectator_hit_effect_show_text", True)),
+                    "hitFxShowSpecialText": bool(getattr(self.cfg, "spectator_hit_effect_show_special_text", True)),
                     "hitFxTextScale": float(max(0.5, min(2.0, float(getattr(self.cfg, "spectator_hit_effect_text_scale", 1.0) or 1.0)))),
                     "hitFxLatencyLog": bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)),
                     "hitFxSpriteEnabled": bool(getattr(self.cfg, "spectator_hit_effect_sprite_enabled", True)),
@@ -29526,6 +29540,7 @@ class MainApp(QObject):
                 "spectator_hit_effect_glow": "hitFxGlow",
                 "spectator_hit_effect_fill_opacity": "hitFxFillOpacity",
                 "spectator_hit_effect_show_text": "hitFxShowText",
+                "spectator_hit_effect_show_special_text": "hitFxShowSpecialText",
                 "spectator_hit_effect_text_scale": "hitFxTextScale",
                 "spectator_hit_effect_latency_log": "hitFxLatencyLog",
                 "spectator_hit_effect_sprite_enabled": "hitFxSpriteEnabled",
@@ -29608,6 +29623,7 @@ class MainApp(QObject):
             update.setdefault("hitFxGlow", float(max(0.0, min(3.0, float(getattr(self.cfg, "spectator_hit_effect_glow", 1.0) or 1.0)))))
             update.setdefault("hitFxFillOpacity", float(max(0.0, min(1.5, number_setting(getattr(self.cfg, "spectator_hit_effect_fill_opacity", 1.0), 1.0)))))
             update.setdefault("hitFxShowText", bool(getattr(self.cfg, "spectator_hit_effect_show_text", True)))
+            update.setdefault("hitFxShowSpecialText", bool(getattr(self.cfg, "spectator_hit_effect_show_special_text", True)))
             update.setdefault("hitFxTextScale", float(max(0.5, min(2.0, float(getattr(self.cfg, "spectator_hit_effect_text_scale", 1.0) or 1.0)))))
             update.setdefault("hitFxLatencyLog", bool(getattr(self.cfg, "spectator_hit_effect_latency_log", True)))
             update.setdefault("hitFxSpriteEnabled", bool(getattr(self.cfg, "spectator_hit_effect_sprite_enabled", True)))

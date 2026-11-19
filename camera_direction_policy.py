@@ -15,7 +15,31 @@ CAMERA_DEFAULTS = {
     'camera_director_rotation_blue_sec':10.0,
     'camera_director_rotation_red_sec':10.0,
     'camera_director_rotation_normal_sec':10.0,
+    'camera_director_rotation_layout':'three',
+    'camera_director_rotation_normal_first_sec':3.0,
+    'camera_director_rotation_normal_last_sec':7.0,
+    'camera_director_rotation_custom':(),
 }
+ROTATION_SLOT_LIMIT=8
+ROTATION_DEFAULT_CUSTOM=(('blue',10),('normal',3),('red',10),('normal',7))
+
+
+def rotation_custom_slots(value):
+    if not isinstance(value,(tuple,list)) or not 1<=len(value)<=ROTATION_SLOT_LIMIT:
+        return ROTATION_DEFAULT_CUSTOM
+    result=[]
+    for slot in value:
+        if not isinstance(slot,(tuple,list)) or len(slot)!=2 or slot[0] not in ('blue','red','normal'):
+            return ROTATION_DEFAULT_CUSTOM
+        side,seconds=slot
+        try:
+            seconds=float(seconds)
+            if not math.isfinite(seconds):
+                return ROTATION_DEFAULT_CUSTOM
+        except (ValueError,TypeError,OverflowError):
+            return ROTATION_DEFAULT_CUSTOM
+        result.append((side,max(0 if side=='normal' else 1,min(600 if side=='normal' else 300,seconds))))
+    return tuple(result) if any(side!='normal' for side,_ in result) else ROTATION_DEFAULT_CUSTOM
 PROFILES = {
     'cautious':dict(hits=4, score=82, stability=.22, speed=2, turn=100, near=.8, far=2.8),
     'balanced':dict(hits=3, score=72, stability=.15, speed=2.5, turn=120, near=.7, far=3.2),
@@ -29,10 +53,15 @@ def camera_settings(source):
     limits = {'duration':(1,3), 'max_duration':(1,3), 'cooldown':(0,120), 'min_hits':(3,10),
               'target_pct':(5,35),'idle_sec':(6,60),
               'rotation_blue_sec':(1,300),'rotation_red_sec':(1,300),
-              'rotation_normal_sec':(0,600)}
+              'rotation_normal_sec':(0,600),'rotation_normal_first_sec':(0,600),
+              'rotation_normal_last_sec':(0,600)}
     for key, default in CAMERA_DEFAULTS.items():
         value = source.get(key, default) if isinstance(source,dict) else getattr(source,key,default)
-        if key=='camera_view_mode':
+        if key.endswith('_rotation_layout'):
+            value=value if value in ('three','four','custom') else default
+        elif key.endswith('_rotation_custom'):
+            value=rotation_custom_slots(value)
+        elif key=='camera_view_mode':
             value=value if value in ('opponent','raw','hybrid') else default
         elif key=='camera_hybrid_player_pct':
             try:

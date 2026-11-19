@@ -21,14 +21,14 @@ class CameraRotationTests(unittest.TestCase):
     def step(self, at, **kwargs):
         return self.fixture.step(at, **kwargs)
 
-    def enter(self, at):
+    def enter(self, at, side='blue'):
         self.step(at)
         self.assertEqual(self.director.state, 'probe')
         self.step(at + .14)
         self.assertEqual(self.director.state, 'enter')
         self.step(at + .16); self.step(at + .18)
         self.assertEqual(self.director.state, 'active')
-        self.assertEqual(self.director.camera.side, 'blue')
+        self.assertEqual(self.director.camera.side, side)
 
     def switch_red(self, at):
         self.step(at)
@@ -128,7 +128,7 @@ class CameraRotationTests(unittest.TestCase):
         self.assertEqual(values['camera_director_rotation_red_sec'],1)
         self.assertEqual(values['camera_director_rotation_normal_sec'],600)
 
-    def test_stun_and_knockdown_do_not_shorten_blue_or_red(self):
+    def test_stun_is_ignored_but_kd_holds_then_resumes_with_red(self):
         self.enter(0)
         self.director.feed.update({'spectator_effect_events': [{'kind': 'stun'}]}, now=1)
         self.step(1)
@@ -136,11 +136,94 @@ class CameraRotationTests(unittest.TestCase):
         (self.fixture.root/'match/round_state.txt').write_text('RoundKnockdown')
         self.director.feed.update({'spectator_round_state': 'knockdown',
                                    'spectator_effect_events': [{'kind': 'knockdown'}]}, busy=True, now=2)
-        self.step(2, busy=True)
-        self.assertEqual(self.director.state, 'active')
-        self.switch_red(10.19)
-        self.step(18, busy=True)
-        self.assertEqual(self.director.state, 'active')
+        self.leave(2)
+        self.step(3, busy=True)
+        self.assertEqual(self.director.state,'idle')
+        (self.fixture.root/'match/round_state.txt').write_text('RoundFight')
+        replay=Mock(return_value=True)
+        self.director.rotation_replay_check=replay
+        self.step(4)
+        self.assertEqual(self.director.state,'idle')
+        replay.return_value=False
+        self.enter(5,'red')
+        self.assertEqual(self.fixture.calls,['probe','release','probe'])
+
+    def restart_with(self, **options):
+        self.director.thread=None
+        with patch('camera_director.threading.Thread'):
+            self.director.start(self.fixture.root,{'fov':75},profile='rotation',**options)
+
+    def test_four_slots_use_two_separate_normal_times(self):
+        self.restart_with(rotation_layout='four',rotation_blue_sec=2,rotation_red_sec=4,
+                          rotation_normal_first_sec=3,rotation_normal_last_sec=7)
+        self.enter(0);self.leave(2.19)
+        self.assertAlmostEqual(self.director.next_cut,5.38)
+        self.step(5.37);self.assertEqual(self.director.state,'idle')
+        self.enter(5.39,'red');self.leave(9.58)
+        self.assertAlmostEqual(self.director.next_cut,16.77)
+        self.enter(16.78)
+        self.assertEqual(self.fixture.calls,['probe','release','probe','release','probe'])
+
+    def test_custom_order_uses_each_slots_own_clock(self):
+        self.restart_with(rotation_layout='custom',
+                          rotation_custom=[('normal',2),('red',1),('red',3),('normal',1),('blue',5)])
+        self.step(0);self.step(1.99);self.assertEqual(self.director.state,'idle')
+        self.enter(2.01,'red')
+        self.step(3.20)
+        self.assertEqual(self.director.state,'active')
+        self.assertEqual(self.director.prepared['duration'],3)
+        self.assertEqual(self.fixture.calls,['probe'])
+        self.leave(6.21)
+        self.assertAlmostEqual(self.director.next_cut,7.40)
+        self.enter(7.41)
+        self.assertEqual(self.director.prepared['duration'],5)
+
+    def test_custom_slots_and_independent_normal_times_round_trip(self):
+        import tempfile
+        from pathlib import Path
+        from config_model import AppConfig
+        cfg=AppConfig()
+        cfg.camera_director_rotation_layout='custom'
+        cfg.camera_director_rotation_custom=(('red',2.5),('normal',0),('blue',12))
+        cfg.camera_director_rotation_normal_first_sec=1.5
+        cfg.camera_director_rotation_normal_last_sec=8.5
+        with tempfile.TemporaryDirectory() as temp:
+            file=str(Path(temp,'config.json'))
+            cfg.to_json(file);restored=AppConfig.from_json(file)
+        for suffix in ('layout','custom','normal_first_sec','normal_last_sec'):
+            key='camera_director_rotation_'+suffix
+            self.assertEqual(getattr(restored,key),getattr(cfg,key))
+
+    def test_kd_capture_hold_expires_and_can_be_cancelled(self):
+        from types import SimpleNamespace
+        from obs_auto_replay import ObsAutoReplayController
+        clock=[50]
+        controller=ObsAutoReplayController(lambda:SimpleNamespace(),lambda:None,Mock(),clock=lambda:clock[0])
+        context=dict(auto_replay_kind='kd',trigger_monotonic=50,replay_capture_delay_sec=2,
+                     auto_replay_source_wait_sec=3)
+        controller.expect_kd_capture(context)
+        clock[0]=54;self.assertTrue(controller.kd_pending())
+        clock[0]=55;self.assertFalse(controller.kd_pending())
+        clock[0]=52;controller.cancel()
+        self.assertFalse(controller.kd_pending())
+
+    def test_kd_during_normal_has_no_extra_toggle_or_wait(self):
+        self.restart_with(rotation_layout='four',rotation_blue_sec=2,rotation_normal_first_sec=60)
+        self.enter(0);self.leave(2.19)
+        (self.fixture.root/'match/round_state.txt').write_text('RoundKnockdown')
+        self.step(3);self.step(4)
+        self.assertEqual(self.fixture.calls,['probe','release'])
+        (self.fixture.root/'match/round_state.txt').write_text('RoundFight')
+        self.enter(5,'red')
+
+    def test_terminal_during_kd_does_not_resume_the_old_slot(self):
+        self.enter(0)
+        state=self.fixture.root/'match/round_state.txt'
+        state.write_text('RoundKnockdown');self.leave(1)
+        state.write_text('RoundKnockout');self.step(2)
+        state.write_text('Results');self.step(3)
+        self.assertEqual(self.fixture.calls,['probe','release'])
+        state.write_text('RoundFight');self.enter(4)
 
     def test_entry_guard_ignores_effects_and_presentation_busy(self):
         def guarded(guard):
@@ -268,6 +351,26 @@ with patch.object(service.director,'start') as start,patch.object(service.timer,
  assert start.call_args.kwargs['rotation_blue_sec']==12.5
  assert start.call_args.kwargs['rotation_red_sec']==4
  assert start.call_args.kwargs['rotation_normal_sec']==0
+ selector=panel.findChild(QComboBox,'cameraRotationLayout')
+ selector.setCurrentIndex(selector.findData('four'))
+ first=panel.findChild(QDoubleSpinBox,'cameraDirector_rotation_normal_first_sec')
+ last=panel.findChild(QDoubleSpinBox,'cameraDirector_rotation_normal_last_sec')
+ assert first.isEnabled() and last.isEnabled()
+ first.setValue(2.5);last.setValue(9)
+ check=next(x for x in panel.findChildren(QCheckBox) if x.text().startswith('F6 파일 카메라'))
+ check.setChecked(True);button=next(x for x in panel.findChildren(QPushButton) if x.text()=='자동 연출 시작')
+ button.click()
+ assert start.call_args.kwargs['rotation_layout']=='four'
+ assert start.call_args.kwargs['rotation_normal_first_sec']==2.5
+ assert start.call_args.kwargs['rotation_normal_last_sec']==9
+ selector.setCurrentIndex(selector.findData('custom'))
+ from PyQt6.QtWidgets import QSpinBox
+ panel.findChild(QSpinBox,'cameraRotationSlotCount').setValue(2)
+ slot=panel.findChild(QComboBox,'cameraRotationSlot1View');slot.setCurrentIndex(slot.findData('red'))
+ panel.findChild(QDoubleSpinBox,'cameraRotationSlot1Seconds').setValue(3.5)
+ check.setChecked(True);button.click()
+ assert start.call_args.kwargs['rotation_layout']=='custom'
+ assert start.call_args.kwargs['rotation_custom']==[('red',3.5),('normal',3.0)]
 '''
         result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
                                 encoding='utf-8', errors='replace', timeout=20,

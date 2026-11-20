@@ -3208,6 +3208,8 @@ html,body{
 .rrFighter.red .rrNameLine{justify-content:flex-end;}
 .rrResultBadge{flex:0 0 auto;padding:12px 24px 11px;border-radius:6px;font-size:40px;line-height:1;font-weight:1000;font-style:italic;letter-spacing:3px;text-shadow:0 2px 3px #000;animation:rrResultBadgeIn .42s cubic-bezier(.16,1,.3,1) both;}
 .rrResultBadge.win{color:#fff4bd;border:1px solid #ffe082;background:linear-gradient(180deg,#9a6400,#3d2600);box-shadow:0 0 16px rgba(255,193,7,.55),inset 0 1px 0 rgba(255,255,255,.35);}
+.rrResultBadge.method{font-size:30px;font-style:normal;letter-spacing:1px;padding-inline:15px;white-space:nowrap;}
+.rrNameLine .rrNameBig{min-width:0;overflow-wrap:anywhere;}
 .rrResultBadge.draw{color:#f8fafc;border:1px solid #d7dee8;background:linear-gradient(180deg,#536170,#1d2732);box-shadow:0 0 14px rgba(203,213,225,.42),inset 0 1px 0 rgba(255,255,255,.30);}
 @keyframes rrResultBadgeIn{0%{opacity:0;transform:translateY(-7px) scale(.72)}70%{opacity:1;transform:translateY(1px) scale(1.08)}100%{opacity:1;transform:translateY(0) scale(1)}}
 .rrFlag{margin:8px 0 0!important;width:44px!important;height:28px!important;}
@@ -3875,7 +3877,17 @@ function rrV4ComboDetails(data,isFinal){
   const size=Math.max(12,18-Math.floor(Math.max(0,sequence.length-8)/4));
   return '<div class="rrComboDetails" style="--combo-detail-size:'+size+'px"><div class="rrComboSequence">'+line+'</div>'+(notes.length?'<div class="rrComboNotes">'+escapeHtml(notes.join(' · '))+'</div>':'')+'</div>';
 }
-function rrV4Fighter(side,data,opp,s,winner,leader,isFinal,showResult){
+function rrV4WinMethod(e){
+  const method=String(e.resultMethod||(e.matchResult&&e.matchResult.method)||'').trim().toLowerCase();
+  if(method==='ko/tko'||method==='tko/ko')return 'KO/TKO';
+  if(['tko','technical knockout','technicalknockout','tko승'].includes(method))return 'TKO';
+  if(['ko','knockout','ko승'].includes(method))return 'KO';
+  if(['판정','판정승','decision','points','point','unanimous decision','split decision','majority decision'].includes(method))return '판정승';
+  if(['기권','기권승','forfeit','surrender','retire','retirement'].includes(method))return '기권승';
+  if(['disqualified','disqualification','dq','실격'].includes(method))return '실격승';
+  return '';
+}
+function rrV4Fighter(side,data,opp,s,winner,leader,isFinal,showResult,winMethod){
   const red=side==='red';
   const name=rrV4Name(side,data,s);
   const portrait=rrV4Portrait(side,s);
@@ -3883,8 +3895,9 @@ function rrV4Fighter(side,data,opp,s,winner,leader,isFinal,showResult){
   const stamina=Number.isFinite(Number(data.staminaPct))?rrV4Pct(data.staminaPct):100-rrV4Pct((data.punishment&&data.punishment.mid)||0);
   const win=String(winner||'').toLowerCase()===side;
   const draw=showResult&&String(winner||'').toLowerCase()==='draw';
-  const resultText=showResult?(draw?'DRAW':(win?'WIN':'')):'';
-  const resultBadge=resultText?'<span class="rrResultBadge '+(draw?'draw':'win')+'">'+resultText+'</span>':'';
+  const methodLabel=showResult&&isFinal&&win?winMethod:'';
+  const resultText=showResult?(draw?'DRAW':(win?(methodLabel||'WIN'):'')):'';
+  const resultBadge=resultText?'<span class="rrResultBadge '+(draw?'draw':'win')+(methodLabel?' method':'')+'">'+escapeHtml(resultText)+'</span>':'';
   const style=Object.assign({},data.fightStyle||{});
   const styleLabel=String(style.label||'').trim();
   const styleSecondary=String(style.secondaryLabel||style.signature||'').trim();
@@ -3974,12 +3987,13 @@ function showRoundReport(e,s){
   const isFinal=!!e.isFinal;
   const showResult=isFinal||!!e.showWinner;
   const winner=showResult?String(e.winner||'').toLowerCase():'';
+  const winMethod=isFinal?rrV4WinMethod(e):'';
   const leader=String(e.leader||'').toLowerCase();
   const title=isFinal?'\uACBD\uAE30 \uC804\uCCB4 \uB9AC\uD3EC\uD2B8':((round||'')+'\uB77C\uC6B4\uB4DC \uB9AC\uD3EC\uD2B8');
   const meta=isFinal?'\uACBD\uAE30 \uC885\uB8CC \uB9AC\uD3EC\uD2B8':'\uD734\uC2DD \uC2DC\uAC04 \uB9AC\uD3EC\uD2B8';
   const logoSrc=(q('rrBrandLogo')&&q('rrBrandLogo').getAttribute('src'))||'';
   const logo=logoSrc?'<img id="rrBrandLogo" class="rrLogoImg" src="'+escapeHtml(logoSrc)+'">':'<div id="rrBrandLogo" class="rrLogoMark"><div class="main"><span>Room</span><b class="fight">Fight</b><span>Club</span></div><div class="sub">VR BOXING</div></div>';
-  const html='<div class="rrV4">'+rrV4Fighter('blue',blue,red,s,winner,leader,isFinal,showResult)+'<section class="rrCenter"><div class="rrCenterMeta"><div class="rrScoreLine"><b class="rrScoreBlue">'+rrV4Num(blue.officialScore)+'</b><strong>'+escapeHtml(title)+'</strong><b class="rrScoreRed">'+rrV4Num(red.officialScore)+'</b></div><span>'+escapeHtml(meta)+'</span></div><div class="rrRows">'+rrV4Rows(blue,red)+'</div><div class="rrLogo">'+logo+'</div></section>'+rrV4Fighter('red',red,blue,s,winner,leader,isFinal,showResult)+'</div>';
+  const html='<div class="rrV4">'+rrV4Fighter('blue',blue,red,s,winner,leader,isFinal,showResult,winMethod)+'<section class="rrCenter"><div class="rrCenterMeta"><div class="rrScoreLine"><b class="rrScoreBlue">'+rrV4Num(blue.officialScore)+'</b><strong>'+escapeHtml(title)+'</strong><b class="rrScoreRed">'+rrV4Num(red.officialScore)+'</b></div><span>'+escapeHtml(meta)+'</span></div><div class="rrRows">'+rrV4Rows(blue,red)+'</div><div class="rrLogo">'+logo+'</div></section>'+rrV4Fighter('red',red,blue,s,winner,leader,isFinal,showResult,winMethod)+'</div>';
   el.innerHTML=html;
   el.classList.remove('hide');
   restartClass(el,'show');

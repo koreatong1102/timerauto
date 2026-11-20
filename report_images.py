@@ -10,6 +10,7 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -19,42 +20,54 @@ import uuid
 from diagnostics import diagnostics as DIAG
 
 
-def safe_name(value):
-    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(value or '')).strip(' .')
-    return (text[:48].rstrip(' .') or 'UNKNOWN')
-
-
 def image_metadata(report, events, folder):
-    """Number exactly as the chapter's result summary, including resumed journals."""
+    """Use the recorded match date, independent of the active broadcast."""
     if report.get('_reportImageTest'):
         return None
     key = str(report.get('matchSessionId') or '')
-    order = []
-    results = {}
-    for event in events:
-        if event.get('source') != 'match_result_summary':
-            continue
-        session = str(event.get('match_session_id') or '')
-        if session and session not in results:
-            order.append(session)
-            results[session] = event
-    if not key or key not in results:
-        return None  # Never guess a match number if the journal write failed.
-    event = results[key]
+    if not key:
+        return None
+    event = next((entry for entry in events if entry.get('source') == 'match_result_summary'
+                  and str(entry.get('match_session_id') or '') == key), None)
+    if event is None:
+        return None
     stamp = str(event.get('wall_time') or '')
     for entry in events:
         if (entry.get('source') in ('spectatorlog_vs_intro', 'match_archive_recovery')
-                and entry.get('match_session_id') == key):
+                and str(entry.get('match_session_id') or '') == key):
             stamp = str(entry.get('wall_time') or stamp)
             break
     try:
-        date = datetime.fromisoformat(stamp).strftime('%Y-%m-%d_%H-%M-%S')
+        date = datetime.fromisoformat(stamp).date().isoformat()
     except (TypeError, ValueError):
         return None
-    number = order.index(key) + 1
-    blue = safe_name(event.get('blue_name') or (report.get('blue') or {}).get('name') or 'BLUE')
-    red = safe_name(event.get('red_name') or (report.get('red') or {}).get('name') or 'RED')
-    return dict(folder=str(folder), filename=f'{date}_제{number:03d}경기_{blue}_vs_{red}.png')
+    return dict(folder=str(Path(folder) / date), dailyMatchId=key)
+
+
+def daily_report_target(folder, match_id):
+    """Reserve one stable filename per match, even across application restarts."""
+    folder = Path(folder).absolute()
+    folder.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(folder / '.report-index.sqlite3', timeout=0.25)
+    try:
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('CREATE TABLE IF NOT EXISTS reports '
+                       '(match_id TEXT PRIMARY KEY, number INTEGER NOT NULL UNIQUE)')
+            reserved = db.execute('SELECT number FROM reports WHERE match_id = ?', (match_id,)).fetchone()
+            if reserved:
+                number = reserved[0]
+            else:
+                last = db.execute('SELECT COALESCE(MAX(number), 0) FROM reports').fetchone()[0]
+                for path in folder.iterdir():
+                    match = re.fullmatch(r'([0-9]{1,18})\.png', path.name, flags=re.IGNORECASE)
+                    if match:
+                        last = max(last, int(match[1]))
+                number = last + 1
+                db.execute('INSERT INTO reports VALUES (?, ?)', (match_id, number))
+    finally:
+        db.close()
+    return str(folder / f'{number:03d}.png')
 
 
 def browser_executable():
@@ -146,10 +159,18 @@ class ReportImageExporter:
             return False
         folder = str(meta.get('folder') or '')
         name = str(meta.get('filename') or '')
-        if not folder or not name.endswith('.png') or os.path.basename(name) != name or '/' in name or '\\' in name:
+        if not folder:
             return False
-        target = os.path.abspath(os.path.join(folder, name))
         try:
+            daily_match = meta.get('dailyMatchId')
+            if daily_match:
+                if daily_match != str(report.get('matchSessionId') or '') or report.get('_reportImageTest'):
+                    return False
+                target = daily_report_target(folder, daily_match)
+            elif name.endswith('.png') and os.path.basename(name) == name and '/' not in name and '\\' not in name:
+                target = os.path.abspath(os.path.join(folder, name))
+            else:
+                return False
             revision = max(0, int(report.get('reportRevision') or 0))
             frozen = copy.deepcopy(report)
             semantic = {key: value for key, value in frozen.items()
@@ -310,8 +331,8 @@ def create_settings_panel(cfg, parent, changed, test_callback):
     browse = QPushButton('폴더 선택')
     row = QHBoxLayout(); row.addWidget(folder); row.addWidget(browse)
     layout.addWidget(enabled); layout.addLayout(row)
-    hint = QLabel('1920×1080 PNG · 날짜/시간_제001경기_블루닉네임_vs_레드닉네임.png\n'
-                  '경기 번호는 방송 챕터의 경기 결과 요약과 같습니다. 재시작해도 챕터 기록을 이어 쓰면 번호도 이어집니다.\n'
+    hint = QLabel('1920×1080 PNG · 날짜별 폴더에 001.png, 002.png 순서로 저장합니다.\n'
+                  '같은 날에는 앱이나 방송을 다시 시작해도 번호가 이어집니다.\n'
                   '실제 종료리포트가 나올 때 별도 작업으로 저장합니다. Edge/Chrome이 필요하며 방송 화면은 건드리지 않습니다.')
     hint.setWordWrap(True); layout.addWidget(hint)
     test = QPushButton('마지막 종료리포트 이미지 저장 테스트')

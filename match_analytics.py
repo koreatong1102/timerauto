@@ -107,8 +107,12 @@ def resolve_match_result(
         stoppage_data = dict(stoppage or {})
         stoppage_winner = str(stoppage_data.get("winner") or "").lower().strip()
         stoppage_method = str(stoppage_data.get("method") or "").strip()
+        # winner.txt names the winner, but does not encode the finish method.
+        # A Cancel with a valid winner is not evidence of a points decision.
+        default_method = {"knockout": "KO/TKO", "disqualified": "disqualified",
+                          "cancel": ""}.get(_normalized_token(state), "판정")
         method = stoppage_method if winner == stoppage_winner and stoppage_method else str(
-            winner_data.get("method") or ('KO/TKO' if _normalized_token(state)=='knockout' else '판정')
+            winner_data.get("method") or default_method
         )
         return {
             "winner": winner,

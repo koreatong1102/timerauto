@@ -323,6 +323,14 @@ class MatchAnalyticsTests(unittest.TestCase):
         self.assertEqual(result["winner"], "")
         self.assertEqual(result["source"], "pending")
 
+    def test_winner_file_alone_does_not_turn_cancel_into_decision(self):
+        for state, method in (("cancel", ""), ("disqualified", "disqualified"),
+                              ("knockout", "KO/TKO"), ("results", "판정")):
+            with self.subTest(state=state):
+                result = resolve_match_result({"side": "red"}, {}, state, 29, 28)
+                self.assertEqual(result["winner"], "red")
+                self.assertEqual(result["method"], method)
+
     def test_style_names_and_descriptions_are_korean(self):
         style = analyze_fight_style(
             {

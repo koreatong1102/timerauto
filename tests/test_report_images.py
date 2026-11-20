@@ -1,16 +1,49 @@
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import time
 import unittest
 from unittest.mock import Mock, patch
 
 from config_model import AppConfig
-from report_images import ReportImageExporter, browser_executable, image_metadata, render_html, safe_name, save_png
+from report_images import ReportImageExporter, browser_executable, image_metadata, render_html, save_png
 
 
 class ReportImagesTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('node'), 'Node needed for browser function test')
+    def test_final_report_badge_uses_method_only_for_winning_corner(self):
+        from browser_overlay import BrowserOverlayServer
+        html = BrowserOverlayServer()._html()
+        start = html.index('function rrV4Num(')
+        end = html.index('\nfunction ', html.index('\n}', html.index('function showRoundReport(')))
+        script = '''
+const assert=require('node:assert/strict');
+const el={classList:{remove(){}}}, q=id=>id==='roundReport'?el:null;
+const timers={}, hideFullscreen=()=>{}, restartClass=()=>{}, setTimeout=()=>0;
+const escapeHtml=x=>String(x);
+''' + html[start:end] + '''
+const badges=e=>{
+    showRoundReport(e,{});
+    return [...el.innerHTML.matchAll(/<span class="rrResultBadge [^"]+">([^<]+)<\\/span>/g)].map(m=>m[1]);
+};
+const final={isFinal:true,winner:'blue',blue:{name:'BLUE-NAME'},red:{name:'RED-NAME'}};
+for(const [method,label] of [['TKO','TKO'],['KO','KO'],['판정','판정승'],['KO/TKO','KO/TKO'],['unknown','WIN']]){
+    assert.deepEqual(badges({...final,resultMethod:method}),[label]);
+    assert(el.innerHTML.includes('BLUE-NAME</div><span class="rrResultBadge'));
+}
+assert.deepEqual(badges({...final,winner:'red',matchResult:{method:'decision'}}),['판정승']);
+assert(el.innerHTML.includes('판정승</span><div class="rrNameBig">RED-NAME'));
+assert.deepEqual(badges({...final,winner:'draw',resultMethod:'TKO'}),['DRAW','DRAW']);
+assert.deepEqual(badges({...final,isFinal:false,resultMethod:'TKO'}),[]);
+assert.deepEqual(badges({...final,isFinal:false,showWinner:true,resultMethod:'TKO'}),['WIN']);
+'''
+        result = subprocess.run(['node'], input=script, capture_output=True, text=True,
+                                encoding='utf8', timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_png_save_without_pillow_in_unicode_directory(self):
         import builtins
         from PyQt6.QtGui import QImage,QColor
@@ -46,14 +79,50 @@ class ReportImagesTests(unittest.TestCase):
             dict(source='match_result_summary', match_session_id='two', wall_time='2026-11-14T20:10:10', blue_name='통', red_name='선수'),
         ]
 
-    def test_date_time_and_number_are_chapter_result_order_not_player_names(self):
-        meta = image_metadata({'matchSessionId':'two'}, self.journal(), 'exports')
-        self.assertEqual(meta['filename'], '2026-11-14_20-06-00_제002경기_통_vs_선수.png')
-        self.assertEqual(meta, image_metadata({'matchSessionId':'two'}, json.loads(json.dumps(self.journal())), 'exports'))
+    def test_match_start_date_wins_when_result_crosses_midnight(self):
+        rows = self.journal()
+        rows[3]['wall_time'] = '2026-11-15T00:02:00'
+        meta = image_metadata({'matchSessionId':'two'}, rows, 'exports')
+        self.assertEqual(meta, dict(folder=str(Path('exports', '2026-11-14')), dailyMatchId='two'))
+        self.assertEqual(meta, image_metadata({'matchSessionId':'two'}, json.loads(json.dumps(rows)), 'exports'))
 
-    def test_new_broadcast_journal_restarts_number(self):
-        rows = [x for x in self.journal() if x['match_session_id']=='two']
-        self.assertIn('제001경기', image_metadata({'matchSessionId':'two'}, rows, 'x')['filename'])
+    def test_daily_numbers_survive_restart_and_new_journal_without_overwriting(self):
+        def exporter():
+            overlay = Mock()
+            overlay.snapshot.return_value = {}
+            overlay.image_path.return_value = ''
+            worker = ReportImageExporter(overlay)
+            worker.worker = Mock()
+            worker.worker.is_alive.return_value = True
+            return worker
+
+        def report(match_id, events):
+            result = dict(isFinal=True, matchSessionId=match_id)
+            result['_reportImage'] = image_metadata(result, events, temp)
+            return result
+
+        with tempfile.TemporaryDirectory() as temp:
+            first_worker = exporter()
+            day = Path(temp, '2026-11-14')
+            first = report('one', self.journal())
+            self.assertTrue(first_worker.enqueue(first))
+            target = day / '001.png'
+            self.assertEqual(first_worker.queue.get_nowait(), str(target))
+            target.write_bytes(b'original')
+            (day / '2.PNG').write_bytes(b'existing')
+
+            restarted = exporter()
+            self.assertFalse(restarted.enqueue(first))
+            self.assertTrue(restarted.enqueue(dict(first, reportRevision=1, winner='red')))
+            self.assertEqual(restarted.queue.get_nowait(), str(target))
+            self.assertTrue(restarted.enqueue(report('two', [row for row in self.journal()
+                                                             if row['match_session_id'] == 'two'])))
+            self.assertEqual(restarted.queue.get_nowait(), str(day / '003.png'))
+            self.assertEqual((day / '2.PNG').read_bytes(), b'existing')
+
+            next_day = [dict(source='match_result_summary', match_session_id='three', wall_time='2026-11-15T10:00:00')]
+            self.assertTrue(restarted.enqueue(report('three', next_day)))
+            self.assertEqual(restarted.queue.get_nowait(), str(Path(temp, '2026-11-15', '001.png')))
 
     def test_unknown_match_or_invalid_date_does_not_guess_number(self):
         self.assertIsNone(image_metadata({'matchSessionId':'missing'}, self.journal(), 'x'))
@@ -87,10 +156,6 @@ assert test.call_count==1
         run=subprocess.run([sys.executable,'-c',code],capture_output=True,text=True,
                            env={**os.environ,'QT_QPA_PLATFORM':'offscreen'},timeout=15)
         self.assertEqual(run.returncode,0,run.stderr)
-
-    def test_filename_sanitization(self):
-        self.assertEqual(safe_name('A/B:C?*<>|"\\'), 'A_B_C_______')
-        self.assertLessEqual(len(safe_name('가'*200)),48)
 
     def test_config_round_trip(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -157,15 +222,16 @@ assert test.call_count==1
                     fixture=QImage(260,300,QImage.Format.Format_RGB32);fixture.fill(QColor(*color));fixture.save(str(path),'PNG')
                 overlay._image_paths={'blue':str(blue_image),'red':str(red_image)}
                 overlay.update(blueHasImage=True,redHasImage=True,blueImageRev=1,redImageRev=1)
-                report={'isFinal':True,'round':3,'winner':'blue',
+                report={'isFinal':True,'round':3,'winner':'blue','resultMethod':'판정',
                     'blue':dict(name='통',officialScore=30,damage=1245,landed=52,thrown=88,maxComboHits=4,maxComboDamage=151,averageDamage=23.9,healthPct=61,staminaPct=54,maxComboSequence=['JAB','CROSS','HOOK','HOOK'],maxComboRound=2,maxComboStartTimeText='1:23'),
                     'red':dict(name='현선호',officialScore=27,damage=1040,landed=40,thrown=90,maxComboHits=3,maxComboDamage=100,averageDamage=26,healthPct=50,staminaPct=43),
-                    '_reportImage':dict(folder=temp,filename='real_report.png')}
+                    'matchSessionId':'real-match',
+                    '_reportImage':dict(folder=str(Path(temp,'2026-11-14')),dailyMatchId='real-match')}
                 self.assertTrue(overlay.report_images.enqueue(report))
                 end=time.monotonic()+40
                 while overlay.report_images.pending and time.monotonic()<end:
                     time.sleep(.1)
-                target=Path(temp,'real_report.png')
+                target=Path(temp,'2026-11-14','001.png')
                 self.assertTrue(target.is_file(),'renderer failed; inspect REPORT_IMAGE_FAILED')
                 image=QImage(str(target))
                 self.assertEqual((image.width(),image.height()),(1920,1080))
